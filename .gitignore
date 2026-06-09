@@ -1,0 +1,7 @@
+/target/
+/gen/
+/conf/state/
+/logs/*
+!/logs/.gitkeep
+/bin/*
+!/bin/.gitkeep

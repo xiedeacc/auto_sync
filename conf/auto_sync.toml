@@ -1,0 +1,16 @@
+[app]
+data_db = "conf/state/auto_sync.sqlite"
+log_dir = "logs"
+status_log_interval_secs = 300
+
+[schedule]
+mode = "daily"
+time = "02:00:00"
+timezone = "local"
+weekday = "monday"
+sync_current_cycle_manually = false
+
+[deploy]
+targets = [
+  { id = "nas", host = "192.168.3.178", port = 10022, user = "root", install_dir = "/opt/auto_sync" },
+]

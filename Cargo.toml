@@ -1,0 +1,43 @@
+[package]
+name = "auto_sync"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "auto_syncd"
+path = "src/bin/auto_syncd.rs"
+
+[[bin]]
+name = "auto_syncctl"
+path = "src/bin/auto_syncctl.rs"
+
+[[bin]]
+name = "auto_sync_gui"
+path = "src/bin/auto_sync_gui.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+filetime = "0.2"
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = "2"
+tauri-plugin-dialog = "2"
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["chrono", "env-filter", "fmt"] }
+walkdir = "2"
+
+[build-dependencies]
+tauri-build = "2"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
