@@ -17,13 +17,12 @@ pub fn next_boundary_after(
     starts_at: DateTime<Utc>,
     cfg: &ScheduleConfig,
 ) -> Result<DateTime<Utc>> {
-    let (hour, minute, second) = parse_schedule_time(&cfg.time)?;
-    let time = NaiveTime::from_hms_opt(hour, minute, second)
-        .with_context(|| format!("invalid schedule time {}", cfg.time))?;
     let start_local = starts_at.with_timezone(&Local);
 
     match cfg.mode {
+        ScheduleMode::Realtime => Ok(starts_at),
         ScheduleMode::Daily => {
+            let time = schedule_time(cfg)?;
             let mut date = start_local.date_naive();
             loop {
                 let candidate = local_datetime(date, time)?;
@@ -36,6 +35,7 @@ pub fn next_boundary_after(
             }
         }
         ScheduleMode::Weekly => {
+            let time = schedule_time(cfg)?;
             let wanted = parse_weekday(cfg.weekday.as_deref().unwrap_or("monday"))?;
             let mut date = start_local.date_naive();
             for _ in 0..14 {
@@ -52,6 +52,12 @@ pub fn next_boundary_after(
             bail!("failed to calculate weekly schedule boundary")
         }
     }
+}
+
+fn schedule_time(cfg: &ScheduleConfig) -> Result<NaiveTime> {
+    let (hour, minute, second) = parse_schedule_time(&cfg.time)?;
+    NaiveTime::from_hms_opt(hour, minute, second)
+        .with_context(|| format!("invalid schedule time {}", cfg.time))
 }
 
 fn local_datetime(date: NaiveDate, time: NaiveTime) -> Result<DateTime<Local>> {

@@ -249,6 +249,26 @@ impl State {
         Ok(closed)
     }
 
+    pub fn close_current_cycle_for_source(&self, source_id: &str) -> Result<Option<Cycle>> {
+        let now = Utc::now();
+        let Some(cycle) = self.current_open_cycle(source_id)? else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            r#"
+            UPDATE sync_cycle
+            SET status='closed', ends_at=?1, updated_at=?1
+            WHERE id=?2 AND status='open'
+            "#,
+            params![now.to_rfc3339(), cycle.id],
+        )?;
+        self.ensure_open_cycle(source_id, now)?;
+        let mut closed_cycle = cycle;
+        closed_cycle.status = "closed".to_string();
+        closed_cycle.ends_at = Some(now);
+        Ok(Some(closed_cycle))
+    }
+
     pub fn current_open_cycle(&self, source_id: &str) -> Result<Option<Cycle>> {
         self.conn
             .query_row(

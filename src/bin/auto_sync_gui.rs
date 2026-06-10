@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use auto_sync::core::config::{AppConfig, load_config, load_or_create_config, save_config};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::state::{DestinationView, State as DbState};
-use auto_sync::core::sync::sync_all_pending;
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -45,20 +44,16 @@ fn get_status(state: tauri::State<'_, GuiState>) -> Result<Vec<DestinationView>,
 }
 
 #[tauri::command]
-async fn sync_now(state: tauri::State<'_, GuiState>) -> Result<Vec<DestinationView>, String> {
-    let config_path = state.config_path.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<DestinationView>> {
-        let cfg = load_config(&config_path)?;
-        let mut state_db = DbState::open(&cfg.app.data_db)?;
-        state_db.ensure_config(&cfg)?;
-        state_db.ensure_open_cycles(&cfg)?;
-        state_db.close_due_cycles(&cfg, true)?;
-        sync_all_pending(&cfg, &mut state_db)?;
-        state_db.destination_views(&cfg)
-    })
-    .await
-    .map_err(|err| format!("sync task failed: {err}"))?
-    .map_err(error_text)
+async fn sync_now(_state: tauri::State<'_, GuiState>) -> Result<Vec<DestinationView>, String> {
+    Err("sync is disabled during UI development".to_string())
+}
+
+#[tauri::command]
+async fn sync_source_now(
+    _state: tauri::State<'_, GuiState>,
+    _source_id: String,
+) -> Result<Vec<DestinationView>, String> {
+    Err("sync is disabled during UI development".to_string())
 }
 
 fn main() -> Result<()> {
@@ -79,7 +74,8 @@ fn main() -> Result<()> {
             get_config,
             save_config_command,
             get_status,
-            sync_now
+            sync_now,
+            sync_source_now
         ])
         .run(tauri::generate_context!())
         .context("failed to run Tauri GUI")?;

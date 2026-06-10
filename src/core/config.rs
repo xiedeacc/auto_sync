@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct AppConfig {
     pub app: AppSection,
+    #[serde(skip_serializing)]
     pub schedule: ScheduleConfig,
     pub source_groups: Vec<SourceGroupConfig>,
     pub deploy: DeployConfig,
@@ -20,6 +21,7 @@ pub struct AppSection {
     pub data_db: PathBuf,
     pub log_dir: PathBuf,
     pub status_log_interval_secs: u64,
+    pub web_bind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +37,7 @@ pub struct ScheduleConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScheduleMode {
+    Realtime,
     Daily,
     Weekly,
 }
@@ -61,6 +64,7 @@ pub struct DestinationConfig {
     pub id: String,
     pub path: PathBuf,
     pub enabled: bool,
+    pub schedule: ScheduleConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -104,6 +108,7 @@ impl Default for AppSection {
             data_db: PathBuf::from("conf/state/auto_sync.sqlite"),
             log_dir: PathBuf::from("logs"),
             status_log_interval_secs: 300,
+            web_bind: "0.0.0.0:18765".to_string(),
         }
     }
 }
@@ -111,7 +116,7 @@ impl Default for AppSection {
 impl Default for ScheduleConfig {
     fn default() -> Self {
         Self {
-            mode: ScheduleMode::Daily,
+            mode: ScheduleMode::Realtime,
             time: "02:00:00".to_string(),
             timezone: "local".to_string(),
             weekday: Some("monday".to_string()),
@@ -122,7 +127,7 @@ impl Default for ScheduleConfig {
 
 impl Default for ScheduleMode {
     fn default() -> Self {
-        Self::Daily
+        Self::Realtime
     }
 }
 
@@ -150,6 +155,7 @@ impl Default for DestinationConfig {
             id: String::new(),
             path: PathBuf::new(),
             enabled: true,
+            schedule: ScheduleConfig::default(),
         }
     }
 }
@@ -205,7 +211,7 @@ pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<()> {
 
 impl AppConfig {
     pub fn validate(&self) -> Result<()> {
-        parse_schedule_time(&self.schedule.time)?;
+        validate_schedule(&self.schedule)?;
 
         let mut source_ids = HashSet::new();
         for source in &self.source_groups {
@@ -234,6 +240,8 @@ impl AppConfig {
                 if dst.path.as_os_str().is_empty() {
                     bail!("destination {} has empty path", dst.id);
                 }
+                validate_schedule(&dst.schedule)
+                    .with_context(|| format!("destination {} has invalid schedule", dst.id))?;
                 if path_has_prefix(&dst.path, &source.src) {
                     bail!(
                         "destination {} ({}) must not be inside source {} ({})",
@@ -246,6 +254,16 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+}
+
+pub fn validate_schedule(schedule: &ScheduleConfig) -> Result<()> {
+    match schedule.mode {
+        ScheduleMode::Realtime => Ok(()),
+        ScheduleMode::Daily | ScheduleMode::Weekly => {
+            parse_schedule_time(&schedule.time)?;
+            Ok(())
+        }
     }
 }
 
@@ -304,6 +322,7 @@ mod tests {
                 id: "bad".to_string(),
                 path: PathBuf::from("/data/src/backup"),
                 enabled: true,
+                schedule: ScheduleConfig::default(),
             }],
         });
         assert!(cfg.validate().is_err());

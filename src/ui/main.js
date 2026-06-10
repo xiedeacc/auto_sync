@@ -1,188 +1,401 @@
-const invoke = window.__TAURI__.core.invoke;
-const dialogOpen = window.__TAURI__.dialog.open;
+const isTauri = Boolean(window.__TAURI__);
+const invoke = isTauri ? window.__TAURI__.core.invoke : invokeWeb;
+const dialogOpen = isTauri ? window.__TAURI__.dialog.open : null;
 
 let cfg = null;
+let statuses = [];
+let activeTab = "0";
 let busy = false;
+let folderPicker = null;
+let scheduleEditor = null;
+let latestDestinationSchedule = defaultDestinationSchedule();
 
 const el = {
   configPath: document.getElementById("config-path"),
-  scheduleMode: document.getElementById("schedule-mode"),
-  scheduleTime: document.getElementById("schedule-time"),
-  scheduleWeekday: document.getElementById("schedule-weekday"),
-  sources: document.getElementById("sources"),
-  statusBody: document.getElementById("status-body"),
-  statusCount: document.getElementById("status-count"),
+  sourcePanel: document.getElementById("source-panel"),
   message: document.getElementById("message"),
   refresh: document.getElementById("refresh"),
-  sync: document.getElementById("sync"),
   save: document.getElementById("save"),
-  addSource: document.getElementById("add-source"),
+  folderModal: document.getElementById("folder-modal"),
+  folderPath: document.getElementById("folder-path"),
+  folderList: document.getElementById("folder-list"),
+  folderUp: document.getElementById("folder-up"),
+  folderSelect: document.getElementById("folder-select"),
+  folderClose: document.getElementById("folder-close"),
+  scheduleModal: document.getElementById("schedule-modal"),
+  scheduleClose: document.getElementById("schedule-close"),
+  scheduleApply: document.getElementById("schedule-apply"),
+  cycleMode: document.getElementById("cycle-mode"),
+  cycleTime: document.getElementById("cycle-time"),
+  cycleWeekday: document.getElementById("cycle-weekday"),
+  cycleWeekdayField: document.getElementById("cycle-weekday-field"),
 };
 
 async function loadAll() {
   cfg = await invoke("get_config");
-  renderConfig();
+  normalizeConfig(cfg);
   await loadStatus();
+  if (!cfg.source_groups[Number(activeTab)]) {
+    activeTab = cfg.source_groups.length ? "0" : "";
+  }
+  render();
 }
 
 async function loadStatus() {
-  const rows = await invoke("get_status");
-  el.statusBody.innerHTML = "";
-  el.statusCount.textContent = rows.length ? `${rows.length} destination(s)` : "";
-
-  if (!rows.length) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `<td colspan="4" class="empty">No destinations configured</td>`;
-    el.statusBody.appendChild(tr);
-    return;
-  }
-
-  for (const row of rows) {
-    const tr = document.createElement("tr");
-    const dotClass = row.status === "green" ? "green" : "red";
-    tr.innerHTML = `
-      <td><span class="dot ${dotClass}"></span>${escapeHtml(row.status)}</td>
-      <td>${escapeHtml(row.source_id)}</td>
-      <td>${escapeHtml(row.destination_id)}<div class="subtle">${escapeHtml(row.status_reason)}</div></td>
-      <td>${row.last_verified_cycle_id ?? "-"} / ${row.latest_closed_cycle_id ?? "-"}</td>
-    `;
-    el.statusBody.appendChild(tr);
-  }
+  statuses = await invoke("get_status");
 }
 
-function renderConfig() {
-  el.configPath.textContent = "Linux Tauri GUI";
-  el.scheduleMode.value = cfg.schedule.mode;
-  el.scheduleTime.value = cfg.schedule.time;
-  el.scheduleWeekday.value = cfg.schedule.weekday || "monday";
-  el.sources.innerHTML = "";
+function render() {
+  el.configPath.textContent = isTauri ? "Linux Tauri GUI" : "Headless Web UI";
+  renderSourcePanel();
+}
 
-  if (!cfg.source_groups.length) {
-    const div = document.createElement("div");
-    div.className = "empty";
-    div.textContent = "No sources configured";
-    el.sources.appendChild(div);
+function tabButton(label, tabId) {
+  const button = document.createElement("button");
+  button.className = tabId === activeTab ? "tab active" : "tab";
+  button.textContent = label;
+  button.onclick = () => {
+    activeTab = tabId;
+    render();
+  };
+  return button;
+}
+
+function addSource() {
+  cfg.source_groups.push({
+    id: `source_${cfg.source_groups.length + 1}`,
+    src: "",
+    enabled: true,
+    mode: "mirror",
+    destinations: [],
+  });
+  activeTab = String(cfg.source_groups.length - 1);
+  render();
+}
+
+function renderSourcePanel() {
+  const sourceIndex = Number(activeTab);
+  const source = cfg.source_groups[sourceIndex];
+  if (!source) {
+    el.sourcePanel.hidden = false;
+    el.sourcePanel.innerHTML = `
+      <div class="section-head">
+        <h2>Source</h2>
+        <button data-action="add-source">Add Source</button>
+      </div>
+      <div class="empty">No sources configured</div>
+    `;
+    el.sourcePanel.querySelector('[data-action="add-source"]').onclick = addSource;
     return;
   }
 
+  el.sourcePanel.hidden = false;
+  el.sourcePanel.innerHTML = `
+    <div class="section-head">
+      <h2>Source</h2>
+      <div class="row-actions">
+        <button data-action="add-source">Add Source</button>
+      </div>
+    </div>
+    <nav id="source-tabs" class="tabs"></nav>
+    <div class="source-layout">
+      <div class="source-card">
+        <div>
+          <label>ID</label>
+          <input value="${escapeAttr(source.id)}" data-field="source-id">
+        </div>
+        <div>
+          <label>Source Path</label>
+          <input class="path-picker" value="${escapeAttr(source.src)}" data-field="source-src" readonly title="Choose source folder">
+        </div>
+        <button class="danger icon" data-action="remove-source" title="Remove source">x</button>
+      </div>
+      <div class="destination-list">
+        <div class="destination-grid">
+          <label>Destination</label>
+          <label>Cycle</label>
+          <label>Reason</label>
+          <label>Actions</label>
+          <div id="sync-body" class="destination-body"></div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  renderSourceTabs();
+  bindSourceControls(source, sourceIndex);
+  renderSyncRows(source, sourceIndex);
+}
+
+function renderSourceTabs() {
+  const tabs = document.getElementById("source-tabs");
+  tabs.innerHTML = "";
   cfg.source_groups.forEach((source, index) => {
-    el.sources.appendChild(renderSource(source, index));
+    tabs.appendChild(tabButton(source.id || `source_${index + 1}`, String(index)));
   });
 }
 
-function renderSource(source, index) {
-  const div = document.createElement("div");
-  div.className = "source";
-  div.innerHTML = `
-    <div class="source-grid">
-      <div>
-        <label>ID</label>
-        <input value="${escapeAttr(source.id)}" data-field="id">
-      </div>
-      <div>
-        <label>Source Path</label>
-        <input value="${escapeAttr(source.src)}" data-field="src">
-      </div>
-      <button data-action="browse-source">Browse</button>
-      <button class="danger icon" data-action="remove-source" title="Remove source">x</button>
-    </div>
-    <div class="dst-list" data-dsts></div>
-    <button class="add-dst" data-action="add-dst">Add Destination</button>
-  `;
-
-  div.querySelector('[data-field="id"]').oninput = (event) => {
-    source.id = event.target.value;
+function bindSourceControls(source, sourceIndex) {
+  const idInput = el.sourcePanel.querySelector('[data-field="source-id"]');
+  const srcInput = el.sourcePanel.querySelector('[data-field="source-src"]');
+  idInput.oninput = () => {
+    source.id = idInput.value;
+    renderSourceTabs();
   };
-  div.querySelector('[data-field="src"]').oninput = (event) => {
-    source.src = event.target.value;
-  };
-  div.querySelector('[data-action="browse-source"]').onclick = async () => {
-    const path = await pickFolder();
+  srcInput.onclick = async () => {
+    const path = await pickFolder(source.src || "/");
     if (path) {
       source.src = path;
-      renderConfig();
+      renderSourcePanel();
     }
   };
-  div.querySelector('[data-action="remove-source"]').onclick = () => {
-    cfg.source_groups.splice(index, 1);
-    renderConfig();
+  el.sourcePanel.querySelector('[data-action="remove-source"]').onclick = () => {
+    cfg.source_groups.splice(sourceIndex, 1);
+    activeTab = cfg.source_groups.length ? String(Math.max(0, sourceIndex - 1)) : "";
+    render();
   };
-  div.querySelector('[data-action="add-dst"]').onclick = () => {
-    source.destinations.push({
-      id: `dst_${source.destinations.length + 1}`,
-      path: "",
-      enabled: true,
-    });
-    renderConfig();
-  };
+  el.sourcePanel.querySelector('[data-action="add-source"]').onclick = addSource;
+}
 
-  const dstRoot = div.querySelector("[data-dsts]");
+function renderSyncRows(source, sourceIndex) {
+  const body = document.getElementById("sync-body");
+  body.innerHTML = "";
+
   source.destinations.forEach((dst, dstIndex) => {
-    dstRoot.appendChild(renderDestination(source, dst, dstIndex));
+    const status = statusFor(source.id, dst.id);
+    const row = document.createElement("div");
+    row.className = "destination-row";
+    const dotClass = status?.status === "green" ? "green" : "red";
+    row.innerHTML = `
+      <div>
+        <div class="destination-cell">
+          <span class="dot ${dotClass}" title="${escapeAttr(status?.status || "red")}"></span>
+          <input class="dst-id" value="${escapeAttr(dst.id)}" data-field="dst-id" readonly>
+          <input class="path-picker dst-path" value="${escapeAttr(dst.path)}" data-field="dst-path" readonly title="Choose destination folder">
+        </div>
+      </div>
+      <div><button class="cycle-button" data-action="edit-cycle">${escapeHtml(cycleLabel(dst.schedule))}</button></div>
+      <div>${escapeHtml(status?.status_reason || "not_verified")}</div>
+      <div><button class="danger icon" data-action="remove-dst" title="Remove destination">x</button></div>
+    `;
+    row.querySelector('[data-field="dst-path"]').onclick = async () => {
+      const path = await pickFolder("/");
+      if (path) {
+        dst.path = path;
+        renderSourcePanel();
+      }
+    };
+    row.querySelector('[data-action="remove-dst"]').onclick = () => {
+      source.destinations.splice(dstIndex, 1);
+      renderSourcePanel();
+    };
+    row.querySelector('[data-action="edit-cycle"]').onclick = () => {
+      openScheduleModal(dst.schedule, (schedule) => {
+        dst.schedule = cloneSchedule(schedule);
+        latestDestinationSchedule = cloneSchedule(schedule);
+        renderSourcePanel();
+      });
+    };
+    body.appendChild(row);
   });
-  return div;
+
+  appendAddDestinationRow(body, source);
 }
 
-function renderDestination(source, dst, dstIndex) {
-  const div = document.createElement("div");
-  div.className = "dst";
-  div.innerHTML = `
+function appendAddDestinationRow(body, source) {
+  const addRow = document.createElement("div");
+  addRow.className = "destination-row add-destination-row";
+  const nextId = nextDestinationId(source);
+  addRow.innerHTML = `
     <div>
-      <label>ID</label>
-      <input value="${escapeAttr(dst.id)}" data-field="id">
+      <div class="destination-cell">
+        <span class="dot red" title="red"></span>
+        <input class="dst-id" value="${escapeAttr(nextId)}" data-field="new-dst-id" readonly>
+        <input class="path-picker dst-path" value="" data-field="new-dst-path" readonly title="Choose destination folder">
+      </div>
     </div>
-    <div>
-      <label>Destination Path</label>
-      <input value="${escapeAttr(dst.path)}" data-field="path">
-    </div>
-    <button data-action="browse-dst">Browse</button>
-    <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
+    <div><button class="cycle-button" data-action="new-cycle">${escapeHtml(cycleLabel(latestDestinationSchedule))}</button></div>
+    <div>not_verified</div>
+    <div></div>
   `;
-
-  div.querySelector('[data-field="id"]').oninput = (event) => {
-    dst.id = event.target.value;
+  let newSchedule = cloneSchedule(latestDestinationSchedule);
+  addRow.querySelector('[data-action="new-cycle"]').onclick = () => {
+    openScheduleModal(newSchedule, (schedule) => {
+      newSchedule = cloneSchedule(schedule);
+      latestDestinationSchedule = cloneSchedule(schedule);
+      renderSourcePanel();
+    });
   };
-  div.querySelector('[data-field="path"]').oninput = (event) => {
-    dst.path = event.target.value;
-  };
-  div.querySelector('[data-action="browse-dst"]').onclick = async () => {
-    const path = await pickFolder();
+  addRow.querySelector('[data-field="new-dst-path"]').onclick = async () => {
+    const path = await pickFolder("/");
     if (path) {
-      dst.path = path;
-      renderConfig();
+      source.destinations.push({
+        id: nextId,
+        path,
+        enabled: true,
+        schedule: cloneSchedule(newSchedule),
+      });
+      renderSourcePanel();
     }
   };
-  div.querySelector('[data-action="remove-dst"]').onclick = () => {
-    source.destinations.splice(dstIndex, 1);
-    renderConfig();
-  };
-  return div;
+  body.appendChild(addRow);
 }
 
-async function pickFolder() {
-  try {
-    const selected = await dialogOpen({
-      directory: true,
-      multiple: false,
-      title: "Choose folder",
+function nextDestinationId(source) {
+  let maxId = 0;
+  for (const dst of source.destinations) {
+    const match = /^dst_(\d+)$/.exec(dst.id || "");
+    if (match) {
+      maxId = Math.max(maxId, Number(match[1]));
+    }
+  }
+  return `dst_${maxId + 1}`;
+}
+
+function normalizeConfig(nextCfg) {
+  nextCfg.schedule = nextCfg.schedule || defaultDestinationSchedule();
+  for (const source of nextCfg.source_groups || []) {
+    for (const dst of source.destinations || []) {
+      dst.schedule = normalizeSchedule(dst.schedule);
+      latestDestinationSchedule = cloneSchedule(dst.schedule);
+    }
+  }
+}
+
+function defaultDestinationSchedule() {
+  return {
+    mode: "realtime",
+    time: "02:00:00",
+    timezone: "local",
+    weekday: "monday",
+    sync_current_cycle_manually: false,
+  };
+}
+
+function normalizeSchedule(schedule) {
+  return {
+    ...defaultDestinationSchedule(),
+    ...(schedule || {}),
+    weekday: schedule?.weekday || "monday",
+  };
+}
+
+function cloneSchedule(schedule) {
+  return { ...normalizeSchedule(schedule) };
+}
+
+function cycleLabel(schedule) {
+  const next = normalizeSchedule(schedule);
+  if (next.mode === "daily") {
+    return `Daily ${next.time || "02:00:00"}`;
+  }
+  if (next.mode === "weekly") {
+    return `Weekly ${next.weekday || "monday"} ${next.time || "02:00:00"}`;
+  }
+  return "Realtime";
+}
+
+function openScheduleModal(schedule, onApply) {
+  const draft = cloneSchedule(schedule);
+  scheduleEditor = { draft, onApply };
+  el.cycleMode.value = draft.mode;
+  el.cycleTime.value = draft.time;
+  el.cycleWeekday.value = draft.weekday || "monday";
+  updateScheduleModalFields();
+  el.scheduleModal.hidden = false;
+}
+
+function updateScheduleModalFields() {
+  const mode = el.cycleMode.value;
+  const scheduled = mode !== "realtime";
+  el.cycleTime.parentElement.hidden = !scheduled;
+  el.cycleWeekdayField.hidden = mode !== "weekly";
+}
+
+function closeScheduleModal(apply) {
+  if (apply && scheduleEditor) {
+    const schedule = normalizeSchedule({
+      mode: el.cycleMode.value,
+      time: el.cycleTime.value || "02:00:00",
+      timezone: "local",
+      weekday: el.cycleWeekday.value || "monday",
+      sync_current_cycle_manually: false,
     });
-    return Array.isArray(selected) ? selected[0] : selected;
+    scheduleEditor.onApply(schedule);
+  }
+  el.scheduleModal.hidden = true;
+  scheduleEditor = null;
+}
+
+function statusFor(sourceId, destinationId) {
+  return statuses.find((status) =>
+    status.source_id === sourceId && status.destination_id === destinationId
+  );
+}
+
+async function pickFolder(startPath = "/") {
+  if (isTauri) {
+    try {
+      const selected = await dialogOpen({
+        directory: true,
+        multiple: false,
+        title: "Choose folder",
+      });
+      return Array.isArray(selected) ? selected[0] : selected;
+    } catch (error) {
+      setMessage(String(error));
+      return null;
+    }
+  }
+  return pickWebFolder(startPath);
+}
+
+async function pickWebFolder(startPath) {
+  return new Promise(async (resolve) => {
+    folderPicker = { resolve, path: startPath || "/" };
+    el.folderModal.hidden = false;
+    await loadFolder(folderPicker.path);
+  });
+}
+
+async function loadFolder(path) {
+  try {
+    const result = await invoke("browse_dirs", { path });
+    folderPicker.path = result.path;
+    folderPicker.parent = result.parent;
+    el.folderPath.textContent = result.path;
+    el.folderList.innerHTML = "";
+    for (const entry of result.entries) {
+      const row = document.createElement("button");
+      row.className = "folder-row";
+      row.textContent = entry.name;
+      row.onclick = () => loadFolder(entry.path);
+      el.folderList.appendChild(row);
+    }
+    if (!result.entries.length) {
+      el.folderList.innerHTML = `<div class="empty">No subdirectories</div>`;
+    }
   } catch (error) {
     setMessage(String(error));
-    return null;
+  }
+}
+
+function closeFolderModal(value) {
+  el.folderModal.hidden = true;
+  if (folderPicker) {
+    folderPicker.resolve(value);
+    folderPicker = null;
   }
 }
 
 function updateCfgFromForm() {
-  cfg.schedule.mode = el.scheduleMode.value;
-  cfg.schedule.time = el.scheduleTime.value;
-  cfg.schedule.weekday = el.scheduleWeekday.value || "monday";
-
+  cfg.schedule = normalizeSchedule(cfg.schedule);
   for (const source of cfg.source_groups) {
     source.enabled = true;
     source.mode = "mirror";
     for (const dst of source.destinations) {
       dst.enabled = true;
+      dst.schedule = normalizeSchedule(dst.schedule);
     }
   }
 }
@@ -190,14 +403,25 @@ function updateCfgFromForm() {
 async function saveConfig() {
   updateCfgFromForm();
   cfg = await invoke("save_config_command", { cfg });
-  renderConfig();
   await loadStatus();
+}
+
+async function runBusy(message, fn) {
+  if (busy) return;
+  try {
+    setBusy(true);
+    setMessage(message || "");
+    await fn();
+  } catch (error) {
+    setMessage(String(error));
+  } finally {
+    setBusy(false);
+  }
 }
 
 function setBusy(nextBusy) {
   busy = nextBusy;
   el.refresh.disabled = busy;
-  el.sync.disabled = busy;
   el.save.disabled = busy;
 }
 
@@ -219,57 +443,57 @@ function escapeAttr(value) {
   return escapeHtml(value).replace(/`/g, "&#96;");
 }
 
-el.addSource.onclick = () => {
-  cfg.source_groups.push({
-    id: `source_${cfg.source_groups.length + 1}`,
-    src: "",
-    enabled: true,
-    mode: "mirror",
-    destinations: [],
-  });
-  renderConfig();
-};
+el.refresh.onclick = () => runBusy("", loadAll);
 
-el.refresh.onclick = async () => {
-  if (busy) return;
-  try {
-    setBusy(true);
-    setMessage("");
-    await loadAll();
-  } catch (error) {
-    setMessage(String(error));
-  } finally {
-    setBusy(false);
+el.save.onclick = () => runBusy("Saving...", async () => {
+  await saveConfig();
+  setMessage("");
+  render();
+});
+
+el.folderClose.onclick = () => closeFolderModal(null);
+el.folderSelect.onclick = () => closeFolderModal(folderPicker?.path || null);
+el.folderUp.onclick = () => {
+  if (folderPicker?.parent) {
+    loadFolder(folderPicker.parent);
   }
 };
 
-el.save.onclick = async () => {
-  if (busy) return;
-  try {
-    setBusy(true);
-    setMessage("");
-    await saveConfig();
-  } catch (error) {
-    setMessage(String(error));
-  } finally {
-    setBusy(false);
-  }
-};
-
-el.sync.onclick = async () => {
-  if (busy) return;
-  try {
-    setBusy(true);
-    setMessage("Sync running...");
-    await saveConfig();
-    await invoke("sync_now");
-    await loadStatus();
-    setMessage("");
-  } catch (error) {
-    setMessage(String(error));
-  } finally {
-    setBusy(false);
-  }
-};
+el.scheduleClose.onclick = () => closeScheduleModal(false);
+el.scheduleApply.onclick = () => closeScheduleModal(true);
+el.cycleMode.onchange = updateScheduleModalFields;
 
 loadAll().catch((error) => setMessage(String(error)));
+
+async function invokeWeb(command, payload = {}) {
+  const routes = {
+    get_config: ["GET", "/api/config"],
+    save_config_command: ["POST", "/api/config"],
+    get_status: ["GET", "/api/status"],
+    browse_dirs: ["GET", "/api/browse-dirs"],
+  };
+  const route = routes[command];
+  if (!route) {
+    throw new Error(`Unsupported command: ${command}`);
+  }
+
+  const [method, path] = route;
+  let url = path;
+  const options = { method, headers: {} };
+  if (command === "browse_dirs") {
+    url = `${path}?path=${encodeURIComponent(payload.path || "/")}`;
+  } else if (method !== "GET") {
+    options.headers["Content-Type"] = "application/json";
+    if (command === "save_config_command") {
+      options.body = JSON.stringify(payload.cfg);
+    } else {
+      options.body = JSON.stringify(payload);
+    }
+  }
+
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return await response.json();
+}

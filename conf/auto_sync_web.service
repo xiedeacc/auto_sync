@@ -1,0 +1,16 @@
+[Unit]
+Description=auto_sync Web UI
+After=network-online.target auto_sync.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/auto_sync
+ExecStart=/opt/auto_sync/bin/auto_sync_web --config /opt/auto_sync/conf/auto_sync.toml
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

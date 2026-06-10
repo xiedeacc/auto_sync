@@ -2,13 +2,7 @@
 data_db = "conf/state/auto_sync.sqlite"
 log_dir = "logs"
 status_log_interval_secs = 300
-
-[schedule]
-mode = "daily"
-time = "02:00:00"
-timezone = "local"
-weekday = "monday"
-sync_current_cycle_manually = false
+web_bind = "0.0.0.0:18765"
 
 [deploy]
 targets = [

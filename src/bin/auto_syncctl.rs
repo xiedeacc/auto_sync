@@ -133,7 +133,7 @@ fn deploy_nas(
         ),
     ]))?;
 
-    for binary in ["auto_syncd", "auto_syncctl"] {
+    for binary in ["auto_syncd", "auto_syncctl", "auto_sync_web"] {
         let local = PathBuf::from("bin").join(binary);
         if !local.exists() {
             bail!(
@@ -156,20 +156,29 @@ fn deploy_nas(
         &format!("{target}:{}/conf/auto_sync.toml", install_dir.display()),
     ]))?;
 
-    let unit = systemd_unit(install_dir);
+    let daemon_unit = systemd_unit(install_dir);
     let tmp_unit = PathBuf::from("conf/auto_sync.service");
-    fs::write(&tmp_unit, unit)?;
+    fs::write(&tmp_unit, daemon_unit)?;
     run(Command::new("scp").args([
         "-P",
         &ssh_port,
         tmp_unit.to_string_lossy().as_ref(),
         &format!("{target}:/etc/systemd/system/auto_sync.service"),
     ]))?;
+    let web_unit = web_systemd_unit(install_dir);
+    let tmp_web_unit = PathBuf::from("conf/auto_sync_web.service");
+    fs::write(&tmp_web_unit, web_unit)?;
+    run(Command::new("scp").args([
+        "-P",
+        &ssh_port,
+        tmp_web_unit.to_string_lossy().as_ref(),
+        &format!("{target}:/etc/systemd/system/auto_sync_web.service"),
+    ]))?;
     run(Command::new("ssh").args([
         "-p",
         &ssh_port,
         &target,
-        "systemctl daemon-reload && systemctl enable --now auto_sync.service && systemctl status --no-pager auto_sync.service",
+        "systemctl daemon-reload && systemctl enable --now auto_sync.service auto_sync_web.service && systemctl status --no-pager auto_sync.service auto_sync_web.service",
     ]))?;
     Ok(())
 }
@@ -180,6 +189,29 @@ fn run(cmd: &mut Command) -> Result<()> {
         bail!("external command failed with status {status}");
     }
     Ok(())
+}
+
+fn web_systemd_unit(install_dir: &Path) -> String {
+    format!(
+        r#"[Unit]
+Description=auto_sync Web UI
+After=network-online.target auto_sync.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={dir}
+ExecStart={dir}/bin/auto_sync_web --config {dir}/conf/auto_sync.toml
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        dir = install_dir.display()
+    )
 }
 
 fn systemd_unit(install_dir: &Path) -> String {

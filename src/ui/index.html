@@ -14,58 +14,60 @@
     </div>
     <div class="toolbar">
       <button id="refresh" title="Refresh status">Refresh</button>
-      <button id="sync" class="primary" title="Close current cycle and sync">Sync</button>
       <button id="save" class="primary" title="Save configuration">Save</button>
     </div>
   </header>
 
   <main>
-    <section class="workspace">
-      <div class="section-head">
-        <h2>Sources</h2>
-        <button id="add-source">Add Source</button>
-      </div>
+    <section id="source-panel" class="panel"></section>
 
-      <div class="schedule-row">
+    <div id="message" class="message"></div>
+  </main>
+
+  <div id="folder-modal" class="modal" hidden>
+    <div class="modal-panel">
+      <div class="modal-head">
+        <h2>Choose Folder</h2>
+        <button id="folder-close" class="icon" title="Close">x</button>
+      </div>
+      <div class="folder-path" id="folder-path"></div>
+      <div class="folder-actions">
+        <button id="folder-up">Up</button>
+        <button id="folder-select" class="primary">Select</button>
+      </div>
+      <div id="folder-list" class="folder-list"></div>
+    </div>
+  </div>
+
+  <div id="schedule-modal" class="modal" hidden>
+    <div class="modal-panel schedule-modal-panel">
+      <div class="modal-head">
+        <h2>Cycle</h2>
+        <button id="schedule-close" class="icon" title="Close">x</button>
+      </div>
+      <div class="schedule-row" id="schedule-form">
         <div>
-          <label for="schedule-mode">Schedule</label>
-          <select id="schedule-mode">
+          <label for="cycle-mode">Cycle</label>
+          <select id="cycle-mode">
+            <option value="realtime">Realtime</option>
             <option value="daily">Daily</option>
             <option value="weekly">Weekly</option>
           </select>
         </div>
         <div>
-          <label for="schedule-time">Time</label>
-          <input id="schedule-time" placeholder="02:00:00">
+          <label for="cycle-time">Time</label>
+          <input id="cycle-time" placeholder="02:00:00">
         </div>
-        <div>
-          <label for="schedule-weekday">Weekday</label>
-          <input id="schedule-weekday" placeholder="monday">
+        <div id="cycle-weekday-field">
+          <label for="cycle-weekday">Weekday</label>
+          <input id="cycle-weekday" placeholder="monday">
         </div>
       </div>
-
-      <div id="sources"></div>
-      <div id="message" class="message"></div>
-    </section>
-
-    <aside>
-      <div class="section-head">
-        <h2>Destinations</h2>
-        <span id="status-count" class="subtle"></span>
+      <div class="folder-actions">
+        <button id="schedule-apply" class="primary">Apply</button>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Status</th>
-            <th>Source</th>
-            <th>Destination</th>
-            <th>Cycle</th>
-          </tr>
-        </thead>
-        <tbody id="status-body"></tbody>
-      </table>
-    </aside>
-  </main>
+    </div>
+  </div>
 
   <script src="./main.js"></script>
 </body>
