@@ -93,41 +93,41 @@
       </div>
       <div id="machine-list" class="machine-list"></div>
       <div class="machine-form">
-        <div>
+        <div class="machine-field machine-field-id">
           <label for="machine-id">ID</label>
-          <input id="machine-id" placeholder="nas_1">
+          <input id="machine-id" placeholder="id">
         </div>
-        <div>
+        <div class="machine-field machine-field-name">
           <label for="machine-name">Name</label>
-          <input id="machine-name" placeholder="NAS">
+          <input id="machine-name" placeholder="name">
         </div>
-        <div>
+        <div class="machine-field machine-field-host">
           <label for="machine-host">Host</label>
-          <input id="machine-host" placeholder="192.168.3.178">
+          <input id="machine-host" placeholder="host">
         </div>
-        <div>
+        <div class="machine-field machine-field-web-port">
           <label for="machine-web-port">Web Port</label>
           <input id="machine-web-port" type="number" min="1" max="65535" value="18765">
         </div>
-        <div>
+        <div class="machine-field machine-field-ssh-user">
           <label for="machine-ssh-user">SSH User</label>
           <input id="machine-ssh-user" placeholder="root">
         </div>
-        <div>
+        <div class="machine-field machine-field-ssh-port">
           <label for="machine-ssh-port">SSH Port</label>
           <input id="machine-ssh-port" type="number" min="1" max="65535" value="22">
         </div>
-        <div>
+        <div class="machine-field machine-field-os">
           <label for="machine-os">OS</label>
           <select id="machine-os">
             <option value="linux">Linux</option>
             <option value="windows">Windows</option>
           </select>
         </div>
-        <button id="machine-add" class="primary">Add</button>
-      </div>
-      <div class="folder-actions">
-        <button id="machine-discover">Discover</button>
+        <div class="machine-form-actions">
+          <button id="machine-add" class="primary">Save</button>
+          <button id="machine-discover">Discover</button>
+        </div>
       </div>
     </div>
   </div>

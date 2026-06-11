@@ -176,16 +176,31 @@ function renderMachineModal() {
   if (!machines.length) {
     el.machineList.innerHTML = `<div class="empty">No machines discovered</div>`;
   } else {
-    el.machineList.innerHTML = machines.map((machine) => `
-      <div class="machine-row">
-        <span class="machine-dot ${machine.online ? "online" : ""}"></span>
-        <div>
-          <div class="machine-name">${escapeHtml(machine.name || machine.id)}</div>
-          <div class="machine-meta">${escapeHtml(machine.id)} · ${escapeHtml(machine.host)}:${escapeHtml(machine.web_port)} · ${escapeHtml(machine.os || "-")}${machine.discovered ? " · discovered" : ""}</div>
-        </div>
-        <button data-action="use-machine" data-id="${escapeAttr(machine.id)}" ${machine.id === "local" ? "disabled" : ""}>Use</button>
+    el.machineList.innerHTML = `
+      <div class="machine-row machine-row-head">
+        <span></span>
+        <span>Name</span>
+        <span>Host</span>
+        <span>Web</span>
+        <span>SSH</span>
+        <span>OS</span>
+        <span></span>
       </div>
-    `).join("");
+      ${machines.map((machine) => `
+        <div class="machine-row">
+          <span class="machine-dot ${machine.online ? "online" : ""}" title="${machine.online ? "Online" : "Offline"}"></span>
+          <div class="machine-name-cell">
+            <div class="machine-name">${escapeHtml(machine.name || machine.id)}</div>
+            <div class="machine-meta">${escapeHtml(machine.id)}${machine.discovered ? " · discovered" : ""}</div>
+          </div>
+          <div class="machine-cell" title="${escapeAttr(machine.host)}">${escapeHtml(machine.host)}</div>
+          <div class="machine-cell">${escapeHtml(String(machine.web_port || "-"))}</div>
+          <div class="machine-cell">${escapeHtml(machineSshLabel(machine))}</div>
+          <div class="machine-cell">${escapeHtml(machine.os || "-")}</div>
+          <button data-action="use-machine" data-id="${escapeAttr(machine.id)}" ${machine.id === "local" ? "disabled" : ""}>Edit</button>
+        </div>
+      `).join("")}
+    `;
     for (const button of el.machineList.querySelectorAll('[data-action="use-machine"]')) {
       button.onclick = () => {
         const machine = machines.find((item) => item.id === button.dataset.id);
@@ -202,6 +217,15 @@ function renderMachineModal() {
       };
     }
   }
+}
+
+function machineSshLabel(machine) {
+  if (machine.id === "local" && !machine.ssh_user) {
+    return "-";
+  }
+  const port = machine.ssh_port || 22;
+  const user = machine.ssh_user === "Administrator" ? "Admin" : machine.ssh_user;
+  return user ? `${user}:${port}` : String(port);
 }
 
 async function discoverMachines() {

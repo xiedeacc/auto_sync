@@ -11,6 +11,8 @@
   --green: #12805c;
   --warn: #a15c07;
   --control-gap: 8px;
+  --app-width: 720px;
+  --panel-width: calc(var(--app-width) - 28px);
 }
 
 * {
@@ -58,7 +60,7 @@ h2 {
 
 main {
   padding: 14px;
-  max-width: 720px;
+  max-width: var(--app-width);
   margin: 0 auto;
 }
 
@@ -466,26 +468,6 @@ th {
   background: #fbfdff;
 }
 
-.schedule-modal-panel {
-  width: min(760px, 100%);
-}
-
-.config-modal-panel {
-  width: min(900px, 100%);
-}
-
-.machine-modal-panel {
-  width: min(900px, 100%);
-}
-
-.issue-modal-panel {
-  width: min(820px, 100%);
-}
-
-.exclude-modal-panel {
-  width: min(780px, 100%);
-}
-
 .config-view {
   min-height: 260px;
   max-height: min(640px, 76vh);
@@ -557,18 +539,37 @@ th {
 }
 
 .machine-list {
-  max-height: min(320px, 42vh);
+  flex: 0 0 auto;
+  max-height: min(360px, 50vh);
   overflow: auto;
   border-top: 1px solid var(--line);
 }
 
 .machine-row {
-  min-height: 44px;
+  min-height: 38px;
   display: grid;
-  grid-template-columns: 12px 1fr max-content;
-  gap: var(--control-gap);
+  grid-template-columns: 10px minmax(100px, 1.35fr) minmax(92px, 1.1fr) 48px minmax(76px, 0.95fr) 58px 52px;
+  gap: 6px;
   align-items: center;
+  justify-content: stretch;
+  padding: 4px 0;
   border-bottom: 1px solid var(--line);
+}
+
+.machine-row > * {
+  min-width: 0;
+}
+
+.machine-row-head {
+  min-height: 28px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.machine-row button {
+  width: 52px;
+  padding: 0;
 }
 
 .machine-dot {
@@ -583,21 +584,59 @@ th {
 }
 
 .machine-name {
+  font-size: 13px;
   font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .machine-meta {
-  margin-top: 3px;
+  margin-top: 2px;
   color: var(--muted);
   font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.machine-cell {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .machine-form {
   display: grid;
-  grid-template-columns: 90px 120px minmax(160px, 1fr) 90px 100px 82px 94px max-content;
-  gap: var(--control-gap);
+  grid-template-columns: 64px 80px minmax(112px, 1fr) 62px 76px 58px 72px;
+  gap: 6px;
   align-items: end;
   margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.machine-field {
+  min-width: 0;
+}
+
+.machine-form-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.machine-form-actions button {
+  width: 72px;
+  padding: 0;
+}
+
+.machine-form-actions button:last-child {
+  width: 76px;
 }
 
 .issue-row {
@@ -675,6 +714,29 @@ th {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 14px;
+}
+
+.schedule-modal-panel {
+  width: min(760px, calc(100vw - 48px));
+}
+
+.config-modal-panel {
+  width: min(900px, calc(100vw - 48px));
+}
+
+.machine-modal-panel {
+  width: min(var(--panel-width), calc(100vw - 48px));
+  max-height: min(760px, calc(100vh - 48px));
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.issue-modal-panel {
+  width: min(820px, calc(100vw - 48px));
+}
+
+.exclude-modal-panel {
+  width: min(780px, calc(100vw - 48px));
 }
 
 .modal-head {
@@ -762,7 +824,33 @@ th {
     grid-template-columns: 1fr;
   }
 
-  .machine-form {
+  .machine-form,
+  .machine-row {
     grid-template-columns: 1fr;
+  }
+
+  .machine-row {
+    gap: 4px;
+    padding: 10px 0;
+  }
+
+  .machine-row-head {
+    display: none;
+  }
+
+  .machine-dot {
+    position: static;
+  }
+
+  .machine-row button {
+    width: 100%;
+  }
+
+  .machine-form-actions {
+    justify-content: stretch;
+  }
+
+  .machine-form-actions button {
+    flex: 1;
   }
 }
