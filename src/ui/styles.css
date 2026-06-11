@@ -216,35 +216,49 @@ th {
   align-items: start;
 }
 
-.source-card {
+/*
+ * Each row is split into two blocks: .row-left hugs the panel's left edge,
+ * .row-right hugs the right edge. Inside each block, labels live in their
+ * own grid cells on row 1 and controls on row 2 — the shared column tracks
+ * keep every label left-aligned with its control.
+ */
+.sync-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: var(--control-gap);
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+}
+
+.row-left,
+.row-right {
   display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
   column-gap: var(--control-gap);
+  row-gap: 4px;
   align-items: end;
-  width: 100%;
 }
 
-.source-fields {
-  display: grid;
+.row-left > label,
+.row-right > label {
+  margin-bottom: 0;
+}
+
+.row-left {
   grid-template-columns: 56px 160px;
-  gap: var(--control-gap);
-  align-items: end;
 }
 
-.source-actions {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 72px 106px 58px 34px;
-  gap: var(--control-gap);
-  align-items: end;
-  width: 100%;
+.source-right {
+  grid-template-columns: 100px max-content 58px 34px;
 }
 
-.source-actions::before {
-  content: "";
+.destination-right {
+  grid-template-columns: 100px 72px 58px 34px;
 }
 
-.source-card .danger {
-  justify-self: end;
+.actions-label {
+  grid-column: span 2;
 }
 
 .exclude-button {
@@ -258,7 +272,6 @@ th {
 }
 
 .destination-grid {
-  --dst-grid-columns: 56px 160px minmax(0, 1fr) 88px 72px max-content;
   display: flex;
   flex-direction: column;
   gap: 0;
@@ -267,35 +280,6 @@ th {
 .destination-body {
   display: flex;
   flex-direction: column;
-}
-
-.destination-row {
-  display: grid;
-  grid-template-columns: var(--dst-grid-columns);
-  column-gap: var(--control-gap);
-  align-items: end;
-  min-height: 58px;
-  border-bottom: 1px solid var(--line);
-  padding-bottom: 6px;
-  margin-bottom: 6px;
-}
-
-.destination-row > div {
-  min-height: 54px;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  min-width: 0;
-}
-
-.add-destination-row {
-  min-height: 40px;
-  padding-bottom: 6px;
-  margin-bottom: 6px;
-}
-
-.add-destination-row > div {
-  min-height: 34px;
 }
 
 .destination-id-cell {
@@ -313,13 +297,6 @@ th {
   display: flex;
   gap: var(--control-gap);
   justify-content: flex-end;
-  justify-self: start;
-  width: max-content;
-}
-
-.destination-actions.add-only {
-  justify-content: flex-end;
-  justify-self: end;
 }
 
 .schedule-button {
@@ -374,10 +351,6 @@ th {
   white-space: pre;
 }
 
-.source-card .path-picker {
-  max-width: 160px;
-}
-
 .dot {
   width: 10px;
   height: 10px;
@@ -388,6 +361,8 @@ th {
   border-radius: 50%;
   position: absolute;
   left: -16px;
+  top: 50%;
+  transform: translateY(-50%);
   display: inline-block;
   line-height: 10px;
   border: 0;
@@ -568,14 +543,11 @@ th {
   }
 
   .schedule-row,
-  .source-layout,
-  .source-card,
-  .source-fields,
-  .source-actions {
+  .source-layout {
     grid-template-columns: 1fr;
   }
 
-  .source-card .danger {
-    grid-column: 1;
+  .sync-row {
+    flex-wrap: wrap;
   }
 }

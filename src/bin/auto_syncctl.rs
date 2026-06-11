@@ -134,6 +134,16 @@ fn deploy_nas(
         ),
     ]))?;
 
+    // Stop running services before overwriting binaries so scp doesn't fail on
+    // a busy (in-use) file. Ignore errors so the first-ever deploy, when the
+    // units don't exist yet, still succeeds.
+    run(Command::new("ssh").args([
+        "-p",
+        &ssh_port,
+        &target,
+        "systemctl stop auto_sync.service auto_sync_web.service 2>/dev/null || true",
+    ]))?;
+
     for binary in ["auto_syncd", "auto_syncctl", "auto_sync_web"] {
         let local = PathBuf::from("bin").join(binary);
         if !local.exists() {
@@ -150,12 +160,24 @@ fn deploy_nas(
         ]))?;
     }
 
-    run(Command::new("scp").args([
-        "-P",
-        &ssh_port,
-        config_path.to_string_lossy().as_ref(),
-        &format!("{target}:{}/conf/auto_sync.toml", install_dir.display()),
-    ]))?;
+    // Only seed the config on first deploy; never overwrite an existing one so
+    // edits made on the NAS survive redeploys.
+    let remote_cfg = format!("{}/conf/auto_sync.toml", install_dir.display());
+    let cfg_exists = Command::new("ssh")
+        .args(["-p", &ssh_port, &target, &format!("test -f {remote_cfg}")])
+        .status()
+        .context("failed to check for existing remote config")?
+        .success();
+    if cfg_exists {
+        println!("remote config {remote_cfg} already exists; leaving it untouched");
+    } else {
+        run(Command::new("scp").args([
+            "-P",
+            &ssh_port,
+            config_path.to_string_lossy().as_ref(),
+            &format!("{target}:{remote_cfg}"),
+        ]))?;
+    }
 
     let daemon_unit = systemd_unit(install_dir);
     let tmp_unit = PathBuf::from("conf/auto_sync.service");

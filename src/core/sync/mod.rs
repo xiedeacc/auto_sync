@@ -561,12 +561,18 @@ impl DestinationEndpoint {
     fn resolve(source: &SourceEndpoint, dst: &DestinationConfig) -> Result<Self> {
         reject_dangerous_destination(&dst.path)?;
         match source {
-            SourceEndpoint::Dir { .. } => {
+            SourceEndpoint::Dir { root: src_root } => {
                 if dst.path.exists() && !dst.path.is_dir() {
                     bail!("directory source cannot sync to non-directory destination");
                 }
+                let dir_name = src_root.file_name().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "source directory has no name: {}",
+                        src_root.display()
+                    )
+                })?;
                 Ok(Self::Dir {
-                    root: dst.path.clone(),
+                    root: dst.path.join(dir_name),
                 })
             }
             SourceEndpoint::File { .. } => {
@@ -673,6 +679,8 @@ fn sync_destination(
     source_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
 ) -> Result<()> {
+    fs::create_dir_all(dst_root)
+        .with_context(|| format!("failed to create destination directory: {}", dst_root.display()))?;
     let result = (|| {
         let mut changing_paths = BTreeSet::new();
         let source_map = map_entries(source_snapshot);
@@ -1345,7 +1353,7 @@ mod tests {
 
         let mut state = State::open(&db).unwrap();
         sync_all_now(&cfg, &mut state).unwrap();
-        assert_eq!(fs::read(dst.join("hello.txt")).unwrap(), b"hello");
+        assert_eq!(fs::read(dst.join("src").join("hello.txt")).unwrap(), b"hello");
 
         let views = state.destination_views(&cfg).unwrap();
         assert_eq!(views.len(), 1);
@@ -1399,8 +1407,8 @@ mod tests {
         let mut state = State::open(&db).unwrap();
         sync_destination_now(&cfg, &mut state, "src_1", "dst_2").unwrap();
 
-        assert!(!dst_1.join("hello.txt").exists());
-        assert_eq!(fs::read(dst_2.join("hello.txt")).unwrap(), b"hello");
+        assert!(!dst_1.join("src").join("hello.txt").exists());
+        assert_eq!(fs::read(dst_2.join("src").join("hello.txt")).unwrap(), b"hello");
 
         let views = state.destination_views(&cfg).unwrap();
         let first = views
@@ -1426,13 +1434,13 @@ mod tests {
         let dst = temp.join("dst");
         let db = temp.join("state.sqlite");
         fs::create_dir_all(src.join("skip_dir")).unwrap();
-        fs::create_dir_all(&dst).unwrap();
+        // effective dst root is dst/src because the source dir is named "src"
+        fs::create_dir_all(dst.join("src").join("skip_dir")).unwrap();
         fs::write(src.join("keep.txt"), b"keep").unwrap();
         fs::write(src.join("skip.txt"), b"skip source").unwrap();
         fs::write(src.join("skip_dir").join("nested.txt"), b"skip nested").unwrap();
-        fs::write(dst.join("skip.txt"), b"existing skip").unwrap();
-        fs::create_dir_all(dst.join("skip_dir")).unwrap();
-        fs::write(dst.join("skip_dir").join("nested.txt"), b"existing nested").unwrap();
+        fs::write(dst.join("src").join("skip.txt"), b"existing skip").unwrap();
+        fs::write(dst.join("src").join("skip_dir").join("nested.txt"), b"existing nested").unwrap();
 
         let mut cfg = AppConfig::default();
         cfg.app.data_db = db.clone();
@@ -1457,13 +1465,14 @@ mod tests {
         let mut state = State::open(&db).unwrap();
         sync_all_now(&cfg, &mut state).unwrap();
 
-        assert_eq!(fs::read(dst.join("keep.txt")).unwrap(), b"keep");
-        assert_eq!(fs::read(dst.join("skip.txt")).unwrap(), b"existing skip");
+        let eff = dst.join("src");
+        assert_eq!(fs::read(eff.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(fs::read(eff.join("skip.txt")).unwrap(), b"existing skip");
         assert_eq!(
-            fs::read(dst.join("skip_dir").join("nested.txt")).unwrap(),
+            fs::read(eff.join("skip_dir").join("nested.txt")).unwrap(),
             b"existing nested"
         );
-        assert!(!dst.join(".auto_sync_trash").exists());
+        assert!(!eff.join(".auto_sync_trash").exists());
 
         fs::remove_dir_all(temp).ok();
     }

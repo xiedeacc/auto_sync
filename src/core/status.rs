@@ -5,14 +5,21 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 pub fn check_destination_online(path: &Path) -> Result<()> {
-    if !path.exists() {
-        bail!("destination path does not exist");
-    }
-    if !path.is_dir() {
-        bail!("destination path is not a directory");
+    // If the effective subdirectory doesn't exist yet (first sync will create it),
+    // verify the parent mount point is accessible instead.
+    let probe_dir = if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .filter(|p| p.exists() && p.is_dir())
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("destination path does not exist: {}", path.display()))?
+    };
+    if !probe_dir.is_dir() {
+        bail!("destination path is not a directory: {}", probe_dir.display());
     }
 
-    let probe = path.join(".auto_sync_probe");
+    let probe = probe_dir.join(".auto_sync_probe");
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)

@@ -103,22 +103,19 @@ function renderSourcePanel() {
     group.className = "source-group";
     group.innerHTML = `
     <div class="source-layout">
-      <div class="source-card">
-        <div class="source-fields">
-          <div>
-            <label>ID</label>
-            <input value="${escapeAttr(source.id)}" data-field="source-id">
-          </div>
-          <div>
-            <label>Source Path</label>
-            <input class="path-picker" value="${escapeAttr(source.src)}" data-field="source-src" readonly title="Choose source path">
-          </div>
+      <div class="sync-row source-row">
+        <div class="row-left">
+          <label>ID</label>
+          <label>Source Path</label>
+          <input value="${escapeAttr(source.id)}" data-field="source-id">
+          <input class="path-picker" value="${escapeAttr(source.src)}" data-field="source-src" readonly title="Choose source path">
         </div>
-        <div class="source-actions">
-          <div>
-            <label>Latest Cycle</label>
-            <input value="${escapeAttr(sourceLatestCycle(source.id))}" readonly>
-          </div>
+        <div class="row-right source-right">
+          <label>Latest Cycle</label>
+          <span></span>
+          <span></span>
+          <span></span>
+          <input value="${escapeAttr(sourceLatestCycle(source.id))}" readonly>
           <button class="exclude-button" data-action="edit-excludes">Excluded ${excludeCountLabel(source)}</button>
           <button data-action="sync-source">Sync</button>
           <button class="danger icon" data-action="remove-source" title="Remove source">x</button>
@@ -182,37 +179,30 @@ function renderSyncRows(source, group) {
   source.destinations.forEach((dst, dstIndex) => {
     const status = statusFor(source.id, dst.id);
     const row = document.createElement("div");
-    row.className = "destination-row";
+    row.className = "sync-row destination-row";
     const dotClass = statusClass(status);
     const issueCount = status?.issues?.length || 0;
     const dotTitle = dotClass === "yellow"
       ? `${issueCount} changing file${issueCount === 1 ? "" : "s"}`
       : (status?.status || "red");
     row.innerHTML = `
-      <div class="destination-id-cell">
+      <div class="row-left">
         <label>ID</label>
-        <button class="dot ${dotClass}" data-action="show-issues" title="${escapeAttr(dotTitle)}" aria-label="${escapeAttr(dotTitle)}"></button>
-        <input class="dst-id" value="${escapeAttr(dst.id)}" data-field="dst-id" readonly>
-      </div>
-      <div>
         <label>Destination Path</label>
+        <div class="destination-id-cell">
+          <button class="dot ${dotClass}" data-action="show-issues" title="${escapeAttr(dotTitle)}" aria-label="${escapeAttr(dotTitle)}"></button>
+          <input class="dst-id" value="${escapeAttr(dst.id)}" data-field="dst-id" readonly>
+        </div>
         <input class="path-picker dst-path" value="${escapeAttr(dst.path)}" data-field="dst-path" readonly title="Choose destination path">
       </div>
-      <span></span>
-      <div>
+      <div class="row-right destination-right">
         <label>Schedule</label>
-        <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
-      </div>
-      <div>
         <label>Cycle</label>
+        <label class="actions-label">Actions</label>
+        <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
         <input class="destination-readonly" value="${escapeAttr(cycleDisplay(status))}" readonly>
-      </div>
-      <div>
-        <label>Actions</label>
-        <div class="destination-actions">
-          <button data-action="sync-dst">Sync</button>
-          <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
-        </div>
+        <button data-action="sync-dst">Sync</button>
+        <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
       </div>
     `;
     row.querySelector('[data-field="dst-path"]').onclick = async () => {
@@ -262,17 +252,11 @@ function renderSyncRows(source, group) {
 
 function appendAddDestinationRow(body, source) {
   const addRow = document.createElement("div");
-  addRow.className = "destination-row add-destination-row";
+  addRow.className = "sync-row add-destination-row";
   addRow.innerHTML = `
     <div></div>
-    <div></div>
-    <span></span>
-    <div></div>
-    <div></div>
-    <div>
-      <div class="destination-actions add-only">
-        <button class="add-destination-button icon" data-action="add-destination" title="Add destination">+</button>
-      </div>
+    <div class="destination-actions add-only">
+      <button class="add-destination-button icon" data-action="add-destination" title="Add destination">+</button>
     </div>
   `;
   addRow.querySelector('[data-action="add-destination"]').onclick = async () => {
