@@ -1,10 +1,15 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use auto_sync::core::config::{AppConfig, load_config, load_or_create_config, save_config};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::state::{DestinationView, State as DbState};
+use auto_sync::core::sync::{
+    sync_all_now, sync_destination_now as sync_destination_now_core,
+    sync_source_now as sync_source_now_core,
+};
 use clap::Parser;
+use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(name = "auto_sync_gui")]
@@ -29,7 +34,7 @@ fn save_config_command(
     state: tauri::State<'_, GuiState>,
     cfg: AppConfig,
 ) -> Result<AppConfig, String> {
-    save_config(&state.config_path, &cfg).map_err(error_text)?;
+    let cfg = save_config(&state.config_path, &cfg).map_err(error_text)?;
     let state_db = DbState::open(&cfg.app.data_db).map_err(error_text)?;
     state_db.ensure_config(&cfg).map_err(error_text)?;
     Ok(cfg)
@@ -44,16 +49,117 @@ fn get_status(state: tauri::State<'_, GuiState>) -> Result<Vec<DestinationView>,
 }
 
 #[tauri::command]
-async fn sync_now(_state: tauri::State<'_, GuiState>) -> Result<Vec<DestinationView>, String> {
-    Err("sync is disabled during UI development".to_string())
+async fn sync_now(state: tauri::State<'_, GuiState>) -> Result<Vec<DestinationView>, String> {
+    let cfg = load_config(&state.config_path).map_err(error_text)?;
+    let mut state_db = DbState::open(&cfg.app.data_db).map_err(error_text)?;
+    state_db.ensure_config(&cfg).map_err(error_text)?;
+    sync_all_now(&cfg, &mut state_db).map_err(error_text)?;
+    state_db.destination_views(&cfg).map_err(error_text)
 }
 
 #[tauri::command]
 async fn sync_source_now(
-    _state: tauri::State<'_, GuiState>,
-    _source_id: String,
+    state: tauri::State<'_, GuiState>,
+    source_id: String,
 ) -> Result<Vec<DestinationView>, String> {
-    Err("sync is disabled during UI development".to_string())
+    let cfg = load_config(&state.config_path).map_err(error_text)?;
+    let mut state_db = DbState::open(&cfg.app.data_db).map_err(error_text)?;
+    state_db.ensure_config(&cfg).map_err(error_text)?;
+    sync_source_now_core(&cfg, &mut state_db, &source_id).map_err(error_text)?;
+    state_db.destination_views(&cfg).map_err(error_text)
+}
+
+#[tauri::command]
+async fn sync_destination_now(
+    state: tauri::State<'_, GuiState>,
+    source_id: String,
+    destination_id: String,
+) -> Result<Vec<DestinationView>, String> {
+    let cfg = load_config(&state.config_path).map_err(error_text)?;
+    let mut state_db = DbState::open(&cfg.app.data_db).map_err(error_text)?;
+    state_db.ensure_config(&cfg).map_err(error_text)?;
+    sync_destination_now_core(&cfg, &mut state_db, &source_id, &destination_id)
+        .map_err(error_text)?;
+    state_db.destination_views(&cfg).map_err(error_text)
+}
+
+#[derive(Debug, Serialize)]
+struct BrowseEntry {
+    name: String,
+    path: String,
+    kind: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowseResponse {
+    path: String,
+    parent: Option<String>,
+    entries: Vec<BrowseEntry>,
+}
+
+#[tauri::command]
+fn browse_paths(path: Option<PathBuf>) -> Result<BrowseResponse, String> {
+    browse_paths_inner(path.unwrap_or_else(|| PathBuf::from("/"))).map_err(error_text)
+}
+
+fn browse_paths_inner(requested: PathBuf) -> Result<BrowseResponse> {
+    let path = normalize_browse_dir(&requested)?;
+    let parent = path
+        .parent()
+        .map(|parent| parent.to_string_lossy().to_string());
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        let kind = if metadata.is_dir() {
+            "dir"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            continue;
+        };
+        let entry_path = entry.path();
+        entries.push(BrowseEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            path: entry_path.to_string_lossy().to_string(),
+            kind: kind.to_string(),
+        });
+    }
+    entries.sort_by(|left, right| {
+        entry_kind_order(&left.kind)
+            .cmp(&entry_kind_order(&right.kind))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(BrowseResponse {
+        path: path.to_string_lossy().to_string(),
+        parent,
+        entries,
+    })
+}
+
+fn normalize_browse_dir(path: &Path) -> Result<PathBuf> {
+    let path = if path.as_os_str().is_empty() {
+        Path::new("/")
+    } else {
+        path
+    };
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("failed to open path {}", path.display()))?;
+    if canonical.is_file() {
+        return canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", canonical.display()));
+    }
+    if !canonical.is_dir() {
+        anyhow::bail!("not a browsable path: {}", canonical.display());
+    }
+    Ok(canonical)
+}
+
+fn entry_kind_order(kind: &str) -> u8 {
+    if kind == "dir" { 0 } else { 1 }
 }
 
 fn main() -> Result<()> {
@@ -75,7 +181,9 @@ fn main() -> Result<()> {
             save_config_command,
             get_status,
             sync_now,
-            sync_source_now
+            sync_source_now,
+            sync_destination_now,
+            browse_paths
         ])
         .run(tauri::generate_context!())
         .context("failed to run Tauri GUI")?;

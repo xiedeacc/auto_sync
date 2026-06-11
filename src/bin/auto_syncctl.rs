@@ -5,7 +5,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use auto_sync::core::config::{AppConfig, load_config, load_or_create_config, save_config};
 use auto_sync::core::state::State;
-use auto_sync::core::sync::sync_all_pending;
+use auto_sync::core::sync::{sync_all_now, sync_all_pending};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -63,10 +63,11 @@ fn main() -> Result<()> {
             state.ensure_config(&cfg)?;
             state.ensure_open_cycles(&cfg)?;
             if close_current {
-                let closed = state.close_due_cycles(&cfg, true)?;
-                println!("closed {} current cycle(s)", closed.len());
+                sync_all_now(&cfg, &mut state)?;
+                println!("closed current cycle(s) and synced all destinations");
+            } else {
+                sync_all_pending(&cfg, &mut state)?;
             }
-            sync_all_pending(&cfg, &mut state)?;
             print_status(&state, &cfg)?;
         }
         CommandKind::PrintSystemd { install_dir } => {
@@ -93,7 +94,7 @@ fn print_status(state: &State, cfg: &AppConfig) -> Result<()> {
     }
     println!(
         "{:<18} {:<18} {:<7} {:<12} {:<12} {}",
-        "SOURCE", "DESTINATION", "STATUS", "LATEST", "VERIFIED", "REASON"
+        "SOURCE", "DESTINATION", "STATUS", "TARGET", "VERIFIED", "REASON"
     );
     for view in views {
         println!(
@@ -101,7 +102,7 @@ fn print_status(state: &State, cfg: &AppConfig) -> Result<()> {
             view.source_id,
             view.destination_id,
             view.status,
-            view.latest_closed_cycle_id
+            view.target_cycle_id
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             view.last_verified_cycle_id

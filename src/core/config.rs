@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct AppConfig {
     pub app: AppSection,
-    #[serde(skip_serializing)]
-    pub schedule: ScheduleConfig,
     pub source_groups: Vec<SourceGroupConfig>,
     pub deploy: DeployConfig,
 }
@@ -47,9 +45,33 @@ pub enum ScheduleMode {
 pub struct SourceGroupConfig {
     pub id: String,
     pub src: PathBuf,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excludes: Vec<PathBuf>,
     pub enabled: bool,
     pub mode: SyncMode,
+    pub snapshot: SnapshotConfig,
     pub destinations: Vec<DestinationConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapshotConfig {
+    pub backend: SnapshotBackend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_in_dataset: Option<PathBuf>,
+    pub prefix: String,
+    pub reconcile_interval_secs: u64,
+    pub keep_extra_cycles: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotBackend {
+    Auto,
+    Manifest,
+    Zfs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +109,6 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             app: AppSection::default(),
-            schedule: ScheduleConfig::default(),
             source_groups: Vec::new(),
             deploy: DeployConfig {
                 targets: vec![DeployTarget {
@@ -136,10 +157,31 @@ impl Default for SourceGroupConfig {
         Self {
             id: String::new(),
             src: PathBuf::new(),
+            excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
             destinations: Vec::new(),
         }
+    }
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            backend: SnapshotBackend::Auto,
+            dataset: None,
+            path_in_dataset: None,
+            prefix: "auto_sync".to_string(),
+            reconcile_interval_secs: 900,
+            keep_extra_cycles: 2,
+        }
+    }
+}
+
+impl Default for SnapshotBackend {
+    fn default() -> Self {
+        Self::Auto
     }
 }
 
@@ -175,8 +217,7 @@ impl Default for DeployTarget {
 pub fn load_or_create_config(path: &Path) -> Result<AppConfig> {
     if !path.exists() {
         let cfg = AppConfig::default();
-        save_config(path, &cfg)?;
-        return Ok(cfg);
+        return save_config(path, &cfg);
     }
     load_config(path)
 }
@@ -190,13 +231,14 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
     Ok(cfg)
 }
 
-pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<()> {
+pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<AppConfig> {
+    let cfg = clean_config_for_save(cfg);
     cfg.validate()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config dir {}", parent.display()))?;
     }
-    let raw = toml::to_string_pretty(cfg).context("failed to serialize config")?;
+    let raw = toml::to_string_pretty(&cfg).context("failed to serialize config")?;
     let tmp = path.with_extension("toml.tmp");
     fs::write(&tmp, raw).with_context(|| format!("failed to write {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| {
@@ -206,13 +248,58 @@ pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<()> {
             tmp.display()
         )
     })?;
-    Ok(())
+    Ok(cfg)
+}
+
+pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
+    let mut cfg = cfg.clone();
+    for source in &mut cfg.source_groups {
+        source.src = clean_path(&source.src);
+        source.excludes = clean_excludes(&source.excludes);
+        let mut destination_paths = HashSet::new();
+        source.destinations.retain_mut(|dst| {
+            dst.path = clean_path(&dst.path);
+            if dst.path.as_os_str().is_empty() {
+                return false;
+            }
+            destination_paths.insert(normalize_lossy(&dst.path))
+        });
+    }
+    cfg.source_groups
+        .retain(|source| !source.src.as_os_str().is_empty());
+    cfg
+}
+
+fn clean_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        PathBuf::new()
+    } else if trimmed == text.as_ref() {
+        path.to_path_buf()
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
+fn clean_excludes(excludes: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut cleaned = Vec::new();
+    for path in excludes {
+        let path = clean_path(path);
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        let path = normalize_lossy(&path);
+        if seen.insert(path.clone()) {
+            cleaned.push(path);
+        }
+    }
+    cleaned
 }
 
 impl AppConfig {
     pub fn validate(&self) -> Result<()> {
-        validate_schedule(&self.schedule)?;
-
         let mut source_ids = HashSet::new();
         for source in &self.source_groups {
             if source.id.trim().is_empty() {
@@ -223,6 +310,15 @@ impl AppConfig {
             }
             if source.src.as_os_str().is_empty() {
                 bail!("source {} has empty src path", source.id);
+            }
+            if source.snapshot.prefix.trim().is_empty() {
+                bail!("source {} has empty snapshot prefix", source.id);
+            }
+            if source.snapshot.reconcile_interval_secs == 0 {
+                bail!("source {} has zero reconcile interval", source.id);
+            }
+            for exclude in &source.excludes {
+                validate_exclude_path(&source.id, exclude)?;
             }
 
             let mut dst_ids = HashSet::new();
@@ -242,6 +338,13 @@ impl AppConfig {
                 }
                 validate_schedule(&dst.schedule)
                     .with_context(|| format!("destination {} has invalid schedule", dst.id))?;
+                if existing_directory_source_to_file_destination(source, dst) {
+                    bail!(
+                        "source {} is a directory, so destination {} must be a directory",
+                        source.id,
+                        dst.id
+                    );
+                }
                 if path_has_prefix(&dst.path, &source.src) {
                     bail!(
                         "destination {} ({}) must not be inside source {} ({})",
@@ -255,6 +358,41 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn validate_exclude_path(source_id: &str, path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        bail!("source {source_id} has empty exclude path");
+    }
+    if path.is_absolute() {
+        bail!(
+            "source {source_id} exclude path must be relative: {}",
+            path.display()
+        );
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!(
+            "source {source_id} exclude path must not contain parent components: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn existing_directory_source_to_file_destination(
+    source: &SourceGroupConfig,
+    dst: &DestinationConfig,
+) -> bool {
+    let Ok(source_meta) = fs::symlink_metadata(&source.src) else {
+        return false;
+    };
+    let Ok(dst_meta) = fs::symlink_metadata(&dst.path) else {
+        return false;
+    };
+    source_meta.is_dir() && !dst_meta.is_dir()
 }
 
 pub fn validate_schedule(schedule: &ScheduleConfig) -> Result<()> {
@@ -322,8 +460,10 @@ mod tests {
         cfg.source_groups.push(SourceGroupConfig {
             id: "main".to_string(),
             src: PathBuf::from("/data/src"),
+            excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {
                 id: "bad".to_string(),
                 path: PathBuf::from("/data/src/backup"),
@@ -332,5 +472,109 @@ mod tests {
             }],
         });
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_existing_directory_source_to_file_destination() {
+        let temp = temp_dir("dir_to_file_config");
+        let src = temp.join("src");
+        let dst = temp.join("dst-file");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(&dst, b"old").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "main".to_string(),
+            src,
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
+            destinations: vec![DestinationConfig {
+                id: "bad".to_string(),
+                path: dst,
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+            }],
+        });
+        assert!(cfg.validate().is_err());
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn clean_config_for_save_drops_empty_sources_and_destinations() {
+        let mut cfg = AppConfig::default();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            src: PathBuf::from(" /data/src "),
+            excludes: vec![
+                PathBuf::from(" log "),
+                PathBuf::from("cache/tmp"),
+                PathBuf::from("log"),
+                PathBuf::new(),
+            ],
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
+            destinations: vec![
+                DestinationConfig {
+                    id: "dst_1".to_string(),
+                    path: PathBuf::from(" /data/dst "),
+                    enabled: true,
+                    schedule: ScheduleConfig::default(),
+                },
+                DestinationConfig {
+                    id: "dst_2".to_string(),
+                    path: PathBuf::new(),
+                    enabled: true,
+                    schedule: ScheduleConfig::default(),
+                },
+                DestinationConfig {
+                    id: "dst_3".to_string(),
+                    path: PathBuf::from("/data/dst"),
+                    enabled: true,
+                    schedule: ScheduleConfig::default(),
+                },
+            ],
+        });
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_2".to_string(),
+            src: PathBuf::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                path: PathBuf::from("/unused"),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+            }],
+        });
+
+        let cleaned = clean_config_for_save(&cfg);
+
+        assert_eq!(cleaned.source_groups.len(), 1);
+        assert_eq!(cleaned.source_groups[0].src, PathBuf::from("/data/src"));
+        assert_eq!(
+            cleaned.source_groups[0].excludes,
+            vec![PathBuf::from("log"), PathBuf::from("cache/tmp")]
+        );
+        assert_eq!(cleaned.source_groups[0].destinations.len(), 1);
+        assert_eq!(
+            cleaned.source_groups[0].destinations[0].path,
+            PathBuf::from("/data/dst")
+        );
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("auto_sync_{name}_{}_{}", std::process::id(), nanos));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }

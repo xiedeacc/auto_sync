@@ -15,7 +15,6 @@
     <div class="toolbar">
       <button id="config" title="Show current configuration">Config</button>
       <button id="refresh" title="Refresh status">Refresh</button>
-      <button id="save" class="primary" title="Save configuration">Save</button>
     </div>
   </header>
 
@@ -28,7 +27,7 @@
   <div id="folder-modal" class="modal" hidden>
     <div class="modal-panel">
       <div class="modal-head">
-        <h2>Choose Folder</h2>
+        <h2>Choose Path</h2>
         <button id="folder-close" class="icon" title="Close">x</button>
       </div>
       <div class="folder-path" id="folder-path"></div>
@@ -36,6 +35,7 @@
         <button id="folder-up">Up</button>
         <button id="folder-select" class="primary">Select</button>
       </div>
+      <div id="folder-error" class="modal-error" hidden></div>
       <div id="folder-list" class="folder-list"></div>
     </div>
   </div>
@@ -77,6 +77,31 @@
         <button id="config-close" class="icon" title="Close">x</button>
       </div>
       <pre id="config-view" class="config-view"></pre>
+    </div>
+  </div>
+
+  <div id="issue-modal" class="modal" hidden>
+    <div class="modal-panel issue-modal-panel">
+      <div class="modal-head">
+        <h2>Changing Files</h2>
+        <button id="issue-close" class="icon" title="Close">x</button>
+      </div>
+      <div id="issue-summary" class="issue-summary"></div>
+      <div id="issue-list" class="issue-list"></div>
+    </div>
+  </div>
+
+  <div id="exclude-modal" class="modal" hidden>
+    <div class="modal-panel exclude-modal-panel">
+      <div class="modal-head">
+        <h2>Excluded</h2>
+        <button id="exclude-close" class="icon" title="Close">x</button>
+      </div>
+      <div id="exclude-source" class="issue-summary"></div>
+      <div id="exclude-list" class="exclude-list"></div>
+      <div class="folder-actions">
+        <button id="exclude-add" class="primary">Add</button>
+      </div>
     </div>
   </div>
 

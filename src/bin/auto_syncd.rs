@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use auto_sync::core::config::{AppConfig, load_config, load_or_create_config};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::state::State;
+use auto_sync::core::sync::sync_all_pending;
 use auto_sync::core::watcher::fanotify::spawn_fanotify_thread;
 use clap::Parser;
 use tracing::{error, info, warn};
@@ -40,7 +41,7 @@ fn main() -> Result<()> {
 
 fn run(config_path: PathBuf, initial_cfg: AppConfig, shutdown: Arc<AtomicBool>) -> Result<()> {
     let mut cfg = initial_cfg;
-    let state = State::open(&cfg.app.data_db)?;
+    let mut state = State::open(&cfg.app.data_db)?;
     state.ensure_config(&cfg)?;
     state.ensure_open_cycles(&cfg)?;
 
@@ -67,7 +68,22 @@ fn run(config_path: PathBuf, initial_cfg: AppConfig, shutdown: Arc<AtomicBool>) 
         if let Err(err) = state.ensure_config(&cfg) {
             error!(error = %err, "failed to persist config into state db");
         }
-        // Sync execution is intentionally disabled while the UI/config workflow is under active development.
+        match state.advance_due_destination_targets(&cfg) {
+            Ok(closed) => {
+                for cycle in closed {
+                    info!(
+                        source = cycle.source_id,
+                        cycle_id = cycle.id,
+                        "cycle target advanced"
+                    );
+                }
+            }
+            Err(err) => error!(error = %err, "failed to advance due destination targets"),
+        }
+
+        if let Err(err) = sync_all_pending(&cfg, &mut state) {
+            error!(error = %err, "sync pending cycles failed");
+        }
 
         if last_status_log.elapsed() >= Duration::from_secs(cfg.app.status_log_interval_secs) {
             log_destination_status(&state, &cfg);

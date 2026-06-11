@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
-use crate::core::config::{AppConfig, SourceGroupConfig};
+use crate::core::config::{AppConfig, ScheduleMode, SourceGroupConfig};
 use crate::core::state::State;
 
 const FAN_CLOEXEC: u32 = 0x0000_0001;
@@ -52,6 +52,7 @@ struct FanotifyEventMetadata {
 struct SourceRoot {
     id: String,
     root: PathBuf,
+    is_file: bool,
 }
 
 pub fn spawn_fanotify_thread(
@@ -60,10 +61,50 @@ pub fn spawn_fanotify_thread(
     shutdown: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        if let Err(err) = run_fanotify_loop(cfg, db_path, shutdown) {
-            error!(error = %err, "fanotify watcher stopped");
+        let sources: Vec<_> = cfg
+            .source_groups
+            .iter()
+            .filter(|source| source_needs_fanotify(source))
+            .cloned()
+            .collect();
+        if sources.is_empty() {
+            info!("fanotify watcher has no realtime sources");
+            while !shutdown.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_secs(1));
+            }
+            return;
+        }
+
+        let mut handles = Vec::new();
+        for source in sources {
+            let mut source_cfg = cfg.clone();
+            source_cfg.source_groups = vec![source];
+            let db_path = db_path.clone();
+            let shutdown = shutdown.clone();
+            handles.push(thread::spawn(move || {
+                if let Err(err) = run_fanotify_loop(source_cfg, db_path, shutdown) {
+                    error!(error = %err, "fanotify source watcher stopped");
+                }
+            }));
+        }
+
+        while !shutdown.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(1));
+        }
+        for handle in handles {
+            if let Err(err) = handle.join() {
+                warn!(?err, "fanotify source watcher join failed");
+            }
         }
     })
+}
+
+fn source_needs_fanotify(source: &SourceGroupConfig) -> bool {
+    source.enabled
+        && source
+            .destinations
+            .iter()
+            .any(|dst| dst.enabled && dst.schedule.mode == ScheduleMode::Realtime)
 }
 
 fn run_fanotify_loop(cfg: AppConfig, db_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<()> {
@@ -82,10 +123,17 @@ fn run_fanotify_loop(cfg: AppConfig, db_path: PathBuf, shutdown: Arc<AtomicBool>
 
     let fd = fanotify_init()?;
     let _guard = FdGuard(fd);
-    let mask = FAN_MODIFY | FAN_CLOSE_WRITE;
+    let mask = FAN_MODIFY
+        | FAN_CLOSE_WRITE
+        | FAN_CREATE
+        | FAN_DELETE
+        | FAN_MOVED_FROM
+        | FAN_MOVED_TO
+        | FAN_DELETE_SELF
+        | FAN_MOVE_SELF;
 
     for source in &sources {
-        mark_source(fd, &source.root, mask)
+        mark_source(fd, source, mask)
             .with_context(|| format!("failed to mark source {}", source.root.display()))?;
         info!(source = source.id, root = %source.root.display(), "fanotify mark registered");
     }
@@ -132,7 +180,8 @@ fn fanotify_init() -> Result<RawFd> {
     Ok(fd)
 }
 
-fn mark_source(fd: RawFd, root: &Path, mask: u64) -> Result<()> {
+fn mark_source(fd: RawFd, source: &SourceRoot, mask: u64) -> Result<()> {
+    let root = &source.root;
     if try_mark(fd, root, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, mask).is_ok() {
         return Ok(());
     }
@@ -147,12 +196,20 @@ fn mark_source(fd: RawFd, root: &Path, mask: u64) -> Result<()> {
         return Ok(());
     }
     let mount_err = std::io::Error::last_os_error();
+    if source.is_file {
+        warn!(
+            path = %root.display(),
+            error = %mount_err,
+            "fanotify mount mark failed; trying file mark"
+        );
+        return try_mark(fd, root, FAN_MARK_ADD, mask);
+    }
+
     warn!(
         path = %root.display(),
         error = %mount_err,
         "fanotify mount mark failed; trying recursive directory marks"
     );
-
     mark_directory_tree(fd, root, mask)
 }
 
@@ -228,14 +285,13 @@ fn persist_event(
     };
 
     for source in sources {
-        if let Ok(rel) = path.strip_prefix(&source.root) {
-            let rel = rel.to_string_lossy();
+        if let Some(rel) = source_relative_event_path(source, &path) {
             let rescan_required = meta.mask & (FAN_DELETE | FAN_MOVED_FROM | FAN_DELETE_SELF) != 0;
             state.record_event(
                 &source.id,
                 meta.mask,
                 mask_to_kind(meta.mask),
-                Some(rel.as_ref()),
+                Some(rel.as_str()),
                 rescan_required,
             )?;
         }
@@ -264,7 +320,7 @@ fn close_event_fd(fd: i32) {
 fn source_roots(cfg: &AppConfig) -> Result<Vec<SourceRoot>> {
     cfg.source_groups
         .iter()
-        .filter(|s| s.enabled)
+        .filter(|s| source_needs_fanotify(s))
         .map(source_root)
         .collect()
 }
@@ -274,10 +330,35 @@ fn source_root(source: &SourceGroupConfig) -> Result<SourceRoot> {
         .src
         .canonicalize()
         .with_context(|| format!("failed to canonicalize source {}", source.src.display()))?;
+    let metadata =
+        std::fs::metadata(&root).with_context(|| format!("failed to stat {}", root.display()))?;
+    if !metadata.is_dir() && !metadata.is_file() {
+        bail!("source is neither file nor directory: {}", root.display());
+    }
     Ok(SourceRoot {
         id: source.id.clone(),
         root,
+        is_file: metadata.is_file(),
     })
+}
+
+fn source_relative_event_path(source: &SourceRoot, path: &Path) -> Option<String> {
+    if source.is_file {
+        if path == source.root {
+            return source
+                .root
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+        }
+        return None;
+    }
+
+    let rel = path.strip_prefix(&source.root).ok()?;
+    if rel.as_os_str().is_empty() {
+        None
+    } else {
+        Some(rel.to_string_lossy().to_string())
+    }
 }
 
 fn mask_to_kind(mask: u64) -> &'static str {

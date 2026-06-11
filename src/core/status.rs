@@ -25,3 +25,13 @@ pub fn check_destination_online(path: &Path) -> Result<()> {
     fs::remove_file(&probe).ok();
     Ok(())
 }
+
+pub fn check_file_destination_online(path: &Path) -> Result<()> {
+    if path.exists() && path.is_dir() {
+        bail!("destination file path is a directory");
+    }
+    let Some(parent) = path.parent() else {
+        bail!("destination file path has no parent");
+    };
+    check_destination_online(parent)
+}
