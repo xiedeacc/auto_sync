@@ -16,7 +16,10 @@ pub fn check_destination_online(path: &Path) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("destination path does not exist: {}", path.display()))?
     };
     if !probe_dir.is_dir() {
-        bail!("destination path is not a directory: {}", probe_dir.display());
+        bail!(
+            "destination path is not a directory: {}",
+            probe_dir.display()
+        );
     }
 
     let probe = probe_dir.join(".auto_sync_probe");

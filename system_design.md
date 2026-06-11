@@ -176,12 +176,16 @@ enabled = true
     timezone = "local"
     weekday = "sunday"
 
+[[sync_order]]
+before = { source_id = "photos", destination_id = "usb_backup" }
+after = { source_id = "docs", destination_id = "docs_backup" }
+
 [[deploy.targets]]
 id = "nas"
 host = "192.168.3.178"
 port = 10022
 user = "root"
-install_dir = "/opt/auto_sync"
+install_dir = "/usr/local/auto_sync"
 ```
 
 配置原则：
@@ -532,7 +536,7 @@ ssh -p 10022 root@192.168.3.178
 建议安装路径：
 
 ```text
-/opt/auto_sync/
+/usr/local/auto_sync/
   bin/
   conf/
   logs/
@@ -543,13 +547,13 @@ ssh -p 10022 root@192.168.3.178
 1. 通过 SSH 执行 `uname -m`、`uname -s`、`systemctl --version`，检测架构和 systemd。
 2. 根据架构选择或交叉编译 Linux 二进制。
 3. 上传 `bin/auto_syncd`、`bin/auto_syncctl`、`bin/auto_sync_web` 和 systemd unit。
-4. 执行权限设置：`chmod +x /opt/auto_sync/bin/*`。
+4. 执行权限设置：`chmod +x /usr/local/auto_sync/bin/*`。
 5. 如果支持 systemd，安装并启动 `auto_sync.service`。
 6. 通过 `auto_syncctl status` 验证状态。
 
 配置部署原则：
 
-- 首次安装时可以生成 `/opt/auto_sync/conf/auto_sync.toml` 示例配置。
+- 首次安装时可以生成 `/usr/local/auto_sync/conf/auto_sync.toml` 示例配置。
 - 升级部署默认不能覆盖 NAS 现有配置。
 - 覆盖配置必须使用显式参数，例如 `--overwrite-config`，并先保存时间戳备份。
 
@@ -563,8 +567,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/auto_sync
-ExecStart=/opt/auto_sync/bin/auto_syncd --config /opt/auto_sync/conf/auto_sync.toml
+WorkingDirectory=/usr/local/auto_sync
+ExecStart=/usr/local/auto_sync/bin/auto_syncd --config /usr/local/auto_sync/conf/auto_sync.toml
 Restart=always
 RestartSec=5
 User=root
@@ -704,17 +708,19 @@ NAS 真实测试约定：
 5. Linux fanotify watcher：每 source 一个 group、事件持久化、overflow、重启恢复。
 6. daemon 与 systemd：后台调度、日志、状态输出。
 7. Tauri/Web UI：src/dst 配置、Schedule 配置、Cycle 进度、状态绿点/红点。
-8. 部署工具：本机安装、NAS SSH 部署、状态检查。
-9. 测试与故障恢复：离线、崩溃、overflow、ZFS snapshot 清理、校验失败。
+8. 部署工具：本机安装、NAS SSH 部署、状态检查；Linux 根据 GUI 环境安装 GUI+headless 或仅 headless。
+9. 局域网多机：Web 状态栏显示在线机器数，UDP 自动发现机器，支持手动机器、远程目录浏览、rsync 跨机器同步以及 remote-to-remote runner 模式。
+10. Windows peer：Windows 使用 OpenSSH + cwRsync runtime，路径转换为 `/cygdrive/<drive>/...`。
+11. 测试与故障恢复：离线、崩溃、overflow、ZFS snapshot 清理、校验失败。
 
 ## 17. 待确认问题
 
 编码前建议确认以下点：
 
 1. 同步语义是否接受默认 mirror 模式，即源目录删除后目标目录也删除；或者需要 archive 模式保留历史文件。
-2. Windows 是否只作为管理 GUI，还是也必须支持 Windows 本地目录作为 src 自动监听。
-3. NAS 的 CPU 架构和系统类型，是否支持 systemd 与 fanotify。
-4. NAS 上 source 所在 ZFS dataset 名称、挂载点和是否存在 nested dataset。
-5. Realtime schedule 的默认 `reconcile_interval`，例如 5 分钟、15 分钟或 1 小时。
-6. 大文件是否需要强 hash 校验，还是 size + mtime + 异常时 hash 即可。
-7. `.auto_sync_trash` 删除保留周期，例如 7 天、30 天或手动清理。
+2. NAS 的 CPU 架构和系统类型，是否支持 systemd 与 fanotify。
+3. NAS 上 source 所在 ZFS dataset 名称、挂载点和是否存在 nested dataset。
+4. Realtime schedule 的默认 `reconcile_interval`，例如 5 分钟、15 分钟或 1 小时。
+5. 大文件是否需要强 hash 校验，还是 size + mtime + 异常时 hash 即可。
+6. `.auto_sync_trash` 删除保留周期，例如 7 天、30 天或手动清理。
+7. Windows 是否需要内置安装 OpenSSH/cwRsync 的远程引导流程，而不仅是提供 runtime 包。

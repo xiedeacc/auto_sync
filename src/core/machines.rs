@@ -1,0 +1,303 @@
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::task::JoinHandle;
+use tracing::{debug, warn};
+
+use crate::core::config::{AppConfig, MachineConfig, load_config, normalized_machines};
+
+pub const DISCOVERY_PORT: u16 = 18766;
+const DISCOVERY_MAGIC: &[u8] = b"auto_sync_discover_v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineHealth {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub web_port: u16,
+    pub os: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MachineView {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub web_port: u16,
+    pub ssh_user: String,
+    pub ssh_port: u16,
+    pub os: String,
+    pub enabled: bool,
+    pub manual: bool,
+    pub online: bool,
+    pub discovered: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MachineStatus {
+    pub online: usize,
+    pub total: usize,
+    pub machines: Vec<MachineView>,
+}
+
+pub fn local_health(cfg: &AppConfig, web_port: u16) -> MachineHealth {
+    let local = normalized_machines(cfg)
+        .into_iter()
+        .find(|machine| machine.id == "local")
+        .unwrap_or_else(MachineConfig::local);
+    MachineHealth {
+        id: local.id,
+        name: local.name,
+        host: local.host,
+        web_port,
+        os: std::env::consts::OS.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+pub fn machine_status(cfg: &AppConfig) -> MachineStatus {
+    let mut machines = Vec::new();
+    for machine in normalized_machines(cfg).into_iter().filter(|m| m.enabled) {
+        let online = machine.id == "local" || ping_machine(&machine);
+        machines.push(MachineView {
+            id: machine.id,
+            name: machine.name,
+            host: machine.host,
+            web_port: machine.web_port,
+            ssh_user: machine.ssh_user,
+            ssh_port: machine.ssh_port,
+            os: machine.os,
+            enabled: machine.enabled,
+            manual: machine.manual,
+            online,
+            discovered: false,
+        });
+    }
+    let online = machines.iter().filter(|machine| machine.online).count();
+    MachineStatus {
+        online,
+        total: machines.len(),
+        machines,
+    }
+}
+
+pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> MachineStatus {
+    let mut status = machine_status(cfg);
+    for health in discovered {
+        if status
+            .machines
+            .iter()
+            .any(|machine| machine.id == health.id)
+        {
+            continue;
+        }
+        status.machines.push(MachineView {
+            id: health.id,
+            name: health.name,
+            host: health.host,
+            web_port: health.web_port,
+            ssh_user: String::new(),
+            ssh_port: 22,
+            os: health.os,
+            enabled: true,
+            manual: false,
+            online: true,
+            discovered: true,
+        });
+    }
+    status.online = status
+        .machines
+        .iter()
+        .filter(|machine| machine.online)
+        .count();
+    status.total = status.machines.len();
+    status
+}
+
+pub fn spawn_discovery_responder(config_path: Arc<PathBuf>, web_port: u16) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let socket = match tokio::net::UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
+            Ok(socket) => socket,
+            Err(err) => {
+                warn!(error = %err, "failed to bind LAN discovery responder");
+                return;
+            }
+        };
+        let mut buf = [0_u8; 512];
+        loop {
+            let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+                continue;
+            };
+            if &buf[..len] != DISCOVERY_MAGIC {
+                continue;
+            }
+            let Ok(cfg) = load_config(&config_path) else {
+                continue;
+            };
+            let health = local_health(&cfg, web_port);
+            let Ok(raw) = serde_json::to_vec(&health) else {
+                continue;
+            };
+            if let Err(err) = socket.send_to(&raw, peer).await {
+                debug!(error = %err, "failed to send discovery response");
+            }
+        }
+    })
+}
+
+pub fn discover_lan(timeout: Duration) -> Result<Vec<MachineHealth>> {
+    let socket = UdpSocket::bind(("0.0.0.0", 0)).context("failed to open discovery socket")?;
+    socket.set_broadcast(true)?;
+    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    socket.send_to(DISCOVERY_MAGIC, ("255.255.255.255", DISCOVERY_PORT))?;
+    let start = Instant::now();
+    let mut out: Vec<MachineHealth> = Vec::new();
+    let mut buf = [0_u8; 2048];
+    while start.elapsed() < timeout {
+        match socket.recv_from(&mut buf) {
+            Ok((len, _)) => {
+                if let Ok(health) = serde_json::from_slice::<MachineHealth>(&buf[..len]) {
+                    if !out.iter().any(|item| item.id == health.id) {
+                        out.push(health);
+                    }
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(out)
+}
+
+pub fn remote_get_json<T: DeserializeOwned>(
+    machine: &MachineConfig,
+    path: &str,
+    timeout: Duration,
+) -> Result<T> {
+    let raw = http_get(&machine.host, machine.web_port, path, timeout)?;
+    serde_json::from_slice(&raw).context("failed to parse peer response")
+}
+
+pub fn find_machine(cfg: &AppConfig, machine_id: &str) -> Option<MachineConfig> {
+    normalized_machines(cfg)
+        .into_iter()
+        .find(|machine| machine.id == machine_id)
+}
+
+pub fn machine_id_from_path(machine_id: Option<&str>) -> &str {
+    machine_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("local")
+}
+
+pub fn encode_query_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+pub fn ssh_target(machine: &MachineConfig) -> String {
+    let user = if machine.ssh_user.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}@", machine.ssh_user.trim())
+    };
+    format!("{user}{}", machine.host)
+}
+
+fn ping_machine(machine: &MachineConfig) -> bool {
+    remote_get_json::<MachineHealth>(machine, "/api/health", Duration::from_millis(700)).is_ok()
+}
+
+fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<Vec<u8>> {
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .with_context(|| format!("invalid peer address {host}:{port}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .with_context(|| format!("failed to connect to peer {host}:{port}"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes())?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        bail!("invalid peer HTTP response");
+    };
+    let header = String::from_utf8_lossy(&raw[..split]);
+    if !header.starts_with("HTTP/1.1 200") && !header.starts_with("HTTP/1.0 200") {
+        bail!(
+            "peer returned non-200 response: {}",
+            header.lines().next().unwrap_or("")
+        );
+    }
+    Ok(raw[split + 4..].to_vec())
+}
+
+pub fn rsync_endpoint(machine: &MachineConfig, path: &Path) -> String {
+    let path = rsync_path(machine, path);
+    if machine.id == "local" {
+        path
+    } else {
+        format!("{}:{path}", ssh_target(machine))
+    }
+}
+
+pub fn rsync_path(machine: &MachineConfig, path: &Path) -> String {
+    let value = path.to_string_lossy();
+    if machine.os.eq_ignore_ascii_case("windows") {
+        return windows_path_to_cygwin(&value);
+    }
+    value.to_string()
+}
+
+fn windows_path_to_cygwin(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        let rest = normalized[2..].trim_start_matches('/');
+        if rest.is_empty() {
+            format!("/cygdrive/{drive}")
+        } else {
+            format!("/cygdrive/{drive}/{rest}")
+        }
+    } else {
+        normalized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_windows_drive_paths_for_rsync() {
+        let mut machine = MachineConfig::local();
+        machine.os = "windows".to_string();
+        assert_eq!(
+            rsync_path(&machine, Path::new("C:\\Users\\me\\data")),
+            "/cygdrive/c/Users/me/data"
+        );
+        assert_eq!(rsync_path(&machine, Path::new("D:\\")), "/cygdrive/d");
+    }
+}

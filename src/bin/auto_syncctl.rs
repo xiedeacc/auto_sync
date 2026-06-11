@@ -28,7 +28,7 @@ enum CommandKind {
         close_current: bool,
     },
     PrintSystemd {
-        #[arg(long, default_value = "/opt/auto_sync")]
+        #[arg(long, default_value = "/usr/local/auto_sync")]
         install_dir: PathBuf,
     },
     DeployNas {
@@ -38,7 +38,7 @@ enum CommandKind {
         port: u16,
         #[arg(long, default_value = "root")]
         user: String,
-        #[arg(long, default_value = "/opt/auto_sync")]
+        #[arg(long, default_value = "/usr/local/auto_sync")]
         install_dir: PathBuf,
     },
 }
@@ -144,6 +144,17 @@ fn deploy_nas(
         "systemctl stop auto_sync.service auto_sync_web.service 2>/dev/null || true",
     ]))?;
 
+    let remote_has_gui = Command::new("ssh")
+        .args([
+            "-p",
+            &ssh_port,
+            &target,
+            "([ -d /usr/share/xsessions ] && ls /usr/share/xsessions/*.desktop >/dev/null 2>&1) || ([ -d /usr/share/wayland-sessions ] && ls /usr/share/wayland-sessions/*.desktop >/dev/null 2>&1) || command -v Xorg >/dev/null 2>&1",
+        ])
+        .status()
+        .context("failed to detect remote GUI environment")?
+        .success();
+
     for binary in ["auto_syncd", "auto_syncctl", "auto_sync_web"] {
         let local = PathBuf::from("bin").join(binary);
         if !local.exists() {
@@ -158,6 +169,24 @@ fn deploy_nas(
             local.to_string_lossy().as_ref(),
             &format!("{target}:{}/bin/{binary}", install_dir.display()),
         ]))?;
+    }
+    let gui_binary = PathBuf::from("bin").join("auto_sync_gui");
+    if remote_has_gui && gui_binary.exists() {
+        run(Command::new("scp").args([
+            "-P",
+            &ssh_port,
+            gui_binary.to_string_lossy().as_ref(),
+            &format!("{target}:{}/bin/auto_sync_gui", install_dir.display()),
+        ]))?;
+        println!("remote GUI environment detected; installed auto_sync_gui");
+    } else {
+        run(Command::new("ssh").args([
+            "-p",
+            &ssh_port,
+            &target,
+            &format!("rm -f {}/bin/auto_sync_gui", install_dir.display()),
+        ]))?;
+        println!("remote has no GUI environment; installed headless mode only");
     }
 
     // Only seed the config on first deploy; never overwrite an existing one so

@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 #[derive(Debug, Parser)]
 #[command(name = "auto_syncd")]
-#[command(about = "Linux fanotify based periodic directory sync daemon")]
+#[command(about = "auto_sync periodic directory sync daemon")]
 struct Args {
     #[arg(long, default_value = "conf/auto_sync.toml")]
     config: PathBuf,
@@ -55,7 +55,7 @@ fn run(config_path: PathBuf, initial_cfg: AppConfig, shutdown: Arc<AtomicBool>) 
             Ok(new_cfg) => {
                 let signature = config_signature(&new_cfg);
                 if signature != watcher_signature {
-                    info!("config changed; restarting fanotify watcher");
+                    info!("config changed; restarting source watcher");
                     stop_watcher(&mut watcher_state);
                     watcher_state = start_watcher(&new_cfg);
                     watcher_signature = signature;
@@ -136,7 +136,7 @@ fn stop_watcher(state: &mut WatcherState) {
     state.stop.store(true, Ordering::SeqCst);
     if let Some(handle) = state.handle.take() {
         if let Err(err) = handle.join() {
-            warn!(?err, "fanotify watcher thread join failed");
+            warn!(?err, "source watcher thread join failed");
         }
     }
 }

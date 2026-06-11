@@ -10,7 +10,11 @@ use filetime::{FileTime, set_file_mtime};
 use tracing::{error, info, warn};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::core::config::{AppConfig, DestinationConfig, SnapshotBackend, SourceGroupConfig};
+use crate::core::config::{
+    AppConfig, DestinationConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef,
+    machine_id_or_local,
+};
+use crate::core::machines::{find_machine, rsync_endpoint, rsync_path, ssh_target};
 use crate::core::state::{Cycle, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
 
@@ -20,14 +24,23 @@ const INTERNAL_PROBE: &str = ".auto_sync_probe";
 
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     state.ensure_config(cfg)?;
-    for source in cfg.source_groups.iter().filter(|s| s.enabled) {
-        let cycles = state.closed_cycles_for_source(&source.id)?;
-        for cycle in cycles {
-            if state.source_has_target_cycle(&source.id, cycle.id)? {
-                sync_cycle_for_source(cfg, state, source, &cycle)?;
-            } else if cycle.status == "closed" {
-                state.mark_cycle_status(cycle.id, "verified")?;
+    loop {
+        let mut progressed = false;
+        let mut blocked = false;
+        for source in cfg.source_groups.iter().filter(|s| s.enabled) {
+            let cycles = state.closed_cycles_for_source(&source.id)?;
+            for cycle in cycles {
+                if state.source_has_target_cycle(&source.id, cycle.id)? {
+                    let outcome = sync_cycle_for_source(cfg, state, source, &cycle)?;
+                    progressed |= outcome.progressed;
+                    blocked |= outcome.blocked;
+                } else if cycle.status == "closed" {
+                    state.mark_cycle_status(cycle.id, "verified")?;
+                }
             }
+        }
+        if !progressed || !blocked {
+            break;
         }
     }
     Ok(())
@@ -54,17 +67,21 @@ pub fn sync_destination_now(
 }
 
 pub fn sync_cycle_for_source(
-    _cfg: &AppConfig,
+    cfg: &AppConfig,
     state: &mut State,
     source: &SourceGroupConfig,
     cycle: &Cycle,
-) -> Result<()> {
+) -> Result<SyncCycleOutcome> {
     info!(
         source = source.id,
         cycle_id = cycle.id,
         needs_full_rescan = cycle.needs_full_rescan,
         "sync cycle started"
     );
+
+    if cycle_needs_rsync(state, source, cycle)? {
+        return sync_cycle_with_rsync(cfg, state, source, cycle);
+    }
 
     let live_source_endpoint = match SourceEndpoint::resolve(source) {
         Ok(endpoint) => endpoint,
@@ -86,6 +103,9 @@ pub fn sync_cycle_for_source(
 
     let mut all_verified = true;
     let mut targeted_count = 0_usize;
+    let mut blocked_count = 0_usize;
+    let mut had_unblocked_failure = false;
+    let mut progressed = false;
     let mut ready_destinations = Vec::new();
     for (dst_index, dst) in source
         .destinations
@@ -109,6 +129,19 @@ pub fn sync_cycle_for_source(
             continue;
         }
 
+        if let Some(blocker) = sync_order_blocker(cfg, state, &source.id, &dst.id)? {
+            all_verified = false;
+            blocked_count += 1;
+            state.upsert_destination_status(
+                &source.id,
+                &dst.id,
+                None,
+                "red",
+                &format!("blocked_by_sync_order:{blocker}"),
+            )?;
+            continue;
+        }
+
         let dst_endpoint =
             match DestinationEndpoint::resolve(&live_source_endpoint, dst).and_then(|endpoint| {
                 endpoint.check_online()?;
@@ -117,6 +150,7 @@ pub fn sync_cycle_for_source(
                 Ok(endpoint) => endpoint,
                 Err(err) => {
                     all_verified = false;
+                    had_unblocked_failure = true;
                     warn!(
                         source = source.id,
                         destination = dst.id,
@@ -140,10 +174,15 @@ pub fn sync_cycle_for_source(
     if ready_destinations.is_empty() {
         if targeted_count == 0 || all_verified {
             state.mark_cycle_status(cycle.id, "verified")?;
+        } else if blocked_count > 0 && !had_unblocked_failure {
+            state.mark_cycle_status(cycle.id, "closed")?;
         } else {
             state.mark_cycle_status(cycle.id, "failed")?;
         }
-        return Ok(());
+        return Ok(SyncCycleOutcome {
+            progressed: false,
+            blocked: blocked_count > 0,
+        });
     }
 
     let source_view = SourceReadView::prepare(source, &live_source_endpoint, cycle.id)?;
@@ -166,6 +205,7 @@ pub fn sync_cycle_for_source(
             &source.excludes,
         ) {
             Ok(()) => {
+                progressed = true;
                 state.clear_destination_issues(&source.id, &dst.id)?;
                 state.upsert_destination_status(
                     &source.id,
@@ -183,6 +223,7 @@ pub fn sync_cycle_for_source(
             }
             Err(err) => {
                 all_verified = false;
+                had_unblocked_failure = true;
                 error!(
                     source = source.id,
                     destination = dst.id,
@@ -224,10 +265,329 @@ pub fn sync_cycle_for_source(
     if targeted_count == 0 || all_verified {
         state.mark_cycle_status(cycle.id, "verified")?;
         source_view.cleanup(source);
+    } else if blocked_count > 0 && !had_unblocked_failure {
+        state.mark_cycle_status(cycle.id, "closed")?;
     } else {
         state.mark_cycle_status(cycle.id, "failed")?;
     }
+    Ok(SyncCycleOutcome {
+        progressed,
+        blocked: blocked_count > 0,
+    })
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SyncCycleOutcome {
+    pub progressed: bool,
+    pub blocked: bool,
+}
+
+fn sync_order_blocker(
+    cfg: &AppConfig,
+    state: &State,
+    source_id: &str,
+    destination_id: &str,
+) -> Result<Option<String>> {
+    let task = SyncTaskRef {
+        source_id: source_id.to_string(),
+        destination_id: destination_id.to_string(),
+    };
+    for predecessor in sync_order_predecessors(cfg, &task) {
+        if !sync_order_predecessor_satisfied(state, &predecessor)? {
+            return Ok(Some(sync_task_label(&predecessor)));
+        }
+    }
+    Ok(None)
+}
+
+fn sync_order_predecessor_satisfied(state: &State, task: &SyncTaskRef) -> Result<bool> {
+    let offset = state.destination_offset(&task.source_id, &task.destination_id)?;
+    if let Some(target) = offset.target_cycle_id {
+        return Ok(offset.last_verified_cycle_id >= Some(target) && offset.status == "green");
+    }
+    Ok(offset.last_verified_cycle_id.is_some() && offset.status == "green")
+}
+
+fn sync_order_predecessors(cfg: &AppConfig, task: &SyncTaskRef) -> Vec<SyncTaskRef> {
+    let mut out = Vec::new();
+    let mut stack: Vec<SyncTaskRef> = cfg
+        .sync_order
+        .iter()
+        .filter(|rule| rule.after == *task)
+        .map(|rule| rule.before.clone())
+        .collect();
+    while let Some(predecessor) = stack.pop() {
+        if out.contains(&predecessor) {
+            continue;
+        }
+        stack.extend(
+            cfg.sync_order
+                .iter()
+                .filter(|rule| rule.after == predecessor)
+                .map(|rule| rule.before.clone()),
+        );
+        out.push(predecessor);
+    }
+    out
+}
+
+fn sync_task_label(task: &SyncTaskRef) -> String {
+    format!("{}:{}", task.source_id, task.destination_id)
+}
+
+fn cycle_needs_rsync(state: &State, source: &SourceGroupConfig, cycle: &Cycle) -> Result<bool> {
+    if machine_id_or_local(&source.machine_id) != "local" {
+        return Ok(true);
+    }
+    for dst in source.destinations.iter().filter(|dst| dst.enabled) {
+        if state.destination_target_cycle(&source.id, &dst.id)? == Some(cycle.id)
+            && machine_id_or_local(&dst.machine_id) != "local"
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sync_cycle_with_rsync(
+    cfg: &AppConfig,
+    state: &mut State,
+    source: &SourceGroupConfig,
+    cycle: &Cycle,
+) -> Result<SyncCycleOutcome> {
+    info!(
+        source = source.id,
+        cycle_id = cycle.id,
+        "rsync cycle started"
+    );
+    let mut all_verified = true;
+    let mut targeted_count = 0_usize;
+    let mut blocked_count = 0_usize;
+    let mut had_unblocked_failure = false;
+    let mut progressed = false;
+
+    state.mark_cycle_status(cycle.id, "syncing")?;
+    for dst in source.destinations.iter().filter(|dst| dst.enabled) {
+        if state.destination_target_cycle(&source.id, &dst.id)? != Some(cycle.id) {
+            continue;
+        }
+        targeted_count += 1;
+        let last_verified = state.destination_last_verified(&source.id, &dst.id)?;
+        if last_verified >= Some(cycle.id) {
+            state.upsert_destination_status(
+                &source.id,
+                &dst.id,
+                Some(cycle.id),
+                "green",
+                "verified",
+            )?;
+            continue;
+        }
+        if let Some(blocker) = sync_order_blocker(cfg, state, &source.id, &dst.id)? {
+            all_verified = false;
+            blocked_count += 1;
+            state.upsert_destination_status(
+                &source.id,
+                &dst.id,
+                None,
+                "red",
+                &format!("blocked_by_sync_order:{blocker}"),
+            )?;
+            continue;
+        }
+
+        match sync_rsync_endpoint(cfg, source, dst) {
+            Ok(()) => {
+                progressed = true;
+                state.clear_destination_issues(&source.id, &dst.id)?;
+                state.upsert_destination_status(
+                    &source.id,
+                    &dst.id,
+                    Some(cycle.id),
+                    "green",
+                    "verified",
+                )?;
+            }
+            Err(err) => {
+                all_verified = false;
+                had_unblocked_failure = true;
+                state.clear_destination_issues(&source.id, &dst.id)?;
+                state.upsert_destination_status(
+                    &source.id,
+                    &dst.id,
+                    None,
+                    "red",
+                    &short_reason(&err),
+                )?;
+            }
+        }
+    }
+
+    if targeted_count == 0 || all_verified {
+        state.mark_cycle_status(cycle.id, "verified")?;
+    } else if blocked_count > 0 && !had_unblocked_failure {
+        state.mark_cycle_status(cycle.id, "closed")?;
+    } else {
+        state.mark_cycle_status(cycle.id, "failed")?;
+    }
+    Ok(SyncCycleOutcome {
+        progressed,
+        blocked: blocked_count > 0,
+    })
+}
+
+fn sync_rsync_endpoint(
+    cfg: &AppConfig,
+    source: &SourceGroupConfig,
+    dst: &DestinationConfig,
+) -> Result<()> {
+    let source_machine_id = machine_id_or_local(&source.machine_id);
+    let dst_machine_id = machine_id_or_local(&dst.machine_id);
+    let source_machine = find_machine(cfg, source_machine_id)
+        .ok_or_else(|| anyhow!("unknown source machine: {source_machine_id}"))?;
+    let dst_machine = find_machine(cfg, dst_machine_id)
+        .ok_or_else(|| anyhow!("unknown destination machine: {dst_machine_id}"))?;
+    let source_spec = format!("{}/", rsync_endpoint(&source_machine, &source.src));
+    let dst_path = dst
+        .path
+        .join(cross_platform_file_name(&source.src).unwrap_or_else(|| "source".to_string()));
+    let dst_spec = format!("{}/", rsync_endpoint(&dst_machine, &dst_path));
+
+    if source_machine_id != "local" && dst_machine_id != "local" {
+        return sync_remote_to_remote(&source_machine, &source.src, &dst_machine, &dst_path);
+    }
+
+    let mut command = Command::new("rsync");
+    command.arg("-a").arg("--delete");
+    if source_machine_id != "local" && source_machine.ssh_port != 22 {
+        command
+            .arg("-e")
+            .arg(format!("ssh -p {}", source_machine.ssh_port));
+    } else if dst_machine_id != "local" && dst_machine.ssh_port != 22 {
+        command
+            .arg("-e")
+            .arg(format!("ssh -p {}", dst_machine.ssh_port));
+    }
+    command.arg(source_spec).arg(dst_spec);
+    let status = command.status().context("failed to execute rsync")?;
+    if !status.success() {
+        bail!("rsync failed with status {status}");
+    }
     Ok(())
+}
+
+fn sync_remote_to_remote(
+    source_machine: &crate::core::config::MachineConfig,
+    source_path: &Path,
+    dst_machine: &crate::core::config::MachineConfig,
+    dst_path: &Path,
+) -> Result<()> {
+    if !source_machine.os.eq_ignore_ascii_case("windows") {
+        let source_spec = trailing_rsync_path(rsync_path(source_machine, source_path));
+        let dst_spec = trailing_rsync_path(rsync_endpoint(dst_machine, dst_path));
+        return run_remote_rsync(
+            source_machine,
+            &source_spec,
+            &dst_spec,
+            dst_machine.ssh_port,
+        );
+    }
+
+    if !dst_machine.os.eq_ignore_ascii_case("windows") {
+        let source_spec = trailing_rsync_path(rsync_endpoint(source_machine, source_path));
+        let dst_spec = trailing_rsync_path(rsync_path(dst_machine, dst_path));
+        return run_remote_rsync(
+            dst_machine,
+            &source_spec,
+            &dst_spec,
+            source_machine.ssh_port,
+        );
+    }
+
+    let source_spec = trailing_rsync_path(rsync_path(source_machine, source_path));
+    let dst_spec = trailing_rsync_path(rsync_endpoint(dst_machine, dst_path));
+    run_remote_rsync(
+        source_machine,
+        &source_spec,
+        &dst_spec,
+        dst_machine.ssh_port,
+    )
+}
+
+fn run_remote_rsync(
+    runner: &crate::core::config::MachineConfig,
+    source_spec: &str,
+    dst_spec: &str,
+    peer_ssh_port: u16,
+) -> Result<()> {
+    let remote_command = remote_rsync_command(runner, source_spec, dst_spec, peer_ssh_port);
+    let mut command = Command::new("ssh");
+    if runner.ssh_port != 22 {
+        command.arg("-p").arg(runner.ssh_port.to_string());
+    }
+    command.arg(ssh_target(runner)).arg(remote_command);
+    let status = command
+        .status()
+        .context("failed to execute ssh for remote-to-remote rsync")?;
+    if !status.success() {
+        bail!("remote-to-remote rsync failed with status {status}");
+    }
+    Ok(())
+}
+
+fn remote_rsync_command(
+    runner: &crate::core::config::MachineConfig,
+    source_spec: &str,
+    dst_spec: &str,
+    peer_ssh_port: u16,
+) -> String {
+    let mut parts = vec![
+        "rsync".to_string(),
+        "-a".to_string(),
+        "--delete".to_string(),
+    ];
+    if peer_ssh_port != 22 {
+        parts.push("-e".to_string());
+        parts.push(remote_shell_quote(
+            runner,
+            &format!("ssh -p {peer_ssh_port}"),
+        ));
+    }
+    parts.push(remote_shell_quote(runner, source_spec));
+    parts.push(remote_shell_quote(runner, dst_spec));
+    parts.join(" ")
+}
+
+fn remote_shell_quote(runner: &crate::core::config::MachineConfig, value: &str) -> String {
+    if runner.os.eq_ignore_ascii_case("windows") {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn trailing_rsync_path(mut value: String) -> String {
+    if !value.ends_with('/') {
+        value.push('/');
+    }
+    value
+}
+
+fn cross_platform_file_name(path: &Path) -> Option<String> {
+    let raw = path.to_string_lossy();
+    let trimmed = raw.trim_end_matches(|ch| ch == '/' || ch == '\\');
+    let leaf = trimmed
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or(trimmed);
+    if leaf.ends_with(':') {
+        return None;
+    }
+    if leaf.is_empty() {
+        None
+    } else {
+        Some(leaf.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -566,10 +926,7 @@ impl DestinationEndpoint {
                     bail!("directory source cannot sync to non-directory destination");
                 }
                 let dir_name = src_root.file_name().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "source directory has no name: {}",
-                        src_root.display()
-                    )
+                    anyhow::anyhow!("source directory has no name: {}", src_root.display())
                 })?;
                 Ok(Self::Dir {
                     root: dst.path.join(dir_name),
@@ -679,8 +1036,12 @@ fn sync_destination(
     source_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
 ) -> Result<()> {
-    fs::create_dir_all(dst_root)
-        .with_context(|| format!("failed to create destination directory: {}", dst_root.display()))?;
+    fs::create_dir_all(dst_root).with_context(|| {
+        format!(
+            "failed to create destination directory: {}",
+            dst_root.display()
+        )
+    })?;
     let result = (|| {
         let mut changing_paths = BTreeSet::new();
         let source_map = map_entries(source_snapshot);
@@ -1212,11 +1573,36 @@ fn cleanup_tmp_cycle(dst_root: &Path, cycle_id: i64) {
 mod tests {
     use super::*;
     use crate::core::config::{
-        AppConfig, DestinationConfig, ScheduleConfig, SnapshotBackend, SnapshotConfig,
-        SourceGroupConfig, SyncMode,
+        AppConfig, DestinationConfig, MachineConfig, ScheduleConfig, SnapshotBackend,
+        SnapshotConfig, SourceGroupConfig, SyncMode, SyncOrderRule, SyncTaskRef,
     };
     use crate::core::state::State;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn extracts_file_name_from_windows_paths() {
+        assert_eq!(
+            cross_platform_file_name(Path::new("C:\\Users\\me\\blog")),
+            Some("blog".to_string())
+        );
+        assert_eq!(
+            cross_platform_file_name(Path::new("D:\\data\\source\\")),
+            Some("source".to_string())
+        );
+        assert_eq!(cross_platform_file_name(Path::new("C:\\")), None);
+    }
+
+    #[test]
+    fn builds_remote_to_remote_rsync_command() {
+        let mut runner = MachineConfig::local();
+        runner.id = "nas-a".to_string();
+        runner.os = "linux".to_string();
+        let command = remote_rsync_command(&runner, "/src/data/", "root@nas-b:/dst/data/", 10022);
+        assert_eq!(
+            command,
+            "rsync -a --delete -e 'ssh -p 10022' '/src/data/' 'root@nas-b:/dst/data/'"
+        );
+    }
 
     #[test]
     fn syncs_source_file_to_destination_directory() {
@@ -1272,6 +1658,7 @@ mod tests {
             &SourceEndpoint::Dir { root: src },
             &DestinationConfig {
                 id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
@@ -1290,6 +1677,7 @@ mod tests {
             },
             &DestinationConfig {
                 id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
                 path: PathBuf::from("/dev"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
@@ -1310,6 +1698,7 @@ mod tests {
             &SourceEndpoint::File { path: src },
             &DestinationConfig {
                 id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
@@ -1335,6 +1724,7 @@ mod tests {
         cfg.app.data_db = db.clone();
         cfg.source_groups.push(SourceGroupConfig {
             id: "src_1".to_string(),
+            machine_id: "local".to_string(),
             src: src.clone(),
             excludes: Vec::new(),
             enabled: true,
@@ -1345,6 +1735,7 @@ mod tests {
             },
             destinations: vec![DestinationConfig {
                 id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
@@ -1353,7 +1744,10 @@ mod tests {
 
         let mut state = State::open(&db).unwrap();
         sync_all_now(&cfg, &mut state).unwrap();
-        assert_eq!(fs::read(dst.join("src").join("hello.txt")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read(dst.join("src").join("hello.txt")).unwrap(),
+            b"hello"
+        );
 
         let views = state.destination_views(&cfg).unwrap();
         assert_eq!(views.len(), 1);
@@ -1380,6 +1774,7 @@ mod tests {
         cfg.app.data_db = db.clone();
         cfg.source_groups.push(SourceGroupConfig {
             id: "src_1".to_string(),
+            machine_id: "local".to_string(),
             src: src.clone(),
             excludes: Vec::new(),
             enabled: true,
@@ -1391,12 +1786,14 @@ mod tests {
             destinations: vec![
                 DestinationConfig {
                     id: "dst_1".to_string(),
+                    machine_id: "local".to_string(),
                     path: dst_1.clone(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
                 },
                 DestinationConfig {
                     id: "dst_2".to_string(),
+                    machine_id: "local".to_string(),
                     path: dst_2.clone(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
@@ -1408,7 +1805,10 @@ mod tests {
         sync_destination_now(&cfg, &mut state, "src_1", "dst_2").unwrap();
 
         assert!(!dst_1.join("src").join("hello.txt").exists());
-        assert_eq!(fs::read(dst_2.join("src").join("hello.txt")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read(dst_2.join("src").join("hello.txt")).unwrap(),
+            b"hello"
+        );
 
         let views = state.destination_views(&cfg).unwrap();
         let first = views
@@ -1440,12 +1840,17 @@ mod tests {
         fs::write(src.join("skip.txt"), b"skip source").unwrap();
         fs::write(src.join("skip_dir").join("nested.txt"), b"skip nested").unwrap();
         fs::write(dst.join("src").join("skip.txt"), b"existing skip").unwrap();
-        fs::write(dst.join("src").join("skip_dir").join("nested.txt"), b"existing nested").unwrap();
+        fs::write(
+            dst.join("src").join("skip_dir").join("nested.txt"),
+            b"existing nested",
+        )
+        .unwrap();
 
         let mut cfg = AppConfig::default();
         cfg.app.data_db = db.clone();
         cfg.source_groups.push(SourceGroupConfig {
             id: "src_1".to_string(),
+            machine_id: "local".to_string(),
             src: src.clone(),
             excludes: vec![PathBuf::from("skip.txt"), PathBuf::from("skip_dir")],
             enabled: true,
@@ -1456,6 +1861,7 @@ mod tests {
             },
             destinations: vec![DestinationConfig {
                 id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
@@ -1473,6 +1879,103 @@ mod tests {
             b"existing nested"
         );
         assert!(!eff.join(".auto_sync_trash").exists());
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn sync_order_blocks_after_task_until_before_task_verifies() {
+        let temp = temp_dir("sync_order_blocks");
+        let before_src = temp.join("before_src");
+        let after_src = temp.join("after_src");
+        let before_dst = temp.join("before_dst_file");
+        let after_dst = temp.join("after_dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&before_src).unwrap();
+        fs::create_dir_all(&after_src).unwrap();
+        fs::create_dir_all(&after_dst).unwrap();
+        fs::write(before_src.join("before.txt"), b"before").unwrap();
+        fs::write(after_src.join("after.txt"), b"after").unwrap();
+        fs::write(&before_dst, b"not a directory").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "after_src".to_string(),
+            machine_id: "local".to_string(),
+            src: after_src.clone(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "after_dst".to_string(),
+                machine_id: "local".to_string(),
+                path: after_dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+            }],
+        });
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "before_src".to_string(),
+            machine_id: "local".to_string(),
+            src: before_src.clone(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "before_dst".to_string(),
+                machine_id: "local".to_string(),
+                path: before_dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+            }],
+        });
+        cfg.sync_order.push(SyncOrderRule {
+            before: SyncTaskRef {
+                source_id: "before_src".to_string(),
+                destination_id: "before_dst".to_string(),
+            },
+            after: SyncTaskRef {
+                source_id: "after_src".to_string(),
+                destination_id: "after_dst".to_string(),
+            },
+        });
+
+        let mut state = State::open(&db).unwrap();
+        sync_all_now(&cfg, &mut state).unwrap();
+
+        assert!(!after_dst.join("after_src").join("after.txt").exists());
+        let views = state.destination_views(&cfg).unwrap();
+        let after_view = views
+            .iter()
+            .find(|view| view.source_id == "after_src")
+            .unwrap();
+        assert!(
+            after_view
+                .status_reason
+                .starts_with("blocked_by_sync_order")
+        );
+
+        fs::remove_file(&before_dst).unwrap();
+        fs::create_dir_all(&before_dst).unwrap();
+        sync_all_now(&cfg, &mut state).unwrap();
+
+        assert_eq!(
+            fs::read(before_dst.join("before_src").join("before.txt")).unwrap(),
+            b"before"
+        );
+        assert_eq!(
+            fs::read(after_dst.join("after_src").join("after.txt")).unwrap(),
+            b"after"
+        );
 
         fs::remove_dir_all(temp).ok();
     }

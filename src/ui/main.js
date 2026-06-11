@@ -1,13 +1,18 @@
 const isTauri = Boolean(window.__TAURI__);
 const invoke = isTauri ? window.__TAURI__.core.invoke : invokeWeb;
+const STATUS_POLL_MS = 3000;
 
 let cfg = null;
 let statuses = [];
+let machineStatus = { online: 1, total: 1, machines: [] };
 let busy = false;
+let statusPolling = false;
+let statusPollTimer = null;
 let folderPicker = null;
 let scheduleEditor = null;
 let excludeEditor = null;
 let latestDestinationSchedule = defaultDestinationSchedule();
+let activeSourceTab = "sources";
 
 const el = {
   configPath: document.getElementById("config-path"),
@@ -15,7 +20,9 @@ const el = {
   message: document.getElementById("message"),
   config: document.getElementById("config"),
   refresh: document.getElementById("refresh"),
+  machineStatus: document.getElementById("machine-status"),
   folderModal: document.getElementById("folder-modal"),
+  folderMachine: document.getElementById("folder-machine"),
   folderPath: document.getElementById("folder-path"),
   folderList: document.getElementById("folder-list"),
   folderUp: document.getElementById("folder-up"),
@@ -32,6 +39,18 @@ const el = {
   configModal: document.getElementById("config-modal"),
   configClose: document.getElementById("config-close"),
   configView: document.getElementById("config-view"),
+  machineModal: document.getElementById("machine-modal"),
+  machineClose: document.getElementById("machine-close"),
+  machineList: document.getElementById("machine-list"),
+  machineDiscover: document.getElementById("machine-discover"),
+  machineAdd: document.getElementById("machine-add"),
+  machineId: document.getElementById("machine-id"),
+  machineName: document.getElementById("machine-name"),
+  machineHost: document.getElementById("machine-host"),
+  machineWebPort: document.getElementById("machine-web-port"),
+  machineSshUser: document.getElementById("machine-ssh-user"),
+  machineSshPort: document.getElementById("machine-ssh-port"),
+  machineOs: document.getElementById("machine-os"),
   issueModal: document.getElementById("issue-modal"),
   issueClose: document.getElementById("issue-close"),
   issueSummary: document.getElementById("issue-summary"),
@@ -47,11 +66,173 @@ async function loadAll() {
   cfg = await invoke("get_config");
   normalizeConfig(cfg);
   await loadStatus();
+  await loadMachines();
   render();
+  startStatusPolling();
 }
 
 async function loadStatus() {
   statuses = await invoke("get_status");
+}
+
+async function loadMachines(discover = false) {
+  machineStatus = await invoke(discover ? "discover_machines" : "get_machines");
+  updateMachineStatusUi();
+}
+
+function startStatusPolling() {
+  if (statusPollTimer) {
+    return;
+  }
+  statusPollTimer = setInterval(refreshStatusOnly, STATUS_POLL_MS);
+}
+
+async function refreshStatusOnly() {
+  if (busy || statusPolling || !cfg) {
+    return;
+  }
+  statusPolling = true;
+  try {
+    statuses = await invoke("get_status");
+    await loadMachines(false);
+    updateStatusUi();
+  } catch (error) {
+    setMessage(String(error));
+  } finally {
+    statusPolling = false;
+  }
+}
+
+function updateStatusUi() {
+  for (const group of el.sourcePanel.querySelectorAll(".source-group")) {
+    const sourceId = group.dataset.sourceId;
+    const latest = group.querySelector(".source-latest-cycle");
+    if (latest) {
+      latest.value = sourceLatestCycle(sourceId);
+    }
+    const sourceSync = group.querySelector('[data-action="sync-source"]');
+    if (sourceSync) {
+      const unavailable = sourceHasUnavailableDestination(sourceId);
+      const blocked = sourceHasBlockedDestination(sourceId);
+      sourceSync.disabled = busy || blocked || unavailable;
+      sourceSync.title = unavailable
+        ? "Destination unavailable"
+        : (blocked ? "Blocked by sync order" : "Sync source");
+    }
+  }
+
+  for (const row of el.sourcePanel.querySelectorAll(".destination-row")) {
+    const status = statusFor(row.dataset.sourceId, row.dataset.destinationId);
+    const unavailable = isDestinationUnavailable(status);
+    row.classList.toggle("destination-unavailable", unavailable);
+    const cycle = row.querySelector(".destination-cycle");
+    if (cycle) {
+      cycle.value = cycleDisplay(status);
+    }
+    const dot = row.querySelector(".dot");
+    if (dot) {
+      const dotClass = statusClass(status);
+      const issueCount = status?.issues?.length || 0;
+      const dotTitle = dotClass === "yellow"
+        ? `${issueCount} changing file${issueCount === 1 ? "" : "s"}`
+        : (status?.status || "red");
+      dot.className = `dot ${dotClass}`;
+      dot.title = dotTitle;
+      dot.setAttribute("aria-label", dotTitle);
+    }
+    const syncButton = row.querySelector('[data-action="sync-dst"]');
+    if (syncButton) {
+      const blocked = isSyncOrderBlocked(status);
+      syncButton.disabled = busy || blocked || unavailable;
+      syncButton.title = unavailable
+        ? unavailableLabel(status)
+        : (blocked ? blockedByLabel(status) : "Sync destination");
+    }
+  }
+}
+
+function updateMachineStatusUi() {
+  const online = machineStatus?.online ?? 1;
+  const total = machineStatus?.total ?? 1;
+  el.machineStatus.textContent = `Machines ${online}/${total}`;
+  el.machineStatus.title = "Manage LAN machines";
+  if (!el.machineModal.hidden) {
+    renderMachineModal();
+  }
+  renderFolderMachineOptions();
+}
+
+function openMachineModal() {
+  renderMachineModal();
+  el.machineModal.hidden = false;
+}
+
+function closeMachineModal() {
+  el.machineModal.hidden = true;
+}
+
+function renderMachineModal() {
+  const machines = machineStatus?.machines || [];
+  if (!machines.length) {
+    el.machineList.innerHTML = `<div class="empty">No machines discovered</div>`;
+  } else {
+    el.machineList.innerHTML = machines.map((machine) => `
+      <div class="machine-row">
+        <span class="machine-dot ${machine.online ? "online" : ""}"></span>
+        <div>
+          <div class="machine-name">${escapeHtml(machine.name || machine.id)}</div>
+          <div class="machine-meta">${escapeHtml(machine.id)} · ${escapeHtml(machine.host)}:${escapeHtml(machine.web_port)} · ${escapeHtml(machine.os || "-")}${machine.discovered ? " · discovered" : ""}</div>
+        </div>
+        <button data-action="use-machine" data-id="${escapeAttr(machine.id)}" ${machine.id === "local" ? "disabled" : ""}>Use</button>
+      </div>
+    `).join("");
+    for (const button of el.machineList.querySelectorAll('[data-action="use-machine"]')) {
+      button.onclick = () => {
+        const machine = machines.find((item) => item.id === button.dataset.id);
+        if (!machine) {
+          return;
+        }
+        el.machineId.value = machine.id || "";
+        el.machineName.value = machine.name || machine.id || "";
+        el.machineHost.value = machine.host || "";
+        el.machineWebPort.value = machine.web_port || 18765;
+        el.machineSshUser.value = machine.ssh_user || "";
+        el.machineSshPort.value = machine.ssh_port || 22;
+        el.machineOs.value = machine.os || "linux";
+      };
+    }
+  }
+}
+
+async function discoverMachines() {
+  await runBusy("Discovering machines...", async () => {
+    await loadMachines(true);
+    setMessage("");
+  });
+}
+
+async function addMachine() {
+  const id = cleanMachineId(el.machineId.value);
+  const host = trimPathValue(el.machineHost.value);
+  if (!id || !host) {
+    setMessage("Machine ID and host are required");
+    return;
+  }
+  const machine = {
+    id,
+    name: trimPathValue(el.machineName.value) || id,
+    host,
+    web_port: Number(el.machineWebPort.value || 18765),
+    ssh_user: trimPathValue(el.machineSshUser.value),
+    ssh_port: Number(el.machineSshPort.value || 22),
+    os: el.machineOs.value || "linux",
+    enabled: true,
+    manual: true,
+  };
+  cfg = await invoke("add_machine", { machine });
+  normalizeConfig(cfg);
+  await loadMachines(false);
+  setMessage("");
 }
 
 function render() {
@@ -62,6 +243,7 @@ function render() {
 function addSource() {
   cfg.source_groups.push({
     id: nextSourceId(),
+    machine_id: "local",
     src: "",
     enabled: true,
     mode: "mirror",
@@ -72,19 +254,6 @@ function addSource() {
 }
 
 function renderSourcePanel() {
-  if (!cfg.source_groups.length) {
-    el.sourcePanel.hidden = false;
-    el.sourcePanel.innerHTML = `
-      <div class="section-head">
-        <h2>Source</h2>
-        <button data-action="add-source">Add Source</button>
-      </div>
-      <div class="empty">No sources configured</div>
-    `;
-    el.sourcePanel.querySelector('[data-action="add-source"]').onclick = addSource;
-    return;
-  }
-
   el.sourcePanel.hidden = false;
   el.sourcePanel.innerHTML = `
     <div class="section-head">
@@ -94,13 +263,42 @@ function renderSourcePanel() {
         <button data-action="add-source">Add Source</button>
       </div>
     </div>
+    <div class="panel-tabs" role="tablist" aria-label="Source settings">
+      <button class="${activeSourceTab === "sources" ? "active" : ""}" data-tab="sources" role="tab">Sources</button>
+      <button class="${activeSourceTab === "order" ? "active" : ""}" data-tab="order" role="tab">Order</button>
+    </div>
+    <div id="source-tab-body"></div>
+  `;
+
+  el.sourcePanel.querySelector('[data-action="add-source"]').onclick = addSource;
+  el.sourcePanel.querySelector('[data-action="sync-all"]').onclick = syncAllNow;
+  for (const tab of el.sourcePanel.querySelectorAll("[data-tab]")) {
+    tab.onclick = () => {
+      activeSourceTab = tab.dataset.tab;
+      renderSourcePanel();
+    };
+  }
+
+  if (activeSourceTab === "order") {
+    renderSyncOrderPanel(el.sourcePanel.querySelector("#source-tab-body"));
+    return;
+  }
+
+  const body = el.sourcePanel.querySelector("#source-tab-body");
+  if (!cfg.source_groups.length) {
+    body.innerHTML = `<div class="empty">No sources configured</div>`;
+    return;
+  }
+
+  body.innerHTML = `
     <div id="sources-stack" class="sources-stack"></div>
   `;
 
-  const stack = el.sourcePanel.querySelector("#sources-stack");
+  const stack = body.querySelector("#sources-stack");
   cfg.source_groups.forEach((source, sourceIndex) => {
     const group = document.createElement("div");
     group.className = "source-group";
+    group.dataset.sourceId = source.id;
     group.innerHTML = `
     <div class="source-layout">
       <div class="sync-row source-row">
@@ -108,16 +306,16 @@ function renderSourcePanel() {
           <label>ID</label>
           <label>Source Path</label>
           <input value="${escapeAttr(source.id)}" data-field="source-id">
-          <input class="path-picker" value="${escapeAttr(source.src)}" data-field="source-src" readonly title="Choose source path">
+          <input class="path-picker" value="${escapeAttr(source.src)}" data-field="source-src" readonly title="${escapeAttr(machineLabel(source.machine_id))}">
         </div>
         <div class="row-right source-right">
           <label>Latest Cycle</label>
           <span></span>
           <span></span>
           <span></span>
-          <input value="${escapeAttr(sourceLatestCycle(source.id))}" readonly>
+          <input class="source-latest-cycle" value="${escapeAttr(sourceLatestCycle(source.id))}" readonly>
           <button class="exclude-button" data-action="edit-excludes">Excluded ${excludeCountLabel(source)}</button>
-          <button data-action="sync-source">Sync</button>
+          <button class="source-sync-button" data-action="sync-source" title="Sync source">Sync</button>
           <button class="danger icon" data-action="remove-source" title="Remove source">x</button>
         </div>
       </div>
@@ -135,6 +333,116 @@ function renderSourcePanel() {
   });
 }
 
+function renderSyncOrderPanel(container) {
+  normalizeConfig(cfg);
+  const tasks = syncTaskOptions();
+  const analysis = analyzeSyncOrderGraph();
+  const optionsHtml = tasks.map((task) =>
+    `<option value="${escapeAttr(task.key)}">${escapeHtml(task.label)}</option>`
+  ).join("");
+  const statusClass = analysis.cycle.length ? "order-status error" : "order-status ok";
+  const statusText = analysis.cycle.length
+    ? `Cycle detected: ${analysis.cycle.join(" > ")}`
+    : "DAG valid";
+
+  if (tasks.length < 2) {
+    container.innerHTML = `
+      <div class="order-panel">
+        <div class="empty">Add at least two sync destinations to configure order</div>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = `
+    <div class="order-panel">
+      <div class="order-add sync-row">
+        <div class="order-selects">
+          <label>Before</label>
+          <label>After</label>
+          <select data-field="new-before">${optionsHtml}</select>
+          <select data-field="new-after">${optionsHtml}</select>
+        </div>
+        <button data-action="add-order" class="primary">Add</button>
+      </div>
+      <div class="${statusClass}">${escapeHtml(statusText)}</div>
+      <div class="order-list"></div>
+      <div class="dag-wrap">${renderDagSvg(analysis)}</div>
+    </div>
+  `;
+
+  const beforeSelect = container.querySelector('[data-field="new-before"]');
+  const afterSelect = container.querySelector('[data-field="new-after"]');
+  if (tasks[1]) {
+    afterSelect.value = tasks[1].key;
+  }
+  container.querySelector('[data-action="add-order"]').onclick = async () => {
+    const before = beforeSelect.value;
+    const after = afterSelect.value;
+    if (!before || !after || before === after) {
+      setMessage("Choose two different sync tasks");
+      return;
+    }
+    cfg.sync_order = cleanSyncOrder([
+      ...(cfg.sync_order || []),
+      { before: keyToTaskRef(before), after: keyToTaskRef(after) },
+    ]);
+    await saveSyncOrderDraft();
+  };
+  renderSyncOrderRows(container.querySelector(".order-list"), optionsHtml);
+}
+
+function renderSyncOrderRows(container, optionsHtml) {
+  if (!cfg.sync_order.length) {
+    container.innerHTML = `<div class="empty">No sync order rules</div>`;
+    return;
+  }
+  container.innerHTML = cfg.sync_order.map((rule, index) => `
+    <div class="order-rule">
+      <select data-field="rule-before" data-index="${index}">${optionsHtml}</select>
+      <span class="order-arrow">&gt;</span>
+      <select data-field="rule-after" data-index="${index}">${optionsHtml}</select>
+      <button class="danger icon" data-action="remove-order" data-index="${index}" title="Remove order">x</button>
+    </div>
+  `).join("");
+
+  cfg.sync_order.forEach((rule, index) => {
+    container.querySelector(`[data-field="rule-before"][data-index="${index}"]`).value = ruleEndpointToKey(rule.before);
+    container.querySelector(`[data-field="rule-after"][data-index="${index}"]`).value = ruleEndpointToKey(rule.after);
+  });
+
+  for (const select of container.querySelectorAll("select")) {
+    select.onchange = async () => {
+      const rule = cfg.sync_order[Number(select.dataset.index)];
+      rule.before = keyToTaskRef(container.querySelector(`[data-field="rule-before"][data-index="${select.dataset.index}"]`).value);
+      rule.after = keyToTaskRef(container.querySelector(`[data-field="rule-after"][data-index="${select.dataset.index}"]`).value);
+      cfg.sync_order = cleanSyncOrder(cfg.sync_order || []);
+      await saveSyncOrderDraft();
+    };
+  }
+  for (const button of container.querySelectorAll('[data-action="remove-order"]')) {
+    button.onclick = async () => {
+      cfg.sync_order.splice(Number(button.dataset.index), 1);
+      await saveSyncOrderDraft();
+    };
+  }
+}
+
+async function saveSyncOrderDraft() {
+  const analysis = analyzeSyncOrderGraph();
+  if (analysis.cycle.length) {
+    setMessage(`Cycle detected: ${analysis.cycle.join(" > ")}`);
+    renderSourcePanel();
+    return;
+  }
+  try {
+    await autoSaveConfig();
+  } catch (error) {
+    setMessage(String(error));
+  }
+  renderSourcePanel();
+}
+
 function bindSourceControls(source, sourceIndex, group) {
   const idInput = group.querySelector('[data-field="source-id"]');
   const srcInput = group.querySelector('[data-field="source-src"]');
@@ -145,9 +453,12 @@ function bindSourceControls(source, sourceIndex, group) {
     autoSaveConfig().catch((error) => setMessage(String(error)));
   };
   srcInput.onclick = async () => {
-    const path = await pickPath(source.src || "/");
-    if (path) {
-      source.src = path;
+    const selected = await pickPath(source.src || defaultPathForMachine(source.machine_id), {
+      machineId: source.machine_id || "local",
+    });
+    if (selected) {
+      source.machine_id = selected.machine_id;
+      source.src = selected.path;
       await autoSaveConfig();
       renderSourcePanel();
     }
@@ -161,6 +472,16 @@ function bindSourceControls(source, sourceIndex, group) {
     openExcludeModal(source);
   };
   group.querySelector('[data-action="sync-source"]').onclick = () => {
+    if (sourceHasUnavailableDestination(source.id)) {
+      setMessage("Source sync is disabled because a destination is unavailable");
+      updateStatusUi();
+      return;
+    }
+    if (sourceHasBlockedDestination(source.id)) {
+      setMessage("Source sync is blocked by sync order");
+      updateStatusUi();
+      return;
+    }
     runBusy("Syncing...", async () => {
       await saveConfig();
       statuses = await invoke("sync_source_now", { sourceId: source.id });
@@ -180,6 +501,8 @@ function renderSyncRows(source, group) {
     const status = statusFor(source.id, dst.id);
     const row = document.createElement("div");
     row.className = "sync-row destination-row";
+    row.dataset.sourceId = source.id;
+    row.dataset.destinationId = dst.id;
     const dotClass = statusClass(status);
     const issueCount = status?.issues?.length || 0;
     const dotTitle = dotClass === "yellow"
@@ -193,24 +516,26 @@ function renderSyncRows(source, group) {
           <button class="dot ${dotClass}" data-action="show-issues" title="${escapeAttr(dotTitle)}" aria-label="${escapeAttr(dotTitle)}"></button>
           <input class="dst-id" value="${escapeAttr(dst.id)}" data-field="dst-id" readonly>
         </div>
-        <input class="path-picker dst-path" value="${escapeAttr(dst.path)}" data-field="dst-path" readonly title="Choose destination path">
+        <input class="path-picker dst-path" value="${escapeAttr(dst.path)}" data-field="dst-path" readonly title="${escapeAttr(machineLabel(dst.machine_id))}">
       </div>
       <div class="row-right destination-right">
         <label>Schedule</label>
         <label>Cycle</label>
         <label class="actions-label">Actions</label>
         <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
-        <input class="destination-readonly" value="${escapeAttr(cycleDisplay(status))}" readonly>
-        <button data-action="sync-dst">Sync</button>
+        <input class="destination-readonly destination-cycle" value="${escapeAttr(cycleDisplay(status))}" readonly>
+        <button class="destination-sync-button" data-action="sync-dst" title="Sync destination">Sync</button>
         <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
       </div>
     `;
     row.querySelector('[data-field="dst-path"]').onclick = async () => {
-      const path = await pickPath("/", {
-        validate: (nextPath) => destinationPathError(source, nextPath, dst),
+      const selected = await pickPath(dst.path || defaultPathForMachine(dst.machine_id), {
+        machineId: dst.machine_id || source.machine_id || "local",
+        validate: (next) => destinationPathError(source, next.path, dst, next.machine_id),
       });
-      if (path) {
-        dst.path = path;
+      if (selected) {
+        dst.machine_id = selected.machine_id;
+        dst.path = selected.path;
         await autoSaveConfig();
         renderSourcePanel();
       }
@@ -229,11 +554,23 @@ function renderSyncRows(source, group) {
       });
     };
     row.querySelector('[data-action="show-issues"]').onclick = () => {
-      if (status?.status === "yellow") {
-        openIssueModal(status);
+      const latestStatus = statusFor(source.id, dst.id);
+      if (latestStatus?.status === "yellow") {
+        openIssueModal(latestStatus);
       }
     };
     row.querySelector('[data-action="sync-dst"]').onclick = () => {
+      const latestStatus = statusFor(source.id, dst.id);
+      if (isDestinationUnavailable(latestStatus)) {
+        setMessage(unavailableLabel(latestStatus));
+        updateStatusUi();
+        return;
+      }
+      if (isSyncOrderBlocked(latestStatus)) {
+        setMessage(blockedByLabel(latestStatus));
+        updateStatusUi();
+        return;
+      }
       runBusy("Syncing...", async () => {
         await saveConfig();
         statuses = await invoke("sync_destination_now", {
@@ -248,6 +585,7 @@ function renderSyncRows(source, group) {
   });
 
   appendAddDestinationRow(body, source);
+  updateStatusUi();
 }
 
 function appendAddDestinationRow(body, source) {
@@ -260,13 +598,15 @@ function appendAddDestinationRow(body, source) {
     </div>
   `;
   addRow.querySelector('[data-action="add-destination"]').onclick = async () => {
-    const path = await pickPath("/", {
-      validate: (nextPath) => destinationPathError(source, nextPath),
+    const selected = await pickPath(defaultPathForMachine(source.machine_id), {
+      machineId: source.machine_id || "local",
+      validate: (next) => destinationPathError(source, next.path, null, next.machine_id),
     });
-    if (path) {
+    if (selected) {
       source.destinations.push({
         id: nextDestinationId(source),
-        path,
+        machine_id: selected.machine_id,
+        path: selected.path,
         enabled: true,
         schedule: cloneSchedule(latestDestinationSchedule),
       });
@@ -277,18 +617,18 @@ function appendAddDestinationRow(body, source) {
   body.appendChild(addRow);
 }
 
-function destinationPathError(source, path, ignoreDst = null) {
+function destinationPathError(source, path, ignoreDst = null, machineId = "local") {
   const normalized = normalizeAbsolutePath(path);
-  if (hasDestinationPath(source, normalized, ignoreDst)) {
+  if (hasDestinationPath(source, normalized, ignoreDst, machineId)) {
     return `Destination path already exists: ${normalized}`;
   }
   return "";
 }
 
-function hasDestinationPath(source, path, ignoreDst = null) {
+function hasDestinationPath(source, path, ignoreDst = null, machineId = "local") {
   const normalized = normalizeAbsolutePath(path);
   return (source.destinations || []).some((dst) =>
-    dst !== ignoreDst && normalizeAbsolutePath(dst.path) === normalized
+    dst !== ignoreDst && machineIdOrLocal(dst.machine_id) === machineIdOrLocal(machineId) && normalizeAbsolutePath(dst.path) === normalized
   );
 }
 
@@ -332,14 +672,258 @@ function sourceLatestCycle(sourceId) {
 
 function normalizeConfig(nextCfg) {
   delete nextCfg.schedule;
+  nextCfg.machines = normalizeMachines(nextCfg.machines || []);
   for (const source of nextCfg.source_groups || []) {
     source.id = normalizeSourceId(source.id);
+    source.machine_id = machineIdOrLocal(source.machine_id);
     source.excludes = cleanExcludeList(source.excludes || []);
     for (const dst of source.destinations || []) {
+      dst.machine_id = machineIdOrLocal(dst.machine_id);
       dst.schedule = normalizeSchedule(dst.schedule);
       latestDestinationSchedule = cloneSchedule(dst.schedule);
     }
   }
+  nextCfg.sync_order = cleanSyncOrder(nextCfg.sync_order || []);
+}
+
+function normalizeMachines(values) {
+  const seen = new Set();
+  const machines = [
+    {
+      id: "local",
+      name: "This machine",
+      host: "127.0.0.1",
+      web_port: 18765,
+      ssh_user: "",
+      ssh_port: 22,
+      os: "linux",
+      enabled: true,
+      manual: true,
+    },
+    ...(values || []),
+  ];
+  const cleaned = [];
+  for (const machine of machines) {
+    const id = cleanMachineId(machine.id || "");
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    cleaned.push({
+      id,
+      name: trimPathValue(machine.name) || id,
+      host: trimPathValue(machine.host) || "127.0.0.1",
+      web_port: Number(machine.web_port || 18765),
+      ssh_user: trimPathValue(machine.ssh_user),
+      ssh_port: Number(machine.ssh_port || 22),
+      os: trimPathValue(machine.os) || "linux",
+      enabled: machine.enabled !== false,
+      manual: machine.manual !== false,
+    });
+  }
+  return cleaned;
+}
+
+function cleanMachineId(value) {
+  return String(value || "").trim().replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+function machineIdOrLocal(value) {
+  return String(value || "").trim() || "local";
+}
+
+function machineLabel(machineId = "local") {
+  const id = machineIdOrLocal(machineId);
+  const machine = (machineStatus?.machines || cfg?.machines || []).find((item) => item.id === id);
+  return machine ? `Machine: ${machine.name || machine.id}` : `Machine: ${id}`;
+}
+
+function syncTaskOptions() {
+  const tasks = [];
+  for (const source of cfg.source_groups || []) {
+    for (const dst of source.destinations || []) {
+      const key = makeTaskKey(source.id, dst.id);
+      tasks.push({
+        key,
+        label: key,
+        source,
+        destination: dst,
+      });
+    }
+  }
+  return tasks;
+}
+
+function cleanSyncOrder(rules) {
+  const taskKeys = new Set(syncTaskOptions().map((task) => task.key));
+  const seen = new Set();
+  const cleaned = [];
+  for (const rule of rules || []) {
+    const before = ruleEndpointToKey(rule.before);
+    const after = ruleEndpointToKey(rule.after);
+    const edge = `${before}>${after}`;
+    if (!before || !after || before === after || !taskKeys.has(before) || !taskKeys.has(after) || seen.has(edge)) {
+      continue;
+    }
+    seen.add(edge);
+    cleaned.push({
+      before: keyToTaskRef(before),
+      after: keyToTaskRef(after),
+    });
+  }
+  return cleaned;
+}
+
+function analyzeSyncOrderGraph() {
+  const tasks = syncTaskOptions();
+  const taskKeys = tasks.map((task) => task.key);
+  const graph = new Map(taskKeys.map((key) => [key, []]));
+  const indegree = new Map(taskKeys.map((key) => [key, 0]));
+  const edges = [];
+
+  for (const rule of cleanSyncOrder(cfg.sync_order || [])) {
+    const before = ruleEndpointToKey(rule.before);
+    const after = ruleEndpointToKey(rule.after);
+    graph.get(before).push(after);
+    indegree.set(after, indegree.get(after) + 1);
+    edges.push([before, after]);
+  }
+
+  const levels = new Map(taskKeys.map((key) => [key, 0]));
+  const queue = taskKeys.filter((key) => indegree.get(key) === 0);
+  let visited = 0;
+  for (let index = 0; index < queue.length; index += 1) {
+    const key = queue[index];
+    visited += 1;
+    for (const next of graph.get(key)) {
+      levels.set(next, Math.max(levels.get(next), levels.get(key) + 1));
+      indegree.set(next, indegree.get(next) - 1);
+      if (indegree.get(next) === 0) {
+        queue.push(next);
+      }
+    }
+  }
+
+  const cycle = visited === taskKeys.length ? [] : detectSyncOrderCycle(graph, taskKeys);
+  if (cycle.length) {
+    taskKeys.forEach((key, index) => levels.set(key, index % 3));
+  }
+
+  return { tasks, edges, levels, cycle };
+}
+
+function detectSyncOrderCycle(graph, taskKeys) {
+  const visiting = new Set();
+  const visited = new Set();
+  const stack = [];
+
+  function visit(key) {
+    if (visiting.has(key)) {
+      const start = stack.indexOf(key);
+      return [...stack.slice(start), key];
+    }
+    if (visited.has(key)) {
+      return [];
+    }
+    visiting.add(key);
+    stack.push(key);
+    for (const next of graph.get(key) || []) {
+      const cycle = visit(next);
+      if (cycle.length) {
+        return cycle;
+      }
+    }
+    stack.pop();
+    visiting.delete(key);
+    visited.add(key);
+    return [];
+  }
+
+  for (const key of taskKeys) {
+    const cycle = visit(key);
+    if (cycle.length) {
+      return cycle;
+    }
+  }
+  return [];
+}
+
+function renderDagSvg(analysis) {
+  const nodeWidth = 132;
+  const nodeHeight = 34;
+  const columnGap = 72;
+  const rowGap = 18;
+  const grouped = new Map();
+  for (const task of analysis.tasks) {
+    const level = analysis.levels.get(task.key) || 0;
+    if (!grouped.has(level)) {
+      grouped.set(level, []);
+    }
+    grouped.get(level).push(task);
+  }
+  const maxLevel = Math.max(0, ...grouped.keys());
+  const maxRows = Math.max(1, ...[...grouped.values()].map((items) => items.length));
+  const width = Math.max(360, (maxLevel + 1) * nodeWidth + maxLevel * columnGap + 32);
+  const height = Math.max(96, maxRows * nodeHeight + (maxRows - 1) * rowGap + 32);
+  const positions = new Map();
+  for (const [level, items] of grouped) {
+    items.forEach((task, index) => {
+      positions.set(task.key, {
+        x: 16 + level * (nodeWidth + columnGap),
+        y: 16 + index * (nodeHeight + rowGap),
+      });
+    });
+  }
+
+  const lines = analysis.edges.map(([from, to]) => {
+    const a = positions.get(from);
+    const b = positions.get(to);
+    if (!a || !b) {
+      return "";
+    }
+    return `<line x1="${a.x + nodeWidth}" y1="${a.y + nodeHeight / 2}" x2="${b.x}" y2="${b.y + nodeHeight / 2}" marker-end="url(#dag-arrow)" />`;
+  }).join("");
+  const nodes = analysis.tasks.map((task) => {
+    const pos = positions.get(task.key);
+    const cycleClass = analysis.cycle.includes(task.key) ? " cycle" : "";
+    return `
+      <g class="dag-node${cycleClass}" transform="translate(${pos.x} ${pos.y})">
+        <rect width="${nodeWidth}" height="${nodeHeight}" rx="6"></rect>
+        <text x="10" y="22">${escapeHtml(task.label)}</text>
+      </g>
+    `;
+  }).join("");
+
+  return `
+    <svg class="dag-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Sync order DAG">
+      <defs>
+        <marker id="dag-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 8 4 L 0 8 z"></path>
+        </marker>
+      </defs>
+      <g class="dag-lines">${lines}</g>
+      <g>${nodes}</g>
+    </svg>
+  `;
+}
+
+function makeTaskKey(sourceId, destinationId) {
+  return `${sourceId || ""}:${destinationId || ""}`;
+}
+
+function ruleEndpointToKey(endpoint) {
+  if (!endpoint) {
+    return "";
+  }
+  if (typeof endpoint === "string") {
+    return endpoint;
+  }
+  return makeTaskKey(endpoint.source_id, endpoint.destination_id);
+}
+
+function keyToTaskRef(key) {
+  const [source_id, destination_id] = String(key || "").split(":");
+  return { source_id: source_id || "", destination_id: destination_id || "" };
 }
 
 function defaultDestinationSchedule() {
@@ -530,11 +1114,15 @@ async function addExcludePath() {
     setMessage("Select source path first");
     return;
   }
-  const selected = await pickPath(source.src);
+  const selected = await pickPath(source.src, { machineId: source.machine_id || "local" });
   if (!selected) {
     return;
   }
-  const relative = pathToSourceRelative(source.src, selected);
+  if (machineIdOrLocal(selected.machine_id) !== machineIdOrLocal(source.machine_id)) {
+    setMessage("Excluded path must be on the source machine");
+    return;
+  }
+  const relative = pathToSourceRelative(source.src, selected.path);
   if (relative === null) {
     setMessage("Excluded path must be inside source");
     return;
@@ -561,10 +1149,86 @@ function statusFor(sourceId, destinationId) {
   );
 }
 
+function sourceHasBlockedDestination(sourceId) {
+  return statuses.some((status) =>
+    normalizeSourceId(status.source_id) === sourceId && isSyncOrderBlocked(status)
+  );
+}
+
+function sourceHasUnavailableDestination(sourceId) {
+  return statuses.some((status) =>
+    normalizeSourceId(status.source_id) === sourceId && isDestinationUnavailable(status)
+  );
+}
+
+function isSyncOrderBlocked(status) {
+  return String(status?.status_reason || "").startsWith("blocked_by_sync_order:");
+}
+
+function blockedByLabel(status) {
+  const reason = String(status?.status_reason || "");
+  const blocker = reason.slice("blocked_by_sync_order:".length);
+  return blocker ? `Blocked by ${blocker}` : "Blocked by sync order";
+}
+
+function isDestinationUnavailable(status) {
+  if (!status || status.status !== "red") {
+    return false;
+  }
+  const reason = String(status.status_reason || "").toLowerCase();
+  return [
+    "destination path does not exist",
+    "destination path is not a directory",
+    "destination file path is a directory",
+    "destination file path has no parent",
+    "destination is not writable",
+    "destination offline",
+    "destination unavailable",
+    "no such file or directory",
+    "permission denied",
+    "read-only file system",
+    "transport endpoint is not connected",
+    "stale file handle",
+    "input/output error",
+  ].some((text) => reason.includes(text));
+}
+
+function unavailableLabel(status) {
+  const reason = String(status?.status_reason || "").trim();
+  return reason ? `Destination unavailable: ${reason}` : "Destination unavailable";
+}
+
+function renderFolderMachineOptions() {
+  if (!el.folderMachine) {
+    return;
+  }
+  const machines = machineStatus?.machines?.length
+    ? machineStatus.machines
+    : normalizeMachines(cfg?.machines || []);
+  el.folderMachine.innerHTML = machines.map((machine) => `
+    <option value="${escapeAttr(machine.id)}">${escapeHtml(machine.name || machine.id)}${machine.online === false ? " (offline)" : ""}</option>
+  `).join("");
+  if (folderPicker) {
+    el.folderMachine.value = folderPicker.machineId || "local";
+  }
+}
+
+function defaultPathForMachine(machineId = "local") {
+  const machine = (machineStatus?.machines || cfg?.machines || [])
+    .find((item) => item.id === machineIdOrLocal(machineId));
+  return String(machine?.os || "").toLowerCase() === "windows" ? "C:\\" : "/";
+}
+
 async function pickPath(startPath = "/", options = {}) {
   return new Promise(async (resolve) => {
-    folderPicker = { resolve, path: startPath || "/", validate: options.validate || null };
+    folderPicker = {
+      resolve,
+      path: startPath || "/",
+      machineId: machineIdOrLocal(options.machineId),
+      validate: options.validate || null,
+    };
     setFolderError("");
+    renderFolderMachineOptions();
     el.folderModal.hidden = false;
     await loadPath(folderPicker.path);
   });
@@ -572,7 +1236,11 @@ async function pickPath(startPath = "/", options = {}) {
 
 async function loadPath(path) {
   try {
-    const result = await invoke("browse_paths", { path });
+    const result = await invoke("browse_paths", {
+      path,
+      machineId: folderPicker.machineId,
+      machine_id: folderPicker.machineId,
+    });
     folderPicker.path = result.path;
     folderPicker.parent = result.parent;
     el.folderPath.textContent = result.path;
@@ -585,7 +1253,7 @@ async function loadPath(path) {
         if (entry.kind === "dir") {
           loadPath(entry.path);
         } else {
-          closeFolderModal(entry.path);
+          closeFolderModal({ machine_id: folderPicker.machineId, path: entry.path });
         }
       };
       el.folderList.appendChild(row);
@@ -609,7 +1277,10 @@ function closeFolderModal(value) {
   el.folderModal.hidden = true;
   setFolderError("");
   if (folderPicker) {
-    folderPicker.resolve(value);
+    folderPicker.resolve(value ? {
+      machine_id: value.machine_id || folderPicker.machineId,
+      path: value.path || value,
+    } : null);
     folderPicker = null;
   }
 }
@@ -621,12 +1292,15 @@ function setFolderError(text) {
 
 function updateCfgFromForm() {
   delete cfg.schedule;
+  cfg.machines = normalizeMachines(cfg.machines || []);
   cfg.source_groups = (cfg.source_groups || []).map((source) => {
+    source.machine_id = machineIdOrLocal(source.machine_id);
     source.src = trimPathValue(source.src);
     source.excludes = cleanExcludeList(source.excludes || []);
     source.enabled = true;
     source.mode = "mirror";
     source.destinations = (source.destinations || []).map((dst) => {
+      dst.machine_id = machineIdOrLocal(dst.machine_id);
       dst.path = trimPathValue(dst.path);
       dst.enabled = true;
       dst.schedule = normalizeSchedule(dst.schedule);
@@ -635,6 +1309,7 @@ function updateCfgFromForm() {
     source.destinations = dedupeDestinationsByPath(source.destinations);
     return source;
   }).filter((source) => source.src);
+  cfg.sync_order = cleanSyncOrder(cfg.sync_order || []);
 }
 
 function dedupeDestinationsByPath(destinations) {
@@ -642,10 +1317,11 @@ function dedupeDestinationsByPath(destinations) {
   const cleaned = [];
   for (const dst of destinations || []) {
     const path = normalizeAbsolutePath(dst.path);
-    if (!path || seen.has(path)) {
+    const key = `${machineIdOrLocal(dst.machine_id)}:${path}`;
+    if (!path || seen.has(key)) {
       continue;
     }
-    seen.add(path);
+    seen.add(key);
     dst.path = path;
     cleaned.push(dst);
   }
@@ -746,6 +1422,7 @@ function setBusy(nextBusy) {
   busy = nextBusy;
   el.config.disabled = busy;
   el.refresh.disabled = busy;
+  updateStatusUi();
 }
 
 function setMessage(text) {
@@ -768,19 +1445,34 @@ function escapeAttr(value) {
 
 el.config.onclick = openConfigModal;
 el.refresh.onclick = () => runBusy("", loadAll);
+el.machineStatus.onclick = openMachineModal;
 
 el.folderClose.onclick = () => closeFolderModal(null);
-el.folderSelect.onclick = () => closeFolderModal(folderPicker?.path || null);
+el.folderSelect.onclick = () => closeFolderModal(folderPicker ? {
+  machine_id: folderPicker.machineId,
+  path: folderPicker.path,
+} : null);
 el.folderUp.onclick = () => {
   if (folderPicker?.parent) {
     loadPath(folderPicker.parent);
   }
+};
+el.folderMachine.onchange = () => {
+  if (!folderPicker) {
+    return;
+  }
+  folderPicker.machineId = el.folderMachine.value || "local";
+  folderPicker.path = defaultPathForMachine(folderPicker.machineId);
+  loadPath(folderPicker.path);
 };
 
 el.scheduleClose.onclick = () => closeScheduleModal(false);
 el.scheduleApply.onclick = () => closeScheduleModal(true);
 el.cycleMode.onchange = updateScheduleModalFields;
 el.configClose.onclick = closeConfigModal;
+el.machineClose.onclick = closeMachineModal;
+el.machineDiscover.onclick = () => discoverMachines().catch((error) => setMessage(String(error)));
+el.machineAdd.onclick = () => addMachine().catch((error) => setMessage(String(error)));
 el.issueClose.onclick = closeIssueModal;
 el.excludeClose.onclick = closeExcludeModal;
 el.excludeAdd.onclick = () => addExcludePath().catch((error) => setMessage(String(error)));
@@ -791,6 +1483,9 @@ async function invokeWeb(command, payload = {}) {
   const routes = {
     get_config: ["GET", "/api/config"],
     save_config_command: ["POST", "/api/config"],
+    get_machines: ["GET", "/api/machines"],
+    discover_machines: ["GET", "/api/machines/discover"],
+    add_machine: ["POST", "/api/machines"],
     get_status: ["GET", "/api/status"],
     sync_now: ["POST", "/api/sync-now"],
     sync_source_now: ["POST", "/api/sync-source-now"],
@@ -806,7 +1501,8 @@ async function invokeWeb(command, payload = {}) {
   let url = path;
   const options = { method, headers: {} };
   if (command === "browse_paths") {
-    url = `${path}?path=${encodeURIComponent(payload.path || "/")}`;
+    const machineId = payload.machineId || payload.machine_id || "local";
+    url = `${path}?path=${encodeURIComponent(payload.path || "/")}&machine_id=${encodeURIComponent(machineId)}`;
   } else if (method !== "GET") {
     options.headers["Content-Type"] = "application/json";
     if (command === "save_config_command") {
@@ -818,6 +1514,8 @@ async function invokeWeb(command, payload = {}) {
         source_id: payload.sourceId || payload.source_id,
         destination_id: payload.destinationId || payload.destination_id,
       });
+    } else if (command === "add_machine") {
+      options.body = JSON.stringify(payload.machine);
     } else {
       options.body = JSON.stringify(payload);
     }

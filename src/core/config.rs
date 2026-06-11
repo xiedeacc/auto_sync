@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct AppConfig {
     pub app: AppSection,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<MachineConfig>,
     pub source_groups: Vec<SourceGroupConfig>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sync_order: Vec<SyncOrderRule>,
     pub deploy: DeployConfig,
 }
 
@@ -44,6 +48,8 @@ pub enum ScheduleMode {
 #[serde(default)]
 pub struct SourceGroupConfig {
     pub id: String,
+    #[serde(skip_serializing_if = "is_local_machine")]
+    pub machine_id: String,
     pub src: PathBuf,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excludes: Vec<PathBuf>,
@@ -84,9 +90,39 @@ pub enum SyncMode {
 #[serde(default)]
 pub struct DestinationConfig {
     pub id: String,
+    #[serde(skip_serializing_if = "is_local_machine")]
+    pub machine_id: String,
     pub path: PathBuf,
     pub enabled: bool,
     pub schedule: ScheduleConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MachineConfig {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub web_port: u16,
+    pub ssh_user: String,
+    pub ssh_port: u16,
+    pub os: String,
+    pub enabled: bool,
+    pub manual: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
+#[serde(default)]
+pub struct SyncTaskRef {
+    pub source_id: String,
+    pub destination_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SyncOrderRule {
+    pub before: SyncTaskRef,
+    pub after: SyncTaskRef,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -109,14 +145,16 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             app: AppSection::default(),
+            machines: vec![MachineConfig::local()],
             source_groups: Vec::new(),
+            sync_order: Vec::new(),
             deploy: DeployConfig {
                 targets: vec![DeployTarget {
                     id: "nas".to_string(),
                     host: "192.168.3.178".to_string(),
                     port: 10022,
                     user: "root".to_string(),
-                    install_dir: PathBuf::from("/opt/auto_sync"),
+                    install_dir: PathBuf::from("/usr/local/auto_sync"),
                 }],
             },
         }
@@ -156,6 +194,7 @@ impl Default for SourceGroupConfig {
     fn default() -> Self {
         Self {
             id: String::new(),
+            machine_id: "local".to_string(),
             src: PathBuf::new(),
             excludes: Vec::new(),
             enabled: true,
@@ -195,9 +234,26 @@ impl Default for DestinationConfig {
     fn default() -> Self {
         Self {
             id: String::new(),
+            machine_id: "local".to_string(),
             path: PathBuf::new(),
             enabled: true,
             schedule: ScheduleConfig::default(),
+        }
+    }
+}
+
+impl MachineConfig {
+    pub fn local() -> Self {
+        Self {
+            id: "local".to_string(),
+            name: "This machine".to_string(),
+            host: "127.0.0.1".to_string(),
+            web_port: 18765,
+            ssh_user: String::new(),
+            ssh_port: 22,
+            os: std::env::consts::OS.to_string(),
+            enabled: true,
+            manual: true,
         }
     }
 }
@@ -209,7 +265,7 @@ impl Default for DeployTarget {
             host: String::new(),
             port: 22,
             user: "root".to_string(),
-            install_dir: PathBuf::from("/opt/auto_sync"),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
         }
     }
 }
@@ -253,11 +309,18 @@ pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<AppConfig> {
 
 pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
     let mut cfg = cfg.clone();
+    cfg.machines = clean_machines(&cfg.machines);
     for source in &mut cfg.source_groups {
+        if source.machine_id.trim().is_empty() {
+            source.machine_id = "local".to_string();
+        }
         source.src = clean_path(&source.src);
         source.excludes = clean_excludes(&source.excludes);
         let mut destination_paths = HashSet::new();
         source.destinations.retain_mut(|dst| {
+            if dst.machine_id.trim().is_empty() {
+                dst.machine_id = "local".to_string();
+            }
             dst.path = clean_path(&dst.path);
             if dst.path.as_os_str().is_empty() {
                 return false;
@@ -267,7 +330,66 @@ pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
     }
     cfg.source_groups
         .retain(|source| !source.src.as_os_str().is_empty());
+    let task_ids = sync_task_ids(&cfg);
+    let mut order_edges = HashSet::new();
+    cfg.sync_order.retain(|rule| {
+        let before = sync_task_key(&rule.before);
+        let after = sync_task_key(&rule.after);
+        before != after
+            && task_ids.contains(&before)
+            && task_ids.contains(&after)
+            && order_edges.insert((before, after))
+    });
     cfg
+}
+
+fn clean_machines(machines: &[MachineConfig]) -> Vec<MachineConfig> {
+    let local = MachineConfig::local();
+    let mut seen = HashSet::new();
+    let mut cleaned = Vec::new();
+    for machine in std::iter::once(&local).chain(machines.iter()) {
+        let mut machine = machine.clone();
+        machine.id = clean_id(&machine.id);
+        if machine.id.is_empty() || !seen.insert(machine.id.clone()) {
+            continue;
+        }
+        machine.name = machine.name.trim().to_string();
+        machine.host = machine.host.trim().to_string();
+        machine.ssh_user = machine.ssh_user.trim().to_string();
+        machine.os = machine.os.trim().to_string();
+        if machine.name.is_empty() {
+            machine.name = machine.id.clone();
+        }
+        if machine.host.is_empty() {
+            machine.host = "127.0.0.1".to_string();
+        }
+        if machine.web_port == 0 {
+            machine.web_port = 18765;
+        }
+        if machine.ssh_port == 0 {
+            machine.ssh_port = 22;
+        }
+        cleaned.push(machine);
+    }
+    cleaned
+}
+
+fn clean_id(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn is_local_machine(value: &str) -> bool {
+    value.is_empty() || value == "local"
 }
 
 fn clean_path(path: &Path) -> PathBuf {
@@ -301,6 +423,11 @@ fn clean_excludes(excludes: &[PathBuf]) -> Vec<PathBuf> {
 impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         let mut source_ids = HashSet::new();
+        let mut task_ids = HashSet::new();
+        let machine_ids: HashSet<String> = clean_machines(&self.machines)
+            .into_iter()
+            .map(|machine| machine.id)
+            .collect();
         for source in &self.source_groups {
             if source.id.trim().is_empty() {
                 bail!("source group id cannot be empty");
@@ -310,6 +437,14 @@ impl AppConfig {
             }
             if source.src.as_os_str().is_empty() {
                 bail!("source {} has empty src path", source.id);
+            }
+            let source_machine = machine_id_or_local(&source.machine_id);
+            if !machine_ids.contains(source_machine) {
+                bail!(
+                    "source {} references unknown machine {}",
+                    source.id,
+                    source_machine
+                );
             }
             if source.snapshot.prefix.trim().is_empty() {
                 bail!("source {} has empty snapshot prefix", source.id);
@@ -336,6 +471,14 @@ impl AppConfig {
                 if dst.path.as_os_str().is_empty() {
                     bail!("destination {} has empty path", dst.id);
                 }
+                let dst_machine = machine_id_or_local(&dst.machine_id);
+                if !machine_ids.contains(dst_machine) {
+                    bail!(
+                        "destination {} references unknown machine {}",
+                        dst.id,
+                        dst_machine
+                    );
+                }
                 validate_schedule(&dst.schedule)
                     .with_context(|| format!("destination {} has invalid schedule", dst.id))?;
                 if existing_directory_source_to_file_destination(source, dst) {
@@ -354,10 +497,94 @@ impl AppConfig {
                         source.src.display()
                     );
                 }
+                task_ids.insert(sync_task_key_parts(&source.id, &dst.id));
             }
         }
+        validate_sync_order(&self.sync_order, &task_ids)?;
         Ok(())
     }
+}
+
+pub fn machine_id_or_local(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "local"
+    } else {
+        value.trim()
+    }
+}
+
+pub fn normalized_machines(cfg: &AppConfig) -> Vec<MachineConfig> {
+    clean_machines(&cfg.machines)
+}
+
+fn sync_task_ids(cfg: &AppConfig) -> HashSet<String> {
+    cfg.source_groups
+        .iter()
+        .flat_map(|source| {
+            source
+                .destinations
+                .iter()
+                .map(|dst| sync_task_key_parts(&source.id, &dst.id))
+        })
+        .collect()
+}
+
+fn sync_task_key(task: &SyncTaskRef) -> String {
+    sync_task_key_parts(&task.source_id, &task.destination_id)
+}
+
+fn sync_task_key_parts(source_id: &str, destination_id: &str) -> String {
+    format!("{source_id}:{destination_id}")
+}
+
+fn validate_sync_order(rules: &[SyncOrderRule], task_ids: &HashSet<String>) -> Result<()> {
+    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    let mut indegree: HashMap<String, usize> = HashMap::new();
+    let mut edges = HashSet::new();
+
+    for rule in rules {
+        let before = sync_task_key(&rule.before);
+        let after = sync_task_key(&rule.after);
+        if !task_ids.contains(&before) {
+            bail!("sync order references unknown task: {before}");
+        }
+        if !task_ids.contains(&after) {
+            bail!("sync order references unknown task: {after}");
+        }
+        if before == after {
+            bail!("sync order task cannot depend on itself: {before}");
+        }
+        if !edges.insert((before.clone(), after.clone())) {
+            continue;
+        }
+        graph.entry(before.clone()).or_default().push(after.clone());
+        graph.entry(after.clone()).or_default();
+        indegree.entry(before).or_insert(0);
+        *indegree.entry(after).or_insert(0) += 1;
+    }
+
+    let mut queue: VecDeque<String> = indegree
+        .iter()
+        .filter_map(|(task, count)| (*count == 0).then(|| task.clone()))
+        .collect();
+    let mut visited = 0_usize;
+    while let Some(task) = queue.pop_front() {
+        visited += 1;
+        for next in graph.get(&task).into_iter().flatten() {
+            let Some(count) = indegree.get_mut(next) else {
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                queue.push_back(next.clone());
+            }
+        }
+    }
+
+    if visited != indegree.len() {
+        bail!("sync order contains a cycle");
+    }
+    Ok(())
 }
 
 fn validate_exclude_path(source_id: &str, path: &Path) -> Result<()> {
@@ -459,6 +686,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.source_groups.push(SourceGroupConfig {
             id: "main".to_string(),
+            machine_id: "local".to_string(),
             src: PathBuf::from("/data/src"),
             excludes: Vec::new(),
             enabled: true,
@@ -466,6 +694,7 @@ mod tests {
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {
                 id: "bad".to_string(),
+                machine_id: "local".to_string(),
                 path: PathBuf::from("/data/src/backup"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
@@ -485,6 +714,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.source_groups.push(SourceGroupConfig {
             id: "main".to_string(),
+            machine_id: "local".to_string(),
             src,
             excludes: Vec::new(),
             enabled: true,
@@ -492,6 +722,7 @@ mod tests {
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {
                 id: "bad".to_string(),
+                machine_id: "local".to_string(),
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
@@ -506,6 +737,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.source_groups.push(SourceGroupConfig {
             id: "src_1".to_string(),
+            machine_id: "local".to_string(),
             src: PathBuf::from(" /data/src "),
             excludes: vec![
                 PathBuf::from(" log "),
@@ -519,18 +751,21 @@ mod tests {
             destinations: vec![
                 DestinationConfig {
                     id: "dst_1".to_string(),
+                    machine_id: "local".to_string(),
                     path: PathBuf::from(" /data/dst "),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
                 },
                 DestinationConfig {
                     id: "dst_2".to_string(),
+                    machine_id: "local".to_string(),
                     path: PathBuf::new(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
                 },
                 DestinationConfig {
                     id: "dst_3".to_string(),
+                    machine_id: "local".to_string(),
                     path: PathBuf::from("/data/dst"),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
@@ -539,6 +774,7 @@ mod tests {
         });
         cfg.source_groups.push(SourceGroupConfig {
             id: "src_2".to_string(),
+            machine_id: "local".to_string(),
             src: PathBuf::new(),
             excludes: Vec::new(),
             enabled: true,
@@ -546,6 +782,7 @@ mod tests {
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {
                 id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
                 path: PathBuf::from("/unused"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
@@ -565,6 +802,118 @@ mod tests {
             cleaned.source_groups[0].destinations[0].path,
             PathBuf::from("/data/dst")
         );
+    }
+
+    #[test]
+    fn validates_sync_order_dag() {
+        let mut cfg = config_with_two_tasks();
+        cfg.sync_order.push(SyncOrderRule {
+            before: SyncTaskRef {
+                source_id: "src_1".to_string(),
+                destination_id: "dst_1".to_string(),
+            },
+            after: SyncTaskRef {
+                source_id: "src_2".to_string(),
+                destination_id: "dst_1".to_string(),
+            },
+        });
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_sync_order_cycle() {
+        let mut cfg = config_with_two_tasks();
+        cfg.sync_order.push(SyncOrderRule {
+            before: SyncTaskRef {
+                source_id: "src_1".to_string(),
+                destination_id: "dst_1".to_string(),
+            },
+            after: SyncTaskRef {
+                source_id: "src_2".to_string(),
+                destination_id: "dst_1".to_string(),
+            },
+        });
+        cfg.sync_order.push(SyncOrderRule {
+            before: SyncTaskRef {
+                source_id: "src_2".to_string(),
+                destination_id: "dst_1".to_string(),
+            },
+            after: SyncTaskRef {
+                source_id: "src_1".to_string(),
+                destination_id: "dst_1".to_string(),
+            },
+        });
+
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn clean_config_for_save_drops_stale_sync_order_rules() {
+        let mut cfg = config_with_two_tasks();
+        cfg.sync_order.push(SyncOrderRule {
+            before: SyncTaskRef {
+                source_id: "src_1".to_string(),
+                destination_id: "dst_1".to_string(),
+            },
+            after: SyncTaskRef {
+                source_id: "missing".to_string(),
+                destination_id: "dst_1".to_string(),
+            },
+        });
+        cfg.sync_order.push(SyncOrderRule {
+            before: SyncTaskRef {
+                source_id: "src_1".to_string(),
+                destination_id: "dst_1".to_string(),
+            },
+            after: SyncTaskRef {
+                source_id: "src_2".to_string(),
+                destination_id: "dst_1".to_string(),
+            },
+        });
+
+        let cleaned = clean_config_for_save(&cfg);
+
+        assert_eq!(cleaned.sync_order.len(), 1);
+        assert_eq!(cleaned.sync_order[0].before.source_id, "src_1");
+        assert_eq!(cleaned.sync_order[0].after.source_id, "src_2");
+    }
+
+    fn config_with_two_tasks() -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: PathBuf::from("/data/src_1"),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: PathBuf::from("/data/dst_1"),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+            }],
+        });
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_2".to_string(),
+            machine_id: "local".to_string(),
+            src: PathBuf::from("/data/src_2"),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: PathBuf::from("/data/dst_2"),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+            }],
+        });
+        cfg
     }
 
     fn temp_dir(name: &str) -> PathBuf {

@@ -4,7 +4,43 @@ log_dir = "logs"
 status_log_interval_secs = 300
 web_bind = "0.0.0.0:18765"
 
+[[machines]]
+id = "windows"
+name = "windows"
+host = "192.168.3.7"
+web_port = 18765
+ssh_user = "Administrator"
+ssh_port = 22
+os = "windows"
+enabled = true
+manual = true
+
+[[machines]]
+id = "nas"
+name = "nas"
+host = "192.168.3.178"
+web_port = 18765
+ssh_user = "root"
+ssh_port = 10022
+os = "linux"
+enabled = true
+manual = true
+
+[[machines]]
+id = "openwrt"
+name = "openwrt"
+host = "192.168.2.1"
+web_port = 18765
+ssh_user = "root"
+ssh_port = 10022
+os = "linux"
+enabled = true
+manual = true
+
 [deploy]
 targets = [
-  { id = "nas", host = "192.168.3.178", port = 10022, user = "root", install_dir = "/opt/auto_sync" },
+  { id = "tiger", host = "localhost", port = 22, user = "root", install_dir = "/usr/local/auto_sync" },
+  { id = "nas", host = "192.168.3.178", port = 10022, user = "root", install_dir = "/usr/local/auto_sync" },
+  { id = "windows", host = "192.168.3.7", port = 22, user = "Administrator", install_dir = "C:/auto_sync" },
+  { id = "openwrt", host = "192.168.2.1", port = 10022, user = "root", install_dir = "/usr/local/auto_sync" },
 ]

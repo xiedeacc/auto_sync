@@ -3,8 +3,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use auto_sync::core::config::{AppConfig, load_config, load_or_create_config, save_config};
+use auto_sync::core::config::{
+    AppConfig, MachineConfig, load_config, load_or_create_config, save_config,
+};
 use auto_sync::core::logging::init_logging;
+use auto_sync::core::machines::{
+    MachineHealth, MachineStatus, discover_lan, encode_query_component, find_machine, local_health,
+    machine_id_from_path, merge_discovered, remote_get_json, spawn_discovery_responder,
+};
 use auto_sync::core::state::{DestinationView, State as DbState};
 use auto_sync::core::sync::{sync_all_now, sync_destination_now, sync_source_now};
 use axum::extract::Query;
@@ -31,6 +37,7 @@ struct Args {
 #[derive(Clone)]
 struct WebState {
     config_path: Arc<PathBuf>,
+    web_port: u16,
 }
 
 #[tokio::main]
@@ -45,12 +52,17 @@ async fn main() -> Result<()> {
 
     let state = WebState {
         config_path: Arc::new(args.config),
+        web_port: addr.port(),
     };
+    let _discovery = spawn_discovery_responder(state.config_path.clone(), addr.port());
     let app = Router::new()
         .route("/", get(index))
         .route("/main.js", get(main_js))
         .route("/styles.css", get(styles_css))
         .route("/api/config", get(api_get_config).post(api_save_config))
+        .route("/api/health", get(api_health))
+        .route("/api/machines", get(api_machines).post(api_add_machine))
+        .route("/api/machines/discover", get(api_discover_machines))
         .route("/api/status", get(api_status))
         .route("/api/sync-now", post(api_sync_now))
         .route("/api/sync-source-now", post(api_sync_source_now))
@@ -104,6 +116,41 @@ async fn api_save_config(
     let state_db = DbState::open(&cfg.app.data_db)?;
     state_db.ensure_config(&cfg)?;
     Ok(Json(cfg))
+}
+
+async fn api_health(
+    AxumState(state): AxumState<WebState>,
+) -> Result<Json<MachineHealth>, ApiError> {
+    let cfg = load_or_create_config(&state.config_path)?;
+    Ok(Json(local_health(&cfg, state.web_port)))
+}
+
+async fn api_machines(
+    AxumState(state): AxumState<WebState>,
+) -> Result<Json<MachineStatus>, ApiError> {
+    let cfg = load_or_create_config(&state.config_path)?;
+    Ok(Json(auto_sync::core::machines::machine_status(&cfg)))
+}
+
+async fn api_discover_machines(
+    AxumState(state): AxumState<WebState>,
+) -> Result<Json<MachineStatus>, ApiError> {
+    let cfg = load_or_create_config(&state.config_path)?;
+    let discovered = discover_lan(std::time::Duration::from_millis(700))?;
+    Ok(Json(merge_discovered(&cfg, discovered)))
+}
+
+async fn api_add_machine(
+    AxumState(state): AxumState<WebState>,
+    Json(machine): Json<MachineConfig>,
+) -> Result<Json<AppConfig>, ApiError> {
+    let mut cfg = load_or_create_config(&state.config_path)?;
+    if let Some(existing) = cfg.machines.iter_mut().find(|item| item.id == machine.id) {
+        *existing = machine;
+    } else {
+        cfg.machines.push(machine);
+    }
+    Ok(Json(save_config(&state.config_path, &cfg)?))
 }
 
 async fn api_status(
@@ -161,16 +208,17 @@ async fn api_sync_destination_now(
 #[derive(Debug, Deserialize)]
 struct BrowseQuery {
     path: Option<PathBuf>,
+    machine_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BrowseEntry {
     name: String,
     path: String,
     kind: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BrowseResponse {
     path: String,
     parent: Option<String>,
@@ -178,8 +226,25 @@ struct BrowseResponse {
 }
 
 async fn api_browse_paths(
+    AxumState(state): AxumState<WebState>,
     Query(query): Query<BrowseQuery>,
 ) -> Result<Json<BrowseResponse>, ApiError> {
+    let machine_id = machine_id_from_path(query.machine_id.as_deref());
+    if machine_id != "local" {
+        let cfg = load_config(&state.config_path)?;
+        let machine = find_machine(&cfg, machine_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown machine: {machine_id}"))?;
+        let requested = query
+            .path
+            .unwrap_or_else(|| default_path_for_os(&machine.os));
+        let path = format!(
+            "/api/browse-paths?path={}",
+            encode_query_component(&requested.to_string_lossy())
+        );
+        let response =
+            remote_get_json::<BrowseResponse>(&machine, &path, std::time::Duration::from_secs(3))?;
+        return Ok(Json(response));
+    }
     let requested = query.path.unwrap_or_else(|| PathBuf::from("/"));
     let path = normalize_browse_dir(&requested)?;
     let parent = path
@@ -213,6 +278,14 @@ async fn api_browse_paths(
         parent,
         entries,
     }))
+}
+
+fn default_path_for_os(os: &str) -> PathBuf {
+    if os.eq_ignore_ascii_case("windows") {
+        PathBuf::from("C:\\")
+    } else {
+        PathBuf::from("/")
+    }
 }
 
 fn normalize_browse_dir(path: &Path) -> Result<PathBuf> {

@@ -1,15 +1,21 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use auto_sync::core::config::{AppConfig, load_config, load_or_create_config, save_config};
+use auto_sync::core::config::{
+    AppConfig, MachineConfig, load_config, load_or_create_config, save_config,
+};
 use auto_sync::core::logging::init_logging;
+use auto_sync::core::machines::{
+    MachineStatus, discover_lan, encode_query_component, find_machine, machine_id_from_path,
+    machine_status, remote_get_json,
+};
 use auto_sync::core::state::{DestinationView, State as DbState};
 use auto_sync::core::sync::{
     sync_all_now, sync_destination_now as sync_destination_now_core,
     sync_source_now as sync_source_now_core,
 };
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(name = "auto_sync_gui")]
@@ -38,6 +44,35 @@ fn save_config_command(
     let state_db = DbState::open(&cfg.app.data_db).map_err(error_text)?;
     state_db.ensure_config(&cfg).map_err(error_text)?;
     Ok(cfg)
+}
+
+#[tauri::command]
+fn get_machines(state: tauri::State<'_, GuiState>) -> Result<MachineStatus, String> {
+    let cfg = load_or_create_config(&state.config_path).map_err(error_text)?;
+    Ok(machine_status(&cfg))
+}
+
+#[tauri::command]
+fn discover_machines(state: tauri::State<'_, GuiState>) -> Result<MachineStatus, String> {
+    let cfg = load_or_create_config(&state.config_path).map_err(error_text)?;
+    let discovered = discover_lan(std::time::Duration::from_millis(700)).map_err(error_text)?;
+    Ok(auto_sync::core::machines::merge_discovered(
+        &cfg, discovered,
+    ))
+}
+
+#[tauri::command]
+fn add_machine(
+    state: tauri::State<'_, GuiState>,
+    machine: MachineConfig,
+) -> Result<AppConfig, String> {
+    let mut cfg = load_or_create_config(&state.config_path).map_err(error_text)?;
+    if let Some(existing) = cfg.machines.iter_mut().find(|item| item.id == machine.id) {
+        *existing = machine;
+    } else {
+        cfg.machines.push(machine);
+    }
+    save_config(&state.config_path, &cfg).map_err(error_text)
 }
 
 #[tauri::command]
@@ -83,14 +118,14 @@ async fn sync_destination_now(
     state_db.destination_views(&cfg).map_err(error_text)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BrowseEntry {
     name: String,
     path: String,
     kind: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BrowseResponse {
     path: String,
     parent: Option<String>,
@@ -98,8 +133,37 @@ struct BrowseResponse {
 }
 
 #[tauri::command]
-fn browse_paths(path: Option<PathBuf>) -> Result<BrowseResponse, String> {
+fn browse_paths(
+    state: tauri::State<'_, GuiState>,
+    path: Option<PathBuf>,
+    machine_id: Option<String>,
+) -> Result<BrowseResponse, String> {
+    let machine_id = machine_id_from_path(machine_id.as_deref());
+    if machine_id != "local" {
+        let cfg = load_config(&state.config_path).map_err(error_text)?;
+        let machine = find_machine(&cfg, machine_id)
+            .ok_or_else(|| format!("unknown machine: {machine_id}"))?;
+        let requested = path.unwrap_or_else(|| default_path_for_os(&machine.os));
+        let path = format!(
+            "/api/browse-paths?path={}",
+            encode_query_component(&requested.to_string_lossy())
+        );
+        return remote_get_json::<BrowseResponse>(
+            &machine,
+            &path,
+            std::time::Duration::from_secs(3),
+        )
+        .map_err(error_text);
+    }
     browse_paths_inner(path.unwrap_or_else(|| PathBuf::from("/"))).map_err(error_text)
+}
+
+fn default_path_for_os(os: &str) -> PathBuf {
+    if os.eq_ignore_ascii_case("windows") {
+        PathBuf::from("C:\\")
+    } else {
+        PathBuf::from("/")
+    }
 }
 
 fn browse_paths_inner(requested: PathBuf) -> Result<BrowseResponse> {
@@ -179,6 +243,9 @@ fn main() -> Result<()> {
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_config_command,
+            get_machines,
+            discover_machines,
+            add_machine,
             get_status,
             sync_now,
             sync_source_now,

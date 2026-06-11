@@ -12,6 +12,7 @@
       <h1>auto_sync</h1>
       <span id="config-path" class="subtle"></span>
     </div>
+    <button id="machine-status" class="machine-status" title="Manage LAN machines">Machines -/-</button>
     <div class="toolbar">
       <button id="config" title="Show current configuration">Config</button>
       <button id="refresh" title="Refresh status">Refresh</button>
@@ -29,6 +30,10 @@
       <div class="modal-head">
         <h2>Choose Path</h2>
         <button id="folder-close" class="icon" title="Close">x</button>
+      </div>
+      <div class="folder-machine-row">
+        <label for="folder-machine">Machine</label>
+        <select id="folder-machine"></select>
       </div>
       <div class="folder-path" id="folder-path"></div>
       <div class="folder-actions">
@@ -77,6 +82,53 @@
         <button id="config-close" class="icon" title="Close">x</button>
       </div>
       <pre id="config-view" class="config-view"></pre>
+    </div>
+  </div>
+
+  <div id="machine-modal" class="modal" hidden>
+    <div class="modal-panel machine-modal-panel">
+      <div class="modal-head">
+        <h2>Machines</h2>
+        <button id="machine-close" class="icon" title="Close">x</button>
+      </div>
+      <div id="machine-list" class="machine-list"></div>
+      <div class="machine-form">
+        <div>
+          <label for="machine-id">ID</label>
+          <input id="machine-id" placeholder="nas_1">
+        </div>
+        <div>
+          <label for="machine-name">Name</label>
+          <input id="machine-name" placeholder="NAS">
+        </div>
+        <div>
+          <label for="machine-host">Host</label>
+          <input id="machine-host" placeholder="192.168.3.178">
+        </div>
+        <div>
+          <label for="machine-web-port">Web Port</label>
+          <input id="machine-web-port" type="number" min="1" max="65535" value="18765">
+        </div>
+        <div>
+          <label for="machine-ssh-user">SSH User</label>
+          <input id="machine-ssh-user" placeholder="root">
+        </div>
+        <div>
+          <label for="machine-ssh-port">SSH Port</label>
+          <input id="machine-ssh-port" type="number" min="1" max="65535" value="22">
+        </div>
+        <div>
+          <label for="machine-os">OS</label>
+          <select id="machine-os">
+            <option value="linux">Linux</option>
+            <option value="windows">Windows</option>
+          </select>
+        </div>
+        <button id="machine-add" class="primary">Add</button>
+      </div>
+      <div class="folder-actions">
+        <button id="machine-discover">Discover</button>
+      </div>
     </div>
   </div>
 

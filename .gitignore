@@ -5,3 +5,5 @@
 !/logs/.gitkeep
 /bin/*
 !/bin/.gitkeep
+!/bin/windows/
+!/bin/windows/**
