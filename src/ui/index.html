@@ -13,6 +13,7 @@
       <span id="config-path" class="subtle"></span>
     </div>
     <div class="toolbar">
+      <button id="config" title="Show current configuration">Config</button>
       <button id="refresh" title="Refresh status">Refresh</button>
       <button id="save" class="primary" title="Save configuration">Save</button>
     </div>
@@ -42,12 +43,12 @@
   <div id="schedule-modal" class="modal" hidden>
     <div class="modal-panel schedule-modal-panel">
       <div class="modal-head">
-        <h2>Cycle</h2>
+        <h2>Schedule</h2>
         <button id="schedule-close" class="icon" title="Close">x</button>
       </div>
       <div class="schedule-row" id="schedule-form">
         <div>
-          <label for="cycle-mode">Cycle</label>
+          <label for="cycle-mode">Schedule</label>
           <select id="cycle-mode">
             <option value="realtime">Realtime</option>
             <option value="daily">Daily</option>
@@ -56,7 +57,7 @@
         </div>
         <div>
           <label for="cycle-time">Time</label>
-          <input id="cycle-time" placeholder="02:00:00">
+          <input id="cycle-time" type="time" step="60" placeholder="02:00">
         </div>
         <div id="cycle-weekday-field">
           <label for="cycle-weekday">Weekday</label>
@@ -66,6 +67,16 @@
       <div class="folder-actions">
         <button id="schedule-apply" class="primary">Apply</button>
       </div>
+    </div>
+  </div>
+
+  <div id="config-modal" class="modal" hidden>
+    <div class="modal-panel config-modal-panel">
+      <div class="modal-head">
+        <h2>Config</h2>
+        <button id="config-close" class="icon" title="Close">x</button>
+      </div>
+      <pre id="config-view" class="config-view"></pre>
     </div>
   </div>
 

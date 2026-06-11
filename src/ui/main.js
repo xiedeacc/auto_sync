@@ -14,6 +14,7 @@ const el = {
   configPath: document.getElementById("config-path"),
   sourcePanel: document.getElementById("source-panel"),
   message: document.getElementById("message"),
+  config: document.getElementById("config"),
   refresh: document.getElementById("refresh"),
   save: document.getElementById("save"),
   folderModal: document.getElementById("folder-modal"),
@@ -29,6 +30,9 @@ const el = {
   cycleTime: document.getElementById("cycle-time"),
   cycleWeekday: document.getElementById("cycle-weekday"),
   cycleWeekdayField: document.getElementById("cycle-weekday-field"),
+  configModal: document.getElementById("config-modal"),
+  configClose: document.getElementById("config-close"),
+  configView: document.getElementById("config-view"),
 };
 
 async function loadAll() {
@@ -63,7 +67,7 @@ function tabButton(label, tabId) {
 
 function addSource() {
   cfg.source_groups.push({
-    id: `source_${cfg.source_groups.length + 1}`,
+    id: nextSourceId(),
     src: "",
     enabled: true,
     mode: "mirror",
@@ -108,11 +112,16 @@ function renderSourcePanel() {
           <label>Source Path</label>
           <input class="path-picker" value="${escapeAttr(source.src)}" data-field="source-src" readonly title="Choose source folder">
         </div>
+        <div>
+          <label>Latest Cycle</label>
+          <input value="${escapeAttr(sourceLatestCycle(source.id))}" readonly>
+        </div>
         <button class="danger icon" data-action="remove-source" title="Remove source">x</button>
       </div>
       <div class="destination-list">
         <div class="destination-grid">
           <label>Destination</label>
+          <label>Schedule</label>
           <label>Cycle</label>
           <label>Reason</label>
           <label>Actions</label>
@@ -131,7 +140,7 @@ function renderSourceTabs() {
   const tabs = document.getElementById("source-tabs");
   tabs.innerHTML = "";
   cfg.source_groups.forEach((source, index) => {
-    tabs.appendChild(tabButton(source.id || `source_${index + 1}`, String(index)));
+    tabs.appendChild(tabButton(source.id || `src_${index + 1}`, String(index)));
   });
 }
 
@@ -174,7 +183,8 @@ function renderSyncRows(source, sourceIndex) {
           <input class="path-picker dst-path" value="${escapeAttr(dst.path)}" data-field="dst-path" readonly title="Choose destination folder">
         </div>
       </div>
-      <div><button class="cycle-button" data-action="edit-cycle">${escapeHtml(cycleLabel(dst.schedule))}</button></div>
+      <div><button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button></div>
+      <div>${escapeHtml(cycleDisplay(status))}</div>
       <div>${escapeHtml(status?.status_reason || "not_verified")}</div>
       <div><button class="danger icon" data-action="remove-dst" title="Remove destination">x</button></div>
     `;
@@ -189,7 +199,7 @@ function renderSyncRows(source, sourceIndex) {
       source.destinations.splice(dstIndex, 1);
       renderSourcePanel();
     };
-    row.querySelector('[data-action="edit-cycle"]').onclick = () => {
+    row.querySelector('[data-action="edit-schedule"]').onclick = () => {
       openScheduleModal(dst.schedule, (schedule) => {
         dst.schedule = cloneSchedule(schedule);
         latestDestinationSchedule = cloneSchedule(schedule);
@@ -205,35 +215,23 @@ function renderSyncRows(source, sourceIndex) {
 function appendAddDestinationRow(body, source) {
   const addRow = document.createElement("div");
   addRow.className = "destination-row add-destination-row";
-  const nextId = nextDestinationId(source);
   addRow.innerHTML = `
-    <div>
-      <div class="destination-cell">
-        <span class="dot red" title="red"></span>
-        <input class="dst-id" value="${escapeAttr(nextId)}" data-field="new-dst-id" readonly>
-        <input class="path-picker dst-path" value="" data-field="new-dst-path" readonly title="Choose destination folder">
-      </div>
-    </div>
-    <div><button class="cycle-button" data-action="new-cycle">${escapeHtml(cycleLabel(latestDestinationSchedule))}</button></div>
-    <div>not_verified</div>
     <div></div>
+    <div></div>
+    <div></div>
+    <div></div>
+    <div>
+      <button class="add-destination-button icon" data-action="add-destination" title="Add destination">+</button>
+    </div>
   `;
-  let newSchedule = cloneSchedule(latestDestinationSchedule);
-  addRow.querySelector('[data-action="new-cycle"]').onclick = () => {
-    openScheduleModal(newSchedule, (schedule) => {
-      newSchedule = cloneSchedule(schedule);
-      latestDestinationSchedule = cloneSchedule(schedule);
-      renderSourcePanel();
-    });
-  };
-  addRow.querySelector('[data-field="new-dst-path"]').onclick = async () => {
+  addRow.querySelector('[data-action="add-destination"]').onclick = async () => {
     const path = await pickFolder("/");
     if (path) {
       source.destinations.push({
-        id: nextId,
+        id: nextDestinationId(source),
         path,
         enabled: true,
-        schedule: cloneSchedule(newSchedule),
+        schedule: cloneSchedule(latestDestinationSchedule),
       });
       renderSourcePanel();
     }
@@ -252,9 +250,37 @@ function nextDestinationId(source) {
   return `dst_${maxId + 1}`;
 }
 
+function nextSourceId() {
+  let maxId = 0;
+  for (const source of cfg.source_groups || []) {
+    const id = normalizeSourceId(source.id || "");
+    const match = /^src_(\d+)$/.exec(id);
+    if (match) {
+      maxId = Math.max(maxId, Number(match[1]));
+    }
+  }
+  return `src_${maxId + 1}`;
+}
+
+function normalizeSourceId(id) {
+  return String(id || "").replace(/^source_(\d+)$/, "src_$1");
+}
+
+function sourceLatestCycle(sourceId) {
+  const cycles = statuses
+    .filter((status) => normalizeSourceId(status.source_id) === sourceId)
+    .map((status) => status.latest_closed_cycle_id)
+    .filter((cycle) => cycle !== null && cycle !== undefined);
+  if (!cycles.length) {
+    return "-";
+  }
+  return String(Math.max(...cycles));
+}
+
 function normalizeConfig(nextCfg) {
   nextCfg.schedule = nextCfg.schedule || defaultDestinationSchedule();
   for (const source of nextCfg.source_groups || []) {
+    source.id = normalizeSourceId(source.id);
     for (const dst of source.destinations || []) {
       dst.schedule = normalizeSchedule(dst.schedule);
       latestDestinationSchedule = cloneSchedule(dst.schedule);
@@ -265,7 +291,7 @@ function normalizeConfig(nextCfg) {
 function defaultDestinationSchedule() {
   return {
     mode: "realtime",
-    time: "02:00:00",
+    time: "02:00",
     timezone: "local",
     weekday: "monday",
     sync_current_cycle_manually: false,
@@ -276,6 +302,7 @@ function normalizeSchedule(schedule) {
   return {
     ...defaultDestinationSchedule(),
     ...(schedule || {}),
+    time: normalizeScheduleTime(schedule?.time || defaultDestinationSchedule().time),
     weekday: schedule?.weekday || "monday",
   };
 }
@@ -284,22 +311,61 @@ function cloneSchedule(schedule) {
   return { ...normalizeSchedule(schedule) };
 }
 
-function cycleLabel(schedule) {
+function scheduleLabel(schedule) {
   const next = normalizeSchedule(schedule);
   if (next.mode === "daily") {
-    return `Daily ${next.time || "02:00:00"}`;
+    return formatScheduleTime(next.time);
   }
   if (next.mode === "weekly") {
-    return `Weekly ${next.weekday || "monday"} ${next.time || "02:00:00"}`;
+    return `${weekdayAbbrev(next.weekday)} ${formatScheduleTime(next.time)}`;
   }
   return "Realtime";
+}
+
+function normalizeScheduleTime(value) {
+  const text = String(value || "02:00");
+  const match = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(text);
+  if (!match) {
+    return "02:00";
+  }
+  const hour = Math.min(23, Number(match[1]));
+  const minute = Math.min(59, Number(match[2]));
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function formatScheduleTime(value) {
+  return normalizeScheduleTime(value);
+}
+
+function weekdayAbbrev(value) {
+  const weekdays = {
+    monday: "Mon",
+    mon: "Mon",
+    tuesday: "Tue",
+    tue: "Tue",
+    wednesday: "Wed",
+    wed: "Wed",
+    thursday: "Thu",
+    thu: "Thu",
+    friday: "Fri",
+    fri: "Fri",
+    saturday: "Sat",
+    sat: "Sat",
+    sunday: "Sun",
+    sun: "Sun",
+  };
+  return weekdays[String(value || "monday").toLowerCase()] || "Mon";
+}
+
+function cycleDisplay(status) {
+  return `${status?.last_verified_cycle_id ?? "-"} / ${status?.latest_closed_cycle_id ?? "-"}`;
 }
 
 function openScheduleModal(schedule, onApply) {
   const draft = cloneSchedule(schedule);
   scheduleEditor = { draft, onApply };
   el.cycleMode.value = draft.mode;
-  el.cycleTime.value = draft.time;
+  el.cycleTime.value = formatScheduleTime(draft.time);
   el.cycleWeekday.value = draft.weekday || "monday";
   updateScheduleModalFields();
   el.scheduleModal.hidden = false;
@@ -316,7 +382,7 @@ function closeScheduleModal(apply) {
   if (apply && scheduleEditor) {
     const schedule = normalizeSchedule({
       mode: el.cycleMode.value,
-      time: el.cycleTime.value || "02:00:00",
+      time: normalizeScheduleTime(el.cycleTime.value || "02:00"),
       timezone: "local",
       weekday: el.cycleWeekday.value || "monday",
       sync_current_cycle_manually: false,
@@ -327,9 +393,19 @@ function closeScheduleModal(apply) {
   scheduleEditor = null;
 }
 
+function openConfigModal() {
+  updateCfgFromForm();
+  el.configView.textContent = JSON.stringify(cfg, null, 2);
+  el.configModal.hidden = false;
+}
+
+function closeConfigModal() {
+  el.configModal.hidden = true;
+}
+
 function statusFor(sourceId, destinationId) {
   return statuses.find((status) =>
-    status.source_id === sourceId && status.destination_id === destinationId
+    normalizeSourceId(status.source_id) === sourceId && status.destination_id === destinationId
   );
 }
 
@@ -421,6 +497,7 @@ async function runBusy(message, fn) {
 
 function setBusy(nextBusy) {
   busy = nextBusy;
+  el.config.disabled = busy;
   el.refresh.disabled = busy;
   el.save.disabled = busy;
 }
@@ -443,6 +520,7 @@ function escapeAttr(value) {
   return escapeHtml(value).replace(/`/g, "&#96;");
 }
 
+el.config.onclick = openConfigModal;
 el.refresh.onclick = () => runBusy("", loadAll);
 
 el.save.onclick = () => runBusy("Saving...", async () => {
@@ -462,6 +540,7 @@ el.folderUp.onclick = () => {
 el.scheduleClose.onclick = () => closeScheduleModal(false);
 el.scheduleApply.onclick = () => closeScheduleModal(true);
 el.cycleMode.onchange = updateScheduleModalFields;
+el.configClose.onclick = closeConfigModal;
 
 loadAll().catch((error) => setMessage(String(error)));
 

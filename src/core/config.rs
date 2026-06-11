@@ -117,7 +117,7 @@ impl Default for ScheduleConfig {
     fn default() -> Self {
         Self {
             mode: ScheduleMode::Realtime,
-            time: "02:00:00".to_string(),
+            time: "02:00".to_string(),
             timezone: "local".to_string(),
             weekday: Some("monday".to_string()),
             sync_current_cycle_manually: false,
@@ -269,13 +269,17 @@ pub fn validate_schedule(schedule: &ScheduleConfig) -> Result<()> {
 
 pub fn parse_schedule_time(value: &str) -> Result<(u32, u32, u32)> {
     let parts: Vec<&str> = value.split(':').collect();
-    if parts.len() != 3 {
-        bail!("schedule time must use HH:MM:SS");
+    if parts.len() != 2 && parts.len() != 3 {
+        bail!("schedule time must use HH:MM");
     }
     let hour = parts[0].parse::<u32>().context("invalid schedule hour")?;
     let minute = parts[1].parse::<u32>().context("invalid schedule minute")?;
-    let second = parts[2].parse::<u32>().context("invalid schedule second")?;
-    if hour > 23 || minute > 59 || second > 59 {
+    let second = if parts.len() == 3 {
+        parts[2].parse::<u32>().context("invalid schedule second")?
+    } else {
+        0
+    };
+    if hour > 23 || minute > 59 || second != 0 {
         return Err(anyhow!("schedule time out of range: {value}"));
     }
     Ok((hour, minute, second))
@@ -301,13 +305,15 @@ mod tests {
 
     #[test]
     fn parses_valid_schedule_time() {
-        assert_eq!(parse_schedule_time("02:03:04").unwrap(), (2, 3, 4));
+        assert_eq!(parse_schedule_time("02:03").unwrap(), (2, 3, 0));
+        assert_eq!(parse_schedule_time("02:03:00").unwrap(), (2, 3, 0));
     }
 
     #[test]
     fn rejects_invalid_schedule_time() {
-        assert!(parse_schedule_time("25:00:00").is_err());
-        assert!(parse_schedule_time("02:00").is_err());
+        assert!(parse_schedule_time("25:00").is_err());
+        assert!(parse_schedule_time("02:00:01").is_err());
+        assert!(parse_schedule_time("02").is_err());
     }
 
     #[test]

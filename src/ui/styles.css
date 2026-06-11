@@ -195,14 +195,14 @@ th {
 
 .source-layout {
   display: grid;
-  grid-template-columns: 330px minmax(480px, 1fr);
+  grid-template-columns: 410px minmax(480px, 1fr);
   gap: 14px;
   align-items: start;
 }
 
 .source-card {
   display: grid;
-  grid-template-columns: 92px 160px 34px;
+  grid-template-columns: 74px 160px 96px 34px;
   gap: 8px;
   align-items: end;
   padding-right: 6px;
@@ -218,7 +218,7 @@ th {
 
 .destination-grid {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) 120px 220px 80px;
+  grid-template-columns: minmax(260px, 1fr) 180px 120px 220px 80px;
   column-gap: 8px;
   row-gap: 4px;
   align-items: end;
@@ -243,12 +243,18 @@ th {
 
 .destination-cell {
   display: grid;
-  grid-template-columns: 18px 110px minmax(180px, 260px);
+  grid-template-columns: 18px 74px minmax(180px, 260px);
   gap: 8px;
   align-items: center;
 }
 
-.cycle-button {
+.add-destination-button {
+  color: var(--accent);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.schedule-button {
   width: 100%;
   max-width: 180px;
   display: flex;
@@ -267,6 +273,26 @@ th {
 
 .schedule-modal-panel {
   width: min(760px, 100%);
+}
+
+.config-modal-panel {
+  width: min(900px, 100%);
+}
+
+.config-view {
+  min-height: 260px;
+  max-height: min(640px, 76vh);
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8fafc;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
 }
 
 .source-card .path-picker {
