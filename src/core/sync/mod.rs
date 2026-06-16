@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+#[cfg(windows)]
+use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, anyhow, bail};
 use filetime::{FileTime, set_file_mtime};
@@ -1224,9 +1228,9 @@ fn snapshot_entry_if_supported(path: &Path, rel_path: String) -> Result<Option<S
     Ok(Some(SnapshotEntry {
         rel_path,
         file_type: file_type.to_string(),
-        size: metadata.size() as i64,
-        mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
-        mode: metadata.mode(),
+        size: metadata.len() as i64,
+        mtime_ns: metadata_mtime_ns(&metadata)?,
+        mode: metadata_mode(&metadata),
         hash,
     }))
 }
@@ -1330,7 +1334,7 @@ fn copy_symlink(
     if tmp.exists() {
         remove_any(&tmp)?;
     }
-    symlink(&target, &tmp)
+    create_symlink(src, &target, &tmp)
         .with_context(|| format!("failed to create symlink {}", tmp.display()))?;
     if Some(hash_symlink(&tmp)?) != entry.hash {
         remove_any(&tmp).ok();
@@ -1479,9 +1483,74 @@ fn remove_any(path: &Path) -> Result<()> {
 
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     let mut perms = fs::symlink_metadata(path)?.permissions();
-    perms.set_mode(mode);
+    set_permissions_mode(&mut perms, mode);
     fs::set_permissions(path, perms)?;
     Ok(())
+}
+
+fn metadata_mtime_ns(metadata: &fs::Metadata) -> Result<i64> {
+    let modified = metadata.modified()?;
+    let ns = match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            let secs = i64::try_from(duration.as_secs()).context("mtime seconds overflow")?;
+            secs.checked_mul(1_000_000_000)
+                .and_then(|value| value.checked_add(i64::from(duration.subsec_nanos())))
+                .ok_or_else(|| anyhow!("mtime nanoseconds overflow"))?
+        }
+        Err(err) => {
+            let duration = err.duration();
+            let secs = i64::try_from(duration.as_secs()).context("mtime seconds overflow")?;
+            let ns = secs
+                .checked_mul(1_000_000_000)
+                .and_then(|value| value.checked_add(i64::from(duration.subsec_nanos())))
+                .ok_or_else(|| anyhow!("mtime nanoseconds overflow"))?;
+            -ns
+        }
+    };
+    Ok(ns)
+}
+
+#[cfg(unix)]
+fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+    metadata.mode()
+}
+
+#[cfg(windows)]
+fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        0o120777
+    } else if metadata.is_dir() {
+        0o040755
+    } else if metadata.permissions().readonly() {
+        0o100444
+    } else {
+        0o100644
+    }
+}
+
+#[cfg(unix)]
+fn set_permissions_mode(perms: &mut fs::Permissions, mode: u32) {
+    perms.set_mode(mode);
+}
+
+#[cfg(windows)]
+fn set_permissions_mode(perms: &mut fs::Permissions, mode: u32) {
+    perms.set_readonly(mode & 0o222 == 0);
+}
+
+#[cfg(unix)]
+fn create_symlink(_src: &Path, target: &Path, tmp: &Path) -> io::Result<()> {
+    symlink(target, tmp)
+}
+
+#[cfg(windows)]
+fn create_symlink(src: &Path, target: &Path, tmp: &Path) -> io::Result<()> {
+    if fs::metadata(src).map(|meta| meta.is_dir()).unwrap_or(false) {
+        symlink_dir(target, tmp)
+    } else {
+        symlink_file(target, tmp)
+    }
 }
 
 fn fsync_file(path: &Path) -> io::Result<()> {

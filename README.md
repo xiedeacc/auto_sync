@@ -17,15 +17,17 @@ Cross-machine sync uses `rsync`. Local-to-remote and remote-to-local are run
 from the controller. Remote-to-remote is run by SSHing into one remote machine
 and running `rsync` there, so that runner must be able to SSH to the peer.
 
-Windows peers require OpenSSH plus rsync in PATH. Download the bundled runtime
-archives with:
+Windows peers require OpenSSH plus rsync in PATH. Download the bundled fallback
+runtime archives with:
 
 ```bash
 scripts/download_windows_runtime.sh
 ```
 
 The script places OpenSSH and cwRsync under `bin/windows/`, including extracted
-folders and `SHA256SUMS`. The Windows runtime directory is tracked in git.
+folders and `SHA256SUMS`. The Windows runtime directory is tracked in git. Local
+Windows deployment prefers the Windows OpenSSH Server optional feature when it
+is available, and falls back to the bundled OpenSSH runtime when it is not.
 
 ## Build
 
@@ -64,12 +66,13 @@ Machine deploy helpers:
 ```bash
 scripts/deploy_tiger.sh
 scripts/deploy_nas.sh --host 192.168.3.178 --port 10022 --user root
-powershell -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1
+pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1
 scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 ```
 
 `deploy_tiger.sh` deploys to localhost. `deploy_nas.sh` deploys to the NAS with
-systemd. `deploy_windows.ps1` is run locally on Windows and installs the
-downloaded OpenSSH/cwRsync runtime. `deploy_openwrt.sh` cross-compiles aarch64
-OpenWrt binaries, installs procd init scripts, and deploys to
-`/usr/local/auto_sync`.
+systemd. `deploy_windows.ps1` is run locally on Windows, builds release
+binaries, installs them under `C:\auto_sync`, installs cwRsync, ensures `sshd`
+is available, and requests administrator privileges when service or machine
+PATH changes are needed. `deploy_openwrt.sh` cross-compiles aarch64 OpenWrt
+binaries, installs procd init scripts, and deploys to `/usr/local/auto_sync`.
