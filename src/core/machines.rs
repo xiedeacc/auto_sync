@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -53,10 +54,11 @@ pub fn local_health(cfg: &AppConfig, web_port: u16) -> MachineHealth {
         .into_iter()
         .find(|machine| machine.id == "local")
         .unwrap_or_else(MachineConfig::local);
+    let host = local.host;
     MachineHealth {
-        id: local.id,
+        id: discovery_machine_id(&host, web_port),
         name: local.name,
-        host: local.host,
+        host,
         web_port,
         os: std::env::consts::OS.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -91,17 +93,40 @@ pub fn machine_status(cfg: &AppConfig) -> MachineStatus {
 
 pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> MachineStatus {
     let mut status = machine_status(cfg);
+    let mut known_ids: HashSet<String> = status
+        .machines
+        .iter()
+        .map(|machine| machine.id.clone())
+        .collect();
     for health in discovered {
-        if status
+        if let Some(existing) = status
             .machines
-            .iter()
-            .any(|machine| machine.id == health.id)
+            .iter_mut()
+            .find(|machine| machine.host == health.host && machine.web_port == health.web_port)
         {
+            existing.online = true;
             continue;
         }
+
+        let mut id = clean_machine_id(&health.id);
+        if id.is_empty() || id == "local" || known_ids.contains(&id) {
+            id = discovery_machine_id(&health.host, health.web_port);
+        }
+        id = unique_machine_id(id, &known_ids);
+        known_ids.insert(id.clone());
+
+        let name = if health.name.trim().is_empty()
+            || health.name == "local"
+            || health.name == "This machine"
+        {
+            health.host.clone()
+        } else {
+            health.name
+        };
+
         status.machines.push(MachineView {
-            id: health.id,
-            name: health.name,
+            id,
+            name,
             host: health.host,
             web_port: health.web_port,
             ssh_user: String::new(),
@@ -120,6 +145,59 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
         .count();
     status.total = status.machines.len();
     status
+}
+
+fn discovery_machine_id(host: &str, web_port: u16) -> String {
+    let host = clean_machine_id(host);
+    let path_hash = current_exe_path_hash();
+    if host.is_empty() {
+        format!("lan_{web_port}_{path_hash}")
+    } else {
+        format!("lan_{host}_{web_port}_{path_hash}")
+    }
+}
+
+fn current_exe_path_hash() -> String {
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_PKG_NAME")));
+    let digest = blake3::hash(path.to_string_lossy().as_bytes());
+    digest.to_hex().chars().take(8).collect()
+}
+
+fn clean_machine_id(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn unique_machine_id(base: String, known_ids: &HashSet<String>) -> String {
+    let base = if base.is_empty() {
+        "discovered".to_string()
+    } else {
+        base
+    };
+    if !known_ids.contains(&base) {
+        return base;
+    }
+    for index in 2.. {
+        let candidate = format!("{base}_{index}");
+        if !known_ids.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 pub fn spawn_discovery_responder(config_path: Arc<PathBuf>, web_port: u16) -> JoinHandle<()> {
@@ -169,7 +247,10 @@ pub fn discover_lan(timeout: Duration) -> Result<Vec<MachineHealth>> {
         match socket.recv_from(&mut buf) {
             Ok((len, _)) => {
                 if let Ok(health) = serde_json::from_slice::<MachineHealth>(&buf[..len]) {
-                    if !out.iter().any(|item| item.id == health.id) {
+                    if !out
+                        .iter()
+                        .any(|item| item.host == health.host && item.web_port == health.web_port)
+                    {
                         out.push(health);
                     }
                 }
@@ -324,5 +405,88 @@ mod tests {
             "/cygdrive/c/Users/me/data"
         );
         assert_eq!(rsync_path(&machine, Path::new("D:\\")), "/cygdrive/d");
+    }
+
+    #[test]
+    fn merge_discovered_keeps_multiple_local_ids_by_host() {
+        let cfg = AppConfig::default();
+        let status = merge_discovered(
+            &cfg,
+            vec![
+                MachineHealth {
+                    id: "local".to_string(),
+                    name: "This machine".to_string(),
+                    host: "192.168.2.247".to_string(),
+                    web_port: 18765,
+                    os: "linux".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                MachineHealth {
+                    id: "local".to_string(),
+                    name: "This machine".to_string(),
+                    host: "192.168.2.126".to_string(),
+                    web_port: 18765,
+                    os: "linux".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+            ],
+        );
+
+        assert!(status.machines.iter().any(|machine| {
+            machine.id.starts_with("lan_192_168_2_247_18765_")
+                && machine.id.len() == "lan_192_168_2_247_18765_".len() + 8
+                && machine.name == "192.168.2.247"
+                && machine.discovered
+        }));
+        assert!(status.machines.iter().any(|machine| {
+            machine.id.starts_with("lan_192_168_2_126_18765_")
+                && machine.id.len() == "lan_192_168_2_126_18765_".len() + 8
+                && machine.name == "192.168.2.126"
+                && machine.discovered
+        }));
+    }
+
+    #[test]
+    fn local_health_uses_network_discovery_id() {
+        let mut cfg = AppConfig::default();
+        cfg.machines[0].host = "192.168.2.166".to_string();
+        let health = local_health(&cfg, 18765);
+
+        assert!(health.id.starts_with("lan_192_168_2_166_18765_"));
+        assert_eq!(health.id.len(), "lan_192_168_2_166_18765_".len() + 8);
+        assert_eq!(health.host, "192.168.2.166");
+    }
+
+    #[test]
+    fn merge_discovered_marks_existing_endpoint_online() {
+        let mut cfg = AppConfig::default();
+        let mut nas = MachineConfig::local();
+        nas.id = "nas".to_string();
+        nas.name = "nas".to_string();
+        nas.host = "192.168.2.247".to_string();
+        nas.web_port = 18765;
+        nas.os = "linux".to_string();
+        cfg.machines.push(nas);
+
+        let status = merge_discovered(
+            &cfg,
+            vec![MachineHealth {
+                id: "local".to_string(),
+                name: "This machine".to_string(),
+                host: "192.168.2.247".to_string(),
+                web_port: 18765,
+                os: "linux".to_string(),
+                version: "0.1.0".to_string(),
+            }],
+        );
+
+        let matches: Vec<_> = status
+            .machines
+            .iter()
+            .filter(|machine| machine.host == "192.168.2.247")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, "nas");
+        assert!(matches[0].online);
     }
 }
