@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -151,7 +152,7 @@ impl Default for AppConfig {
             deploy: DeployConfig {
                 targets: vec![DeployTarget {
                     id: "nas".to_string(),
-                    host: "192.168.3.178".to_string(),
+                    host: "192.168.2.247".to_string(),
                     port: 10022,
                     user: "root".to_string(),
                     install_dir: PathBuf::from("/usr/local/auto_sync"),
@@ -247,7 +248,7 @@ impl MachineConfig {
         Self {
             id: "local".to_string(),
             name: "This machine".to_string(),
-            host: "127.0.0.1".to_string(),
+            host: preferred_local_host(),
             web_port: 18765,
             ssh_user: String::new(),
             ssh_port: 22,
@@ -361,7 +362,7 @@ fn clean_machines(machines: &[MachineConfig]) -> Vec<MachineConfig> {
             machine.name = machine.id.clone();
         }
         if machine.host.is_empty() {
-            machine.host = "127.0.0.1".to_string();
+            machine.host = preferred_local_host();
         }
         if machine.web_port == 0 {
             machine.web_port = 18765;
@@ -515,6 +516,27 @@ pub fn machine_id_or_local(value: &str) -> &str {
 
 pub fn normalized_machines(cfg: &AppConfig) -> Vec<MachineConfig> {
     clean_machines(&cfg.machines)
+}
+
+pub fn preferred_local_host() -> String {
+    if let Some(ip) = detect_local_ip_for(Ipv4Addr::new(192, 168, 2, 1))
+        .filter(|ip| ip.octets()[0..3] == [192, 168, 2])
+    {
+        return ip.to_string();
+    }
+    if let Some(ip) = detect_local_ip_for(Ipv4Addr::new(8, 8, 8, 8)) {
+        return ip.to_string();
+    }
+    "127.0.0.1".to_string()
+}
+
+fn detect_local_ip_for(peer: Ipv4Addr) -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect(SocketAddr::from((peer, 9))).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
 }
 
 fn sync_task_ids(cfg: &AppConfig) -> HashSet<String> {

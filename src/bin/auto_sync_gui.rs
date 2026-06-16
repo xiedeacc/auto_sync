@@ -1,4 +1,6 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use auto_sync::core::config::{
@@ -7,7 +9,7 @@ use auto_sync::core::config::{
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::machines::{
     MachineStatus, discover_lan, encode_query_component, find_machine, machine_id_from_path,
-    machine_status, remote_get_json,
+    machine_status, remote_get_json, spawn_discovery_responder,
 };
 use auto_sync::core::state::{DestinationView, State as DbState};
 use auto_sync::core::sync::{
@@ -19,10 +21,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(name = "auto_sync_gui")]
-#[command(about = "Tauri Linux GUI for auto_sync")]
+#[command(about = "Tauri GUI for auto_sync")]
 struct Args {
-    #[arg(long, default_value = "conf/auto_sync.toml")]
-    config: PathBuf,
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -228,14 +230,20 @@ fn entry_kind_order(kind: &str) -> u8 {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let cfg = load_or_create_config(&args.config)?;
+    let config_arg = args.config.unwrap_or_else(default_gui_config_path);
+    let cfg = load_or_create_config(&config_arg)?;
     let _log_guard = init_logging(&cfg.app.log_dir, "auto_sync_gui")?;
-    let state = GuiState {
-        config_path: args
-            .config
-            .canonicalize()
-            .unwrap_or_else(|_| args.config.clone()),
-    };
+    let config_path = config_arg
+        .canonicalize()
+        .unwrap_or_else(|_| config_arg.clone());
+    let web_port = cfg
+        .app
+        .web_bind
+        .parse::<SocketAddr>()
+        .map(|addr| addr.port())
+        .unwrap_or(18765);
+    let _discovery = spawn_discovery_responder(Arc::new(config_path.clone()), web_port);
+    let state = GuiState { config_path };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -255,6 +263,24 @@ fn main() -> Result<()> {
         .run(tauri::generate_context!())
         .context("failed to run Tauri GUI")?;
     Ok(())
+}
+
+fn default_gui_config_path() -> PathBuf {
+    let Ok(exe) = std::env::current_exe() else {
+        return PathBuf::from("conf/auto_sync.toml");
+    };
+    let Some(exe_dir) = exe.parent() else {
+        return PathBuf::from("conf/auto_sync.toml");
+    };
+    let install_dir = if exe_dir
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("bin"))
+    {
+        exe_dir.parent().unwrap_or(exe_dir)
+    } else {
+        exe_dir
+    };
+    install_dir.join("conf").join("auto_sync.toml")
 }
 
 fn error_text(err: anyhow::Error) -> String {

@@ -65,10 +65,26 @@ const el = {
 async function loadAll() {
   cfg = await invoke("get_config");
   normalizeConfig(cfg);
-  await loadStatus();
-  await loadMachines();
+  render();
+  const errors = [];
+  try {
+    await loadStatus();
+  } catch (error) {
+    statuses = [];
+    errors.push(String(error));
+  }
+  try {
+    await loadMachines(true);
+  } catch (error) {
+    machineStatus = { online: 0, total: 0, machines: [] };
+    updateMachineStatusUi();
+    errors.push(String(error));
+  }
   render();
   startStatusPolling();
+  if (errors.length) {
+    setMessage(errors.join(" | "));
+  }
 }
 
 async function loadStatus() {
@@ -93,11 +109,26 @@ async function refreshStatusOnly() {
   }
   statusPolling = true;
   try {
-    statuses = await invoke("get_status");
-    await loadMachines(false);
-    updateStatusUi();
-  } catch (error) {
-    setMessage(String(error));
+    const errors = [];
+    try {
+      statuses = await invoke("get_status");
+    } catch (error) {
+      statuses = [];
+      errors.push(String(error));
+    }
+    try {
+      await loadMachines(true);
+    } catch (error) {
+      errors.push(String(error));
+    }
+    try {
+      updateStatusUi();
+    } catch (error) {
+      errors.push(String(error));
+    }
+    if (errors.length) {
+      setMessage(errors.join(" | "));
+    }
   } finally {
     statusPolling = false;
   }

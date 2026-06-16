@@ -32,7 +32,7 @@ enum CommandKind {
         install_dir: PathBuf,
     },
     DeployNas {
-        #[arg(long, default_value = "192.168.3.178")]
+        #[arg(long, default_value = "192.168.2.247")]
         host: String,
         #[arg(long, default_value_t = 10022)]
         port: u16,

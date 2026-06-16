@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 CONFIG="${CONFIG:-conf/auto_sync.toml}"
-HOST="${HOST:-192.168.3.178}"
+HOST="${HOST:-192.168.2.247}"
 PORT="${PORT:-10022}"
 USER="${USER:-root}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/auto_sync}"

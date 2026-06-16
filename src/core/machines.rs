@@ -1,15 +1,17 @@
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::core::config::{AppConfig, MachineConfig, load_config, normalized_machines};
+use crate::core::config::{
+    AppConfig, MachineConfig, load_config, normalized_machines, preferred_local_host,
+};
 
 pub const DISCOVERY_PORT: u16 = 18766;
 const DISCOVERY_MAGIC: &[u8] = b"auto_sync_discover_v1";
@@ -121,8 +123,8 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
 }
 
 pub fn spawn_discovery_responder(config_path: Arc<PathBuf>, web_port: u16) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let socket = match tokio::net::UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
+    std::thread::spawn(move || {
+        let socket = match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) {
             Ok(socket) => socket,
             Err(err) => {
                 warn!(error = %err, "failed to bind LAN discovery responder");
@@ -131,7 +133,7 @@ pub fn spawn_discovery_responder(config_path: Arc<PathBuf>, web_port: u16) -> Jo
         };
         let mut buf = [0_u8; 512];
         loop {
-            let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+            let Ok((len, peer)) = socket.recv_from(&mut buf) else {
                 continue;
             };
             if &buf[..len] != DISCOVERY_MAGIC {
@@ -144,7 +146,7 @@ pub fn spawn_discovery_responder(config_path: Arc<PathBuf>, web_port: u16) -> Jo
             let Ok(raw) = serde_json::to_vec(&health) else {
                 continue;
             };
-            if let Err(err) = socket.send_to(&raw, peer).await {
+            if let Err(err) = socket.send_to(&raw, peer) {
                 debug!(error = %err, "failed to send discovery response");
             }
         }
@@ -155,7 +157,11 @@ pub fn discover_lan(timeout: Duration) -> Result<Vec<MachineHealth>> {
     let socket = UdpSocket::bind(("0.0.0.0", 0)).context("failed to open discovery socket")?;
     socket.set_broadcast(true)?;
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-    socket.send_to(DISCOVERY_MAGIC, ("255.255.255.255", DISCOVERY_PORT))?;
+    for target in discovery_targets() {
+        if let Err(err) = socket.send_to(DISCOVERY_MAGIC, target) {
+            debug!(error = %err, %target, "failed to send LAN discovery packet");
+        }
+    }
     let start = Instant::now();
     let mut out: Vec<MachineHealth> = Vec::new();
     let mut buf = [0_u8; 2048];
@@ -177,6 +183,25 @@ pub fn discover_lan(timeout: Duration) -> Result<Vec<MachineHealth>> {
         }
     }
     Ok(out)
+}
+
+fn discovery_targets() -> Vec<SocketAddr> {
+    let mut targets = vec![SocketAddr::from((
+        Ipv4Addr::new(255, 255, 255, 255),
+        DISCOVERY_PORT,
+    ))];
+    if let Ok(ip) = preferred_local_host().parse::<Ipv4Addr>() {
+        let [a, b, c, _] = ip.octets();
+        if !ip.is_loopback() && !ip.is_unspecified() {
+            targets.push(SocketAddr::from((
+                Ipv4Addr::new(a, b, c, 255),
+                DISCOVERY_PORT,
+            )));
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
 }
 
 pub fn remote_get_json<T: DeserializeOwned>(
