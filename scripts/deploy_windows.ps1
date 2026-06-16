@@ -3,6 +3,7 @@ param(
     [string]$RuntimeDir = "",
     [string]$Config = "",
     [string]$AuthorizedKeyFile = "",
+    [int]$SshPort = 10022,
     [switch]$NoBuild,
     [switch]$InstallSshd,
     [switch]$SkipSshd,
@@ -51,7 +52,9 @@ function Invoke-ElevatedSelf {
         "-Config",
         $Config,
         "-AuthorizedKeyFile",
-        $AuthorizedKeyFile
+        $AuthorizedKeyFile,
+        "-SshPort",
+        ([string]$SshPort)
     )
     if ($NoBuild) { $args += "-NoBuild" }
     if ($InstallSshd) { $args += "-InstallSshd" }
@@ -305,24 +308,93 @@ function Ensure-SshHostKeys {
     }
 }
 
+function Set-SshdConfigOption {
+    param(
+        [string]$Path,
+        [string]$Key,
+        [string]$Value
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Missing sshd_config: $Path"
+    }
+
+    $lines = @(Get-Content -LiteralPath $Path)
+    $pattern = "^\s*#?\s*$([regex]::Escape($Key))(\s+|$)"
+    $replacement = "$Key $Value"
+    $updated = New-Object System.Collections.Generic.List[string]
+    $replaced = $false
+    foreach ($line in $lines) {
+        if ($line -match $pattern) {
+            if (-not $replaced) {
+                $updated.Add($replacement)
+                $replaced = $true
+            }
+            continue
+        }
+        $updated.Add($line)
+    }
+    if (-not $replaced) {
+        $updated.Add($replacement)
+    }
+    Set-Content -LiteralPath $Path -Value $updated -Encoding ascii
+}
+
+function Configure-OpenSshServer {
+    param([int]$Port)
+
+    $config = Join-Path $env:ProgramData "ssh\sshd_config"
+    Set-SshdConfigOption -Path $config -Key "Port" -Value ([string]$Port)
+    Set-SshdConfigOption -Path $config -Key "PubkeyAuthentication" -Value "yes"
+    Set-SshdConfigOption -Path $config -Key "PasswordAuthentication" -Value "no"
+    Set-SshdConfigOption -Path $config -Key "KbdInteractiveAuthentication" -Value "no"
+    Set-SshdConfigOption -Path $config -Key "ChallengeResponseAuthentication" -Value "no"
+}
+
 function Ensure-OpenSshFirewall {
+    param([int]$Port)
+
+    $ruleName = "OpenSSH-Server-In-TCP-$Port"
     try {
-        $rule = Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue
+        $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
         if ($rule) {
-            Enable-NetFirewallRule -Name "OpenSSH-Server-In-TCP" | Out-Null
+            Enable-NetFirewallRule -Name $ruleName | Out-Null
         }
         else {
-            New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" `
-                -DisplayName "OpenSSH SSH Server" `
+            New-NetFirewallRule -Name $ruleName `
+                -DisplayName "OpenSSH SSH Server ($Port)" `
                 -Enabled True `
                 -Direction Inbound `
                 -Protocol TCP `
                 -Action Allow `
-                -LocalPort 22 | Out-Null
+                -LocalPort $Port | Out-Null
         }
+
+        $targetPort = [string]$Port
+        Get-NetFirewallRule -Direction Inbound -ErrorAction Stop |
+            Where-Object { $_.Name -like "*OpenSSH*" -or $_.DisplayName -like "*OpenSSH*" -or $_.Group -like "*OpenSSH*" } |
+            ForEach-Object {
+                $rule = $_
+                $hasTargetPort = $false
+                $rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Protocol -eq "TCP" } |
+                    ForEach-Object {
+                        if ([string]$_.LocalPort -eq $targetPort) {
+                            $hasTargetPort = $true
+                        }
+                    }
+                if (-not $hasTargetPort) {
+                    Disable-NetFirewallRule -Name $rule.Name | Out-Null
+                }
+            }
     }
     catch {
-        netsh advfirewall firewall add rule name="OpenSSH SSH Server" dir=in action=allow protocol=TCP localport=22 | Out-Null
+        netsh advfirewall firewall add rule name="OpenSSH SSH Server ($Port)" dir=in action=allow protocol=TCP localport=$Port | Out-Null
+        if ($Port -ne 22) {
+            netsh advfirewall firewall set rule name="OpenSSH SSH Server" dir=in new enable=no 2>$null | Out-Null
+            netsh advfirewall firewall set rule name="OpenSSH SSH Server (22)" dir=in new enable=no 2>$null | Out-Null
+            netsh advfirewall firewall set rule name="OpenSSH SSH Server (sshd)" dir=in new enable=no 2>$null | Out-Null
+        }
     }
 }
 
@@ -417,16 +489,23 @@ function Ensure-Sshd {
     }
 
     Ensure-SshHostKeys -OpenSshBin $selectedOpenSshBin
+    Configure-OpenSshServer -Port $SshPort
     Repair-OpenSshProgramDataPermissions
-    Ensure-OpenSshFirewall
+    Ensure-OpenSshFirewall -Port $SshPort
     Set-Service -Name sshd -StartupType Automatic
-    Start-Service -Name sshd
+    if ((Get-Service sshd -ErrorAction SilentlyContinue).Status -eq "Running") {
+        Restart-Service -Name sshd -Force
+    }
+    else {
+        Start-Service -Name sshd
+    }
     $defaultShell = Set-OpenSshDefaultShell
 
     [PSCustomObject]@{
         OpenSshBin = $selectedOpenSshBin
         ServiceStatus = (Get-Service sshd).Status
         DefaultShell = $defaultShell
+        Port = $SshPort
     }
 }
 
@@ -572,6 +651,7 @@ Write-Host "cwRsync bin: $($runtime.CwrsyncBin)"
 Write-Host "PATH scope: $pathScope"
 if ($sshResult) {
     Write-Host "sshd status: $($sshResult.ServiceStatus)"
+    Write-Host "sshd port: $($sshResult.Port)"
     if ($sshResult.DefaultShell) {
         Write-Host "OpenSSH default shell: $($sshResult.DefaultShell)"
     }
