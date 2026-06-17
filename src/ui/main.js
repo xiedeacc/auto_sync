@@ -13,6 +13,7 @@ let scheduleEditor = null;
 let excludeEditor = null;
 let latestDestinationSchedule = defaultDestinationSchedule();
 let activeSourceTab = "sources";
+let machineHostLocked = false;
 
 const el = {
   configPath: document.getElementById("config-path"),
@@ -204,6 +205,7 @@ function closeMachineModal() {
 
 function renderMachineModal() {
   const machines = machineStatus?.machines || [];
+  const selectedId = cleanMachineId(el.machineId.value);
   if (!machines.length) {
     el.machineList.innerHTML = `<div class="empty">No machines discovered</div>`;
   } else {
@@ -218,7 +220,7 @@ function renderMachineModal() {
         <span></span>
       </div>
       ${machines.map((machine) => `
-        <div class="machine-row">
+        <div class="machine-row ${machine.id === selectedId ? "machine-row-selected" : ""}" data-id="${escapeAttr(machine.id)}" title="Edit machine">
           <span class="machine-dot ${machine.online ? "online" : ""}" title="${machine.online ? "Online" : "Offline"}"></span>
           <div class="machine-name-cell">
             <div class="machine-name">${escapeHtml(machine.name || machine.id)}</div>
@@ -228,32 +230,72 @@ function renderMachineModal() {
           <div class="machine-cell">${escapeHtml(String(machine.web_port || "-"))}</div>
           <div class="machine-cell">${escapeHtml(machineSshLabel(machine))}</div>
           <div class="machine-cell">${escapeHtml(machine.os || "-")}</div>
-          <button data-action="use-machine" data-id="${escapeAttr(machine.id)}" ${machine.id === "local" ? "disabled" : ""}>Edit</button>
+          <button class="danger icon" data-action="remove-machine" data-id="${escapeAttr(machine.id)}" title="Delete machine" ${machine.id === "local" ? "disabled" : ""}>x</button>
         </div>
       `).join("")}
     `;
-    for (const button of el.machineList.querySelectorAll('[data-action="use-machine"]')) {
-      button.onclick = () => {
-        const machine = machines.find((item) => item.id === button.dataset.id);
+    for (const row of el.machineList.querySelectorAll(".machine-row[data-id]")) {
+      row.onclick = () => {
+        const machine = machines.find((item) => item.id === row.dataset.id);
         if (!machine) {
           return;
         }
-        el.machineId.value = machine.id || "";
-        el.machineName.value = machine.name || machine.id || "";
-        el.machineHost.value = machine.host || "";
-        el.machineWebPort.value = machine.web_port || 18765;
-        el.machineSshUser.value = machine.ssh_user || "";
-        el.machineSshPort.value = machine.ssh_port || 22;
-        el.machineOs.value = machine.os || "linux";
-        setMachineHostLocked(Boolean(machine.discovered));
+        selectMachineForEdit(machine);
+      };
+    }
+    for (const button of el.machineList.querySelectorAll('[data-action="remove-machine"]')) {
+      button.onclick = (event) => {
+        event.stopPropagation();
+        removeMachine(button.dataset.id).catch((error) => setMessage(String(error)));
       };
     }
   }
+  syncMachineFormLock(machines);
+}
+
+function selectMachineForEdit(machine) {
+  el.machineId.value = machine.id || "";
+  el.machineName.value = machine.name || machine.id || "";
+  el.machineHost.value = machine.host || "";
+  el.machineWebPort.value = machine.web_port || 18765;
+  el.machineSshUser.value = machine.ssh_user || "";
+  el.machineSshPort.value = machine.ssh_port || 22;
+  el.machineOs.value = machine.os || "linux";
+  setMachineHostLocked(machineHostShouldLock(machine));
+  renderMachineModal();
+}
+
+function clearMachineForm() {
+  el.machineId.value = "";
+  el.machineName.value = "";
+  el.machineHost.value = "";
+  el.machineWebPort.value = 18765;
+  el.machineSshUser.value = "root";
+  el.machineSshPort.value = 22;
+  el.machineOs.value = "linux";
+  setMachineHostLocked(false);
+}
+
+function syncMachineFormLock(machines) {
+  const selectedId = cleanMachineId(el.machineId.value);
+  if (!selectedId) {
+    setMachineHostLocked(false);
+    return;
+  }
+  const selected = machines.find((machine) => machine.id === selectedId);
+  if (selected) {
+    setMachineHostLocked(machineHostShouldLock(selected));
+  }
+}
+
+function machineHostShouldLock(machine) {
+  return Boolean(machine?.online);
 }
 
 function setMachineHostLocked(locked) {
+  machineHostLocked = locked;
   el.machineHost.disabled = locked;
-  el.machineHost.title = locked ? "Discovered machine host cannot be changed" : "";
+  el.machineHost.title = locked ? "Detected online machine host cannot be changed" : "";
 }
 
 function machineSshLabel(machine) {
@@ -294,7 +336,21 @@ async function addMachine() {
   cfg = await invoke("add_machine", { machine });
   normalizeConfig(cfg);
   await loadMachines(false);
-  setMachineHostLocked(false);
+  setMachineHostLocked(machineHostLocked);
+  setMessage("");
+}
+
+async function removeMachine(machineId) {
+  const id = cleanMachineId(machineId);
+  if (!id || id === "local") {
+    return;
+  }
+  cfg = await invoke("remove_machine", { machineId: id });
+  normalizeConfig(cfg);
+  if (cleanMachineId(el.machineId.value) === id) {
+    clearMachineForm();
+  }
+  await loadMachines(false);
   setMessage("");
 }
 
@@ -1555,6 +1611,7 @@ async function invokeWeb(command, payload = {}) {
     get_machines: ["GET", "/api/machines"],
     discover_machines: ["GET", "/api/machines/discover"],
     add_machine: ["POST", "/api/machines"],
+    remove_machine: ["DELETE", "/api/machines"],
     get_status: ["GET", "/api/status"],
     sync_now: ["POST", "/api/sync-now"],
     sync_source_now: ["POST", "/api/sync-source-now"],
@@ -1572,6 +1629,9 @@ async function invokeWeb(command, payload = {}) {
   if (command === "browse_paths") {
     const machineId = payload.machineId || payload.machine_id || "local";
     url = `${path}?path=${encodeURIComponent(payload.path || "/")}&machine_id=${encodeURIComponent(machineId)}`;
+  } else if (command === "remove_machine") {
+    const machineId = payload.machineId || payload.machine_id;
+    url = `${path}/${encodeURIComponent(machineId || "")}`;
   } else if (method !== "GET") {
     options.headers["Content-Type"] = "application/json";
     if (command === "save_config_command") {

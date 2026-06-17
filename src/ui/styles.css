@@ -563,6 +563,15 @@ th {
   border-bottom: 1px solid var(--line);
 }
 
+.machine-row[data-id] {
+  cursor: pointer;
+}
+
+.machine-row[data-id]:hover,
+.machine-row-selected {
+  background: #f8fafc;
+}
+
 .machine-row > * {
   min-width: 0;
 }
@@ -577,6 +586,11 @@ th {
 .machine-row button {
   width: 52px;
   padding: 0;
+}
+
+.machine-row button.icon {
+  width: 34px;
+  justify-self: end;
 }
 
 .machine-dot {

@@ -13,11 +13,12 @@ use auto_sync::core::machines::{
 };
 use auto_sync::core::state::{DestinationView, State as DbState};
 use auto_sync::core::sync::{sync_all_now, sync_destination_now, sync_source_now};
+use axum::extract::Path as AxumPath;
 use axum::extract::Query;
 use axum::extract::State as AxumState;
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,7 @@ async fn main() -> Result<()> {
         .route("/api/config", get(api_get_config).post(api_save_config))
         .route("/api/health", get(api_health))
         .route("/api/machines", get(api_machines).post(api_add_machine))
+        .route("/api/machines/:machine_id", delete(api_remove_machine))
         .route("/api/machines/discover", get(api_discover_machines))
         .route("/api/status", get(api_status))
         .route("/api/sync-now", post(api_sync_now))
@@ -150,6 +152,18 @@ async fn api_add_machine(
     } else {
         cfg.machines.push(machine);
     }
+    Ok(Json(save_config(&state.config_path, &cfg)?))
+}
+
+async fn api_remove_machine(
+    AxumState(state): AxumState<WebState>,
+    AxumPath(machine_id): AxumPath<String>,
+) -> Result<Json<AppConfig>, ApiError> {
+    if machine_id == "local" {
+        return Err(anyhow::anyhow!("local machine cannot be deleted").into());
+    }
+    let mut cfg = load_or_create_config(&state.config_path)?;
+    cfg.machines.retain(|machine| machine.id != machine_id);
     Ok(Json(save_config(&state.config_path, &cfg)?))
 }
 

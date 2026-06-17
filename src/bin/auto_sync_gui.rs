@@ -80,6 +80,19 @@ fn add_machine(
 }
 
 #[tauri::command]
+fn remove_machine(
+    state: tauri::State<'_, GuiState>,
+    machine_id: String,
+) -> Result<AppConfig, String> {
+    if machine_id == "local" {
+        return Err("local machine cannot be deleted".to_string());
+    }
+    let mut cfg = load_or_create_config(&state.config_path).map_err(error_text)?;
+    cfg.machines.retain(|machine| machine.id != machine_id);
+    save_config(&state.config_path, &cfg).map_err(error_text)
+}
+
+#[tauri::command]
 fn get_status(state: tauri::State<'_, GuiState>) -> Result<Vec<DestinationView>, String> {
     let cfg = load_config(&state.config_path).map_err(error_text)?;
     let state_db = DbState::open(&cfg.app.data_db).map_err(error_text)?;
@@ -256,6 +269,7 @@ fn main() -> Result<()> {
             get_machines,
             discover_machines,
             add_machine,
+            remove_machine,
             get_status,
             sync_now,
             sync_source_now,
