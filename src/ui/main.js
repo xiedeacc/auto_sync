@@ -245,9 +245,15 @@ function renderMachineModal() {
         el.machineSshUser.value = machine.ssh_user || "";
         el.machineSshPort.value = machine.ssh_port || 22;
         el.machineOs.value = machine.os || "linux";
+        setMachineHostLocked(Boolean(machine.discovered));
       };
     }
   }
+}
+
+function setMachineHostLocked(locked) {
+  el.machineHost.disabled = locked;
+  el.machineHost.title = locked ? "Discovered machine host cannot be changed" : "";
 }
 
 function machineSshLabel(machine) {
@@ -288,6 +294,7 @@ async function addMachine() {
   cfg = await invoke("add_machine", { machine });
   normalizeConfig(cfg);
   await loadMachines(false);
+  setMachineHostLocked(false);
   setMessage("");
 }
 

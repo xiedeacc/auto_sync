@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -61,11 +62,11 @@ pub fn local_health(cfg: &AppConfig, web_port: u16) -> MachineHealth {
         .find(|machine| machine.id == "local")
         .cloned()
         .unwrap_or_else(MachineConfig::local);
-    let (ssh_user, ssh_port) = advertised_ssh_config(&machines, &local, web_port);
+    let (ssh_user, ssh_port) = advertised_ssh_config(cfg, &machines, &local, web_port);
     let host = local.host;
     MachineHealth {
         id: discovery_machine_id(&host, web_port),
-        name: local.name,
+        name: local_machine_name(&local.name),
         host,
         web_port,
         ssh_user,
@@ -77,8 +78,9 @@ pub fn local_health(cfg: &AppConfig, web_port: u16) -> MachineHealth {
 
 pub fn machine_status(cfg: &AppConfig) -> MachineStatus {
     let mut machines = Vec::new();
-    for machine in normalized_machines(cfg).into_iter().filter(|m| m.enabled) {
-        let endpoint = machine_endpoint_key(&machine);
+    let normalized = normalized_machines(cfg);
+    for machine in normalized.iter().filter(|m| m.enabled) {
+        let endpoint = machine_endpoint_key(machine);
         if let Some(existing) = machines
             .iter_mut()
             .find(|view| machine_view_endpoint_key(view) == endpoint)
@@ -86,15 +88,23 @@ pub fn machine_status(cfg: &AppConfig) -> MachineStatus {
             merge_ssh_from_machine(existing, &machine);
             continue;
         }
-        let online = machine.id == "local" || ping_machine(&machine);
+        let online = machine.id == "local" || ping_machine(machine);
+        let (ssh_user, ssh_port) = if machine.id == "local" {
+            advertised_ssh_config(cfg, &normalized, machine, machine.web_port)
+        } else {
+            (
+                machine.ssh_user.trim().to_string(),
+                normalized_ssh_port(machine.ssh_port),
+            )
+        };
         machines.push(MachineView {
-            id: machine.id,
-            name: machine.name,
-            host: machine.host,
+            id: machine.id.clone(),
+            name: machine.name.clone(),
+            host: machine.host.clone(),
             web_port: machine.web_port,
-            ssh_user: machine.ssh_user,
-            ssh_port: machine.ssh_port,
-            os: machine.os,
+            ssh_user,
+            ssh_port,
+            os: machine.os.clone(),
             enabled: machine.enabled,
             manual: machine.manual,
             online,
@@ -129,11 +139,38 @@ fn normalized_ssh_port(port: u16) -> u16 {
     if port == 0 { default_ssh_port() } else { port }
 }
 
+fn local_machine_name(fallback: &str) -> String {
+    for value in [
+        std::env::var("COMPUTERNAME").ok(),
+        std::env::var("HOSTNAME").ok(),
+        std::fs::read_to_string("/etc/hostname").ok(),
+        Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+    let fallback = fallback.trim();
+    if fallback.is_empty() {
+        "This machine".to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
 fn has_advertised_ssh(machine: &MachineConfig) -> bool {
     !machine.ssh_user.trim().is_empty() || normalized_ssh_port(machine.ssh_port) != 22
 }
 
 fn advertised_ssh_config(
+    cfg: &AppConfig,
     machines: &[MachineConfig],
     local: &MachineConfig,
     web_port: u16,
@@ -150,10 +187,130 @@ fn advertised_ssh_config(
             normalized_ssh_port(machine.ssh_port),
         );
     }
+    if let Some(ssh_port) = detect_local_ssh_port(cfg, machines, local) {
+        return (advertised_ssh_user(cfg, local, ssh_port), ssh_port);
+    }
     (
         local.ssh_user.trim().to_string(),
         normalized_ssh_port(local.ssh_port),
     )
+}
+
+fn detect_local_ssh_port(
+    cfg: &AppConfig,
+    machines: &[MachineConfig],
+    local: &MachineConfig,
+) -> Option<u16> {
+    let hosts = local_ssh_probe_hosts(local);
+    let ports = local_ssh_probe_ports(cfg, machines, local);
+    detect_ssh_port(&hosts, &ports)
+}
+
+fn local_ssh_probe_hosts(local: &MachineConfig) -> Vec<String> {
+    let mut hosts = Vec::new();
+    push_unique_string(&mut hosts, "127.0.0.1".to_string());
+    push_unique_string(&mut hosts, local.host.trim().to_string());
+    hosts
+}
+
+fn local_ssh_probe_ports(
+    cfg: &AppConfig,
+    machines: &[MachineConfig],
+    local: &MachineConfig,
+) -> Vec<u16> {
+    let mut ports = Vec::new();
+    let local_port = normalized_ssh_port(local.ssh_port);
+    if local_port != 22 {
+        push_unique_port(&mut ports, local_port);
+    }
+    for target in &cfg.deploy.targets {
+        if is_localish_host(&target.host, &local.host) {
+            push_unique_port(&mut ports, target.port);
+        }
+    }
+    for machine in machines {
+        let port = normalized_ssh_port(machine.ssh_port);
+        if port != 22 {
+            push_unique_port(&mut ports, port);
+        }
+    }
+    push_unique_port(&mut ports, 10022);
+    push_unique_port(&mut ports, 22);
+    ports
+}
+
+fn advertised_ssh_user(cfg: &AppConfig, local: &MachineConfig, ssh_port: u16) -> String {
+    if !local.ssh_user.trim().is_empty() {
+        return local.ssh_user.trim().to_string();
+    }
+    cfg.deploy
+        .targets
+        .iter()
+        .find(|target| {
+            is_localish_host(&target.host, &local.host)
+                && (target.port == ssh_port || target.port == 0)
+                && !target.user.trim().is_empty()
+        })
+        .or_else(|| {
+            cfg.deploy.targets.iter().find(|target| {
+                is_localish_host(&target.host, &local.host) && !target.user.trim().is_empty()
+            })
+        })
+        .map(|target| target.user.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn is_localish_host(host: &str, local_host: &str) -> bool {
+    let host = host.trim();
+    host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.eq_ignore_ascii_case(local_host.trim())
+}
+
+fn detect_ssh_port(hosts: &[String], ports: &[u16]) -> Option<u16> {
+    for &port in ports {
+        if port == 0 {
+            continue;
+        }
+        if hosts.iter().any(|host| ssh_port_has_banner(host, port)) {
+            return Some(port);
+        }
+    }
+    None
+}
+
+fn ssh_port_has_banner(host: &str, port: u16) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    for addr in addrs {
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(120)) else {
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(180)));
+        let mut buf = [0_u8; 4];
+        if stream.read_exact(&mut buf).is_ok() && &buf == b"SSH-" {
+            return true;
+        }
+    }
+    false
+}
+
+fn push_unique_port(values: &mut Vec<u16>, value: u16) {
+    if value != 0 && !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !values.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
+        values.push(value);
+    }
 }
 
 fn merge_ssh_from_machine(view: &mut MachineView, machine: &MachineConfig) {
@@ -168,6 +325,9 @@ fn merge_ssh_from_machine(view: &mut MachineView, machine: &MachineConfig) {
 }
 
 fn merge_ssh_from_health(view: &mut MachineView, health: &MachineHealth) {
+    if view.manual {
+        return;
+    }
     let ssh_user = health.ssh_user.trim();
     if view.ssh_user.trim().is_empty() && !ssh_user.is_empty() {
         view.ssh_user = ssh_user.to_string();
@@ -192,6 +352,7 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
             .find(|machine| machine.host == health.host && machine.web_port == health.web_port)
         {
             existing.online = true;
+            merge_name_from_health(existing, &health);
             merge_ssh_from_health(existing, &health);
             continue;
         }
@@ -203,14 +364,7 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
         id = unique_machine_id(id, &known_ids);
         known_ids.insert(id.clone());
 
-        let name = if health.name.trim().is_empty()
-            || health.name == "local"
-            || health.name == "This machine"
-        {
-            health.host.clone()
-        } else {
-            health.name
-        };
+        let name = discovered_machine_name(&health);
 
         status.machines.push(MachineView {
             id,
@@ -233,6 +387,21 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
         .count();
     status.total = status.machines.len();
     status
+}
+
+fn merge_name_from_health(view: &mut MachineView, health: &MachineHealth) {
+    if !view.manual {
+        view.name = discovered_machine_name(health);
+    }
+}
+
+fn discovered_machine_name(health: &MachineHealth) -> String {
+    let name = health.name.trim();
+    if name.is_empty() || name == "local" || name == "This machine" {
+        health.host.clone()
+    } else {
+        name.to_string()
+    }
 }
 
 fn discovery_machine_id(host: &str, web_port: u16) -> String {
@@ -483,6 +652,8 @@ fn windows_path_to_cygwin(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn converts_windows_drive_paths_for_rsync() {
@@ -567,6 +738,21 @@ mod tests {
     }
 
     #[test]
+    fn detects_local_ssh_port_from_banner() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"SSH-2.0-auto_sync_test\r\n").unwrap();
+        });
+
+        let detected = detect_ssh_port(&["127.0.0.1".to_string()], &[port, 22]);
+
+        handle.join().unwrap();
+        assert_eq!(detected, Some(port));
+    }
+
+    #[test]
     fn machine_health_defaults_ssh_for_old_peers() {
         let health: MachineHealth = serde_json::from_str(
             r#"{"id":"peer","name":"peer","host":"203.0.113.20","web_port":18765,"os":"linux","version":"0.1.0"}"#,
@@ -603,6 +789,8 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "local");
         assert!(matches[0].online);
+        assert_eq!(matches[0].ssh_user, "root");
+        assert_eq!(matches[0].ssh_port, 10022);
     }
 
     #[test]
@@ -614,6 +802,7 @@ mod tests {
         nas.host = "203.0.113.10".to_string();
         nas.web_port = 18765;
         nas.os = "linux".to_string();
+        nas.manual = false;
         cfg.machines.push(nas);
 
         let status = merge_discovered(
@@ -640,5 +829,45 @@ mod tests {
         assert!(matches[0].online);
         assert_eq!(matches[0].ssh_user, "root");
         assert_eq!(matches[0].ssh_port, 10022);
+    }
+
+    #[test]
+    fn merge_discovered_preserves_manual_machine_edits() {
+        let mut cfg = AppConfig::default();
+        cfg.machines.push(MachineConfig {
+            id: "manual_peer".to_string(),
+            name: "Manual Name".to_string(),
+            host: "203.0.113.30".to_string(),
+            web_port: 18765,
+            ssh_user: "manual".to_string(),
+            ssh_port: 2222,
+            os: "linux".to_string(),
+            enabled: true,
+            manual: true,
+        });
+
+        let status = merge_discovered(
+            &cfg,
+            vec![MachineHealth {
+                id: "lan_peer".to_string(),
+                name: "Auto Name".to_string(),
+                host: "203.0.113.30".to_string(),
+                web_port: 18765,
+                ssh_user: "root".to_string(),
+                ssh_port: 10022,
+                os: "linux".to_string(),
+                version: "0.1.0".to_string(),
+            }],
+        );
+
+        let peer = status
+            .machines
+            .iter()
+            .find(|machine| machine.id == "manual_peer")
+            .unwrap();
+        assert!(peer.online);
+        assert_eq!(peer.name, "Manual Name");
+        assert_eq!(peer.ssh_user, "manual");
+        assert_eq!(peer.ssh_port, 2222);
     }
 }

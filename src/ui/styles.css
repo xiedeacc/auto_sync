@@ -134,6 +134,13 @@ select {
   color: var(--text);
 }
 
+input:disabled,
+select:disabled {
+  background: #eef2f6;
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
 label {
   display: block;
   margin-bottom: 4px;
