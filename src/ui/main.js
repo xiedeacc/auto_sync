@@ -267,17 +267,18 @@ async function discoverMachines() {
 }
 
 async function addMachine() {
-  const id = cleanMachineId(el.machineId.value);
   const host = trimPathValue(el.machineHost.value);
-  if (!id || !host) {
-    setMessage("Machine ID and host are required");
+  if (!host) {
+    setMessage("Machine host is required");
     return;
   }
+  const webPort = Number(el.machineWebPort.value || 18765);
+  const id = cleanMachineId(el.machineId.value) || machineIdFromEndpoint(host, webPort);
   const machine = {
     id,
     name: trimPathValue(el.machineName.value) || id,
     host,
-    web_port: Number(el.machineWebPort.value || 18765),
+    web_port: webPort,
     ssh_user: trimPathValue(el.machineSshUser.value),
     ssh_port: Number(el.machineSshPort.value || 22),
     os: el.machineOs.value || "linux",
@@ -781,6 +782,12 @@ function normalizeMachines(values) {
 
 function cleanMachineId(value) {
   return String(value || "").trim().replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+function machineIdFromEndpoint(host, webPort) {
+  const hostId = cleanMachineId(host).replace(/^_+|_+$/g, "");
+  const port = Number(webPort || 18765);
+  return hostId ? `machine_${hostId}_${port}` : `machine_${port}`;
 }
 
 function machineIdOrLocal(value) {

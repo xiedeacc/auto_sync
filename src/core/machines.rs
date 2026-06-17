@@ -67,7 +67,11 @@ pub fn local_health(cfg: &AppConfig, web_port: u16) -> MachineHealth {
 
 pub fn machine_status(cfg: &AppConfig) -> MachineStatus {
     let mut machines = Vec::new();
+    let mut endpoints = HashSet::new();
     for machine in normalized_machines(cfg).into_iter().filter(|m| m.enabled) {
+        if !endpoints.insert(machine_endpoint_key(&machine)) {
+            continue;
+        }
         let online = machine.id == "local" || ping_machine(&machine);
         machines.push(MachineView {
             id: machine.id,
@@ -89,6 +93,10 @@ pub fn machine_status(cfg: &AppConfig) -> MachineStatus {
         total: machines.len(),
         machines,
     }
+}
+
+fn machine_endpoint_key(machine: &MachineConfig) -> (String, u16) {
+    (machine.host.trim().to_ascii_lowercase(), machine.web_port)
 }
 
 pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> MachineStatus {
@@ -416,7 +424,7 @@ mod tests {
                 MachineHealth {
                     id: "local".to_string(),
                     name: "This machine".to_string(),
-                    host: "192.168.2.247".to_string(),
+                    host: "203.0.113.10".to_string(),
                     web_port: 18765,
                     os: "linux".to_string(),
                     version: "0.1.0".to_string(),
@@ -424,7 +432,7 @@ mod tests {
                 MachineHealth {
                     id: "local".to_string(),
                     name: "This machine".to_string(),
-                    host: "192.168.2.126".to_string(),
+                    host: "203.0.113.11".to_string(),
                     web_port: 18765,
                     os: "linux".to_string(),
                     version: "0.1.0".to_string(),
@@ -433,15 +441,15 @@ mod tests {
         );
 
         assert!(status.machines.iter().any(|machine| {
-            machine.id.starts_with("lan_192_168_2_247_18765_")
-                && machine.id.len() == "lan_192_168_2_247_18765_".len() + 8
-                && machine.name == "192.168.2.247"
+            machine.id.starts_with("lan_203_0_113_10_18765_")
+                && machine.id.len() == "lan_203_0_113_10_18765_".len() + 8
+                && machine.name == "203.0.113.10"
                 && machine.discovered
         }));
         assert!(status.machines.iter().any(|machine| {
-            machine.id.starts_with("lan_192_168_2_126_18765_")
-                && machine.id.len() == "lan_192_168_2_126_18765_".len() + 8
-                && machine.name == "192.168.2.126"
+            machine.id.starts_with("lan_203_0_113_11_18765_")
+                && machine.id.len() == "lan_203_0_113_11_18765_".len() + 8
+                && machine.name == "203.0.113.11"
                 && machine.discovered
         }));
     }
@@ -458,12 +466,40 @@ mod tests {
     }
 
     #[test]
+    fn machine_status_prefers_local_for_duplicate_endpoint() {
+        let mut cfg = AppConfig::default();
+        let local_host = MachineConfig::local().host;
+        cfg.machines.push(MachineConfig {
+            id: "nas".to_string(),
+            name: "nas".to_string(),
+            host: local_host.clone(),
+            web_port: 18765,
+            ssh_user: "root".to_string(),
+            ssh_port: 10022,
+            os: "linux".to_string(),
+            enabled: true,
+            manual: true,
+        });
+
+        let status = machine_status(&cfg);
+        let matches: Vec<_> = status
+            .machines
+            .iter()
+            .filter(|machine| machine.host == local_host && machine.web_port == 18765)
+            .collect();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, "local");
+        assert!(matches[0].online);
+    }
+
+    #[test]
     fn merge_discovered_marks_existing_endpoint_online() {
         let mut cfg = AppConfig::default();
         let mut nas = MachineConfig::local();
         nas.id = "nas".to_string();
         nas.name = "nas".to_string();
-        nas.host = "192.168.2.247".to_string();
+        nas.host = "203.0.113.10".to_string();
         nas.web_port = 18765;
         nas.os = "linux".to_string();
         cfg.machines.push(nas);
@@ -473,7 +509,7 @@ mod tests {
             vec![MachineHealth {
                 id: "local".to_string(),
                 name: "This machine".to_string(),
-                host: "192.168.2.247".to_string(),
+                host: "203.0.113.10".to_string(),
                 web_port: 18765,
                 os: "linux".to_string(),
                 version: "0.1.0".to_string(),
@@ -483,7 +519,7 @@ mod tests {
         let matches: Vec<_> = status
             .machines
             .iter()
-            .filter(|machine| machine.host == "192.168.2.247")
+            .filter(|machine| machine.host == "203.0.113.10")
             .collect();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "nas");

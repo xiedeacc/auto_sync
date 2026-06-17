@@ -345,10 +345,14 @@ pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
 }
 
 fn clean_machines(machines: &[MachineConfig]) -> Vec<MachineConfig> {
-    let local = MachineConfig::local();
+    let local = local_machine_from_config(machines);
     let mut seen = HashSet::new();
     let mut cleaned = Vec::new();
-    for machine in std::iter::once(&local).chain(machines.iter()) {
+    for machine in std::iter::once(&local).chain(
+        machines
+            .iter()
+            .filter(|machine| clean_id(&machine.id) != "local"),
+    ) {
         let mut machine = machine.clone();
         machine.id = clean_id(&machine.id);
         if machine.id.is_empty() || !seen.insert(machine.id.clone()) {
@@ -373,6 +377,45 @@ fn clean_machines(machines: &[MachineConfig]) -> Vec<MachineConfig> {
         cleaned.push(machine);
     }
     cleaned
+}
+
+fn local_machine_from_config(machines: &[MachineConfig]) -> MachineConfig {
+    let mut local = MachineConfig::local();
+    let Some(configured) = machines
+        .iter()
+        .find(|machine| clean_id(&machine.id) == "local")
+    else {
+        return local;
+    };
+
+    if !configured.name.trim().is_empty() {
+        local.name = configured.name.trim().to_string();
+    }
+    if is_advertisable_host(&configured.host) {
+        local.host = configured.host.trim().to_string();
+    }
+    if configured.web_port != 0 {
+        local.web_port = configured.web_port;
+    }
+    if configured.ssh_port != 0 {
+        local.ssh_port = configured.ssh_port;
+    }
+    if !configured.ssh_user.trim().is_empty() {
+        local.ssh_user = configured.ssh_user.trim().to_string();
+    }
+    if !configured.os.trim().is_empty() {
+        local.os = configured.os.trim().to_string();
+    }
+    local
+}
+
+fn is_advertisable_host(host: &str) -> bool {
+    let host = host.trim();
+    !host.is_empty()
+        && host != "0.0.0.0"
+        && host != "::"
+        && host != "localhost"
+        && !host.starts_with("127.")
 }
 
 fn clean_id(value: &str) -> String {
