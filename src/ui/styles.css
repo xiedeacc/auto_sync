@@ -42,6 +42,11 @@ header .toolbar {
   justify-content: flex-end;
 }
 
+header > div:first-child {
+  min-width: 0;
+  overflow: hidden;
+}
+
 h1,
 h2 {
   margin: 0;
@@ -208,6 +213,10 @@ th {
 }
 
 .subtle {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--muted);
   font-size: 12px;
 }

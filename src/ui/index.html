@@ -12,10 +12,10 @@
       <h1>auto_sync</h1>
       <span id="config-path" class="subtle"></span>
     </div>
-    <button id="machine-status" class="machine-status" title="Manage LAN machines">Machines -/-</button>
+    <button id="machine-status" class="machine-status" type="button" title="Manage LAN machines" onclick="window.autoSyncOpenMachines(event)">Machines -/-</button>
     <div class="toolbar">
-      <button id="config" title="Show current configuration">Config</button>
-      <button id="refresh" title="Refresh status">Refresh</button>
+      <button id="config" type="button" title="Show current configuration">Config</button>
+      <button id="refresh" type="button" title="Refresh status">Refresh</button>
     </div>
   </header>
 
@@ -89,7 +89,7 @@
     <div class="modal-panel machine-modal-panel">
       <div class="modal-head">
         <h2>Machines</h2>
-        <button id="machine-close" class="icon" title="Close">x</button>
+        <button id="machine-close" class="icon" type="button" title="Close" onclick="window.autoSyncCloseMachines(event)">x</button>
       </div>
       <div id="machine-list" class="machine-list"></div>
       <div class="machine-form">
@@ -116,8 +116,8 @@
           </select>
         </div>
         <div class="machine-form-actions">
-          <button id="machine-add" class="primary">Save</button>
-          <button id="machine-discover">Discover</button>
+          <button id="machine-add" class="primary" type="button">Save</button>
+          <button id="machine-discover" type="button" onclick="window.autoSyncRefreshMachines && window.autoSyncRefreshMachines(event)">Discover</button>
         </div>
       </div>
     </div>
@@ -148,6 +148,111 @@
     </div>
   </div>
 
+  <script>
+    (() => {
+      const isTauriAssetOrigin = location.hostname === "tauri.localhost";
+      const apiBase = (location.protocol === "http:" || location.protocol === "https:") && !isTauriAssetOrigin
+        ? ""
+        : "http://127.0.0.1:18765";
+      const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[ch]);
+      const machineSshLabel = (machine) => {
+        if (machine.id === "local" && !machine.ssh_user) {
+          return "-";
+        }
+        const port = machine.ssh_port || 22;
+        const user = machine.ssh_user === "Administrator" ? "Admin" : machine.ssh_user;
+        return user ? `${user}:${port}` : String(port);
+      };
+      const renderMachines = (machines) => {
+        const list = document.getElementById("machine-list");
+        if (!list) {
+          return;
+        }
+        if (!machines.length) {
+          list.innerHTML = '<div class="empty">No machines discovered</div>';
+          return;
+        }
+        list.innerHTML = `
+          <div class="machine-row machine-row-head">
+            <span></span>
+            <span>Name</span>
+            <span>Host</span>
+            <span>Web</span>
+            <span>SSH</span>
+            <span>OS</span>
+            <span></span>
+          </div>
+          ${machines.map((machine) => `
+            <div class="machine-row">
+              <span class="machine-dot ${machine.online ? "online" : ""}" title="${machine.online ? "Online" : "Offline"}"></span>
+              <div class="machine-name-cell">
+                <div class="machine-name">${escapeHtml(machine.name || machine.id)}</div>
+                <div class="machine-meta">${escapeHtml(machine.id)}${machine.discovered ? " · discovered" : ""}</div>
+              </div>
+              <div class="machine-cell">${escapeHtml(machine.host)}</div>
+              <div class="machine-cell">${escapeHtml(String(machine.web_port || "-"))}</div>
+              <div class="machine-cell">${escapeHtml(machineSshLabel(machine))}</div>
+              <div class="machine-cell">${escapeHtml(machine.os || "-")}</div>
+              <span></span>
+            </div>
+          `).join("")}
+        `;
+      };
+      const getMachineStatus = async () => {
+        const tauriInvoke = window.__TAURI__?.core?.invoke;
+        if (tauriInvoke) {
+          return await tauriInvoke("discover_machines");
+        }
+        const response = await fetch(`${apiBase}/api/machines/discover`, {
+          headers: { "Accept": "application/json" },
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+        return await response.json();
+      };
+      window.autoSyncRefreshMachines = async (event) => {
+        event?.preventDefault?.();
+        const list = document.getElementById("machine-list");
+        if (list) {
+          list.innerHTML = '<div class="empty">Discovering machines...</div>';
+        }
+        try {
+          const status = await getMachineStatus();
+          const button = document.getElementById("machine-status");
+          if (button) {
+            button.textContent = `Machines ${status.online ?? "-"}/${status.total ?? "-"}`;
+          }
+          renderMachines(status.machines || []);
+        } catch (error) {
+          if (list) {
+            list.innerHTML = `<div class="empty">${escapeHtml(error)}</div>`;
+          }
+        }
+      };
+      window.autoSyncOpenMachines = (event) => {
+        event?.preventDefault?.();
+        const modal = document.getElementById("machine-modal");
+        if (modal) {
+          modal.hidden = false;
+        }
+        window.autoSyncRefreshMachines(event);
+      };
+      window.autoSyncCloseMachines = (event) => {
+        event?.preventDefault?.();
+        const modal = document.getElementById("machine-modal");
+        if (modal) {
+          modal.hidden = true;
+        }
+      };
+    })();
+  </script>
   <script src="./main.js"></script>
 </body>
 </html>

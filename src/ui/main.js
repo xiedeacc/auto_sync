@@ -1,5 +1,6 @@
-const isTauri = Boolean(window.__TAURI__);
-const invoke = isTauri ? window.__TAURI__.core.invoke : invokeWeb;
+const tauriInvoke = window.__TAURI__?.core?.invoke;
+const isTauri = Boolean(tauriInvoke);
+const invoke = isTauri ? invokeTauri : invokeWeb;
 const STATUS_POLL_MS = 3000;
 
 let cfg = null;
@@ -194,7 +195,8 @@ function updateMachineStatusUi() {
   renderFolderMachineOptions();
 }
 
-function openMachineModal() {
+function openMachineModal(event) {
+  event?.preventDefault?.();
   renderMachineModal();
   el.machineModal.hidden = false;
 }
@@ -1568,9 +1570,25 @@ function escapeAttr(value) {
   return escapeHtml(value).replace(/`/g, "&#96;");
 }
 
-el.config.onclick = openConfigModal;
-el.refresh.onclick = () => runBusy("", loadAll);
-el.machineStatus.onclick = openMachineModal;
+function bindButtonClick(button, handler) {
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    handler(event);
+  });
+}
+
+bindButtonClick(el.config, openConfigModal);
+bindButtonClick(el.refresh, () => runBusy("", loadAll));
+bindButtonClick(el.machineStatus, openMachineModal);
+window.autoSyncOpenMachines = openMachineModal;
+window.autoSyncCloseMachines = (event) => {
+  event?.preventDefault?.();
+  closeMachineModal();
+};
+window.autoSyncRefreshMachines = (event) => {
+  event?.preventDefault?.();
+  return discoverMachines();
+};
 
 el.folderClose.onclick = () => closeFolderModal(null);
 el.folderSelect.onclick = () => closeFolderModal(folderPicker ? {
@@ -1603,6 +1621,10 @@ el.excludeClose.onclick = closeExcludeModal;
 el.excludeAdd.onclick = () => addExcludePath().catch((error) => setMessage(String(error)));
 
 loadAll().catch((error) => setMessage(String(error)));
+
+async function invokeTauri(command, payload = {}) {
+  return await tauriInvoke(command, payload);
+}
 
 async function invokeWeb(command, payload = {}) {
   const routes = {
@@ -1650,7 +1672,11 @@ async function invokeWeb(command, payload = {}) {
     }
   }
 
-  const response = await fetch(url, options);
+  const isTauriAssetOrigin = location.hostname === "tauri.localhost";
+  const apiBase = (location.protocol === "http:" || location.protocol === "https:") && !isTauriAssetOrigin
+    ? ""
+    : "http://127.0.0.1:18765";
+  const response = await fetch(`${apiBase}${url}`, options);
   if (!response.ok) {
     throw new Error(await response.text());
   }

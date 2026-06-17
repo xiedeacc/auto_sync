@@ -354,6 +354,9 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
             existing.online = true;
             merge_name_from_health(existing, &health);
             merge_ssh_from_health(existing, &health);
+            if existing.id != "local" {
+                existing.discovered = true;
+            }
             continue;
         }
 
@@ -829,6 +832,7 @@ mod tests {
         assert!(matches[0].online);
         assert_eq!(matches[0].ssh_user, "root");
         assert_eq!(matches[0].ssh_port, 10022);
+        assert!(matches[0].discovered);
     }
 
     #[test]

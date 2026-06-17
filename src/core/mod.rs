@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod config;
 pub mod logging;
 pub mod machines;
@@ -6,3 +7,4 @@ pub mod state;
 pub mod status;
 pub mod sync;
 pub mod watcher;
+pub mod web_api;

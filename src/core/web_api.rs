@@ -1,0 +1,186 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use anyhow::Result;
+use axum::extract::Path as AxumPath;
+use axum::extract::Query;
+use axum::extract::State as AxumState;
+use axum::http::{StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+use tracing::info;
+
+use crate::core::backend::{Backend, BrowseResponse};
+use crate::core::config::{AppConfig, MachineConfig};
+use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
+use crate::core::state::DestinationView;
+
+pub fn router(backend: Backend) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/main.js", get(main_js))
+        .route("/styles.css", get(styles_css))
+        .route("/api/config", get(api_get_config).post(api_save_config))
+        .route("/api/health", get(api_health))
+        .route("/api/machines", get(api_machines).post(api_add_machine))
+        .route("/api/machines/:machine_id", delete(api_remove_machine))
+        .route("/api/machines/discover", get(api_discover_machines))
+        .route("/api/status", get(api_status))
+        .route("/api/sync-now", post(api_sync_now))
+        .route("/api/sync-source-now", post(api_sync_source_now))
+        .route("/api/sync-destination-now", post(api_sync_destination_now))
+        .route("/api/browse-dirs", get(api_browse_paths))
+        .route("/api/browse-paths", get(api_browse_paths))
+        .with_state(backend)
+}
+
+pub async fn serve(backend: Backend, addr: SocketAddr) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let _discovery = spawn_discovery_responder(backend.config_path(), backend.web_port());
+    let app = router(backend);
+    info!(url = %format!("http://{addr}/"), "auto_sync web listening");
+    println!("auto_sync Web UI: http://{addr}/");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}
+
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../ui/index.html"))
+}
+
+async fn main_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../ui/main.js"),
+    )
+        .into_response()
+}
+
+async fn styles_css() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("../ui/styles.css"),
+    )
+        .into_response()
+}
+
+async fn api_get_config(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<AppConfig>, ApiError> {
+    Ok(Json(backend.get_config()?))
+}
+
+async fn api_save_config(
+    AxumState(backend): AxumState<Backend>,
+    Json(cfg): Json<AppConfig>,
+) -> Result<Json<AppConfig>, ApiError> {
+    Ok(Json(backend.save_config(&cfg)?))
+}
+
+async fn api_health(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<MachineHealth>, ApiError> {
+    Ok(Json(backend.health()?))
+}
+
+async fn api_machines(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<MachineStatus>, ApiError> {
+    Ok(Json(backend.machines()?))
+}
+
+async fn api_discover_machines(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<MachineStatus>, ApiError> {
+    Ok(Json(backend.discover_machines()?))
+}
+
+async fn api_add_machine(
+    AxumState(backend): AxumState<Backend>,
+    Json(machine): Json<MachineConfig>,
+) -> Result<Json<AppConfig>, ApiError> {
+    Ok(Json(backend.add_machine(machine)?))
+}
+
+async fn api_remove_machine(
+    AxumState(backend): AxumState<Backend>,
+    AxumPath(machine_id): AxumPath<String>,
+) -> Result<Json<AppConfig>, ApiError> {
+    Ok(Json(backend.remove_machine(&machine_id)?))
+}
+
+async fn api_status(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<Vec<DestinationView>>, ApiError> {
+    Ok(Json(backend.status()?))
+}
+
+async fn api_sync_now(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<Vec<DestinationView>>, ApiError> {
+    Ok(Json(backend.sync_now()?))
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncSourceRequest {
+    source_id: String,
+}
+
+async fn api_sync_source_now(
+    AxumState(backend): AxumState<Backend>,
+    Json(req): Json<SyncSourceRequest>,
+) -> Result<Json<Vec<DestinationView>>, ApiError> {
+    Ok(Json(backend.sync_source_now(&req.source_id)?))
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncDestinationRequest {
+    source_id: String,
+    destination_id: String,
+}
+
+async fn api_sync_destination_now(
+    AxumState(backend): AxumState<Backend>,
+    Json(req): Json<SyncDestinationRequest>,
+) -> Result<Json<Vec<DestinationView>>, ApiError> {
+    Ok(Json(backend.sync_destination_now(
+        &req.source_id,
+        &req.destination_id,
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowseQuery {
+    path: Option<PathBuf>,
+    machine_id: Option<String>,
+}
+
+async fn api_browse_paths(
+    AxumState(backend): AxumState<Backend>,
+    Query(query): Query<BrowseQuery>,
+) -> Result<Json<BrowseResponse>, ApiError> {
+    Ok(Json(backend.browse_paths(query.path, query.machine_id)?))
+}
+
+struct ApiError(anyhow::Error);
+
+impl<E> From<E> for ApiError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(value: E) -> Self {
+        Self(value.into())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
+    }
+}
