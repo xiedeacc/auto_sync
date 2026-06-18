@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -17,6 +19,8 @@ use crate::core::config::{
 
 pub const DISCOVERY_PORT: u16 = 18766;
 const DISCOVERY_MAGIC: &[u8] = b"auto_sync_discover_v1";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineHealth {
@@ -140,29 +144,53 @@ fn normalized_ssh_port(port: u16) -> u16 {
 }
 
 fn local_machine_name(fallback: &str) -> String {
+    static LOCAL_MACHINE_NAME: OnceLock<Option<String>> = OnceLock::new();
+    if let Some(value) = LOCAL_MACHINE_NAME.get_or_init(detect_local_machine_name) {
+        return value.clone();
+    }
+
+    fallback_machine_name(fallback)
+}
+
+fn detect_local_machine_name() -> Option<String> {
     for value in [
         std::env::var("COMPUTERNAME").ok(),
         std::env::var("HOSTNAME").ok(),
         std::fs::read_to_string("/etc/hostname").ok(),
-        Command::new("hostname")
-            .output()
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok()),
     ]
     .into_iter()
     .flatten()
     {
         let value = value.trim();
         if !value.is_empty() {
-            return value.to_string();
+            return Some(value.to_string());
         }
     }
+    hostname_command_name()
+}
+
+fn fallback_machine_name(fallback: &str) -> String {
     let fallback = fallback.trim();
     if fallback.is_empty() {
         "This machine".to_string()
     } else {
         fallback.to_string()
     }
+}
+
+fn hostname_command_name() -> Option<String> {
+    let mut command = Command::new("hostname");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.output().ok().and_then(|output| {
+        let value = String::from_utf8(output.stdout).ok()?;
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
 }
 
 fn has_advertised_ssh(machine: &MachineConfig) -> bool {
