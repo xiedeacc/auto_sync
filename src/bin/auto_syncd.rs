@@ -9,7 +9,7 @@ use auto_sync::core::config::{AppConfig, load_config, load_or_create_config};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::state::State;
 use auto_sync::core::sync::sync_all_pending;
-use auto_sync::core::watcher::fanotify::spawn_fanotify_thread;
+use auto_sync::core::watcher::spawn_source_watcher_thread;
 use clap::Parser;
 use tracing::{error, info, warn};
 
@@ -125,7 +125,7 @@ struct WatcherState {
 
 fn start_watcher(cfg: &AppConfig) -> WatcherState {
     let stop = Arc::new(AtomicBool::new(false));
-    let handle = spawn_fanotify_thread(cfg.clone(), cfg.app.data_db.clone(), stop.clone());
+    let handle = spawn_source_watcher_thread(cfg.clone(), cfg.app.data_db.clone(), stop.clone());
     WatcherState {
         stop,
         handle: Some(handle),

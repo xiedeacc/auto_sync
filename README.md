@@ -73,6 +73,11 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 `deploy_tiger.sh` deploys to localhost. `deploy_nas.sh` deploys to the NAS with
 systemd. `deploy_windows.ps1` is run locally on Windows, builds release
 binaries, installs them under `C:\auto_sync`, installs cwRsync, ensures `sshd`
-is available, and requests administrator privileges when service or machine
-PATH changes are needed. `deploy_openwrt.sh` cross-compiles aarch64 OpenWrt
-binaries, installs procd init scripts, and deploys to `/usr/local/auto_sync`.
+is available, installs the `auto_syncd` service with Automatic startup, and
+requests administrator privileges when service or machine PATH changes are
+needed. The Windows daemon uses the NTFS USN Journal for realtime local source
+change detection and keeps periodic full reconciliation as a fallback for
+journal gaps, journal resets, and first-run verification. The GUI and Web UI
+share this daemon-backed state instead of running separate watcher logic.
+`deploy_openwrt.sh` cross-compiles aarch64 OpenWrt binaries, installs procd
+init scripts, and deploys to `/usr/local/auto_sync`.

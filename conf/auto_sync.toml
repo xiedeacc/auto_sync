@@ -5,17 +5,6 @@ status_log_interval_secs = 300
 web_bind = "0.0.0.0:18765"
 
 [[machines]]
-id = "windows"
-name = "windows"
-host = "192.168.3.7"
-web_port = 18765
-ssh_user = "Administrator"
-ssh_port = 22
-os = "windows"
-enabled = true
-manual = true
-
-[[machines]]
 id = "nas"
 name = "nas"
 host = "192.168.2.247"

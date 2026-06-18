@@ -159,6 +159,14 @@ impl State {
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (source_id, destination_id, rel_path, issue_kind)
             );
+
+            CREATE TABLE IF NOT EXISTS windows_usn_cursor (
+                source_id TEXT PRIMARY KEY,
+                volume TEXT NOT NULL,
+                journal_id TEXT NOT NULL,
+                next_usn INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             "#,
         )?;
         self.ensure_column("destination_offset", "target_cycle_id", "INTEGER")?;
@@ -811,6 +819,12 @@ impl State {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsUsnCursor {
+    pub journal_id: u64,
+    pub next_usn: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct DestinationOffset {
     pub target_cycle_id: Option<i64>,
@@ -857,6 +871,65 @@ impl State {
             status_reason: "not_verified".to_string(),
             updated_at: now_string(),
         }))
+    }
+}
+
+impl State {
+    pub fn windows_usn_cursor(
+        &self,
+        source_id: &str,
+        volume: &str,
+    ) -> Result<Option<WindowsUsnCursor>> {
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                r#"
+                SELECT journal_id, next_usn
+                FROM windows_usn_cursor
+                WHERE source_id=?1 AND volume=?2
+                "#,
+                params![source_id, volume],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(journal_id, next_usn)| {
+            Ok(WindowsUsnCursor {
+                journal_id: journal_id
+                    .parse()
+                    .with_context(|| format!("invalid persisted USN journal id {journal_id}"))?,
+                next_usn,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn set_windows_usn_cursor(
+        &self,
+        source_id: &str,
+        volume: &str,
+        journal_id: u64,
+        next_usn: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO windows_usn_cursor
+                (source_id, volume, journal_id, next_usn, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(source_id) DO UPDATE SET
+                volume=excluded.volume,
+                journal_id=excluded.journal_id,
+                next_usn=excluded.next_usn,
+                updated_at=excluded.updated_at
+            "#,
+            params![
+                source_id,
+                volume,
+                journal_id.to_string(),
+                next_usn,
+                now_string()
+            ],
+        )?;
+        Ok(())
     }
 }
 

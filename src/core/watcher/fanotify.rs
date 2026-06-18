@@ -99,6 +99,14 @@ pub fn spawn_fanotify_thread(
     })
 }
 
+pub fn spawn_source_watcher_thread(
+    cfg: AppConfig,
+    db_path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    spawn_fanotify_thread(cfg, db_path, shutdown)
+}
+
 fn source_needs_fanotify(source: &SourceGroupConfig) -> bool {
     source.enabled
         && source

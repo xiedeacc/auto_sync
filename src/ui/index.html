@@ -154,7 +154,23 @@
       const apiBase = (location.protocol === "http:" || location.protocol === "https:") && !isTauriAssetOrigin
         ? ""
         : "http://127.0.0.1:18765";
-      const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+      const valueOr = (value, fallback) => value === null || value === undefined ? fallback : value;
+      const preventDefault = (event) => {
+        if (event && event.preventDefault) {
+          event.preventDefault();
+        }
+      };
+      const getTauriInvoke = () => {
+        if (
+          window.__TAURI__ &&
+          window.__TAURI__.core &&
+          typeof window.__TAURI__.core.invoke === "function"
+        ) {
+          return window.__TAURI__.core.invoke;
+        }
+        return null;
+      };
+      const escapeHtml = (value) => String(valueOr(value, "")).replace(/[&<>"']/g, (ch) => ({
         "&": "&amp;",
         "<": "&lt;",
         ">": "&gt;",
@@ -204,12 +220,14 @@
           `).join("")}
         `;
       };
-      const getMachineStatus = async () => {
-        const tauriInvoke = window.__TAURI__?.core?.invoke;
+      const getMachineStatus = async (refresh = false) => {
+        const tauriInvoke = getTauriInvoke();
+        const command = refresh ? "discover_machines" : "get_machines";
         if (tauriInvoke) {
-          return await tauriInvoke("discover_machines");
+          return await tauriInvoke(command);
         }
-        const response = await fetch(`${apiBase}/api/machines/discover`, {
+        const path = refresh ? "/api/machines/discover" : "/api/machines";
+        const response = await fetch(`${apiBase}${path}`, {
           headers: { "Accept": "application/json" },
         });
         if (!response.ok) {
@@ -217,17 +235,19 @@
         }
         return await response.json();
       };
-      window.autoSyncRefreshMachines = async (event) => {
-        event?.preventDefault?.();
+      window.autoSyncRefreshMachines = async (event, refresh = true) => {
+        preventDefault(event);
         const list = document.getElementById("machine-list");
         if (list) {
-          list.innerHTML = '<div class="empty">Discovering machines...</div>';
+          list.innerHTML = refresh
+            ? '<div class="empty">Discovering machines...</div>'
+            : '<div class="empty">Loading machines...</div>';
         }
         try {
-          const status = await getMachineStatus();
+          const status = await getMachineStatus(refresh);
           const button = document.getElementById("machine-status");
           if (button) {
-            button.textContent = `Machines ${status.online ?? "-"}/${status.total ?? "-"}`;
+            button.textContent = `Machines ${valueOr(status.online, "-")}/${valueOr(status.total, "-")}`;
           }
           renderMachines(status.machines || []);
         } catch (error) {
@@ -237,15 +257,15 @@
         }
       };
       window.autoSyncOpenMachines = (event) => {
-        event?.preventDefault?.();
+        preventDefault(event);
         const modal = document.getElementById("machine-modal");
         if (modal) {
           modal.hidden = false;
         }
-        window.autoSyncRefreshMachines(event);
+        window.autoSyncRefreshMachines(event, false);
       };
       window.autoSyncCloseMachines = (event) => {
-        event?.preventDefault?.();
+        preventDefault(event);
         const modal = document.getElementById("machine-modal");
         if (modal) {
           modal.hidden = true;

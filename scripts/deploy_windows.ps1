@@ -9,6 +9,7 @@ param(
     [switch]$SkipSshd,
     [switch]$UseBundledOpenSsh,
     [switch]$UserPath,
+    [switch]$SkipService,
     [switch]$NoElevate
 )
 
@@ -61,6 +62,7 @@ function Invoke-ElevatedSelf {
     if ($SkipSshd) { $args += "-SkipSshd" }
     if ($UseBundledOpenSsh) { $args += "-UseBundledOpenSsh" }
     if ($UserPath) { $args += "-UserPath" }
+    if ($SkipService) { $args += "-SkipService" }
 
     $argLine = ($args | ForEach-Object { ConvertTo-CommandLineArgument $_ }) -join " "
     Write-Host "Administrator privileges are required; requesting elevation with $powerShellExe ..."
@@ -589,6 +591,38 @@ function Ensure-AuthorizedKey {
     }
 }
 
+function Ensure-AutoSyncDaemonService {
+    param(
+        [string]$BinDir,
+        [string]$ConfigPath
+    )
+
+    $serviceName = "auto_syncd"
+    $daemonExe = Join-Path $BinDir "auto_syncd.exe"
+    if (-not (Test-Path -LiteralPath $daemonExe)) {
+        throw "Missing daemon binary: $daemonExe"
+    }
+    $binaryPath = "`"$daemonExe`" --config `"$ConfigPath`""
+    $existing = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
+    if ($existing) {
+        if ($existing.State -eq "Running") {
+            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        }
+        & sc.exe config $serviceName binPath= $binaryPath start= auto | Out-Null
+        Set-Service -Name $serviceName -StartupType Automatic
+    }
+    else {
+        New-Service `
+            -Name $serviceName `
+            -DisplayName "auto_sync daemon" `
+            -BinaryPathName $binaryPath `
+            -Description "auto_sync realtime watcher and sync scheduler" `
+            -StartupType Automatic | Out-Null
+    }
+    Start-Service -Name $serviceName
+    Get-Service -Name $serviceName
+}
+
 if ($InstallSshd -and $SkipSshd) {
     throw "-InstallSshd and -SkipSshd cannot be used together."
 }
@@ -607,7 +641,8 @@ if ([string]::IsNullOrWhiteSpace($AuthorizedKeyFile)) {
 }
 
 $ensureSshd = -not $SkipSshd
-$needsAdmin = (-not $UserPath) -or $ensureSshd
+$ensureService = -not $SkipService
+$needsAdmin = (-not $UserPath) -or $ensureSshd -or $ensureService
 if ($needsAdmin -and -not (Test-IsAdministrator)) {
     if ($NoElevate) {
         throw "Administrator privileges are required. Re-run without -NoElevate or start PowerShell as Administrator."
@@ -641,6 +676,10 @@ else {
 $pathScope = if ($UserPath) { "User" } else { "Machine" }
 Add-PathEntries -Scope $pathScope -Paths @($openSshBinForPath, $runtime.CwrsyncBin, $binDir)
 $authorizedKeyResult = Ensure-AuthorizedKey -PublicKeyFile $AuthorizedKeyFile
+$daemonService = $null
+if ($ensureService) {
+    $daemonService = Ensure-AutoSyncDaemonService -BinDir $binDir -ConfigPath $targetConfig
+}
 
 Write-Host "auto_sync installed under $InstallDir"
 Write-Host "Binaries: $binDir"
@@ -658,6 +697,12 @@ if ($sshResult) {
 }
 else {
     Write-Host "sshd setup skipped by -SkipSshd"
+}
+if ($daemonService) {
+    Write-Host "auto_syncd service: $($daemonService.Status)"
+}
+else {
+    Write-Host "auto_syncd service setup skipped by -SkipService"
 }
 if ($authorizedKeyResult) {
     Write-Host "authorized_keys: $($authorizedKeyResult.Path) ($($authorizedKeyResult.Action))"

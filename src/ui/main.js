@@ -1,6 +1,4 @@
-const tauriInvoke = window.__TAURI__?.core?.invoke;
-const isTauri = Boolean(tauriInvoke);
-const invoke = isTauri ? invokeTauri : invokeWeb;
+const invoke = invokeBackend;
 const STATUS_POLL_MS = 3000;
 
 let cfg = null;
@@ -65,10 +63,19 @@ const el = {
 };
 
 async function loadAll() {
-  cfg = await invoke("get_config");
-  normalizeConfig(cfg);
-  render();
+  if (!cfg) {
+    cfg = defaultUiConfig();
+    render();
+  }
   const errors = [];
+  try {
+    const nextCfg = await invoke("get_config");
+    cfg = nextCfg;
+    normalizeConfig(cfg);
+  } catch (error) {
+    errors.push(String(error));
+  }
+  render();
   try {
     await loadStatus();
   } catch (error) {
@@ -76,7 +83,7 @@ async function loadAll() {
     errors.push(String(error));
   }
   try {
-    await loadMachines(true);
+    await loadMachines(false);
   } catch (error) {
     machineStatus = { online: 0, total: 0, machines: [] };
     updateMachineStatusUi();
@@ -119,7 +126,7 @@ async function refreshStatusOnly() {
       errors.push(String(error));
     }
     try {
-      await loadMachines(true);
+      await loadMachines(false);
     } catch (error) {
       errors.push(String(error));
     }
@@ -165,10 +172,10 @@ function updateStatusUi() {
     const dot = row.querySelector(".dot");
     if (dot) {
       const dotClass = statusClass(status);
-      const issueCount = status?.issues?.length || 0;
+      const issueCount = status && status.issues ? status.issues.length : 0;
       const dotTitle = dotClass === "yellow"
         ? `${issueCount} changing file${issueCount === 1 ? "" : "s"}`
-        : (status?.status || "red");
+        : ((status && status.status) || "red");
       dot.className = `dot ${dotClass}`;
       dot.title = dotTitle;
       dot.setAttribute("aria-label", dotTitle);
@@ -185,8 +192,8 @@ function updateStatusUi() {
 }
 
 function updateMachineStatusUi() {
-  const online = machineStatus?.online ?? 1;
-  const total = machineStatus?.total ?? 1;
+  const online = valueOr(machineStatus && machineStatus.online, 1);
+  const total = valueOr(machineStatus && machineStatus.total, 1);
   el.machineStatus.textContent = `Machines ${online}/${total}`;
   el.machineStatus.title = "Manage LAN machines";
   if (!el.machineModal.hidden) {
@@ -196,7 +203,7 @@ function updateMachineStatusUi() {
 }
 
 function openMachineModal(event) {
-  event?.preventDefault?.();
+  preventDefault(event);
   renderMachineModal();
   el.machineModal.hidden = false;
 }
@@ -206,7 +213,7 @@ function closeMachineModal() {
 }
 
 function renderMachineModal() {
-  const machines = machineStatus?.machines || [];
+  const machines = (machineStatus && machineStatus.machines) || [];
   const selectedId = cleanMachineId(el.machineId.value);
   if (!machines.length) {
     el.machineList.innerHTML = `<div class="empty">No machines discovered</div>`;
@@ -291,7 +298,7 @@ function syncMachineFormLock(machines) {
 }
 
 function machineHostShouldLock(machine) {
-  return Boolean(machine?.online);
+  return Boolean(machine && machine.online);
 }
 
 function setMachineHostLocked(locked) {
@@ -357,7 +364,7 @@ async function removeMachine(machineId) {
 }
 
 function render() {
-  el.configPath.textContent = isTauri ? "Linux Tauri GUI" : "Headless Web UI";
+  el.configPath.textContent = isTauriRuntime() ? "Tauri GUI" : "Headless Web UI";
   renderSourcePanel();
 }
 
@@ -625,10 +632,10 @@ function renderSyncRows(source, group) {
     row.dataset.sourceId = source.id;
     row.dataset.destinationId = dst.id;
     const dotClass = statusClass(status);
-    const issueCount = status?.issues?.length || 0;
+    const issueCount = status && status.issues ? status.issues.length : 0;
     const dotTitle = dotClass === "yellow"
       ? `${issueCount} changing file${issueCount === 1 ? "" : "s"}`
-      : (status?.status || "red");
+      : ((status && status.status) || "red");
     row.innerHTML = `
       <div class="row-left">
         <label>ID</label>
@@ -676,7 +683,7 @@ function renderSyncRows(source, group) {
     };
     row.querySelector('[data-action="show-issues"]').onclick = () => {
       const latestStatus = statusFor(source.id, dst.id);
-      if (latestStatus?.status === "yellow") {
+      if (latestStatus && latestStatus.status === "yellow") {
         openIssueModal(latestStatus);
       }
     };
@@ -861,7 +868,8 @@ function machineIdOrLocal(value) {
 
 function machineLabel(machineId = "local") {
   const id = machineIdOrLocal(machineId);
-  const machine = (machineStatus?.machines || cfg?.machines || []).find((item) => item.id === id);
+  const machines = (machineStatus && machineStatus.machines) || (cfg && cfg.machines) || [];
+  const machine = machines.find((item) => item.id === id);
   return machine ? `Machine: ${machine.name || machine.id}` : `Machine: ${id}`;
 }
 
@@ -1064,16 +1072,15 @@ function defaultDestinationSchedule() {
 }
 
 function normalizeSchedule(schedule) {
-  return {
-    ...defaultDestinationSchedule(),
-    ...(schedule || {}),
-    time: normalizeScheduleTime(schedule?.time || defaultDestinationSchedule().time),
-    weekday: schedule?.weekday || "monday",
-  };
+  const defaults = defaultDestinationSchedule();
+  const next = Object.assign({}, defaults, schedule || {});
+  next.time = normalizeScheduleTime((schedule && schedule.time) || defaults.time);
+  next.weekday = (schedule && schedule.weekday) || "monday";
+  return next;
 }
 
 function cloneSchedule(schedule) {
-  return { ...normalizeSchedule(schedule) };
+  return Object.assign({}, normalizeSchedule(schedule));
 }
 
 function scheduleLabel(schedule) {
@@ -1123,14 +1130,14 @@ function weekdayAbbrev(value) {
 }
 
 function cycleDisplay(status) {
-  return `${status?.last_verified_cycle_id ?? "-"} / ${status?.target_cycle_id ?? "-"}`;
+  return `${valueOr(status && status.last_verified_cycle_id, "-")} / ${valueOr(status && status.target_cycle_id, "-")}`;
 }
 
 function statusClass(status) {
-  if (status?.status === "green") {
+  if (status && status.status === "green") {
     return "green";
   }
-  if (status?.status === "yellow") {
+  if (status && status.status === "yellow") {
     return "yellow";
   }
   return "red";
@@ -1187,7 +1194,7 @@ function openIssueModal(status) {
     el.issueList.innerHTML = issues.map((issue) => `
       <div class="issue-row">
         <div class="issue-path">${escapeHtml(issue.rel_path)}</div>
-        <div class="issue-meta">cycle ${escapeHtml(issue.cycle_id ?? "-")} · ${escapeHtml(issue.message || issue.issue_kind || "source_changing")}</div>
+        <div class="issue-meta">cycle ${escapeHtml(valueOr(issue.cycle_id, "-"))} · ${escapeHtml(issue.message || issue.issue_kind || "source_changing")}</div>
       </div>
     `).join("");
   }
@@ -1206,7 +1213,7 @@ function openExcludeModal(source) {
 }
 
 function renderExcludeModal() {
-  const source = excludeEditor?.source;
+  const source = excludeEditor && excludeEditor.source;
   if (!source) {
     return;
   }
@@ -1233,7 +1240,7 @@ function renderExcludeModal() {
 }
 
 async function addExcludePath() {
-  const source = excludeEditor?.source;
+  const source = excludeEditor && excludeEditor.source;
   if (!source) {
     return;
   }
@@ -1289,11 +1296,11 @@ function sourceHasUnavailableDestination(sourceId) {
 }
 
 function isSyncOrderBlocked(status) {
-  return String(status?.status_reason || "").startsWith("blocked_by_sync_order:");
+  return String((status && status.status_reason) || "").startsWith("blocked_by_sync_order:");
 }
 
 function blockedByLabel(status) {
-  const reason = String(status?.status_reason || "");
+  const reason = String((status && status.status_reason) || "");
   const blocker = reason.slice("blocked_by_sync_order:".length);
   return blocker ? `Blocked by ${blocker}` : "Blocked by sync order";
 }
@@ -1321,7 +1328,7 @@ function isDestinationUnavailable(status) {
 }
 
 function unavailableLabel(status) {
-  const reason = String(status?.status_reason || "").trim();
+  const reason = String((status && status.status_reason) || "").trim();
   return reason ? `Destination unavailable: ${reason}` : "Destination unavailable";
 }
 
@@ -1329,9 +1336,9 @@ function renderFolderMachineOptions() {
   if (!el.folderMachine) {
     return;
   }
-  const machines = machineStatus?.machines?.length
+  const machines = machineStatus && machineStatus.machines && machineStatus.machines.length
     ? machineStatus.machines
-    : normalizeMachines(cfg?.machines || []);
+    : normalizeMachines((cfg && cfg.machines) || []);
   el.folderMachine.innerHTML = machines.map((machine) => `
     <option value="${escapeAttr(machine.id)}">${escapeHtml(machine.name || machine.id)}${machine.online === false ? " (offline)" : ""}</option>
   `).join("");
@@ -1341,9 +1348,9 @@ function renderFolderMachineOptions() {
 }
 
 function defaultPathForMachine(machineId = "local") {
-  const machine = (machineStatus?.machines || cfg?.machines || [])
+  const machine = ((machineStatus && machineStatus.machines) || (cfg && cfg.machines) || [])
     .find((item) => item.id === machineIdOrLocal(machineId));
-  return String(machine?.os || "").toLowerCase() === "windows" ? "C:\\" : "/";
+  return String((machine && machine.os) || "").toLowerCase() === "windows" ? "C:\\" : "/";
 }
 
 async function pickPath(startPath = "/", options = {}) {
@@ -1394,7 +1401,7 @@ async function loadPath(path) {
 }
 
 function closeFolderModal(value) {
-  if (value && folderPicker?.validate) {
+  if (value && folderPicker && folderPicker.validate) {
     const error = folderPicker.validate(value);
     if (error) {
       setFolderError(error);
@@ -1456,7 +1463,7 @@ function dedupeDestinationsByPath(destinations) {
 }
 
 function trimPathValue(value) {
-  return String(value ?? "").trim();
+  return String(valueOr(value, "")).trim();
 }
 
 function cleanExcludeList(values) {
@@ -1473,7 +1480,7 @@ function cleanExcludeList(values) {
 }
 
 function normalizeRelativePath(value) {
-  let path = String(value ?? "").trim().replaceAll("\\", "/");
+  let path = String(valueOr(value, "")).trim().replace(/\\/g, "/");
   path = path.replace(/\/+/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
   const parts = path.split("/").filter((part) => part && part !== ".");
   if (!parts.length || parts.includes("..")) {
@@ -1483,7 +1490,7 @@ function normalizeRelativePath(value) {
 }
 
 function normalizeAbsolutePath(value) {
-  let path = String(value ?? "").trim().replaceAll("\\", "/");
+  let path = String(valueOr(value, "")).trim().replace(/\\/g, "/");
   path = path.replace(/\/+/g, "/");
   if (path.length > 1) {
     path = path.replace(/\/+$/, "");
@@ -1556,8 +1563,41 @@ function setMessage(text) {
   el.message.textContent = text || "";
 }
 
+function defaultUiConfig() {
+  return {
+    machines: [],
+    source_groups: [],
+    sync_order: [],
+  };
+}
+
+function valueOr(value, fallback) {
+  return value === null || value === undefined ? fallback : value;
+}
+
+function preventDefault(event) {
+  if (event && event.preventDefault) {
+    event.preventDefault();
+  }
+}
+
+function getTauriInvoke() {
+  if (
+    window.__TAURI__ &&
+    window.__TAURI__.core &&
+    typeof window.__TAURI__.core.invoke === "function"
+  ) {
+    return window.__TAURI__.core.invoke;
+  }
+  return null;
+}
+
+function isTauriRuntime() {
+  return Boolean(getTauriInvoke()) || location.hostname === "tauri.localhost";
+}
+
 function escapeHtml(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+  return String(valueOr(value, "")).replace(/[&<>"']/g, (ch) => ({
     "&": "&amp;",
     "<": "&lt;",
     ">": "&gt;",
@@ -1582,11 +1622,11 @@ bindButtonClick(el.refresh, () => runBusy("", loadAll));
 bindButtonClick(el.machineStatus, openMachineModal);
 window.autoSyncOpenMachines = openMachineModal;
 window.autoSyncCloseMachines = (event) => {
-  event?.preventDefault?.();
+  preventDefault(event);
   closeMachineModal();
 };
 window.autoSyncRefreshMachines = (event) => {
-  event?.preventDefault?.();
+  preventDefault(event);
   return discoverMachines();
 };
 
@@ -1596,7 +1636,7 @@ el.folderSelect.onclick = () => closeFolderModal(folderPicker ? {
   path: folderPicker.path,
 } : null);
 el.folderUp.onclick = () => {
-  if (folderPicker?.parent) {
+  if (folderPicker && folderPicker.parent) {
     loadPath(folderPicker.parent);
   }
 };
@@ -1620,10 +1660,21 @@ el.issueClose.onclick = closeIssueModal;
 el.excludeClose.onclick = closeExcludeModal;
 el.excludeAdd.onclick = () => addExcludePath().catch((error) => setMessage(String(error)));
 
+window.addEventListener("error", (event) => {
+  setMessage(event.message || String(event.error || event));
+});
+window.addEventListener("unhandledrejection", (event) => {
+  setMessage(String(event.reason || "Unhandled promise rejection"));
+});
+
 loadAll().catch((error) => setMessage(String(error)));
 
-async function invokeTauri(command, payload = {}) {
-  return await tauriInvoke(command, payload);
+async function invokeBackend(command, payload = {}) {
+  const tauriInvoke = getTauriInvoke();
+  if (tauriInvoke) {
+    return await tauriInvoke(command, payload);
+  }
+  return await invokeWeb(command, payload);
 }
 
 async function invokeWeb(command, payload = {}) {

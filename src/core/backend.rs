@@ -1,32 +1,47 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::core::config::{
     AppConfig, MachineConfig, load_config, load_or_create_config, save_config,
 };
 use crate::core::machines::{
     MachineHealth, MachineStatus, discover_lan, encode_query_component, find_machine, local_health,
-    machine_id_from_path, machine_status, merge_discovered, remote_get_json,
+    machine_id_from_path, merge_discovered, remote_get_json,
 };
 use crate::core::state::{DestinationView, State as DbState};
 use crate::core::sync::{sync_all_now, sync_destination_now, sync_source_now};
+
+const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const MANUAL_DISCOVERY_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct Backend {
     config_path: Arc<PathBuf>,
     web_port: u16,
+    machine_cache: Arc<Mutex<MachineCache>>,
+}
+
+#[derive(Default)]
+struct MachineCache {
+    status: Option<MachineStatus>,
+    refreshed_at: Option<Instant>,
 }
 
 impl Backend {
     pub fn new(config_path: PathBuf, web_port: u16) -> Self {
-        Self {
+        let backend = Self {
             config_path: Arc::new(config_path),
             web_port,
-        }
+            machine_cache: Arc::new(Mutex::new(MachineCache::default())),
+        };
+        backend.spawn_machine_discovery_worker();
+        backend
     }
 
     pub fn config_path(&self) -> Arc<PathBuf> {
@@ -42,9 +57,11 @@ impl Backend {
     }
 
     pub fn save_config(&self, cfg: &AppConfig) -> Result<AppConfig> {
-        let cfg = save_config(&self.config_path, cfg)?;
+        let cfg = preserve_current_machines(&self.config_path, cfg);
+        let cfg = save_config(&self.config_path, &cfg)?;
         let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
+        self.clear_machine_cache();
         Ok(cfg)
     }
 
@@ -54,14 +71,14 @@ impl Backend {
     }
 
     pub fn machines(&self) -> Result<MachineStatus> {
-        let cfg = load_or_create_config(&self.config_path)?;
-        Ok(machine_status(&cfg))
+        if let Some(status) = self.cached_machine_status() {
+            return Ok(status);
+        }
+        self.refresh_machine_cache(DISCOVERY_REFRESH_INTERVAL)
     }
 
     pub fn discover_machines(&self) -> Result<MachineStatus> {
-        let cfg = load_or_create_config(&self.config_path)?;
-        let discovered = discover_lan(Duration::from_millis(700))?;
-        Ok(merge_discovered(&cfg, discovered))
+        self.refresh_machine_cache(MANUAL_DISCOVERY_MIN_INTERVAL)
     }
 
     pub fn add_machine(&self, machine: MachineConfig) -> Result<AppConfig> {
@@ -71,7 +88,9 @@ impl Backend {
         } else {
             cfg.machines.push(machine);
         }
-        save_config(&self.config_path, &cfg)
+        let cfg = save_config(&self.config_path, &cfg)?;
+        self.clear_machine_cache();
+        Ok(cfg)
     }
 
     pub fn remove_machine(&self, machine_id: &str) -> Result<AppConfig> {
@@ -80,7 +99,9 @@ impl Backend {
         }
         let mut cfg = load_or_create_config(&self.config_path)?;
         cfg.machines.retain(|machine| machine.id != machine_id);
-        save_config(&self.config_path, &cfg)
+        let cfg = save_config(&self.config_path, &cfg)?;
+        self.clear_machine_cache();
+        Ok(cfg)
     }
 
     pub fn status(&self) -> Result<Vec<DestinationView>> {
@@ -137,6 +158,67 @@ impl Backend {
         }
         browse_paths_inner(path.unwrap_or_else(|| PathBuf::from("/")))
     }
+
+    fn spawn_machine_discovery_worker(&self) {
+        let backend = self.clone();
+        let result = thread::Builder::new()
+            .name("auto_sync_machine_discovery".to_string())
+            .spawn(move || {
+                loop {
+                    if let Err(err) = backend.refresh_machine_cache(DISCOVERY_REFRESH_INTERVAL) {
+                        warn!(error = %err, "machine discovery refresh failed");
+                    }
+                    thread::sleep(DISCOVERY_REFRESH_INTERVAL);
+                }
+            });
+        if let Err(err) = result {
+            warn!(error = %err, "failed to spawn machine discovery worker");
+        }
+    }
+
+    fn refresh_machine_cache(&self, min_interval: Duration) -> Result<MachineStatus> {
+        let mut cache = self
+            .machine_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let (Some(status), Some(refreshed_at)) = (&cache.status, cache.refreshed_at) {
+            if refreshed_at.elapsed() < min_interval {
+                return Ok(status.clone());
+            }
+        }
+
+        let cfg = load_or_create_config(&self.config_path)?;
+        let discovered = discover_lan(Duration::from_millis(700))?;
+        let status = merge_discovered(&cfg, discovered);
+        cache.status = Some(status.clone());
+        cache.refreshed_at = Some(Instant::now());
+        Ok(status)
+    }
+
+    fn cached_machine_status(&self) -> Option<MachineStatus> {
+        self.machine_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .status
+            .clone()
+    }
+
+    fn clear_machine_cache(&self) {
+        let mut cache = self
+            .machine_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        cache.status = None;
+        cache.refreshed_at = None;
+    }
+}
+
+fn preserve_current_machines(config_path: &Path, cfg: &AppConfig) -> AppConfig {
+    let mut cfg = cfg.clone();
+    if let Ok(current) = load_config(config_path) {
+        cfg.machines = current.machines;
+    }
+    cfg
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -219,4 +301,53 @@ fn normalize_browse_dir(path: &Path) -> Result<PathBuf> {
 
 fn entry_kind_order(kind: &str) -> u8 {
     if kind == "dir" { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_disk_machines_when_saving_stale_config() {
+        let temp = temp_dir("backend_preserve_machines");
+        let config_path = temp.join("auto_sync.toml");
+
+        let mut stale = AppConfig::default();
+        stale.app.data_db = temp.join("state").join("auto_sync.sqlite");
+        stale.app.log_dir = temp.join("logs");
+        stale.machines.push(MachineConfig {
+            id: "windows".to_string(),
+            name: "windows".to_string(),
+            host: "192.168.3.7".to_string(),
+            web_port: 18765,
+            ssh_user: "Administrator".to_string(),
+            ssh_port: 22,
+            os: "windows".to_string(),
+            enabled: true,
+            manual: true,
+        });
+
+        let mut current = stale.clone();
+        current.machines.retain(|machine| machine.id != "windows");
+        crate::core::config::save_config(&config_path, &current).unwrap();
+
+        let merged = preserve_current_machines(&config_path, &stale);
+        assert!(
+            !merged
+                .machines
+                .iter()
+                .any(|machine| machine.id == "windows")
+        );
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("auto_sync_{name}_{}_{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 }
