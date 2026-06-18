@@ -1,25 +1,31 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::net::UdpSocket;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 #[cfg(windows)]
 use std::os::windows::fs::{symlink_dir, symlink_file};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::time::UNIX_EPOCH;
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use filetime::{FileTime, set_file_mtime};
-use tracing::{error, info, warn};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, warn};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::core::config::{
     AppConfig, DestinationConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef,
     machine_id_or_local,
 };
-use crate::core::machines::{find_machine, rsync_endpoint, rsync_path, ssh_target};
+use crate::core::machines::{
+    encode_query_component, find_machine, machines_share_lan, remote_post_bytes, remote_post_json,
+    rsync_endpoint, rsync_path, ssh_target,
+};
 use crate::core::state::{Cycle, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
 
@@ -110,6 +116,711 @@ impl FromStr for SyncRequestMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferProtocol {
+    Udp,
+    Tcp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferSnapshotMode {
+    Source,
+    Destination,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferSnapshotRequest {
+    pub root: PathBuf,
+    pub mode: TransferSnapshotMode,
+    #[serde(default)]
+    pub excludes: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferPathInfoRequest {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferPathInfo {
+    pub kind: String,
+    pub base: PathBuf,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferPrepareDirRequest {
+    pub root: PathBuf,
+    pub rel_path: Option<String>,
+    pub mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferRemovePathRequest {
+    pub root: PathBuf,
+    pub rel_path: String,
+    pub cycle_id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferReceiveFileQuery {
+    pub root: String,
+    pub rel_path: String,
+    pub cycle_id: i64,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub mode: u32,
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferReceiveSymlinkRequest {
+    pub root: PathBuf,
+    pub rel_path: String,
+    pub cycle_id: i64,
+    pub mtime_ns: i64,
+    pub mode: u32,
+    pub hash: Option<String>,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferPushFileRequest {
+    pub source_root: PathBuf,
+    pub rel_path: String,
+    pub entry: SnapshotEntry,
+    pub destination: crate::core::config::MachineConfig,
+    pub destination_root: PathBuf,
+    pub protocol: TransferProtocol,
+    pub cycle_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferAck {
+    pub ok: bool,
+}
+
+const TRANSFER_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+const TRANSFER_UDP_MAGIC: &[u8; 5] = b"ASU01";
+const TRANSFER_UDP_KIND_START: u8 = 1;
+const TRANSFER_UDP_KIND_DATA: u8 = 2;
+const TRANSFER_UDP_KIND_FINISH: u8 = 3;
+const TRANSFER_UDP_KIND_ACK: u8 = 4;
+const TRANSFER_UDP_KIND_ERROR: u8 = 5;
+const TRANSFER_UDP_START_SEQ: u32 = u32::MAX;
+const TRANSFER_UDP_FINISH_SEQ: u32 = u32::MAX - 1;
+const TRANSFER_UDP_CHUNK_SIZE: usize = 48 * 1024;
+const TRANSFER_UDP_RETRIES: usize = 6;
+
+pub fn transfer_udp_port(web_port: u16) -> u16 {
+    web_port.checked_add(2).unwrap_or(web_port)
+}
+
+pub fn spawn_transfer_udp_receiver(web_port: u16) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let port = transfer_udp_port(web_port);
+        let socket = match UdpSocket::bind(("0.0.0.0", port)) {
+            Ok(socket) => socket,
+            Err(err) => {
+                warn!(error = %err, port, "failed to bind transfer UDP receiver");
+                return;
+            }
+        };
+        info!(port, "transfer UDP receiver listening");
+        let mut sessions: HashMap<[u8; 16], UdpReceiveSession> = HashMap::new();
+        let mut buf = vec![0_u8; TRANSFER_UDP_CHUNK_SIZE + 128];
+        loop {
+            let Ok((len, peer)) = socket.recv_from(&mut buf) else {
+                continue;
+            };
+            let packet = match parse_udp_packet(&buf[..len]) {
+                Ok(packet) => packet,
+                Err(err) => {
+                    debug!(error = %err, "ignored invalid transfer UDP packet");
+                    continue;
+                }
+            };
+            let result = handle_udp_packet(packet, &mut sessions);
+            match result {
+                Ok(seq) => {
+                    let ack = build_udp_packet(TRANSFER_UDP_KIND_ACK, &packet.id, seq, &[]);
+                    let _ = socket.send_to(&ack, peer);
+                }
+                Err(err) => {
+                    warn!(error = %err, "transfer UDP packet failed");
+                    let error = build_udp_packet(
+                        TRANSFER_UDP_KIND_ERROR,
+                        &packet.id,
+                        packet.seq,
+                        err.to_string().as_bytes(),
+                    );
+                    let _ = socket.send_to(&error, peer);
+                }
+            }
+        }
+    })
+}
+
+pub fn transfer_snapshot(req: TransferSnapshotRequest) -> Result<Vec<SnapshotEntry>> {
+    match req.mode {
+        TransferSnapshotMode::Source => {
+            take_snapshot_with_excludes(&req.root, SnapshotMode::Source, &req.excludes)
+        }
+        TransferSnapshotMode::Destination => {
+            reject_dangerous_destination(&req.root)?;
+            if !req.root.exists() {
+                return Ok(Vec::new());
+            }
+            take_snapshot(&req.root, SnapshotMode::Destination)
+        }
+    }
+}
+
+pub fn transfer_path_info(req: TransferPathInfoRequest) -> Result<TransferPathInfo> {
+    let metadata = fs::symlink_metadata(&req.path)
+        .with_context(|| format!("failed to read path {}", req.path.display()))?;
+    let name = cross_platform_file_name(&req.path)
+        .ok_or_else(|| anyhow!("path has no file name: {}", req.path.display()))?;
+    if metadata.is_dir() {
+        return Ok(TransferPathInfo {
+            kind: "dir".to_string(),
+            base: req.path,
+            name,
+        });
+    }
+    if metadata.is_file() || metadata.file_type().is_symlink() {
+        let base = req
+            .path
+            .parent()
+            .ok_or_else(|| anyhow!("file path has no parent: {}", req.path.display()))?
+            .to_path_buf();
+        return Ok(TransferPathInfo {
+            kind: "file".to_string(),
+            base,
+            name,
+        });
+    }
+    bail!(
+        "path is neither a file nor a directory: {}",
+        req.path.display()
+    )
+}
+
+pub fn transfer_prepare_dir(req: TransferPrepareDirRequest) -> Result<TransferAck> {
+    reject_dangerous_destination(&req.root)?;
+    let path = match req.rel_path.as_deref() {
+        Some(rel_path) => safe_join_rel(&req.root, rel_path)?,
+        None => req.root,
+    };
+    fs::create_dir_all(&path)
+        .with_context(|| format!("failed to create directory {}", path.display()))?;
+    if let Some(mode) = req.mode {
+        set_mode(&path, mode).ok();
+    }
+    Ok(transfer_ack())
+}
+
+pub fn transfer_remove_path(req: TransferRemovePathRequest) -> Result<TransferAck> {
+    reject_dangerous_destination(&req.root)?;
+    let path = safe_join_rel(&req.root, &req.rel_path)?;
+    if !path.exists() && fs::symlink_metadata(&path).is_err() {
+        return Ok(transfer_ack());
+    }
+    move_to_trash(&req.root, &req.rel_path, req.cycle_id)?;
+    Ok(transfer_ack())
+}
+
+pub fn transfer_receive_file(query: TransferReceiveFileQuery, bytes: &[u8]) -> Result<TransferAck> {
+    let entry = SnapshotEntry {
+        rel_path: query.rel_path,
+        file_type: "file".to_string(),
+        size: query.size,
+        mtime_ns: query.mtime_ns,
+        mode: query.mode,
+        hash: query.hash,
+    };
+    receive_file_bytes(Path::new(&query.root), query.cycle_id, &entry, bytes)?;
+    Ok(transfer_ack())
+}
+
+pub fn transfer_receive_symlink(req: TransferReceiveSymlinkRequest) -> Result<TransferAck> {
+    let entry = SnapshotEntry {
+        rel_path: req.rel_path,
+        file_type: "symlink".to_string(),
+        size: 0,
+        mtime_ns: req.mtime_ns,
+        mode: req.mode,
+        hash: req.hash,
+    };
+    receive_symlink_target(&req.root, req.cycle_id, &entry, &req.target)?;
+    Ok(transfer_ack())
+}
+
+pub fn transfer_push_file(req: TransferPushFileRequest) -> Result<TransferAck> {
+    let src = safe_join_rel(&req.source_root, &req.rel_path)?;
+    match req.entry.file_type.as_str() {
+        "file" => match req.protocol {
+            TransferProtocol::Udp => send_file_udp(
+                &req.destination,
+                &req.destination_root,
+                req.cycle_id,
+                &req.entry,
+                &src,
+            ),
+            TransferProtocol::Tcp => send_file_tcp(
+                &req.destination,
+                &req.destination_root,
+                req.cycle_id,
+                &req.entry,
+                &src,
+            ),
+        }?,
+        "symlink" => {
+            send_symlink_tcp(
+                &req.destination,
+                &req.destination_root,
+                req.cycle_id,
+                &req.entry,
+                &src,
+            )?;
+        }
+        other => bail!("unsupported transfer entry type {other}"),
+    }
+    Ok(transfer_ack())
+}
+
+fn transfer_ack() -> TransferAck {
+    TransferAck { ok: true }
+}
+
+fn receive_file_bytes(
+    dst_root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    bytes: &[u8],
+) -> Result<()> {
+    reject_dangerous_destination(dst_root)?;
+    if entry.file_type != "file" {
+        bail!("receive_file_bytes requires a file entry");
+    }
+    if bytes.len() as i64 != entry.size {
+        bail!(
+            "received file size mismatch for {}: got {}, expected {}",
+            entry.rel_path,
+            bytes.len(),
+            entry.size
+        );
+    }
+    let final_path = safe_join_rel(dst_root, &entry.rel_path)?;
+    let tmp = tmp_path(dst_root, cycle_id, &entry.rel_path);
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if tmp.exists() || fs::symlink_metadata(&tmp).is_ok() {
+        remove_any(&tmp)?;
+    }
+    {
+        let mut file = File::create(&tmp)
+            .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all().ok();
+    }
+    finish_received_file(dst_root, cycle_id, entry, &tmp, &final_path)
+}
+
+fn receive_symlink_target(
+    dst_root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    target: &str,
+) -> Result<()> {
+    reject_dangerous_destination(dst_root)?;
+    if entry.file_type != "symlink" {
+        bail!("receive_symlink_target requires a symlink entry");
+    }
+    let final_path = safe_join_rel(dst_root, &entry.rel_path)?;
+    let tmp = tmp_path(dst_root, cycle_id, &entry.rel_path);
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if tmp.exists() || fs::symlink_metadata(&tmp).is_ok() {
+        remove_any(&tmp)?;
+    }
+    create_symlink(&final_path, Path::new(target), &tmp)
+        .with_context(|| format!("failed to create symlink {}", tmp.display()))?;
+    if Some(hash_symlink(&tmp)?) != entry.hash {
+        remove_any(&tmp).ok();
+        bail!("received symlink hash mismatch at {}", entry.rel_path);
+    }
+    replace_path(&tmp, &final_path)?;
+    fsync_parent(&final_path).ok();
+    Ok(())
+}
+
+fn finish_received_file(
+    dst_root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    tmp: &Path,
+    final_path: &Path,
+) -> Result<()> {
+    let actual_hash = hash_file(tmp)?;
+    if Some(actual_hash) != entry.hash {
+        remove_any(tmp).ok();
+        bail!("received file hash mismatch at {}", entry.rel_path);
+    }
+    set_mode(tmp, entry.mode).ok();
+    let mtime = FileTime::from_unix_time(
+        entry.mtime_ns / 1_000_000_000,
+        (entry.mtime_ns % 1_000_000_000) as u32,
+    );
+    set_file_mtime(tmp, mtime).ok();
+    fsync_file(tmp).ok();
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    replace_path(tmp, final_path)?;
+    fsync_parent(final_path).ok();
+    cleanup_tmp_cycle(dst_root, cycle_id);
+    Ok(())
+}
+
+fn send_file_tcp(
+    destination: &crate::core::config::MachineConfig,
+    destination_root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    src: &Path,
+) -> Result<()> {
+    let bytes = fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
+    let path = receive_file_api_path(destination_root, cycle_id, entry);
+    let ack: TransferAck = remote_post_bytes(destination, &path, &bytes, TRANSFER_HTTP_TIMEOUT)?;
+    if !ack.ok {
+        bail!("peer rejected TCP file transfer");
+    }
+    Ok(())
+}
+
+fn send_symlink_tcp(
+    destination: &crate::core::config::MachineConfig,
+    destination_root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    src: &Path,
+) -> Result<()> {
+    let target = fs::read_link(src)
+        .with_context(|| format!("failed to read symlink {}", src.display()))?
+        .to_string_lossy()
+        .to_string();
+    let req = TransferReceiveSymlinkRequest {
+        root: destination_root.to_path_buf(),
+        rel_path: entry.rel_path.clone(),
+        cycle_id,
+        mtime_ns: entry.mtime_ns,
+        mode: entry.mode,
+        hash: entry.hash.clone(),
+        target,
+    };
+    let ack: TransferAck = remote_post_json(
+        destination,
+        "/api/transfer/receive-symlink",
+        &req,
+        TRANSFER_HTTP_TIMEOUT,
+    )?;
+    if !ack.ok {
+        bail!("peer rejected symlink transfer");
+    }
+    Ok(())
+}
+
+fn send_file_udp(
+    destination: &crate::core::config::MachineConfig,
+    destination_root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    src: &Path,
+) -> Result<()> {
+    let id = new_transfer_id(destination_root, &entry.rel_path);
+    let addr = format!(
+        "{}:{}",
+        destination.host,
+        transfer_udp_port(destination.web_port)
+    );
+    let socket = UdpSocket::bind(("0.0.0.0", 0)).context("failed to bind UDP transfer sender")?;
+    socket.set_read_timeout(Some(Duration::from_millis(900)))?;
+    socket.set_write_timeout(Some(Duration::from_millis(900)))?;
+    let total_chunks = if entry.size <= 0 {
+        0
+    } else {
+        ((entry.size as usize + TRANSFER_UDP_CHUNK_SIZE - 1) / TRANSFER_UDP_CHUNK_SIZE) as u32
+    };
+    let start = UdpTransferStart {
+        root: destination_root.to_path_buf(),
+        entry: entry.clone(),
+        cycle_id,
+        total_chunks,
+    };
+    let payload = serde_json::to_vec(&start)?;
+    udp_send_with_ack(
+        &socket,
+        &addr,
+        &id,
+        TRANSFER_UDP_START_SEQ,
+        TRANSFER_UDP_KIND_START,
+        &payload,
+    )?;
+
+    let mut file = File::open(src).with_context(|| format!("failed to open {}", src.display()))?;
+    let mut seq = 0_u32;
+    let mut buf = vec![0_u8; TRANSFER_UDP_CHUNK_SIZE];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        udp_send_with_ack(&socket, &addr, &id, seq, TRANSFER_UDP_KIND_DATA, &buf[..n])?;
+        seq += 1;
+    }
+    udp_send_with_ack(
+        &socket,
+        &addr,
+        &id,
+        TRANSFER_UDP_FINISH_SEQ,
+        TRANSFER_UDP_KIND_FINISH,
+        &[],
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UdpTransferStart {
+    root: PathBuf,
+    entry: SnapshotEntry,
+    cycle_id: i64,
+    total_chunks: u32,
+}
+
+struct UdpReceiveSession {
+    root: PathBuf,
+    entry: SnapshotEntry,
+    cycle_id: i64,
+    tmp: PathBuf,
+    file: File,
+    next_seq: u32,
+    total_chunks: u32,
+}
+
+#[derive(Clone, Copy)]
+struct UdpPacket<'a> {
+    kind: u8,
+    id: [u8; 16],
+    seq: u32,
+    payload: &'a [u8],
+}
+
+fn handle_udp_packet(
+    packet: UdpPacket<'_>,
+    sessions: &mut HashMap<[u8; 16], UdpReceiveSession>,
+) -> Result<u32> {
+    match packet.kind {
+        TRANSFER_UDP_KIND_START => {
+            let start: UdpTransferStart = serde_json::from_slice(packet.payload)?;
+            if start.entry.file_type != "file" {
+                bail!("UDP transfer only supports file entries");
+            }
+            reject_dangerous_destination(&start.root)?;
+            let final_path = safe_join_rel(&start.root, &start.entry.rel_path)?;
+            let tmp = tmp_path(&start.root, start.cycle_id, &start.entry.rel_path);
+            if let Some(parent) = tmp.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if tmp.exists() || fs::symlink_metadata(&tmp).is_ok() {
+                remove_any(&tmp)?;
+            }
+            if let Some(parent) = final_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let file = File::create(&tmp)
+                .with_context(|| format!("failed to create UDP temp file {}", tmp.display()))?;
+            sessions.insert(
+                packet.id,
+                UdpReceiveSession {
+                    root: start.root,
+                    entry: start.entry,
+                    cycle_id: start.cycle_id,
+                    tmp,
+                    file,
+                    next_seq: 0,
+                    total_chunks: start.total_chunks,
+                },
+            );
+            Ok(TRANSFER_UDP_START_SEQ)
+        }
+        TRANSFER_UDP_KIND_DATA => {
+            let Some(session) = sessions.get_mut(&packet.id) else {
+                bail!("unknown UDP transfer session");
+            };
+            if packet.seq < session.next_seq {
+                return Ok(packet.seq);
+            }
+            if packet.seq != session.next_seq {
+                bail!(
+                    "out-of-order UDP transfer chunk: got {}, expected {}",
+                    packet.seq,
+                    session.next_seq
+                );
+            }
+            session.file.write_all(packet.payload)?;
+            session.next_seq += 1;
+            Ok(packet.seq)
+        }
+        TRANSFER_UDP_KIND_FINISH => {
+            let Some(mut session) = sessions.remove(&packet.id) else {
+                bail!("unknown UDP transfer session");
+            };
+            if session.next_seq != session.total_chunks {
+                bail!(
+                    "UDP transfer ended early: got {} chunks, expected {}",
+                    session.next_seq,
+                    session.total_chunks
+                );
+            }
+            session.file.flush().ok();
+            session.file.sync_all().ok();
+            drop(session.file);
+            let final_path = safe_join_rel(&session.root, &session.entry.rel_path)?;
+            finish_received_file(
+                &session.root,
+                session.cycle_id,
+                &session.entry,
+                &session.tmp,
+                &final_path,
+            )?;
+            Ok(TRANSFER_UDP_FINISH_SEQ)
+        }
+        other => bail!("unsupported UDP transfer packet kind {other}"),
+    }
+}
+
+fn udp_send_with_ack(
+    socket: &UdpSocket,
+    addr: &str,
+    id: &[u8; 16],
+    seq: u32,
+    kind: u8,
+    payload: &[u8],
+) -> Result<()> {
+    let packet = build_udp_packet(kind, id, seq, payload);
+    let mut buf = [0_u8; 512];
+    for _ in 0..TRANSFER_UDP_RETRIES {
+        socket
+            .send_to(&packet, addr)
+            .with_context(|| format!("failed to send UDP transfer packet to {addr}"))?;
+        match socket.recv_from(&mut buf) {
+            Ok((len, _)) => {
+                let ack = parse_udp_packet(&buf[..len])?;
+                if ack.kind == TRANSFER_UDP_KIND_ACK && ack.id == *id && ack.seq == seq {
+                    return Ok(());
+                }
+                if ack.kind == TRANSFER_UDP_KIND_ERROR && ack.id == *id {
+                    bail!(
+                        "peer rejected UDP transfer packet: {}",
+                        String::from_utf8_lossy(ack.payload)
+                    );
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    bail!("UDP transfer packet was not acknowledged by {addr}");
+}
+
+fn build_udp_packet(kind: u8, id: &[u8; 16], seq: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TRANSFER_UDP_MAGIC.len() + 1 + 16 + 4 + payload.len());
+    out.extend_from_slice(TRANSFER_UDP_MAGIC);
+    out.push(kind);
+    out.extend_from_slice(id);
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+fn parse_udp_packet(raw: &[u8]) -> Result<UdpPacket<'_>> {
+    let header_len = TRANSFER_UDP_MAGIC.len() + 1 + 16 + 4;
+    if raw.len() < header_len || &raw[..TRANSFER_UDP_MAGIC.len()] != TRANSFER_UDP_MAGIC {
+        bail!("invalid UDP transfer packet");
+    }
+    let kind = raw[TRANSFER_UDP_MAGIC.len()];
+    let id_start = TRANSFER_UDP_MAGIC.len() + 1;
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&raw[id_start..id_start + 16]);
+    let seq_start = id_start + 16;
+    let seq = u32::from_be_bytes(raw[seq_start..seq_start + 4].try_into()?);
+    Ok(UdpPacket {
+        kind,
+        id,
+        seq,
+        payload: &raw[header_len..],
+    })
+}
+
+fn new_transfer_id(root: &Path, rel_path: &str) -> [u8; 16] {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seed = format!(
+        "{}:{}:{}:{now}",
+        std::process::id(),
+        root.to_string_lossy(),
+        rel_path
+    );
+    let digest = blake3::hash(seed.as_bytes());
+    let mut out = [0_u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    out
+}
+
+fn receive_file_api_path(root: &Path, cycle_id: i64, entry: &SnapshotEntry) -> String {
+    let mut path = format!(
+        "/api/transfer/receive-file?root={}&rel_path={}&cycle_id={}&size={}&mtime_ns={}&mode={}",
+        encode_query_component(&root.to_string_lossy()),
+        encode_query_component(&entry.rel_path),
+        cycle_id,
+        entry.size,
+        entry.mtime_ns,
+        entry.mode
+    );
+    if let Some(hash) = &entry.hash {
+        path.push_str("&hash=");
+        path.push_str(&encode_query_component(hash));
+    }
+    path
+}
+
+fn safe_join_rel(root: &Path, rel_path: &str) -> Result<PathBuf> {
+    let rel = Path::new(rel_path);
+    if rel.is_absolute() {
+        bail!("relative path is absolute: {rel_path}");
+    }
+    for component in rel.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            bail!("unsafe relative path: {rel_path}");
+        }
+    }
+    Ok(root.join(rel))
+}
+
 pub fn sync_cycle_for_source(
     cfg: &AppConfig,
     state: &mut State,
@@ -123,8 +834,11 @@ pub fn sync_cycle_for_source(
         "sync cycle started"
     );
 
-    if cycle_needs_rsync(state, source, cycle)? {
-        return sync_cycle_with_rsync(cfg, state, source, cycle);
+    if cycle_has_remote_target(state, source, cycle)? {
+        if cycle.needs_full_rescan {
+            return sync_cycle_with_rsync(cfg, state, source, cycle);
+        }
+        return sync_cycle_with_transfer(cfg, state, source, cycle);
     }
 
     let live_source_endpoint = match SourceEndpoint::resolve(source) {
@@ -379,7 +1093,11 @@ fn sync_task_label(task: &SyncTaskRef) -> String {
     format!("{}:{}", task.source_id, task.destination_id)
 }
 
-fn cycle_needs_rsync(state: &State, source: &SourceGroupConfig, cycle: &Cycle) -> Result<bool> {
+fn cycle_has_remote_target(
+    state: &State,
+    source: &SourceGroupConfig,
+    cycle: &Cycle,
+) -> Result<bool> {
     if machine_id_or_local(&source.machine_id) != "local" {
         return Ok(true);
     }
@@ -391,6 +1109,496 @@ fn cycle_needs_rsync(state: &State, source: &SourceGroupConfig, cycle: &Cycle) -
         }
     }
     Ok(false)
+}
+
+fn sync_cycle_with_transfer(
+    cfg: &AppConfig,
+    state: &mut State,
+    source: &SourceGroupConfig,
+    cycle: &Cycle,
+) -> Result<SyncCycleOutcome> {
+    info!(
+        source = source.id,
+        cycle_id = cycle.id,
+        "incremental transfer cycle started"
+    );
+
+    let source_machine_id = machine_id_or_local(&source.machine_id);
+    let source_machine = find_machine(cfg, source_machine_id)
+        .ok_or_else(|| anyhow!("unknown source machine: {source_machine_id}"))?;
+    let source_info = match path_info_on_machine(source_machine_id, &source_machine, &source.src) {
+        Ok(info) => info,
+        Err(err) => {
+            for dst in &source.destinations {
+                state.upsert_destination_status(
+                    &source.id,
+                    &dst.id,
+                    None,
+                    "red",
+                    "source_unavailable",
+                )?;
+            }
+            state.mark_cycle_status(cycle.id, "failed")?;
+            return Err(err)
+                .with_context(|| format!("source path is unavailable: {}", source.src.display()));
+        }
+    };
+
+    if source_info.kind != "dir" {
+        warn!(
+            source = source.id,
+            cycle_id = cycle.id,
+            kind = source_info.kind,
+            "incremental transfer supports directory sources only; falling back to rsync"
+        );
+        return sync_cycle_with_rsync(cfg, state, source, cycle);
+    }
+
+    let mut all_verified = true;
+    let mut targeted_count = 0_usize;
+    let mut blocked_count = 0_usize;
+    let mut had_unblocked_failure = false;
+    let mut progressed = false;
+    let mut ready_destinations = Vec::new();
+
+    for (dst_index, dst) in source
+        .destinations
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.enabled)
+    {
+        if state.destination_target_cycle(&source.id, &dst.id)? != Some(cycle.id) {
+            continue;
+        }
+        targeted_count += 1;
+        let last_verified = state.destination_last_verified(&source.id, &dst.id)?;
+        if last_verified >= Some(cycle.id) {
+            state.upsert_destination_status(
+                &source.id,
+                &dst.id,
+                Some(cycle.id),
+                "green",
+                "verified",
+            )?;
+            continue;
+        }
+        if let Some(blocker) = sync_order_blocker(cfg, state, &source.id, &dst.id)? {
+            all_verified = false;
+            blocked_count += 1;
+            state.upsert_destination_status(
+                &source.id,
+                &dst.id,
+                None,
+                "red",
+                &format!("blocked_by_sync_order:{blocker}"),
+            )?;
+            continue;
+        }
+        ready_destinations.push(dst_index);
+    }
+
+    if ready_destinations.is_empty() {
+        if targeted_count == 0 || all_verified {
+            state.mark_cycle_status(cycle.id, "verified")?;
+        } else if blocked_count > 0 && !had_unblocked_failure {
+            state.mark_cycle_status(cycle.id, "closed")?;
+        } else {
+            state.mark_cycle_status(cycle.id, "failed")?;
+        }
+        return Ok(SyncCycleOutcome {
+            progressed: false,
+            blocked: blocked_count > 0,
+        });
+    }
+
+    state.mark_cycle_status(cycle.id, "planning")?;
+    let source_snapshot = snapshot_on_machine(
+        source_machine_id,
+        &source_machine,
+        &source_info.base,
+        TransferSnapshotMode::Source,
+        &source.excludes,
+    )
+    .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
+    state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
+
+    state.mark_cycle_status(cycle.id, "syncing")?;
+    for dst_index in ready_destinations {
+        let dst = &source.destinations[dst_index];
+        let dst_machine_id = machine_id_or_local(&dst.machine_id);
+        let dst_machine = match find_machine(cfg, dst_machine_id) {
+            Some(machine) => machine,
+            None => {
+                all_verified = false;
+                had_unblocked_failure = true;
+                state.upsert_destination_status(
+                    &source.id,
+                    &dst.id,
+                    None,
+                    "red",
+                    "unknown_destination_machine",
+                )?;
+                continue;
+            }
+        };
+        let dst_root = dst.path.join(&source_info.name);
+        let protocol = transfer_protocol_for_machines(&source_machine, &dst_machine);
+        info!(
+            source = source.id,
+            destination = dst.id,
+            cycle_id = cycle.id,
+            protocol = ?protocol,
+            "syncing destination with incremental transfer"
+        );
+        match sync_directory_with_transfer(
+            source_machine_id,
+            &source_machine,
+            &source_info.base,
+            dst_machine_id,
+            &dst_machine,
+            &dst_root,
+            cycle.id,
+            &source_snapshot,
+            &source.excludes,
+            protocol,
+        ) {
+            Ok(()) => {
+                progressed = true;
+                state.clear_destination_issues(&source.id, &dst.id)?;
+                state.upsert_destination_status(
+                    &source.id,
+                    &dst.id,
+                    Some(cycle.id),
+                    "green",
+                    "verified",
+                )?;
+            }
+            Err(err) => {
+                if matches!(protocol, TransferProtocol::Udp) {
+                    warn!(
+                        source = source.id,
+                        destination = dst.id,
+                        cycle_id = cycle.id,
+                        error = %err,
+                        "UDP incremental transfer failed; retrying with TCP"
+                    );
+                    match sync_directory_with_transfer(
+                        source_machine_id,
+                        &source_machine,
+                        &source_info.base,
+                        dst_machine_id,
+                        &dst_machine,
+                        &dst_root,
+                        cycle.id,
+                        &source_snapshot,
+                        &source.excludes,
+                        TransferProtocol::Tcp,
+                    ) {
+                        Ok(()) => {
+                            progressed = true;
+                            state.clear_destination_issues(&source.id, &dst.id)?;
+                            state.upsert_destination_status(
+                                &source.id,
+                                &dst.id,
+                                Some(cycle.id),
+                                "green",
+                                "verified",
+                            )?;
+                            continue;
+                        }
+                        Err(tcp_err) => {
+                            all_verified = false;
+                            had_unblocked_failure = true;
+                            state.clear_destination_issues(&source.id, &dst.id)?;
+                            state.upsert_destination_status(
+                                &source.id,
+                                &dst.id,
+                                None,
+                                "red",
+                                &short_reason(&tcp_err),
+                            )?;
+                        }
+                    }
+                } else {
+                    all_verified = false;
+                    had_unblocked_failure = true;
+                    state.clear_destination_issues(&source.id, &dst.id)?;
+                    state.upsert_destination_status(
+                        &source.id,
+                        &dst.id,
+                        None,
+                        "red",
+                        &short_reason(&err),
+                    )?;
+                }
+            }
+        }
+    }
+
+    if targeted_count == 0 || all_verified {
+        state.mark_cycle_status(cycle.id, "verified")?;
+    } else if blocked_count > 0 && !had_unblocked_failure {
+        state.mark_cycle_status(cycle.id, "closed")?;
+    } else {
+        state.mark_cycle_status(cycle.id, "failed")?;
+    }
+    Ok(SyncCycleOutcome {
+        progressed,
+        blocked: blocked_count > 0,
+    })
+}
+
+fn sync_directory_with_transfer(
+    source_machine_id: &str,
+    source_machine: &crate::core::config::MachineConfig,
+    source_root: &Path,
+    dst_machine_id: &str,
+    dst_machine: &crate::core::config::MachineConfig,
+    dst_root: &Path,
+    cycle_id: i64,
+    source_snapshot: &[SnapshotEntry],
+    excludes: &[PathBuf],
+    protocol: TransferProtocol,
+) -> Result<()> {
+    prepare_dir_on_machine(dst_machine_id, dst_machine, dst_root, None, None)?;
+    let source_map = map_entries(source_snapshot);
+    let dst_snapshot = snapshot_on_machine(
+        dst_machine_id,
+        dst_machine,
+        dst_root,
+        TransferSnapshotMode::Destination,
+        &[],
+    )?;
+    let dst_map = map_entries(&dst_snapshot);
+
+    for entry in source_snapshot
+        .iter()
+        .filter(|entry| entry.file_type == "dir")
+    {
+        prepare_dir_on_machine(
+            dst_machine_id,
+            dst_machine,
+            dst_root,
+            Some(&entry.rel_path),
+            Some(entry.mode),
+        )?;
+    }
+
+    for entry in source_snapshot
+        .iter()
+        .filter(|entry| entry.file_type == "file" || entry.file_type == "symlink")
+    {
+        let needs_copy = match dst_map.get(&entry.rel_path) {
+            Some(existing) => !entries_match(entry, existing),
+            None => true,
+        };
+        if !needs_copy {
+            continue;
+        }
+        push_entry_between_machines(
+            source_machine_id,
+            source_machine,
+            source_root,
+            dst_machine,
+            dst_root,
+            cycle_id,
+            entry,
+            protocol,
+        )
+        .with_context(|| format!("failed to transfer {}", entry.rel_path))?;
+    }
+
+    let mut extra_paths: Vec<String> = dst_map
+        .keys()
+        .filter(|rel| !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes))
+        .cloned()
+        .collect();
+    extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
+    for rel in extra_paths {
+        remove_path_on_machine(dst_machine_id, dst_machine, dst_root, &rel, cycle_id)
+            .with_context(|| format!("failed to remove extra destination path {rel}"))?;
+    }
+
+    let actual = snapshot_on_machine(
+        dst_machine_id,
+        dst_machine,
+        dst_root,
+        TransferSnapshotMode::Destination,
+        &[],
+    )?;
+    verify_snapshot_entries(source_snapshot, &actual, excludes)?;
+    Ok(())
+}
+
+fn transfer_protocol_for_machines(
+    source_machine: &crate::core::config::MachineConfig,
+    dst_machine: &crate::core::config::MachineConfig,
+) -> TransferProtocol {
+    if machines_share_lan(source_machine, dst_machine, Duration::from_millis(500)) {
+        TransferProtocol::Udp
+    } else {
+        TransferProtocol::Tcp
+    }
+}
+
+fn path_info_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    path: &Path,
+) -> Result<TransferPathInfo> {
+    let req = TransferPathInfoRequest {
+        path: path.to_path_buf(),
+    };
+    if machine_id == "local" {
+        transfer_path_info(req)
+    } else {
+        remote_post_json(
+            machine,
+            "/api/transfer/path-info",
+            &req,
+            TRANSFER_HTTP_TIMEOUT,
+        )
+    }
+}
+
+fn snapshot_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    mode: TransferSnapshotMode,
+    excludes: &[PathBuf],
+) -> Result<Vec<SnapshotEntry>> {
+    let req = TransferSnapshotRequest {
+        root: root.to_path_buf(),
+        mode,
+        excludes: excludes.to_vec(),
+    };
+    if machine_id == "local" {
+        transfer_snapshot(req)
+    } else {
+        remote_post_json(
+            machine,
+            "/api/transfer/snapshot",
+            &req,
+            TRANSFER_HTTP_TIMEOUT,
+        )
+    }
+}
+
+fn prepare_dir_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    rel_path: Option<&str>,
+    mode: Option<u32>,
+) -> Result<()> {
+    let req = TransferPrepareDirRequest {
+        root: root.to_path_buf(),
+        rel_path: rel_path.map(ToString::to_string),
+        mode,
+    };
+    let ack = if machine_id == "local" {
+        transfer_prepare_dir(req)?
+    } else {
+        remote_post_json(
+            machine,
+            "/api/transfer/prepare-dir",
+            &req,
+            TRANSFER_HTTP_TIMEOUT,
+        )?
+    };
+    if !ack.ok {
+        bail!("peer rejected prepare directory request");
+    }
+    Ok(())
+}
+
+fn remove_path_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    rel_path: &str,
+    cycle_id: i64,
+) -> Result<()> {
+    let req = TransferRemovePathRequest {
+        root: root.to_path_buf(),
+        rel_path: rel_path.to_string(),
+        cycle_id,
+    };
+    let ack = if machine_id == "local" {
+        transfer_remove_path(req)?
+    } else {
+        remote_post_json(
+            machine,
+            "/api/transfer/remove-path",
+            &req,
+            TRANSFER_HTTP_TIMEOUT,
+        )?
+    };
+    if !ack.ok {
+        bail!("peer rejected remove path request");
+    }
+    Ok(())
+}
+
+fn push_entry_between_machines(
+    source_machine_id: &str,
+    source_machine: &crate::core::config::MachineConfig,
+    source_root: &Path,
+    dst_machine: &crate::core::config::MachineConfig,
+    dst_root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    protocol: TransferProtocol,
+) -> Result<()> {
+    let req = TransferPushFileRequest {
+        source_root: source_root.to_path_buf(),
+        rel_path: entry.rel_path.clone(),
+        entry: entry.clone(),
+        destination: dst_machine.clone(),
+        destination_root: dst_root.to_path_buf(),
+        protocol,
+        cycle_id,
+    };
+    let ack = if source_machine_id == "local" {
+        transfer_push_file(req)?
+    } else {
+        remote_post_json(
+            source_machine,
+            "/api/transfer/push-file",
+            &req,
+            TRANSFER_HTTP_TIMEOUT,
+        )?
+    };
+    if !ack.ok {
+        bail!("peer rejected file push request");
+    }
+    Ok(())
+}
+
+fn verify_snapshot_entries(
+    expected: &[SnapshotEntry],
+    actual: &[SnapshotEntry],
+    excludes: &[PathBuf],
+) -> Result<()> {
+    let expected = map_entries(expected);
+    let actual = map_entries(actual);
+    for (rel, want) in &expected {
+        match actual.get(rel) {
+            Some(got) if entries_match(want, got) => {}
+            Some(_) => bail!("destination mismatch at {rel}"),
+            None => bail!("destination missing {rel}"),
+        }
+    }
+    for rel in actual.keys() {
+        if is_rel_excluded(Path::new(rel), excludes) {
+            continue;
+        }
+        if !expected.contains_key(rel) {
+            bail!("destination has extra path {rel}");
+        }
+    }
+    Ok(())
 }
 
 fn sync_cycle_with_rsync(
@@ -1724,6 +2932,65 @@ mod tests {
             SyncRequestMode::Full
         );
         assert!("other".parse::<SyncRequestMode>().is_err());
+    }
+
+    #[test]
+    fn transfer_receive_file_path_encodes_windows_paths() {
+        let entry = SnapshotEntry {
+            rel_path: "dir/hello world.txt".to_string(),
+            file_type: "file".to_string(),
+            size: 5,
+            mtime_ns: 123,
+            mode: 0o644,
+            hash: Some("abc+123".to_string()),
+        };
+
+        let path = receive_file_api_path(Path::new("C:\\sync root"), 42, &entry);
+
+        assert!(path.starts_with("/api/transfer/receive-file?"));
+        assert!(path.contains("root=C%3A%5Csync%20root"));
+        assert!(path.contains("rel_path=dir%2Fhello%20world.txt"));
+        assert!(path.contains("hash=abc%2B123"));
+    }
+
+    #[test]
+    fn transfer_safe_join_rejects_absolute_and_parent_paths() {
+        let root = Path::new("/tmp/root");
+
+        assert_eq!(
+            safe_join_rel(root, "nested/file.txt").unwrap(),
+            root.join("nested").join("file.txt")
+        );
+        assert!(safe_join_rel(root, "../escape.txt").is_err());
+        assert!(safe_join_rel(root, "/escape.txt").is_err());
+    }
+
+    #[test]
+    fn transfer_receive_file_writes_and_verifies_file() {
+        let temp = temp_dir("transfer_receive_file");
+        let root = temp.join("dst");
+        let bytes = b"hello over tcp";
+        let hash = blake3::hash(bytes).to_hex().to_string();
+
+        transfer_receive_file(
+            TransferReceiveFileQuery {
+                root: root.to_string_lossy().to_string(),
+                rel_path: "nested/hello.txt".to_string(),
+                cycle_id: 9,
+                size: bytes.len() as i64,
+                mtime_ns: 0,
+                mode: 0o644,
+                hash: Some(hash),
+            },
+            bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(root.join("nested").join("hello.txt")).unwrap(),
+            bytes
+        );
+        fs::remove_dir_all(temp).ok();
     }
 
     #[test]

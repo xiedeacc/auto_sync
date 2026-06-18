@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::Path as AxumPath;
 use axum::extract::Query;
 use axum::extract::State as AxumState;
@@ -15,8 +17,14 @@ use tracing::info;
 use crate::core::backend::{Backend, BrowseResponse};
 use crate::core::config::{AppConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
-use crate::core::state::DestinationView;
-use crate::core::sync::SyncRequestMode;
+use crate::core::state::{DestinationView, SnapshotEntry};
+use crate::core::sync::{
+    SyncRequestMode, TransferAck, TransferPathInfo, TransferPathInfoRequest,
+    TransferPrepareDirRequest, TransferPushFileRequest, TransferReceiveFileQuery,
+    TransferReceiveSymlinkRequest, TransferRemovePathRequest, TransferSnapshotRequest,
+    spawn_transfer_udp_receiver, transfer_path_info, transfer_prepare_dir, transfer_push_file,
+    transfer_receive_file, transfer_receive_symlink, transfer_remove_path, transfer_snapshot,
+};
 
 pub fn router(backend: Backend) -> Router {
     Router::new()
@@ -32,14 +40,29 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/sync-now", post(api_sync_now))
         .route("/api/sync-source-now", post(api_sync_source_now))
         .route("/api/sync-destination-now", post(api_sync_destination_now))
+        .route("/api/transfer/snapshot", post(api_transfer_snapshot))
+        .route("/api/transfer/path-info", post(api_transfer_path_info))
+        .route("/api/transfer/prepare-dir", post(api_transfer_prepare_dir))
+        .route("/api/transfer/remove-path", post(api_transfer_remove_path))
+        .route(
+            "/api/transfer/receive-file",
+            post(api_transfer_receive_file),
+        )
+        .route(
+            "/api/transfer/receive-symlink",
+            post(api_transfer_receive_symlink),
+        )
+        .route("/api/transfer/push-file", post(api_transfer_push_file))
         .route("/api/browse-dirs", get(api_browse_paths))
         .route("/api/browse-paths", get(api_browse_paths))
+        .layer(DefaultBodyLimit::disable())
         .with_state(backend)
 }
 
 pub async fn serve(backend: Backend, addr: SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let _discovery = spawn_discovery_responder(backend.config_path(), backend.web_port());
+    let _transfer_udp = spawn_transfer_udp_receiver(backend.web_port());
     let app = router(backend);
     info!(url = %format!("http://{addr}/"), "auto_sync web listening");
     println!("auto_sync Web UI: http://{addr}/");
@@ -161,6 +184,49 @@ async fn api_sync_destination_now(
         &req.destination_id,
         mode,
     )?))
+}
+
+async fn api_transfer_snapshot(
+    Json(req): Json<TransferSnapshotRequest>,
+) -> Result<Json<Vec<SnapshotEntry>>, ApiError> {
+    Ok(Json(transfer_snapshot(req)?))
+}
+
+async fn api_transfer_path_info(
+    Json(req): Json<TransferPathInfoRequest>,
+) -> Result<Json<TransferPathInfo>, ApiError> {
+    Ok(Json(transfer_path_info(req)?))
+}
+
+async fn api_transfer_prepare_dir(
+    Json(req): Json<TransferPrepareDirRequest>,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_prepare_dir(req)?))
+}
+
+async fn api_transfer_remove_path(
+    Json(req): Json<TransferRemovePathRequest>,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_remove_path(req)?))
+}
+
+async fn api_transfer_receive_file(
+    Query(query): Query<TransferReceiveFileQuery>,
+    body: Bytes,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_receive_file(query, &body)?))
+}
+
+async fn api_transfer_receive_symlink(
+    Json(req): Json<TransferReceiveSymlinkRequest>,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_receive_symlink(req)?))
+}
+
+async fn api_transfer_push_file(
+    Json(req): Json<TransferPushFileRequest>,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_push_file(req)?))
 }
 
 #[derive(Debug, Deserialize)]

@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::core::config::AppConfig;
 use crate::core::config::ScheduleMode;
@@ -19,7 +19,7 @@ pub struct Cycle {
     pub needs_full_rescan: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotEntry {
     pub rel_path: String,
     pub file_type: String,

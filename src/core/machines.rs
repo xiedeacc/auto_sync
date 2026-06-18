@@ -554,6 +554,50 @@ pub fn discover_lan(timeout: Duration) -> Result<Vec<MachineHealth>> {
     Ok(out)
 }
 
+pub fn machines_share_lan(left: &MachineConfig, right: &MachineConfig, timeout: Duration) -> bool {
+    if machine_endpoint_key(left) == machine_endpoint_key(right) {
+        return true;
+    }
+    if same_private_ipv4_lan(&left.host, &right.host) {
+        return true;
+    }
+    let Ok(discovered) = discover_lan(timeout) else {
+        return false;
+    };
+    let left_seen =
+        left.id == "local" || discovered.iter().any(|health| health_matches(left, health));
+    let right_seen = right.id == "local"
+        || discovered
+            .iter()
+            .any(|health| health_matches(right, health));
+    left_seen && right_seen
+}
+
+fn health_matches(machine: &MachineConfig, health: &MachineHealth) -> bool {
+    endpoint_key(&health.host, health.web_port) == machine_endpoint_key(machine)
+        || (!machine.id.trim().is_empty() && machine.id == health.id)
+}
+
+fn same_private_ipv4_lan(left: &str, right: &str) -> bool {
+    let Ok(left) = left.trim().parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(right) = right.trim().parse::<Ipv4Addr>() else {
+        return false;
+    };
+    if !is_private_ipv4(left) || !is_private_ipv4(right) {
+        return false;
+    }
+    let left = left.octets();
+    let right = right.octets();
+    left[..3] == right[..3]
+}
+
+fn is_private_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
+}
+
 fn discovery_targets() -> Vec<SocketAddr> {
     let mut targets = vec![SocketAddr::from((
         Ipv4Addr::new(255, 255, 255, 255),
@@ -578,7 +622,52 @@ pub fn remote_get_json<T: DeserializeOwned>(
     path: &str,
     timeout: Duration,
 ) -> Result<T> {
-    let raw = http_get(&machine.host, machine.web_port, path, timeout)?;
+    let raw = http_request(
+        &machine.host,
+        machine.web_port,
+        "GET",
+        path,
+        None,
+        &[],
+        timeout,
+    )?;
+    serde_json::from_slice(&raw).context("failed to parse peer response")
+}
+
+pub fn remote_post_json<B: Serialize, T: DeserializeOwned>(
+    machine: &MachineConfig,
+    path: &str,
+    body: &B,
+    timeout: Duration,
+) -> Result<T> {
+    let body = serde_json::to_vec(body).context("failed to serialize peer request")?;
+    let raw = http_request(
+        &machine.host,
+        machine.web_port,
+        "POST",
+        path,
+        Some("application/json"),
+        &body,
+        timeout,
+    )?;
+    serde_json::from_slice(&raw).context("failed to parse peer response")
+}
+
+pub fn remote_post_bytes<T: DeserializeOwned>(
+    machine: &MachineConfig,
+    path: &str,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<T> {
+    let raw = http_request(
+        &machine.host,
+        machine.web_port,
+        "POST",
+        path,
+        Some("application/octet-stream"),
+        body,
+        timeout,
+    )?;
     serde_json::from_slice(&raw).context("failed to parse peer response")
 }
 
@@ -620,7 +709,15 @@ fn ping_machine(machine: &MachineConfig) -> bool {
     remote_get_json::<MachineHealth>(machine, "/api/health", Duration::from_millis(700)).is_ok()
 }
 
-fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<Vec<u8>> {
+fn http_request(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .with_context(|| format!("invalid peer address {host}:{port}"))?;
@@ -628,10 +725,20 @@ fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<Vec<
         .with_context(|| format!("failed to connect to peer {host}:{port}"))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
     );
+    if let Some(content_type) = content_type {
+        request.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    if !body.is_empty() || method.eq_ignore_ascii_case("POST") {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
     stream.write_all(request.as_bytes())?;
+    if !body.is_empty() {
+        stream.write_all(body)?;
+    }
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
     let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
@@ -792,6 +899,15 @@ mod tests {
 
         assert_eq!(health.ssh_user, "");
         assert_eq!(health.ssh_port, 22);
+    }
+
+    #[test]
+    fn same_private_ipv4_lan_uses_private_24s_only() {
+        assert!(same_private_ipv4_lan("192.168.2.10", "192.168.2.247"));
+        assert!(same_private_ipv4_lan("10.0.4.10", "10.0.4.11"));
+        assert!(!same_private_ipv4_lan("192.168.2.10", "192.168.3.10"));
+        assert!(!same_private_ipv4_lan("203.0.113.10", "203.0.113.11"));
+        assert!(!same_private_ipv4_lan("nas.local", "192.168.2.247"));
     }
 
     #[test]
