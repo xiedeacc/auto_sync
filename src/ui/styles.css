@@ -305,7 +305,7 @@ th {
 }
 
 .destination-right {
-  grid-template-columns: 100px 72px 58px 34px;
+  grid-template-columns: 100px 72px 96px 34px;
 }
 
 .actions-label {
@@ -344,12 +344,16 @@ th {
 
 .destination-row.destination-unavailable input,
 .destination-row.destination-unavailable select,
-.destination-row.destination-unavailable .schedule-button,
-.destination-row.destination-unavailable .destination-sync-button {
+.destination-row.destination-unavailable .schedule-button {
   filter: grayscale(1);
 }
 
-.destination-row.destination-unavailable .destination-sync-button {
+.destination-sync-select {
+  min-width: 96px;
+  font-weight: 650;
+}
+
+.destination-row.destination-unavailable .destination-sync-select {
   cursor: not-allowed;
 }
 

@@ -15,7 +15,9 @@ use crate::core::machines::{
     machine_id_from_path, merge_discovered, remote_get_json,
 };
 use crate::core::state::{DestinationView, State as DbState};
-use crate::core::sync::{sync_all_now, sync_destination_now, sync_source_now};
+use crate::core::sync::{
+    SyncRequestMode, sync_all_now, sync_destination_now_with_mode, sync_source_now,
+};
 
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MANUAL_DISCOVERY_MIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -131,11 +133,12 @@ impl Backend {
         &self,
         source_id: &str,
         destination_id: &str,
+        mode: SyncRequestMode,
     ) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
         let mut state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
-        sync_destination_now(&cfg, &mut state_db, source_id, destination_id)?;
+        sync_destination_now_with_mode(&cfg, &mut state_db, source_id, destination_id, mode)?;
         state_db.destination_views(&cfg)
     }
 

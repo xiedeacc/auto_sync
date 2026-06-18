@@ -7,6 +7,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -66,8 +67,47 @@ pub fn sync_destination_now(
     source_id: &str,
     destination_id: &str,
 ) -> Result<()> {
-    state.force_target_destination(cfg, source_id, destination_id)?;
+    sync_destination_now_with_mode(
+        cfg,
+        state,
+        source_id,
+        destination_id,
+        SyncRequestMode::Incremental,
+    )
+}
+
+pub fn sync_destination_now_with_mode(
+    cfg: &AppConfig,
+    state: &mut State,
+    source_id: &str,
+    destination_id: &str,
+    mode: SyncRequestMode,
+) -> Result<()> {
+    if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
+        if mode == SyncRequestMode::Full {
+            state.mark_cycle_needs_rescan(cycle.id)?;
+        }
+    }
     sync_all_pending(cfg, state)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SyncRequestMode {
+    #[default]
+    Incremental,
+    Full,
+}
+
+impl FromStr for SyncRequestMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "incremental" => Ok(Self::Incremental),
+            "full" => Ok(Self::Full),
+            other => bail!("unsupported sync mode: {other}"),
+        }
+    }
 }
 
 pub fn sync_cycle_for_source(
@@ -1674,6 +1714,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_destination_sync_request_modes() {
+        assert_eq!(
+            "incremental".parse::<SyncRequestMode>().unwrap(),
+            SyncRequestMode::Incremental
+        );
+        assert_eq!(
+            "full".parse::<SyncRequestMode>().unwrap(),
+            SyncRequestMode::Full
+        );
+        assert!("other".parse::<SyncRequestMode>().is_err());
+    }
+
+    #[test]
     fn syncs_source_file_to_destination_directory() {
         let temp = temp_dir("file_to_dir");
         let src = temp.join("source.txt");
@@ -1892,6 +1945,87 @@ mod tests {
         assert_eq!(first.last_verified_cycle_id, None);
         assert_eq!(second.status, "green");
         assert_eq!(second.target_cycle_id, second.last_verified_cycle_id);
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn full_destination_sync_only_targets_selected_destination() {
+        let temp = temp_dir("full_sync_one_dst_now");
+        let src = temp.join("src");
+        let dst_1 = temp.join("dst_1");
+        let dst_2 = temp.join("dst_2");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst_1).unwrap();
+        fs::create_dir_all(&dst_2).unwrap();
+        fs::write(src.join("hello.txt"), b"hello").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![
+                DestinationConfig {
+                    id: "dst_1".to_string(),
+                    machine_id: "local".to_string(),
+                    path: dst_1.clone(),
+                    enabled: true,
+                    schedule: ScheduleConfig::default(),
+                },
+                DestinationConfig {
+                    id: "dst_2".to_string(),
+                    machine_id: "local".to_string(),
+                    path: dst_2.clone(),
+                    enabled: true,
+                    schedule: ScheduleConfig::default(),
+                },
+            ],
+        });
+
+        let mut state = State::open(&db).unwrap();
+        sync_destination_now_with_mode(&cfg, &mut state, "src_1", "dst_2", SyncRequestMode::Full)
+            .unwrap();
+
+        assert!(!dst_1.join("src").join("hello.txt").exists());
+        assert_eq!(
+            fs::read(dst_2.join("src").join("hello.txt")).unwrap(),
+            b"hello"
+        );
+
+        let views = state.destination_views(&cfg).unwrap();
+        let first = views
+            .iter()
+            .find(|view| view.destination_id == "dst_1")
+            .unwrap();
+        let second = views
+            .iter()
+            .find(|view| view.destination_id == "dst_2")
+            .unwrap();
+        assert_eq!(first.target_cycle_id, None);
+        assert_eq!(first.last_verified_cycle_id, None);
+        assert_eq!(second.status, "green");
+        assert_eq!(second.target_cycle_id, second.last_verified_cycle_id);
+
+        let cycle_id = second.target_cycle_id.unwrap();
+        let needs_full_rescan: i64 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT needs_full_rescan FROM sync_cycle WHERE id=?1",
+                rusqlite::params![cycle_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(needs_full_rescan, 1);
 
         fs::remove_dir_all(temp).ok();
     }

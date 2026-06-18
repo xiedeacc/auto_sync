@@ -16,6 +16,7 @@ use crate::core::backend::{Backend, BrowseResponse};
 use crate::core::config::{AppConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
 use crate::core::state::DestinationView;
+use crate::core::sync::SyncRequestMode;
 
 pub fn router(backend: Backend) -> Router {
     Router::new()
@@ -143,15 +144,22 @@ async fn api_sync_source_now(
 struct SyncDestinationRequest {
     source_id: String,
     destination_id: String,
+    mode: Option<String>,
 }
 
 async fn api_sync_destination_now(
     AxumState(backend): AxumState<Backend>,
     Json(req): Json<SyncDestinationRequest>,
 ) -> Result<Json<Vec<DestinationView>>, ApiError> {
+    let mode = req
+        .mode
+        .as_deref()
+        .unwrap_or("incremental")
+        .parse::<SyncRequestMode>()?;
     Ok(Json(backend.sync_destination_now(
         &req.source_id,
         &req.destination_id,
+        mode,
     )?))
 }
 

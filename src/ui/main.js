@@ -180,11 +180,11 @@ function updateStatusUi() {
       dot.title = dotTitle;
       dot.setAttribute("aria-label", dotTitle);
     }
-    const syncButton = row.querySelector('[data-action="sync-dst"]');
-    if (syncButton) {
+    const syncSelect = row.querySelector('[data-action="sync-dst"]');
+    if (syncSelect) {
       const blocked = isSyncOrderBlocked(status);
-      syncButton.disabled = busy || blocked || unavailable;
-      syncButton.title = unavailable
+      syncSelect.disabled = busy || blocked || unavailable;
+      syncSelect.title = unavailable
         ? unavailableLabel(status)
         : (blocked ? blockedByLabel(status) : "Sync destination");
     }
@@ -652,7 +652,11 @@ function renderSyncRows(source, group) {
         <label class="actions-label">Actions</label>
         <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
         <input class="destination-readonly destination-cycle" value="${escapeAttr(cycleDisplay(status))}" readonly>
-        <button class="destination-sync-button" data-action="sync-dst" title="Sync destination">Sync</button>
+        <select class="destination-sync-select" data-action="sync-dst" title="Sync destination">
+          <option value="">Sync...</option>
+          <option value="incremental">Incremental</option>
+          <option value="full">Full</option>
+        </select>
         <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
       </div>
     `;
@@ -687,7 +691,12 @@ function renderSyncRows(source, group) {
         openIssueModal(latestStatus);
       }
     };
-    row.querySelector('[data-action="sync-dst"]').onclick = () => {
+    row.querySelector('[data-action="sync-dst"]').onchange = (event) => {
+      const mode = event.currentTarget.value;
+      event.currentTarget.value = "";
+      if (!mode) {
+        return;
+      }
       const latestStatus = statusFor(source.id, dst.id);
       if (isDestinationUnavailable(latestStatus)) {
         setMessage(unavailableLabel(latestStatus));
@@ -704,6 +713,7 @@ function renderSyncRows(source, group) {
         statuses = await invoke("sync_destination_now", {
           sourceId: source.id,
           destinationId: dst.id,
+          mode,
         });
         setMessage("");
         render();
@@ -1715,6 +1725,7 @@ async function invokeWeb(command, payload = {}) {
       options.body = JSON.stringify({
         source_id: payload.sourceId || payload.source_id,
         destination_id: payload.destinationId || payload.destination_id,
+        mode: payload.mode || payload.syncMode || payload.sync_mode || "incremental",
       });
     } else if (command === "add_machine") {
       options.body = JSON.stringify(payload.machine);

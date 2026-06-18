@@ -9,6 +9,7 @@ use auto_sync::core::config::{AppConfig, MachineConfig, load_or_create_config};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::machines::MachineStatus;
 use auto_sync::core::state::DestinationView;
+use auto_sync::core::sync::SyncRequestMode;
 use auto_sync::core::web_api;
 use clap::Parser;
 use tracing::warn;
@@ -83,9 +84,15 @@ async fn sync_destination_now(
     backend: tauri::State<'_, Backend>,
     source_id: String,
     destination_id: String,
+    mode: Option<String>,
 ) -> Result<Vec<DestinationView>, String> {
+    let mode = mode
+        .as_deref()
+        .unwrap_or("incremental")
+        .parse::<SyncRequestMode>()
+        .map_err(error_text)?;
     backend
-        .sync_destination_now(&source_id, &destination_id)
+        .sync_destination_now(&source_id, &destination_id, mode)
         .map_err(error_text)
 }
 

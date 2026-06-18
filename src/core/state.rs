@@ -524,13 +524,17 @@ impl State {
         Ok(())
     }
 
-    pub fn mark_open_cycle_needs_rescan(&self, source_id: &str) -> Result<()> {
-        let cycle_id = self.ensure_open_cycle(source_id, Utc::now())?;
+    pub fn mark_cycle_needs_rescan(&self, cycle_id: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE sync_cycle SET needs_full_rescan=1, updated_at=?1 WHERE id=?2",
             params![now_string(), cycle_id],
         )?;
         Ok(())
+    }
+
+    pub fn mark_open_cycle_needs_rescan(&self, source_id: &str) -> Result<()> {
+        let cycle_id = self.ensure_open_cycle(source_id, Utc::now())?;
+        self.mark_cycle_needs_rescan(cycle_id)
     }
 
     pub fn record_event(
