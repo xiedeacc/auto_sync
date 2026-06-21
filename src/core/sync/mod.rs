@@ -911,7 +911,7 @@ fn sync_cycle_with_transfer(
                 continue;
             }
         };
-        let dst_root = dst.path.join(&source_info.name);
+        let dst_root = join_machine_path(&dst.path, &source_info.name, &dst_machine);
         info!(
             source = source.id,
             destination = dst.id,
@@ -1305,9 +1305,11 @@ fn sync_rsync_endpoint(
     let dst_machine = find_machine(cfg, dst_machine_id)
         .ok_or_else(|| anyhow!("unknown destination machine: {dst_machine_id}"))?;
     let source_spec = format!("{}/", rsync_endpoint(&source_machine, &source.src));
-    let dst_path = dst
-        .path
-        .join(cross_platform_file_name(&source.src).unwrap_or_else(|| "source".to_string()));
+    let dst_path = join_machine_path(
+        &dst.path,
+        &cross_platform_file_name(&source.src).unwrap_or_else(|| "source".to_string()),
+        &dst_machine,
+    );
     let dst_spec = format!("{}/", rsync_endpoint(&dst_machine, &dst_path));
 
     if source_machine_id != "local" && dst_machine_id != "local" {
@@ -1445,6 +1447,24 @@ fn cross_platform_file_name(path: &Path) -> Option<String> {
     } else {
         Some(leaf.to_string())
     }
+}
+
+fn join_machine_path(
+    base: &Path,
+    leaf: &str,
+    machine: &crate::core::config::MachineConfig,
+) -> PathBuf {
+    let raw = base.to_string_lossy();
+    let trimmed = raw.trim_end_matches(|ch| ch == '/' || ch == '\\');
+    let sep = if machine.os.eq_ignore_ascii_case("windows") {
+        "\\"
+    } else {
+        "/"
+    };
+    if trimmed.is_empty() {
+        return PathBuf::from(format!("{sep}{leaf}"));
+    }
+    PathBuf::from(format!("{trimmed}{sep}{leaf}"))
 }
 
 #[derive(Debug, Clone)]
@@ -2512,6 +2532,24 @@ mod tests {
             Some("source".to_string())
         );
         assert_eq!(cross_platform_file_name(Path::new("C:\\")), None);
+    }
+
+    #[test]
+    fn joins_paths_using_target_machine_separator() {
+        let mut linux = MachineConfig::local();
+        linux.os = "linux".to_string();
+        assert_eq!(
+            join_machine_path(Path::new("/zfs/tmp"), "auto_sync_test", &linux).to_string_lossy(),
+            "/zfs/tmp/auto_sync_test"
+        );
+
+        let mut windows = MachineConfig::local();
+        windows.os = "windows".to_string();
+        assert_eq!(
+            join_machine_path(Path::new("C:\\Users\\tiger"), "auto_sync_test", &windows)
+                .to_string_lossy(),
+            "C:\\Users\\tiger\\auto_sync_test"
+        );
     }
 
     #[test]

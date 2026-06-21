@@ -19,6 +19,8 @@ const el = {
   sourcePanel: document.getElementById("source-panel"),
   message: document.getElementById("message"),
   config: document.getElementById("config"),
+  statusConfig: document.getElementById("status-config"),
+  statusText: document.getElementById("status-text"),
   refresh: document.getElementById("refresh"),
   machineStatus: document.getElementById("machine-status"),
   folderModal: document.getElementById("folder-modal"),
@@ -1369,6 +1371,7 @@ async function pickPath(startPath = "/", options = {}) {
       resolve,
       path: startPath || "/",
       machineId: machineIdOrLocal(options.machineId),
+      requestId: 0,
       validate: options.validate || null,
     };
     setFolderError("");
@@ -1379,12 +1382,30 @@ async function pickPath(startPath = "/", options = {}) {
 }
 
 async function loadPath(path) {
+  if (!folderPicker) {
+    return;
+  }
+  const machineId = machineIdOrLocal(folderPicker.machineId);
+  const requestId = (folderPicker.requestId || 0) + 1;
+  folderPicker.requestId = requestId;
+  folderPicker.machineId = machineId;
+  folderPicker.path = path || defaultPathForMachine(machineId);
+  folderPicker.parent = null;
+  el.folderPath.textContent = folderPicker.path;
+  el.folderList.innerHTML = `<div class="empty">Loading...</div>`;
   try {
     const result = await invoke("browse_paths", {
-      path,
-      machineId: folderPicker.machineId,
-      machine_id: folderPicker.machineId,
+      path: folderPicker.path,
+      machineId,
+      machine_id: machineId,
     });
+    if (
+      !folderPicker ||
+      folderPicker.requestId !== requestId ||
+      machineIdOrLocal(folderPicker.machineId) !== machineId
+    ) {
+      return;
+    }
     folderPicker.path = result.path;
     folderPicker.parent = result.parent;
     el.folderPath.textContent = result.path;
@@ -1406,6 +1427,10 @@ async function loadPath(path) {
       el.folderList.innerHTML = `<div class="empty">No entries</div>`;
     }
   } catch (error) {
+    if (!folderPicker || folderPicker.requestId !== requestId) {
+      return;
+    }
+    el.folderList.innerHTML = `<div class="empty">Failed to load path</div>`;
     setMessage(String(error));
   }
 }
@@ -1565,12 +1590,16 @@ async function runBusy(message, fn) {
 function setBusy(nextBusy) {
   busy = nextBusy;
   el.config.disabled = busy;
+  el.statusConfig.disabled = busy;
   el.refresh.disabled = busy;
   updateStatusUi();
 }
 
 function setMessage(text) {
-  el.message.textContent = text || "";
+  const value = text || "";
+  el.message.textContent = value;
+  el.statusText.textContent = value || "Ready";
+  el.statusText.title = value || "Ready";
 }
 
 function defaultUiConfig() {
@@ -1628,6 +1657,7 @@ function bindButtonClick(button, handler) {
 }
 
 bindButtonClick(el.config, openConfigModal);
+bindButtonClick(el.statusConfig, openConfigModal);
 bindButtonClick(el.refresh, () => runBusy("", loadAll));
 bindButtonClick(el.machineStatus, openMachineModal);
 window.autoSyncOpenMachines = openMachineModal;
@@ -1656,6 +1686,8 @@ el.folderMachine.onchange = () => {
   }
   folderPicker.machineId = el.folderMachine.value || "local";
   folderPicker.path = defaultPathForMachine(folderPicker.machineId);
+  folderPicker.parent = null;
+  setFolderError("");
   loadPath(folderPicker.path);
 };
 
