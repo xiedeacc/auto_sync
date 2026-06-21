@@ -1,7 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::net::UdpSocket;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 #[cfg(windows)]
@@ -9,13 +8,12 @@ use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use filetime::{FileTime, set_file_mtime};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::core::config::{
@@ -23,8 +21,8 @@ use crate::core::config::{
     machine_id_or_local,
 };
 use crate::core::machines::{
-    encode_query_component, find_machine, machines_share_lan, remote_post_bytes, remote_post_json,
-    rsync_endpoint, rsync_path, ssh_target,
+    configure_tcp_connection_pool, encode_query_component, find_machine, remote_post_bytes,
+    remote_post_json, rsync_endpoint, rsync_path, ssh_target,
 };
 use crate::core::state::{Cycle, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
@@ -34,6 +32,7 @@ const INTERNAL_TRASH: &str = ".auto_sync_trash";
 const INTERNAL_PROBE: &str = ".auto_sync_probe";
 
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
+    configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
     state.ensure_config(cfg)?;
     loop {
         let mut progressed = false;
@@ -116,13 +115,6 @@ impl FromStr for SyncRequestMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TransferProtocol {
-    Udp,
-    Tcp,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransferSnapshotMode {
@@ -193,7 +185,6 @@ pub struct TransferPushFileRequest {
     pub entry: SnapshotEntry,
     pub destination: crate::core::config::MachineConfig,
     pub destination_root: PathBuf,
-    pub protocol: TransferProtocol,
     pub cycle_id: i64,
 }
 
@@ -203,65 +194,6 @@ pub struct TransferAck {
 }
 
 const TRANSFER_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
-const TRANSFER_UDP_MAGIC: &[u8; 5] = b"ASU01";
-const TRANSFER_UDP_KIND_START: u8 = 1;
-const TRANSFER_UDP_KIND_DATA: u8 = 2;
-const TRANSFER_UDP_KIND_FINISH: u8 = 3;
-const TRANSFER_UDP_KIND_ACK: u8 = 4;
-const TRANSFER_UDP_KIND_ERROR: u8 = 5;
-const TRANSFER_UDP_START_SEQ: u32 = u32::MAX;
-const TRANSFER_UDP_FINISH_SEQ: u32 = u32::MAX - 1;
-const TRANSFER_UDP_CHUNK_SIZE: usize = 48 * 1024;
-const TRANSFER_UDP_RETRIES: usize = 6;
-
-pub fn transfer_udp_port(web_port: u16) -> u16 {
-    web_port.checked_add(2).unwrap_or(web_port)
-}
-
-pub fn spawn_transfer_udp_receiver(web_port: u16) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        let port = transfer_udp_port(web_port);
-        let socket = match UdpSocket::bind(("0.0.0.0", port)) {
-            Ok(socket) => socket,
-            Err(err) => {
-                warn!(error = %err, port, "failed to bind transfer UDP receiver");
-                return;
-            }
-        };
-        info!(port, "transfer UDP receiver listening");
-        let mut sessions: HashMap<[u8; 16], UdpReceiveSession> = HashMap::new();
-        let mut buf = vec![0_u8; TRANSFER_UDP_CHUNK_SIZE + 128];
-        loop {
-            let Ok((len, peer)) = socket.recv_from(&mut buf) else {
-                continue;
-            };
-            let packet = match parse_udp_packet(&buf[..len]) {
-                Ok(packet) => packet,
-                Err(err) => {
-                    debug!(error = %err, "ignored invalid transfer UDP packet");
-                    continue;
-                }
-            };
-            let result = handle_udp_packet(packet, &mut sessions);
-            match result {
-                Ok(seq) => {
-                    let ack = build_udp_packet(TRANSFER_UDP_KIND_ACK, &packet.id, seq, &[]);
-                    let _ = socket.send_to(&ack, peer);
-                }
-                Err(err) => {
-                    warn!(error = %err, "transfer UDP packet failed");
-                    let error = build_udp_packet(
-                        TRANSFER_UDP_KIND_ERROR,
-                        &packet.id,
-                        packet.seq,
-                        err.to_string().as_bytes(),
-                    );
-                    let _ = socket.send_to(&error, peer);
-                }
-            }
-        }
-    })
-}
 
 pub fn transfer_snapshot(req: TransferSnapshotRequest) -> Result<Vec<SnapshotEntry>> {
     match req.mode {
@@ -361,22 +293,13 @@ pub fn transfer_receive_symlink(req: TransferReceiveSymlinkRequest) -> Result<Tr
 pub fn transfer_push_file(req: TransferPushFileRequest) -> Result<TransferAck> {
     let src = safe_join_rel(&req.source_root, &req.rel_path)?;
     match req.entry.file_type.as_str() {
-        "file" => match req.protocol {
-            TransferProtocol::Udp => send_file_udp(
-                &req.destination,
-                &req.destination_root,
-                req.cycle_id,
-                &req.entry,
-                &src,
-            ),
-            TransferProtocol::Tcp => send_file_tcp(
-                &req.destination,
-                &req.destination_root,
-                req.cycle_id,
-                &req.entry,
-                &src,
-            ),
-        }?,
+        "file" => send_file_tcp(
+            &req.destination,
+            &req.destination_root,
+            req.cycle_id,
+            &req.entry,
+            &src,
+        )?,
         "symlink" => {
             send_symlink_tcp(
                 &req.destination,
@@ -533,259 +456,6 @@ fn send_symlink_tcp(
         bail!("peer rejected symlink transfer");
     }
     Ok(())
-}
-
-fn send_file_udp(
-    destination: &crate::core::config::MachineConfig,
-    destination_root: &Path,
-    cycle_id: i64,
-    entry: &SnapshotEntry,
-    src: &Path,
-) -> Result<()> {
-    let id = new_transfer_id(destination_root, &entry.rel_path);
-    let addr = format!(
-        "{}:{}",
-        destination.host,
-        transfer_udp_port(destination.web_port)
-    );
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).context("failed to bind UDP transfer sender")?;
-    socket.set_read_timeout(Some(Duration::from_millis(900)))?;
-    socket.set_write_timeout(Some(Duration::from_millis(900)))?;
-    let total_chunks = if entry.size <= 0 {
-        0
-    } else {
-        ((entry.size as usize + TRANSFER_UDP_CHUNK_SIZE - 1) / TRANSFER_UDP_CHUNK_SIZE) as u32
-    };
-    let start = UdpTransferStart {
-        root: destination_root.to_path_buf(),
-        entry: entry.clone(),
-        cycle_id,
-        total_chunks,
-    };
-    let payload = serde_json::to_vec(&start)?;
-    udp_send_with_ack(
-        &socket,
-        &addr,
-        &id,
-        TRANSFER_UDP_START_SEQ,
-        TRANSFER_UDP_KIND_START,
-        &payload,
-    )?;
-
-    let mut file = File::open(src).with_context(|| format!("failed to open {}", src.display()))?;
-    let mut seq = 0_u32;
-    let mut buf = vec![0_u8; TRANSFER_UDP_CHUNK_SIZE];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        udp_send_with_ack(&socket, &addr, &id, seq, TRANSFER_UDP_KIND_DATA, &buf[..n])?;
-        seq += 1;
-    }
-    udp_send_with_ack(
-        &socket,
-        &addr,
-        &id,
-        TRANSFER_UDP_FINISH_SEQ,
-        TRANSFER_UDP_KIND_FINISH,
-        &[],
-    )?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct UdpTransferStart {
-    root: PathBuf,
-    entry: SnapshotEntry,
-    cycle_id: i64,
-    total_chunks: u32,
-}
-
-struct UdpReceiveSession {
-    root: PathBuf,
-    entry: SnapshotEntry,
-    cycle_id: i64,
-    tmp: PathBuf,
-    file: File,
-    next_seq: u32,
-    total_chunks: u32,
-}
-
-#[derive(Clone, Copy)]
-struct UdpPacket<'a> {
-    kind: u8,
-    id: [u8; 16],
-    seq: u32,
-    payload: &'a [u8],
-}
-
-fn handle_udp_packet(
-    packet: UdpPacket<'_>,
-    sessions: &mut HashMap<[u8; 16], UdpReceiveSession>,
-) -> Result<u32> {
-    match packet.kind {
-        TRANSFER_UDP_KIND_START => {
-            let start: UdpTransferStart = serde_json::from_slice(packet.payload)?;
-            if start.entry.file_type != "file" {
-                bail!("UDP transfer only supports file entries");
-            }
-            reject_dangerous_destination(&start.root)?;
-            let final_path = safe_join_rel(&start.root, &start.entry.rel_path)?;
-            let tmp = tmp_path(&start.root, start.cycle_id, &start.entry.rel_path);
-            if let Some(parent) = tmp.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if tmp.exists() || fs::symlink_metadata(&tmp).is_ok() {
-                remove_any(&tmp)?;
-            }
-            if let Some(parent) = final_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let file = File::create(&tmp)
-                .with_context(|| format!("failed to create UDP temp file {}", tmp.display()))?;
-            sessions.insert(
-                packet.id,
-                UdpReceiveSession {
-                    root: start.root,
-                    entry: start.entry,
-                    cycle_id: start.cycle_id,
-                    tmp,
-                    file,
-                    next_seq: 0,
-                    total_chunks: start.total_chunks,
-                },
-            );
-            Ok(TRANSFER_UDP_START_SEQ)
-        }
-        TRANSFER_UDP_KIND_DATA => {
-            let Some(session) = sessions.get_mut(&packet.id) else {
-                bail!("unknown UDP transfer session");
-            };
-            if packet.seq < session.next_seq {
-                return Ok(packet.seq);
-            }
-            if packet.seq != session.next_seq {
-                bail!(
-                    "out-of-order UDP transfer chunk: got {}, expected {}",
-                    packet.seq,
-                    session.next_seq
-                );
-            }
-            session.file.write_all(packet.payload)?;
-            session.next_seq += 1;
-            Ok(packet.seq)
-        }
-        TRANSFER_UDP_KIND_FINISH => {
-            let Some(mut session) = sessions.remove(&packet.id) else {
-                bail!("unknown UDP transfer session");
-            };
-            if session.next_seq != session.total_chunks {
-                bail!(
-                    "UDP transfer ended early: got {} chunks, expected {}",
-                    session.next_seq,
-                    session.total_chunks
-                );
-            }
-            session.file.flush().ok();
-            session.file.sync_all().ok();
-            drop(session.file);
-            let final_path = safe_join_rel(&session.root, &session.entry.rel_path)?;
-            finish_received_file(
-                &session.root,
-                session.cycle_id,
-                &session.entry,
-                &session.tmp,
-                &final_path,
-            )?;
-            Ok(TRANSFER_UDP_FINISH_SEQ)
-        }
-        other => bail!("unsupported UDP transfer packet kind {other}"),
-    }
-}
-
-fn udp_send_with_ack(
-    socket: &UdpSocket,
-    addr: &str,
-    id: &[u8; 16],
-    seq: u32,
-    kind: u8,
-    payload: &[u8],
-) -> Result<()> {
-    let packet = build_udp_packet(kind, id, seq, payload);
-    let mut buf = [0_u8; 512];
-    for _ in 0..TRANSFER_UDP_RETRIES {
-        socket
-            .send_to(&packet, addr)
-            .with_context(|| format!("failed to send UDP transfer packet to {addr}"))?;
-        match socket.recv_from(&mut buf) {
-            Ok((len, _)) => {
-                let ack = parse_udp_packet(&buf[..len])?;
-                if ack.kind == TRANSFER_UDP_KIND_ACK && ack.id == *id && ack.seq == seq {
-                    return Ok(());
-                }
-                if ack.kind == TRANSFER_UDP_KIND_ERROR && ack.id == *id {
-                    bail!(
-                        "peer rejected UDP transfer packet: {}",
-                        String::from_utf8_lossy(ack.payload)
-                    );
-                }
-            }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    bail!("UDP transfer packet was not acknowledged by {addr}");
-}
-
-fn build_udp_packet(kind: u8, id: &[u8; 16], seq: u32, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(TRANSFER_UDP_MAGIC.len() + 1 + 16 + 4 + payload.len());
-    out.extend_from_slice(TRANSFER_UDP_MAGIC);
-    out.push(kind);
-    out.extend_from_slice(id);
-    out.extend_from_slice(&seq.to_be_bytes());
-    out.extend_from_slice(payload);
-    out
-}
-
-fn parse_udp_packet(raw: &[u8]) -> Result<UdpPacket<'_>> {
-    let header_len = TRANSFER_UDP_MAGIC.len() + 1 + 16 + 4;
-    if raw.len() < header_len || &raw[..TRANSFER_UDP_MAGIC.len()] != TRANSFER_UDP_MAGIC {
-        bail!("invalid UDP transfer packet");
-    }
-    let kind = raw[TRANSFER_UDP_MAGIC.len()];
-    let id_start = TRANSFER_UDP_MAGIC.len() + 1;
-    let mut id = [0_u8; 16];
-    id.copy_from_slice(&raw[id_start..id_start + 16]);
-    let seq_start = id_start + 16;
-    let seq = u32::from_be_bytes(raw[seq_start..seq_start + 4].try_into()?);
-    Ok(UdpPacket {
-        kind,
-        id,
-        seq,
-        payload: &raw[header_len..],
-    })
-}
-
-fn new_transfer_id(root: &Path, rel_path: &str) -> [u8; 16] {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let seed = format!(
-        "{}:{}:{}:{now}",
-        std::process::id(),
-        root.to_string_lossy(),
-        rel_path
-    );
-    let digest = blake3::hash(seed.as_bytes());
-    let mut out = [0_u8; 16];
-    out.copy_from_slice(&digest.as_bytes()[..16]);
-    out
 }
 
 fn receive_file_api_path(root: &Path, cycle_id: i64, entry: &SnapshotEntry) -> String {
@@ -1242,13 +912,11 @@ fn sync_cycle_with_transfer(
             }
         };
         let dst_root = dst.path.join(&source_info.name);
-        let protocol = transfer_protocol_for_machines(&source_machine, &dst_machine);
         info!(
             source = source.id,
             destination = dst.id,
             cycle_id = cycle.id,
-            protocol = ?protocol,
-            "syncing destination with incremental transfer"
+            "syncing destination with TCP incremental transfer"
         );
         match sync_directory_with_transfer(
             source_machine_id,
@@ -1260,7 +928,6 @@ fn sync_cycle_with_transfer(
             cycle.id,
             &source_snapshot,
             &source.excludes,
-            protocol,
         ) {
             Ok(()) => {
                 progressed = true;
@@ -1274,63 +941,16 @@ fn sync_cycle_with_transfer(
                 )?;
             }
             Err(err) => {
-                if matches!(protocol, TransferProtocol::Udp) {
-                    warn!(
-                        source = source.id,
-                        destination = dst.id,
-                        cycle_id = cycle.id,
-                        error = %err,
-                        "UDP incremental transfer failed; retrying with TCP"
-                    );
-                    match sync_directory_with_transfer(
-                        source_machine_id,
-                        &source_machine,
-                        &source_info.base,
-                        dst_machine_id,
-                        &dst_machine,
-                        &dst_root,
-                        cycle.id,
-                        &source_snapshot,
-                        &source.excludes,
-                        TransferProtocol::Tcp,
-                    ) {
-                        Ok(()) => {
-                            progressed = true;
-                            state.clear_destination_issues(&source.id, &dst.id)?;
-                            state.upsert_destination_status(
-                                &source.id,
-                                &dst.id,
-                                Some(cycle.id),
-                                "green",
-                                "verified",
-                            )?;
-                            continue;
-                        }
-                        Err(tcp_err) => {
-                            all_verified = false;
-                            had_unblocked_failure = true;
-                            state.clear_destination_issues(&source.id, &dst.id)?;
-                            state.upsert_destination_status(
-                                &source.id,
-                                &dst.id,
-                                None,
-                                "red",
-                                &short_reason(&tcp_err),
-                            )?;
-                        }
-                    }
-                } else {
-                    all_verified = false;
-                    had_unblocked_failure = true;
-                    state.clear_destination_issues(&source.id, &dst.id)?;
-                    state.upsert_destination_status(
-                        &source.id,
-                        &dst.id,
-                        None,
-                        "red",
-                        &short_reason(&err),
-                    )?;
-                }
+                all_verified = false;
+                had_unblocked_failure = true;
+                state.clear_destination_issues(&source.id, &dst.id)?;
+                state.upsert_destination_status(
+                    &source.id,
+                    &dst.id,
+                    None,
+                    "red",
+                    &short_reason(&err),
+                )?;
             }
         }
     }
@@ -1358,7 +978,6 @@ fn sync_directory_with_transfer(
     cycle_id: i64,
     source_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
-    protocol: TransferProtocol,
 ) -> Result<()> {
     prepare_dir_on_machine(dst_machine_id, dst_machine, dst_root, None, None)?;
     let source_map = map_entries(source_snapshot);
@@ -1403,7 +1022,6 @@ fn sync_directory_with_transfer(
             dst_root,
             cycle_id,
             entry,
-            protocol,
         )
         .with_context(|| format!("failed to transfer {}", entry.rel_path))?;
     }
@@ -1428,17 +1046,6 @@ fn sync_directory_with_transfer(
     )?;
     verify_snapshot_entries(source_snapshot, &actual, excludes)?;
     Ok(())
-}
-
-fn transfer_protocol_for_machines(
-    source_machine: &crate::core::config::MachineConfig,
-    dst_machine: &crate::core::config::MachineConfig,
-) -> TransferProtocol {
-    if machines_share_lan(source_machine, dst_machine, Duration::from_millis(500)) {
-        TransferProtocol::Udp
-    } else {
-        TransferProtocol::Tcp
-    }
 }
 
 fn path_info_on_machine(
@@ -1549,7 +1156,6 @@ fn push_entry_between_machines(
     dst_root: &Path,
     cycle_id: i64,
     entry: &SnapshotEntry,
-    protocol: TransferProtocol,
 ) -> Result<()> {
     let req = TransferPushFileRequest {
         source_root: source_root.to_path_buf(),
@@ -1557,7 +1163,6 @@ fn push_entry_between_machines(
         entry: entry.clone(),
         destination: dst_machine.clone(),
         destination_root: dst_root.to_path_buf(),
-        protocol,
         cycle_id,
     };
     let ack = if source_machine_id == "local" {

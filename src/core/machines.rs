@@ -1,11 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -14,13 +15,28 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, warn};
 
 use crate::core::config::{
-    AppConfig, MachineConfig, load_config, normalized_machines, preferred_local_host,
+    AppConfig, DEFAULT_TCP_CONNECTION_POOL_SIZE, MachineConfig, load_config, normalized_machines,
+    preferred_local_host,
 };
 
 pub const DISCOVERY_PORT: u16 = 18766;
 const DISCOVERY_MAGIC: &[u8] = b"auto_sync_discover_v1";
+static TCP_CONNECTION_POOL_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_TCP_CONNECTION_POOL_SIZE);
+static TCP_CONNECTION_POOL: OnceLock<Mutex<TcpConnectionPool>> = OnceLock::new();
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TcpConnectionKey {
+    host: String,
+    port: u16,
+}
+
+#[derive(Default)]
+struct TcpConnectionPool {
+    idle: HashMap<TcpConnectionKey, Vec<TcpStream>>,
+    total_idle: usize,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineHealth {
@@ -671,6 +687,15 @@ pub fn remote_post_bytes<T: DeserializeOwned>(
     serde_json::from_slice(&raw).context("failed to parse peer response")
 }
 
+pub fn configure_tcp_connection_pool(max_idle: usize) {
+    TCP_CONNECTION_POOL_LIMIT.store(max_idle, Ordering::Relaxed);
+    if let Some(pool) = TCP_CONNECTION_POOL.get() {
+        pool.lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .trim_to(max_idle);
+    }
+}
+
 pub fn find_machine(cfg: &AppConfig, machine_id: &str) -> Option<MachineConfig> {
     normalized_machines(cfg)
         .into_iter()
@@ -718,15 +743,44 @@ fn http_request(
     body: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let addr: SocketAddr = format!("{host}:{port}")
-        .parse()
-        .with_context(|| format!("invalid peer address {host}:{port}"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)
-        .with_context(|| format!("failed to connect to peer {host}:{port}"))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let key = TcpConnectionKey {
+        host: host.trim().to_ascii_lowercase(),
+        port,
+    };
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..2 {
+        let (mut stream, reused) = if attempt == 0 {
+            take_tcp_connection(&key, timeout)?
+        } else {
+            (open_tcp_connection(&key, timeout)?, false)
+        };
+        match http_request_on_stream(&mut stream, host, port, method, path, content_type, body) {
+            Ok(response) => {
+                if response.reusable {
+                    return_tcp_connection(key, stream);
+                }
+                return Ok(response.body);
+            }
+            Err(err) if reused && attempt == 0 => {
+                last_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("HTTP request failed")))
+}
+
+fn http_request_on_stream(
+    stream: &mut TcpStream,
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<HttpResponse> {
     let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\nAccept: application/json\r\n"
     );
     if let Some(content_type) = content_type {
         request.push_str(&format!("Content-Type: {content_type}\r\n"));
@@ -739,19 +793,225 @@ fn http_request(
     if !body.is_empty() {
         stream.write_all(body)?;
     }
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
-    let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
-        bail!("invalid peer HTTP response");
-    };
-    let header = String::from_utf8_lossy(&raw[..split]);
-    if !header.starts_with("HTTP/1.1 200") && !header.starts_with("HTTP/1.0 200") {
+    let response = read_http_response(stream)?;
+    if !response.status_line.starts_with("HTTP/1.1 200")
+        && !response.status_line.starts_with("HTTP/1.0 200")
+    {
         bail!(
             "peer returned non-200 response: {}",
-            header.lines().next().unwrap_or("")
+            response.status_line.trim()
         );
     }
-    Ok(raw[split + 4..].to_vec())
+    Ok(response)
+}
+
+struct HttpResponse {
+    status_line: String,
+    body: Vec<u8>,
+    reusable: bool,
+}
+
+fn read_http_response(stream: &mut TcpStream) -> Result<HttpResponse> {
+    let mut raw = Vec::new();
+    let mut buf = [0_u8; 8192];
+    let split = loop {
+        if let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            break split;
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            bail!("peer closed connection before HTTP headers");
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if raw.len() > 128 * 1024 {
+            bail!("peer HTTP headers are too large");
+        }
+    };
+    let header_text = String::from_utf8_lossy(&raw[..split]).to_string();
+    let mut lines = header_text.lines();
+    let status_line = lines.next().unwrap_or("").to_string();
+    if status_line.is_empty() {
+        bail!("invalid peer HTTP response");
+    }
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
+    let connection_close = headers
+        .iter()
+        .any(|(name, value)| name == "connection" && value.to_ascii_lowercase().contains("close"));
+    let chunked = headers.iter().any(|(name, value)| {
+        name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
+    });
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .and_then(|(_, value)| value.parse::<usize>().ok());
+    let body_start = split + 4;
+    let mut body = raw[body_start..].to_vec();
+    let reusable = if let Some(content_length) = content_length {
+        while body.len() < content_length {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                bail!("peer closed connection before response body was complete");
+            }
+            body.extend_from_slice(&buf[..n]);
+        }
+        let exact = body.len() == content_length;
+        body.truncate(content_length);
+        exact && !connection_close
+    } else if chunked {
+        body = read_chunked_body(stream, body)?;
+        !connection_close
+    } else {
+        stream.read_to_end(&mut body)?;
+        false
+    };
+    Ok(HttpResponse {
+        status_line,
+        body,
+        reusable,
+    })
+}
+
+fn read_chunked_body(stream: &mut TcpStream, mut pending: Vec<u8>) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let line = read_crlf_line(stream, &mut pending)?;
+        let size_text = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_text, 16)
+            .with_context(|| format!("invalid chunk size: {size_text}"))?;
+        if size == 0 {
+            loop {
+                let trailer = read_crlf_line(stream, &mut pending)?;
+                if trailer.is_empty() {
+                    return Ok(body);
+                }
+            }
+        }
+        ensure_pending(stream, &mut pending, size + 2)?;
+        body.extend_from_slice(&pending[..size]);
+        if &pending[size..size + 2] != b"\r\n" {
+            bail!("invalid chunk terminator");
+        }
+        pending.drain(..size + 2);
+    }
+}
+
+fn read_crlf_line(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Result<String> {
+    loop {
+        if let Some(pos) = pending.windows(2).position(|window| window == b"\r\n") {
+            let line = String::from_utf8_lossy(&pending[..pos]).to_string();
+            pending.drain(..pos + 2);
+            return Ok(line);
+        }
+        read_more(stream, pending)?;
+    }
+}
+
+fn ensure_pending(stream: &mut TcpStream, pending: &mut Vec<u8>, needed: usize) -> Result<()> {
+    while pending.len() < needed {
+        read_more(stream, pending)?;
+    }
+    Ok(())
+}
+
+fn read_more(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Result<()> {
+    let mut buf = [0_u8; 8192];
+    let n = stream.read(&mut buf)?;
+    if n == 0 {
+        bail!("peer closed connection while reading response");
+    }
+    pending.extend_from_slice(&buf[..n]);
+    Ok(())
+}
+
+fn take_tcp_connection(key: &TcpConnectionKey, timeout: Duration) -> Result<(TcpStream, bool)> {
+    if TCP_CONNECTION_POOL_LIMIT.load(Ordering::Relaxed) > 0 {
+        if let Some(stream) = tcp_connection_pool()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take(key)
+        {
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+            return Ok((stream, true));
+        }
+    }
+    Ok((open_tcp_connection(key, timeout)?, false))
+}
+
+fn open_tcp_connection(key: &TcpConnectionKey, timeout: Duration) -> Result<TcpStream> {
+    let addr: SocketAddr = format!("{}:{}", key.host, key.port)
+        .parse()
+        .with_context(|| format!("invalid peer address {}:{}", key.host, key.port))?;
+    let stream = TcpStream::connect_timeout(&addr, timeout)
+        .with_context(|| format!("failed to connect to peer {}:{}", key.host, key.port))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    Ok(stream)
+}
+
+fn return_tcp_connection(key: TcpConnectionKey, stream: TcpStream) {
+    let limit = TCP_CONNECTION_POOL_LIMIT.load(Ordering::Relaxed);
+    if limit == 0 {
+        return;
+    }
+    tcp_connection_pool()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .put(key, stream, limit);
+}
+
+fn tcp_connection_pool() -> &'static Mutex<TcpConnectionPool> {
+    TCP_CONNECTION_POOL.get_or_init(|| Mutex::new(TcpConnectionPool::default()))
+}
+
+impl TcpConnectionPool {
+    fn take(&mut self, key: &TcpConnectionKey) -> Option<TcpStream> {
+        let stream = self.idle.get_mut(key)?.pop();
+        if stream.is_some() {
+            self.total_idle = self.total_idle.saturating_sub(1);
+        }
+        if self.idle.get(key).is_some_and(Vec::is_empty) {
+            self.idle.remove(key);
+        }
+        stream
+    }
+
+    fn put(&mut self, key: TcpConnectionKey, stream: TcpStream, max_idle: usize) {
+        if self.total_idle >= max_idle {
+            return;
+        }
+        self.idle.entry(key).or_default().push(stream);
+        self.total_idle += 1;
+    }
+
+    fn trim_to(&mut self, max_idle: usize) {
+        while self.total_idle > max_idle {
+            let Some(key) = self.idle.keys().next().cloned() else {
+                self.total_idle = 0;
+                break;
+            };
+            if self.take(&key).is_none() {
+                self.idle.remove(&key);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn pooled_tcp_connection_count() -> usize {
+    TCP_CONNECTION_POOL
+        .get()
+        .map(|pool| {
+            pool.lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .total_idle
+        })
+        .unwrap_or(0)
 }
 
 pub fn rsync_endpoint(machine: &MachineConfig, path: &Path) -> String {
@@ -899,6 +1159,53 @@ mod tests {
 
         assert_eq!(health.ssh_user, "");
         assert_eq!(health.ssh_port, 22);
+    }
+
+    #[test]
+    fn remote_get_json_reuses_pooled_tcp_connection() {
+        configure_tcp_connection_pool(0);
+        configure_tcp_connection_pool(1);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..2 {
+                read_test_http_request(&mut stream);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: keep-alive\r\n\r\n{\"ok\":true}",
+                    )
+                    .unwrap();
+            }
+        });
+        let mut machine = MachineConfig::local();
+        machine.host = "127.0.0.1".to_string();
+        machine.web_port = port;
+
+        let first: serde_json::Value =
+            remote_get_json(&machine, "/first", Duration::from_secs(2)).unwrap();
+        let second: serde_json::Value =
+            remote_get_json(&machine, "/second", Duration::from_secs(2)).unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(first["ok"], true);
+        assert_eq!(second["ok"], true);
+        assert_eq!(pooled_tcp_connection_count(), 1);
+        configure_tcp_connection_pool(0);
+        configure_tcp_connection_pool(DEFAULT_TCP_CONNECTION_POOL_SIZE);
+    }
+
+    fn read_test_http_request(stream: &mut TcpStream) {
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 128];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0);
+            raw.extend_from_slice(&buf[..n]);
+            if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                return;
+            }
+        }
     }
 
     #[test]

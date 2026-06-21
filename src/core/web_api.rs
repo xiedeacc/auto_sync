@@ -22,8 +22,8 @@ use crate::core::sync::{
     SyncRequestMode, TransferAck, TransferPathInfo, TransferPathInfoRequest,
     TransferPrepareDirRequest, TransferPushFileRequest, TransferReceiveFileQuery,
     TransferReceiveSymlinkRequest, TransferRemovePathRequest, TransferSnapshotRequest,
-    spawn_transfer_udp_receiver, transfer_path_info, transfer_prepare_dir, transfer_push_file,
-    transfer_receive_file, transfer_receive_symlink, transfer_remove_path, transfer_snapshot,
+    transfer_path_info, transfer_prepare_dir, transfer_push_file, transfer_receive_file,
+    transfer_receive_symlink, transfer_remove_path, transfer_snapshot,
 };
 
 pub fn router(backend: Backend) -> Router {
@@ -62,7 +62,6 @@ pub fn router(backend: Backend) -> Router {
 pub async fn serve(backend: Backend, addr: SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let _discovery = spawn_discovery_responder(backend.config_path(), backend.web_port());
-    let _transfer_udp = spawn_transfer_udp_receiver(backend.web_port());
     let app = router(backend);
     info!(url = %format!("http://{addr}/"), "auto_sync web listening");
     println!("auto_sync Web UI: http://{addr}/");

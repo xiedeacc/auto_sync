@@ -11,8 +11,9 @@ use crate::core::config::{
     AppConfig, MachineConfig, load_config, load_or_create_config, save_config,
 };
 use crate::core::machines::{
-    MachineHealth, MachineStatus, discover_lan, encode_query_component, find_machine, local_health,
-    machine_id_from_path, merge_discovered, remote_get_json,
+    MachineHealth, MachineStatus, configure_tcp_connection_pool, discover_lan,
+    encode_query_component, find_machine, local_health, machine_id_from_path, merge_discovered,
+    remote_get_json,
 };
 use crate::core::state::{DestinationView, State as DbState};
 use crate::core::sync::{
@@ -55,12 +56,15 @@ impl Backend {
     }
 
     pub fn get_config(&self) -> Result<AppConfig> {
-        load_or_create_config(&self.config_path)
+        let cfg = load_or_create_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
+        Ok(cfg)
     }
 
     pub fn save_config(&self, cfg: &AppConfig) -> Result<AppConfig> {
         let cfg = preserve_current_machines(&self.config_path, cfg);
         let cfg = save_config(&self.config_path, &cfg)?;
+        apply_runtime_config(&cfg);
         let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         self.clear_machine_cache();
@@ -69,6 +73,7 @@ impl Backend {
 
     pub fn health(&self) -> Result<MachineHealth> {
         let cfg = load_or_create_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
         Ok(local_health(&cfg, self.web_port))
     }
 
@@ -91,6 +96,7 @@ impl Backend {
             cfg.machines.push(machine);
         }
         let cfg = save_config(&self.config_path, &cfg)?;
+        apply_runtime_config(&cfg);
         self.clear_machine_cache();
         Ok(cfg)
     }
@@ -102,12 +108,14 @@ impl Backend {
         let mut cfg = load_or_create_config(&self.config_path)?;
         cfg.machines.retain(|machine| machine.id != machine_id);
         let cfg = save_config(&self.config_path, &cfg)?;
+        apply_runtime_config(&cfg);
         self.clear_machine_cache();
         Ok(cfg)
     }
 
     pub fn status(&self) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
         let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         state_db.destination_views(&cfg)
@@ -115,6 +123,7 @@ impl Backend {
 
     pub fn sync_now(&self) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
         let mut state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         sync_all_now(&cfg, &mut state_db)?;
@@ -123,6 +132,7 @@ impl Backend {
 
     pub fn sync_source_now(&self, source_id: &str) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
         let mut state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         sync_source_now(&cfg, &mut state_db, source_id)?;
@@ -136,6 +146,7 @@ impl Backend {
         mode: SyncRequestMode,
     ) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
         let mut state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         sync_destination_now_with_mode(&cfg, &mut state_db, source_id, destination_id, mode)?;
@@ -150,6 +161,7 @@ impl Backend {
         let machine_id = machine_id_from_path(machine_id.as_deref());
         if machine_id != "local" {
             let cfg = load_config(&self.config_path)?;
+            apply_runtime_config(&cfg);
             let machine = find_machine(&cfg, machine_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown machine: {machine_id}"))?;
             let requested = path.unwrap_or_else(|| default_path_for_os(&machine.os));
@@ -191,6 +203,7 @@ impl Backend {
         }
 
         let cfg = load_or_create_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
         let discovered = discover_lan(Duration::from_millis(700))?;
         let status = merge_discovered(&cfg, discovered);
         cache.status = Some(status.clone());
@@ -222,6 +235,10 @@ fn preserve_current_machines(config_path: &Path, cfg: &AppConfig) -> AppConfig {
         cfg.machines = current.machines;
     }
     cfg
+}
+
+fn apply_runtime_config(cfg: &AppConfig) {
+    configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
 }
 
 #[derive(Debug, Serialize, Deserialize)]

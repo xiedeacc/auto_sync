@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_TCP_CONNECTION_POOL_SIZE: usize = 100;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -25,6 +27,7 @@ pub struct AppSection {
     pub log_dir: PathBuf,
     pub status_log_interval_secs: u64,
     pub web_bind: String,
+    pub tcp_connection_pool_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +172,7 @@ impl Default for AppSection {
             log_dir: PathBuf::from("logs"),
             status_log_interval_secs: 300,
             web_bind: "0.0.0.0:18765".to_string(),
+            tcp_connection_pool_size: DEFAULT_TCP_CONNECTION_POOL_SIZE,
         }
     }
 }
