@@ -476,19 +476,36 @@ fn receive_file_api_path(root: &Path, cycle_id: i64, entry: &SnapshotEntry) -> S
 }
 
 fn safe_join_rel(root: &Path, rel_path: &str) -> Result<PathBuf> {
-    let rel = Path::new(rel_path);
+    let rel = normalize_rel_path(rel_path)?;
+    Ok(root.join(rel))
+}
+
+fn normalize_rel_path(rel_path: &str) -> Result<PathBuf> {
+    let normalized = rel_path.replace('\\', "/");
+    let rel = Path::new(&normalized);
     if rel.is_absolute() {
         bail!("relative path is absolute: {rel_path}");
     }
+    let mut out = PathBuf::new();
     for component in rel.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            bail!("unsafe relative path: {rel_path}");
+        match component {
+            Component::Normal(part) => {
+                let part_text = part.to_string_lossy();
+                if part_text.contains(':') {
+                    bail!("unsafe relative path: {rel_path}");
+                }
+                out.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("unsafe relative path: {rel_path}");
+            }
         }
     }
-    Ok(root.join(rel))
+    if out.as_os_str().is_empty() {
+        bail!("invalid empty relative path");
+    }
+    Ok(out)
 }
 
 pub fn sync_cycle_for_source(
@@ -2438,11 +2455,20 @@ fn fsync_parent(path: &Path) -> io::Result<()> {
 }
 
 fn rel_to_string(path: &Path) -> Result<String> {
-    let value = path.to_string_lossy().to_string();
-    if value.is_empty() || value == "." {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("invalid relative path: {}", path.display());
+            }
+        }
+    }
+    if parts.is_empty() {
         bail!("invalid empty relative path");
     }
-    Ok(value)
+    Ok(parts.join("/"))
 }
 
 fn file_name_string(path: &Path) -> Result<String> {
@@ -2550,6 +2576,22 @@ mod tests {
                 .to_string_lossy(),
             "C:\\Users\\tiger\\auto_sync_test"
         );
+    }
+
+    #[test]
+    fn relative_paths_are_normalized_for_cross_platform_transfer() {
+        assert_eq!(
+            rel_to_string(Path::new("nested\\child.txt")).unwrap(),
+            "nested/child.txt"
+        );
+        assert_eq!(
+            safe_join_rel(Path::new("/tmp/root"), "nested\\child.txt")
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/"),
+            "/tmp/root/nested/child.txt"
+        );
+        assert!(safe_join_rel(Path::new("/tmp/root"), "C:\\escape.txt").is_err());
     }
 
     #[test]
