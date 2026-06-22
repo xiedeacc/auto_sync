@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::core::config::{
-    AppConfig, DestinationConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef,
+    AppConfig, DestinationConfig, RsyncConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef,
     machine_id_or_local,
 };
 use crate::core::machines::{
@@ -1350,11 +1350,11 @@ fn sync_rsync_endpoint(
     let dst_spec = format!("{}/", rsync_endpoint(&dst_machine, &dst_path));
 
     if source_machine_id != "local" && dst_machine_id != "local" {
-        return sync_remote_to_remote(&source_machine, &source.src, &dst_machine, &dst_path);
+        return sync_remote_to_remote(cfg, &source_machine, &source.src, &dst_machine, &dst_path);
     }
 
     let mut command = Command::new("rsync");
-    command.arg("-a").arg("--delete");
+    command.args(rsync_args(&cfg.app.rsync));
     if source_machine_id != "local" && source_machine.ssh_port != 22 {
         command
             .arg("-e")
@@ -1373,6 +1373,7 @@ fn sync_rsync_endpoint(
 }
 
 fn sync_remote_to_remote(
+    cfg: &AppConfig,
     source_machine: &crate::core::config::MachineConfig,
     source_path: &Path,
     dst_machine: &crate::core::config::MachineConfig,
@@ -1382,6 +1383,7 @@ fn sync_remote_to_remote(
         let source_spec = trailing_rsync_path(rsync_path(source_machine, source_path));
         let dst_spec = trailing_rsync_path(rsync_endpoint(dst_machine, dst_path));
         return run_remote_rsync(
+            cfg,
             source_machine,
             &source_spec,
             &dst_spec,
@@ -1393,6 +1395,7 @@ fn sync_remote_to_remote(
         let source_spec = trailing_rsync_path(rsync_endpoint(source_machine, source_path));
         let dst_spec = trailing_rsync_path(rsync_path(dst_machine, dst_path));
         return run_remote_rsync(
+            cfg,
             dst_machine,
             &source_spec,
             &dst_spec,
@@ -1403,6 +1406,7 @@ fn sync_remote_to_remote(
     let source_spec = trailing_rsync_path(rsync_path(source_machine, source_path));
     let dst_spec = trailing_rsync_path(rsync_endpoint(dst_machine, dst_path));
     run_remote_rsync(
+        cfg,
         source_machine,
         &source_spec,
         &dst_spec,
@@ -1411,12 +1415,14 @@ fn sync_remote_to_remote(
 }
 
 fn run_remote_rsync(
+    cfg: &AppConfig,
     runner: &crate::core::config::MachineConfig,
     source_spec: &str,
     dst_spec: &str,
     peer_ssh_port: u16,
 ) -> Result<()> {
-    let remote_command = remote_rsync_command(runner, source_spec, dst_spec, peer_ssh_port);
+    let remote_command =
+        remote_rsync_command(runner, &cfg.app.rsync, source_spec, dst_spec, peer_ssh_port);
     let mut command = Command::new("ssh");
     if runner.ssh_port != 22 {
         command.arg("-p").arg(runner.ssh_port.to_string());
@@ -1433,15 +1439,13 @@ fn run_remote_rsync(
 
 fn remote_rsync_command(
     runner: &crate::core::config::MachineConfig,
+    rsync: &RsyncConfig,
     source_spec: &str,
     dst_spec: &str,
     peer_ssh_port: u16,
 ) -> String {
-    let mut parts = vec![
-        "rsync".to_string(),
-        "-a".to_string(),
-        "--delete".to_string(),
-    ];
+    let mut parts = vec!["rsync".to_string()];
+    parts.extend(rsync_args(rsync));
     if peer_ssh_port != 22 {
         parts.push("-e".to_string());
         parts.push(remote_shell_quote(
@@ -1452,6 +1456,31 @@ fn remote_rsync_command(
     parts.push(remote_shell_quote(runner, source_spec));
     parts.push(remote_shell_quote(runner, dst_spec));
     parts.join(" ")
+}
+
+fn rsync_args(rsync: &RsyncConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if rsync.archive {
+        args.push("-a".to_string());
+    }
+    if rsync.delete {
+        args.push("--delete".to_string());
+    }
+    args.push("--whole-file".to_string());
+    if rsync.checksum {
+        args.push("--checksum".to_string());
+    }
+    if rsync.debug_logs {
+        args.push("--itemize-changes".to_string());
+    }
+    if rsync.timeout_secs > 0 {
+        args.push(format!("--timeout={}", rsync.timeout_secs));
+    }
+    if rsync.bwlimit_kbps > 0 {
+        args.push(format!("--bwlimit={}", rsync.bwlimit_kbps));
+    }
+    args.extend(rsync.extra_args.iter().cloned());
+    args
 }
 
 fn remote_shell_quote(runner: &crate::core::config::MachineConfig, value: &str) -> String {
@@ -2619,10 +2648,33 @@ mod tests {
         let mut runner = MachineConfig::local();
         runner.id = "nas-a".to_string();
         runner.os = "linux".to_string();
-        let command = remote_rsync_command(&runner, "/src/data/", "root@nas-b:/dst/data/", 10022);
+        let command = remote_rsync_command(
+            &runner,
+            &RsyncConfig::default(),
+            "/src/data/",
+            "root@nas-b:/dst/data/",
+            10022,
+        );
         assert_eq!(
             command,
-            "rsync -a --delete -e 'ssh -p 10022' '/src/data/' 'root@nas-b:/dst/data/'"
+            "rsync -a --delete --whole-file -e 'ssh -p 10022' '/src/data/' 'root@nas-b:/dst/data/'"
+        );
+    }
+
+    #[test]
+    fn builds_rsync_command_with_configured_args() {
+        let mut runner = MachineConfig::local();
+        runner.id = "nas-a".to_string();
+        runner.os = "linux".to_string();
+        let mut rsync = RsyncConfig::default();
+        rsync.checksum = true;
+        rsync.debug_logs = true;
+        rsync.timeout_secs = 30;
+        rsync.bwlimit_kbps = 2048;
+        let command = remote_rsync_command(&runner, &rsync, "/src/data/", "/dst/data/", 22);
+        assert_eq!(
+            command,
+            "rsync -a --delete --whole-file --checksum --itemize-changes --timeout=30 --bwlimit=2048 '/src/data/' '/dst/data/'"
         );
     }
 

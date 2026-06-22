@@ -64,6 +64,12 @@ h2 {
   font-weight: 720;
 }
 
+h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 720;
+}
+
 main {
   padding: 14px;
   max-width: var(--app-width);
@@ -805,6 +811,10 @@ th {
   width: min(900px, calc(100vw - 48px));
 }
 
+.settings-modal-panel {
+  width: min(760px, calc(100vw - 48px));
+}
+
 .machine-modal-panel {
   width: min(var(--panel-width), calc(100vw - 48px));
   max-height: min(760px, calc(100vh - 48px));
@@ -852,6 +862,44 @@ th {
 .folder-actions {
   justify-content: flex-end;
   margin: 10px 0;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.settings-section {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.settings-wide {
+  grid-column: 1 / -1;
+}
+
+.settings-section label {
+  margin-top: 8px;
+}
+
+.check-row {
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.check-row input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
 }
 
 .modal-error {

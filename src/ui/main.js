@@ -41,6 +41,17 @@ const el = {
   configModal: document.getElementById("config-modal"),
   configClose: document.getElementById("config-close"),
   configView: document.getElementById("config-view"),
+  settingsModal: document.getElementById("settings-modal"),
+  settingsClose: document.getElementById("settings-close"),
+  settingsSave: document.getElementById("settings-save"),
+  settingsRsyncArchive: document.getElementById("settings-rsync-archive"),
+  settingsRsyncDelete: document.getElementById("settings-rsync-delete"),
+  settingsRsyncChecksum: document.getElementById("settings-rsync-checksum"),
+  settingsRsyncDebug: document.getElementById("settings-rsync-debug"),
+  settingsRsyncTimeout: document.getElementById("settings-rsync-timeout"),
+  settingsRsyncBwlimit: document.getElementById("settings-rsync-bwlimit"),
+  settingsRsyncExtra: document.getElementById("settings-rsync-extra"),
+  settingsTcpPool: document.getElementById("settings-tcp-pool"),
   machineModal: document.getElementById("machine-modal"),
   machineClose: document.getElementById("machine-close"),
   machineList: document.getElementById("machine-list"),
@@ -812,6 +823,7 @@ function sourceLatestCycle(sourceId) {
 
 function normalizeConfig(nextCfg) {
   delete nextCfg.schedule;
+  nextCfg.app = normalizeAppConfig(nextCfg.app || {});
   nextCfg.machines = normalizeMachines(nextCfg.machines || []);
   for (const source of nextCfg.source_groups || []) {
     source.id = normalizeSourceId(source.id);
@@ -824,6 +836,34 @@ function normalizeConfig(nextCfg) {
     }
   }
   nextCfg.sync_order = cleanSyncOrder(nextCfg.sync_order || []);
+}
+
+function normalizeAppConfig(app) {
+  return {
+    data_db: app.data_db || "conf/state/auto_sync.sqlite",
+    log_dir: app.log_dir || "logs",
+    status_log_interval_secs: Number(app.status_log_interval_secs || 300),
+    web_bind: trimPathValue(app.web_bind) || "0.0.0.0:18765",
+    tcp_connection_pool_size: Number(app.tcp_connection_pool_size ?? 100),
+    rsync: normalizeRsyncConfig(app.rsync || {}),
+  };
+}
+
+function normalizeRsyncConfig(rsync) {
+  return {
+    archive: rsync.archive !== false,
+    delete: rsync.delete !== false,
+    checksum: rsync.checksum === true,
+    debug_logs: rsync.debug_logs === true || rsync.itemize_changes === true,
+    timeout_secs: Number(rsync.timeout_secs || 0),
+    bwlimit_kbps: Number(rsync.bwlimit_kbps || 0),
+    extra_args: cleanRsyncArgs(rsync.extra_args || []),
+  };
+}
+
+function cleanRsyncArgs(values) {
+  const args = Array.isArray(values) ? values : String(values || "").split(/\s+/);
+  return args.map((value) => String(value || "").trim()).filter(Boolean);
 }
 
 function normalizeMachines(values) {
@@ -1195,6 +1235,49 @@ function openConfigModal() {
 
 function closeConfigModal() {
   el.configModal.hidden = true;
+}
+
+function openSettingsModal(event) {
+  preventDefault(event);
+  updateCfgFromForm();
+  cfg.app = normalizeAppConfig(cfg.app || {});
+  const rsync = cfg.app.rsync;
+  el.settingsRsyncArchive.checked = rsync.archive;
+  el.settingsRsyncDelete.checked = rsync.delete;
+  el.settingsRsyncChecksum.checked = rsync.checksum;
+  el.settingsRsyncDebug.checked = rsync.debug_logs;
+  el.settingsRsyncTimeout.value = String(rsync.timeout_secs || 0);
+  el.settingsRsyncBwlimit.value = String(rsync.bwlimit_kbps || 0);
+  el.settingsRsyncExtra.value = (rsync.extra_args || []).join(" ");
+  el.settingsTcpPool.value = String(cfg.app.tcp_connection_pool_size ?? 100);
+  el.settingsModal.hidden = false;
+}
+
+function closeSettingsModal() {
+  el.settingsModal.hidden = true;
+}
+
+async function saveSettings() {
+  updateCfgFromForm();
+  const extraArgs = cleanRsyncArgs(el.settingsRsyncExtra.value);
+  const forbidden = extraArgs.find((arg) => arg === "-e" || arg.startsWith("--rsh") || arg.startsWith("--rsync-path"));
+  if (forbidden) {
+    setMessage(`Unsupported rsync arg: ${forbidden}`);
+    return;
+  }
+  cfg.app = normalizeAppConfig(cfg.app || {});
+  cfg.app.tcp_connection_pool_size = clampInteger(el.settingsTcpPool.value, 0, 10000);
+  cfg.app.rsync = normalizeRsyncConfig({
+    archive: el.settingsRsyncArchive.checked,
+    delete: el.settingsRsyncDelete.checked,
+    checksum: el.settingsRsyncChecksum.checked,
+    debug_logs: el.settingsRsyncDebug.checked,
+    timeout_secs: clampInteger(el.settingsRsyncTimeout.value, 0, 86400),
+    bwlimit_kbps: clampInteger(el.settingsRsyncBwlimit.value, 0, 10_000_000),
+    extra_args: extraArgs,
+  });
+  await autoSaveConfig();
+  closeSettingsModal();
 }
 
 function openIssueModal(status) {
@@ -1591,6 +1674,7 @@ function setBusy(nextBusy) {
   busy = nextBusy;
   el.config.disabled = busy;
   el.statusConfig.disabled = busy;
+  el.settingsSave.disabled = busy;
   el.refresh.disabled = busy;
   updateStatusUi();
 }
@@ -1604,6 +1688,7 @@ function setMessage(text) {
 
 function defaultUiConfig() {
   return {
+    app: normalizeAppConfig({}),
     machines: [],
     source_groups: [],
     sync_order: [],
@@ -1612,6 +1697,14 @@ function defaultUiConfig() {
 
 function valueOr(value, fallback) {
   return value === null || value === undefined ? fallback : value;
+}
+
+function clampInteger(value, min, max) {
+  const parsed = Number.parseInt(String(value || "0"), 10);
+  if (!Number.isFinite(parsed)) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, parsed));
 }
 
 function preventDefault(event) {
@@ -1657,7 +1750,7 @@ function bindButtonClick(button, handler) {
 }
 
 bindButtonClick(el.config, openConfigModal);
-bindButtonClick(el.statusConfig, openConfigModal);
+bindButtonClick(el.statusConfig, openSettingsModal);
 bindButtonClick(el.refresh, () => runBusy("", loadAll));
 bindButtonClick(el.machineStatus, openMachineModal);
 window.autoSyncOpenMachines = openMachineModal;
@@ -1695,6 +1788,8 @@ el.scheduleClose.onclick = () => closeScheduleModal(false);
 el.scheduleApply.onclick = () => closeScheduleModal(true);
 el.cycleMode.onchange = updateScheduleModalFields;
 el.configClose.onclick = closeConfigModal;
+el.settingsClose.onclick = closeSettingsModal;
+el.settingsSave.onclick = () => saveSettings().catch((error) => setMessage(String(error)));
 el.machineClose.onclick = closeMachineModal;
 el.machineDiscover.onclick = () => discoverMachines().catch((error) => setMessage(String(error)));
 el.machineAdd.onclick = () => addMachine().catch((error) => setMessage(String(error)));
