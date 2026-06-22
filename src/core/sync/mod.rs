@@ -1007,6 +1007,26 @@ fn sync_directory_with_transfer(
     )?;
     let dst_map = map_entries(&dst_snapshot);
 
+    for entry in source_snapshot {
+        if let Some(existing) = dst_map.get(&entry.rel_path) {
+            if existing.file_type != entry.file_type {
+                remove_path_on_machine(
+                    dst_machine_id,
+                    dst_machine,
+                    dst_root,
+                    &entry.rel_path,
+                    cycle_id,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to replace destination path type for {}",
+                        entry.rel_path
+                    )
+                })?;
+            }
+        }
+    }
+
     for entry in source_snapshot
         .iter()
         .filter(|entry| entry.file_type == "dir")
