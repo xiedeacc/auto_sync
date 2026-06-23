@@ -125,6 +125,6 @@ scp -O -P "$PORT" "$tmp_dir/auto_sync" "${target}:/etc/init.d/auto_sync"
 scp -O -P "$PORT" "$tmp_dir/auto_sync_web" "${target}:/etc/init.d/auto_sync_web"
 
 ssh -p "$PORT" "$target" "chmod +x /etc/init.d/auto_sync /etc/init.d/auto_sync_web"
-ssh -p "$PORT" "$target" "if command -v opkg >/dev/null 2>&1; then opkg update && (opkg install rsync openssh-client || opkg install rsync); fi"
+ssh -p "$PORT" "$target" "if command -v opkg >/dev/null 2>&1; then opkg update && opkg install openssh-client || true; fi"
 ssh -p "$PORT" "$target" "/etc/init.d/auto_sync enable && /etc/init.d/auto_sync_web enable && /etc/init.d/auto_sync start && /etc/init.d/auto_sync_web start"
 ssh -p "$PORT" "$target" "/etc/init.d/auto_sync status || true; /etc/init.d/auto_sync_web status || true"

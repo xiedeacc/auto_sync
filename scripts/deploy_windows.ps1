@@ -176,20 +176,11 @@ function Install-WindowsRuntime {
     )
 
     $openSshZip = Join-Path $RuntimeDir "OpenSSH-Win64.zip"
-    $cwrsyncZip = Join-Path $RuntimeDir "cwrsync_6.2.5_x64_free.zip"
-    if (-not (Test-Path -LiteralPath $cwrsyncZip)) {
-        throw "Missing $cwrsyncZip. Run scripts/download_windows_runtime.sh on Linux first, or commit/pull bin/windows."
-    }
 
     New-Item -ItemType Directory -Force -Path $TargetRuntime | Out-Null
-    Copy-Item -Force -LiteralPath $cwrsyncZip -Destination (Join-Path $TargetRuntime "cwrsync_6.2.5_x64_free.zip")
     if (Test-Path -LiteralPath (Join-Path $RuntimeDir "SHA256SUMS")) {
         Copy-Item -Force -LiteralPath (Join-Path $RuntimeDir "SHA256SUMS") -Destination (Join-Path $TargetRuntime "SHA256SUMS")
     }
-
-    $cwrsyncDir = Join-Path $TargetRuntime "cwrsync"
-    Remove-DirectoryUnder -Path $cwrsyncDir -Parent $TargetRuntime
-    Expand-Archive -Force (Join-Path $TargetRuntime "cwrsync_6.2.5_x64_free.zip") $cwrsyncDir
 
     $openSshBin = $null
     if (Test-Path -LiteralPath $openSshZip) {
@@ -202,7 +193,6 @@ function Install-WindowsRuntime {
 
     [PSCustomObject]@{
         OpenSshBin = $openSshBin
-        CwrsyncBin = Join-Path $cwrsyncDir "cwrsync_6.2.5_x64_free\bin"
     }
 }
 
@@ -674,7 +664,7 @@ else {
 }
 
 $pathScope = if ($UserPath) { "User" } else { "Machine" }
-Add-PathEntries -Scope $pathScope -Paths @($openSshBinForPath, $runtime.CwrsyncBin, $binDir)
+Add-PathEntries -Scope $pathScope -Paths @($openSshBinForPath, $binDir)
 $authorizedKeyResult = Ensure-AuthorizedKey -PublicKeyFile $AuthorizedKeyFile
 $daemonService = $null
 if ($ensureService) {
@@ -686,7 +676,6 @@ Write-Host "Binaries: $binDir"
 Write-Host "Config: $targetConfig ($configAction)"
 Write-Host "Runtime: $targetRuntime"
 Write-Host "OpenSSH bin: $openSshBinForPath"
-Write-Host "cwRsync bin: $($runtime.CwrsyncBin)"
 Write-Host "PATH scope: $pathScope"
 if ($sshResult) {
     Write-Host "sshd status: $($sshResult.ServiceStatus)"

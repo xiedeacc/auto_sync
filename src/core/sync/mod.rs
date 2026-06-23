@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 #[cfg(windows)]
@@ -17,12 +17,12 @@ use tracing::{error, info, warn};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::core::config::{
-    AppConfig, DestinationConfig, RsyncConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef,
-    machine_id_or_local,
+    AppConfig, DEFAULT_TRANSFER_TIMEOUT_SECS, DestinationConfig, NativeSyncConfig, SnapshotBackend,
+    SourceGroupConfig, SyncTaskRef, machine_id_or_local,
 };
 use crate::core::machines::{
     configure_tcp_connection_pool, encode_query_component, find_machine, remote_post_bytes,
-    remote_post_json, rsync_endpoint, rsync_path, ssh_target,
+    remote_post_json,
 };
 use crate::core::state::{Cycle, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
@@ -30,6 +30,7 @@ use crate::core::status::{check_destination_online, check_file_destination_onlin
 const INTERNAL_TMP: &str = ".auto_sync_tmp";
 const INTERNAL_TRASH: &str = ".auto_sync_trash";
 const INTERNAL_PROBE: &str = ".auto_sync_probe";
+const TRANSFER_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
@@ -128,6 +129,8 @@ pub struct TransferSnapshotRequest {
     pub mode: TransferSnapshotMode,
     #[serde(default)]
     pub excludes: Vec<PathBuf>,
+    #[serde(default)]
+    pub checksum: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,14 +160,32 @@ pub struct TransferRemovePathRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct TransferReceiveFileQuery {
+pub struct TransferReceiveFileChunkQuery {
     pub root: String,
     pub rel_path: String,
     pub cycle_id: i64,
     pub size: i64,
-    pub mtime_ns: i64,
-    pub mode: u32,
-    pub hash: Option<String>,
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferFileOffsetRequest {
+    pub root: PathBuf,
+    pub rel_path: String,
+    pub cycle_id: i64,
+    pub size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferFileOffset {
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferFinishFileRequest {
+    pub root: PathBuf,
+    pub cycle_id: i64,
+    pub entry: SnapshotEntry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +207,10 @@ pub struct TransferPushFileRequest {
     pub destination: crate::core::config::MachineConfig,
     pub destination_root: PathBuf,
     pub cycle_id: i64,
+    #[serde(default = "default_transfer_timeout_secs")]
+    pub transfer_timeout_secs: u64,
+    #[serde(default)]
+    pub bwlimit_kbps: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,19 +218,28 @@ pub struct TransferAck {
     pub ok: bool,
 }
 
-const TRANSFER_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+fn default_transfer_timeout_secs() -> u64 {
+    DEFAULT_TRANSFER_TIMEOUT_SECS
+}
+
+fn transfer_timeout(sync: &NativeSyncConfig) -> Duration {
+    Duration::from_secs(sync.transfer_timeout_secs.max(1))
+}
 
 pub fn transfer_snapshot(req: TransferSnapshotRequest) -> Result<Vec<SnapshotEntry>> {
     match req.mode {
-        TransferSnapshotMode::Source => {
-            take_snapshot_with_excludes(&req.root, SnapshotMode::Source, &req.excludes)
-        }
+        TransferSnapshotMode::Source => take_snapshot_with_excludes(
+            &req.root,
+            SnapshotMode::Source,
+            &req.excludes,
+            req.checksum,
+        ),
         TransferSnapshotMode::Destination => {
             reject_dangerous_destination(&req.root)?;
             if !req.root.exists() {
                 return Ok(Vec::new());
             }
-            take_snapshot(&req.root, SnapshotMode::Destination)
+            take_snapshot_with_excludes(&req.root, SnapshotMode::Destination, &[], req.checksum)
         }
     }
 }
@@ -264,16 +298,89 @@ pub fn transfer_remove_path(req: TransferRemovePathRequest) -> Result<TransferAc
     Ok(transfer_ack())
 }
 
-pub fn transfer_receive_file(query: TransferReceiveFileQuery, bytes: &[u8]) -> Result<TransferAck> {
-    let entry = SnapshotEntry {
-        rel_path: query.rel_path,
-        file_type: "file".to_string(),
-        size: query.size,
-        mtime_ns: query.mtime_ns,
-        mode: query.mode,
-        hash: query.hash,
+pub fn transfer_file_offset(req: TransferFileOffsetRequest) -> Result<TransferFileOffset> {
+    reject_dangerous_destination(&req.root)?;
+    let tmp = tmp_path(&req.root, req.cycle_id, &req.rel_path);
+    let offset = match fs::metadata(&tmp) {
+        Ok(metadata) if metadata.len() <= req.size.max(0) as u64 => metadata.len(),
+        Ok(_) => {
+            remove_any(&tmp).ok();
+            0
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", tmp.display()));
+        }
     };
-    receive_file_bytes(Path::new(&query.root), query.cycle_id, &entry, bytes)?;
+    Ok(TransferFileOffset { offset })
+}
+
+pub fn transfer_receive_file_chunk(
+    query: TransferReceiveFileChunkQuery,
+    bytes: &[u8],
+) -> Result<TransferAck> {
+    let root = Path::new(&query.root);
+    reject_dangerous_destination(root)?;
+    let size = query.size.max(0) as u64;
+    let end = query
+        .offset
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| anyhow!("file chunk offset overflow"))?;
+    if end > size {
+        bail!(
+            "received file chunk exceeds expected size for {}",
+            query.rel_path
+        );
+    }
+    let tmp = tmp_path(root, query.cycle_id, &query.rel_path);
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if query.offset == 0 && (tmp.exists() || fs::symlink_metadata(&tmp).is_ok()) {
+        remove_any(&tmp)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&tmp)
+        .with_context(|| format!("failed to open temp file {}", tmp.display()))?;
+    let current_len = file.metadata()?.len();
+    if current_len < query.offset {
+        bail!(
+            "resume offset {} is beyond temp file length {} for {}",
+            query.offset,
+            current_len,
+            query.rel_path
+        );
+    }
+    if current_len > query.offset {
+        file.set_len(query.offset)?;
+    }
+    file.seek(SeekFrom::Start(query.offset))?;
+    file.write_all(bytes)?;
+    Ok(transfer_ack())
+}
+
+pub fn transfer_finish_file(req: TransferFinishFileRequest) -> Result<TransferAck> {
+    reject_dangerous_destination(&req.root)?;
+    if req.entry.file_type != "file" {
+        bail!("transfer_finish_file requires a file entry");
+    }
+    let final_path = safe_join_rel(&req.root, &req.entry.rel_path)?;
+    let tmp = tmp_path(&req.root, req.cycle_id, &req.entry.rel_path);
+    let len = fs::metadata(&tmp)
+        .with_context(|| format!("missing temp file {}", tmp.display()))?
+        .len();
+    if len != req.entry.size.max(0) as u64 {
+        bail!(
+            "received file size mismatch for {}: got {}, expected {}",
+            req.entry.rel_path,
+            len,
+            req.entry.size
+        );
+    }
+    finish_received_file(&req.root, req.cycle_id, &req.entry, &tmp, &final_path)?;
     Ok(transfer_ack())
 }
 
@@ -299,6 +406,8 @@ pub fn transfer_push_file(req: TransferPushFileRequest) -> Result<TransferAck> {
             req.cycle_id,
             &req.entry,
             &src,
+            Duration::from_secs(req.transfer_timeout_secs.max(1)),
+            req.bwlimit_kbps,
         )?,
         "symlink" => {
             send_symlink_tcp(
@@ -307,6 +416,7 @@ pub fn transfer_push_file(req: TransferPushFileRequest) -> Result<TransferAck> {
                 req.cycle_id,
                 &req.entry,
                 &src,
+                Duration::from_secs(req.transfer_timeout_secs.max(1)),
             )?;
         }
         other => bail!("unsupported transfer entry type {other}"),
@@ -316,41 +426,6 @@ pub fn transfer_push_file(req: TransferPushFileRequest) -> Result<TransferAck> {
 
 fn transfer_ack() -> TransferAck {
     TransferAck { ok: true }
-}
-
-fn receive_file_bytes(
-    dst_root: &Path,
-    cycle_id: i64,
-    entry: &SnapshotEntry,
-    bytes: &[u8],
-) -> Result<()> {
-    reject_dangerous_destination(dst_root)?;
-    if entry.file_type != "file" {
-        bail!("receive_file_bytes requires a file entry");
-    }
-    if bytes.len() as i64 != entry.size {
-        bail!(
-            "received file size mismatch for {}: got {}, expected {}",
-            entry.rel_path,
-            bytes.len(),
-            entry.size
-        );
-    }
-    let final_path = safe_join_rel(dst_root, &entry.rel_path)?;
-    let tmp = tmp_path(dst_root, cycle_id, &entry.rel_path);
-    if let Some(parent) = tmp.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if tmp.exists() || fs::symlink_metadata(&tmp).is_ok() {
-        remove_any(&tmp)?;
-    }
-    {
-        let mut file = File::create(&tmp)
-            .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
-        file.write_all(bytes)?;
-        file.sync_all().ok();
-    }
-    finish_received_file(dst_root, cycle_id, entry, &tmp, &final_path)
 }
 
 fn receive_symlink_target(
@@ -389,10 +464,12 @@ fn finish_received_file(
     tmp: &Path,
     final_path: &Path,
 ) -> Result<()> {
-    let actual_hash = hash_file(tmp)?;
-    if Some(actual_hash) != entry.hash {
-        remove_any(tmp).ok();
-        bail!("received file hash mismatch at {}", entry.rel_path);
+    if let Some(expected_hash) = &entry.hash {
+        let actual_hash = hash_file(tmp)?;
+        if &actual_hash != expected_hash {
+            remove_any(tmp).ok();
+            bail!("received file hash mismatch at {}", entry.rel_path);
+        }
     }
     set_mode(tmp, entry.mode).ok();
     let mtime = FileTime::from_unix_time(
@@ -416,10 +493,51 @@ fn send_file_tcp(
     cycle_id: i64,
     entry: &SnapshotEntry,
     src: &Path,
+    timeout: Duration,
+    bwlimit_kbps: u64,
 ) -> Result<()> {
-    let bytes = fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
-    let path = receive_file_api_path(destination_root, cycle_id, entry);
-    let ack: TransferAck = remote_post_bytes(destination, &path, &bytes, TRANSFER_HTTP_TIMEOUT)?;
+    let offset_req = TransferFileOffsetRequest {
+        root: destination_root.to_path_buf(),
+        rel_path: entry.rel_path.clone(),
+        cycle_id,
+        size: entry.size,
+    };
+    let offset_response: TransferFileOffset = remote_post_json(
+        destination,
+        "/api/transfer/file-offset",
+        &offset_req,
+        timeout,
+    )?;
+    let mut offset = offset_response.offset;
+    let total_size = entry.size.max(0) as u64;
+    if offset > total_size {
+        offset = 0;
+    }
+    let mut file = File::open(src).with_context(|| format!("failed to read {}", src.display()))?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut sent = offset;
+    let mut buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
+    while sent < total_size {
+        let remaining = (total_size - sent).min(TRANSFER_CHUNK_SIZE as u64) as usize;
+        let n = file.read(&mut buf[..remaining])?;
+        if n == 0 {
+            bail!("source ended while sending {}", entry.rel_path);
+        }
+        let path = receive_file_chunk_api_path(destination_root, cycle_id, entry, sent);
+        let ack: TransferAck = remote_post_bytes(destination, &path, &buf[..n], timeout)?;
+        if !ack.ok {
+            bail!("peer rejected TCP file chunk");
+        }
+        sent += n as u64;
+        throttle_after_transfer(n, bwlimit_kbps);
+    }
+    let finish = TransferFinishFileRequest {
+        root: destination_root.to_path_buf(),
+        cycle_id,
+        entry: entry.clone(),
+    };
+    let ack: TransferAck =
+        remote_post_json(destination, "/api/transfer/finish-file", &finish, timeout)?;
     if !ack.ok {
         bail!("peer rejected TCP file transfer");
     }
@@ -432,6 +550,7 @@ fn send_symlink_tcp(
     cycle_id: i64,
     entry: &SnapshotEntry,
     src: &Path,
+    timeout: Duration,
 ) -> Result<()> {
     let target = fs::read_link(src)
         .with_context(|| format!("failed to read symlink {}", src.display()))?
@@ -446,33 +565,38 @@ fn send_symlink_tcp(
         hash: entry.hash.clone(),
         target,
     };
-    let ack: TransferAck = remote_post_json(
-        destination,
-        "/api/transfer/receive-symlink",
-        &req,
-        TRANSFER_HTTP_TIMEOUT,
-    )?;
+    let ack: TransferAck =
+        remote_post_json(destination, "/api/transfer/receive-symlink", &req, timeout)?;
     if !ack.ok {
         bail!("peer rejected symlink transfer");
     }
     Ok(())
 }
 
-fn receive_file_api_path(root: &Path, cycle_id: i64, entry: &SnapshotEntry) -> String {
-    let mut path = format!(
-        "/api/transfer/receive-file?root={}&rel_path={}&cycle_id={}&size={}&mtime_ns={}&mode={}",
+fn throttle_after_transfer(bytes: usize, bwlimit_kbps: u64) {
+    if bwlimit_kbps == 0 || bytes == 0 {
+        return;
+    }
+    let millis = ((bytes as u128) * 1000) / ((bwlimit_kbps as u128) * 1024);
+    if millis > 0 {
+        std::thread::sleep(Duration::from_millis(millis.min(u64::MAX as u128) as u64));
+    }
+}
+
+fn receive_file_chunk_api_path(
+    root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    offset: u64,
+) -> String {
+    format!(
+        "/api/transfer/receive-file-chunk?root={}&rel_path={}&cycle_id={}&size={}&offset={}",
         encode_query_component(&root.to_string_lossy()),
         encode_query_component(&entry.rel_path),
         cycle_id,
         entry.size,
-        entry.mtime_ns,
-        entry.mode
-    );
-    if let Some(hash) = &entry.hash {
-        path.push_str("&hash=");
-        path.push_str(&encode_query_component(hash));
-    }
-    path
+        offset
+    )
 }
 
 fn safe_join_rel(root: &Path, rel_path: &str) -> Result<PathBuf> {
@@ -522,9 +646,6 @@ pub fn sync_cycle_for_source(
     );
 
     if cycle_has_remote_target(state, source, cycle)? {
-        if cycle.needs_full_rescan {
-            return sync_cycle_with_rsync(cfg, state, source, cycle);
-        }
         return sync_cycle_with_transfer(cfg, state, source, cycle);
     }
 
@@ -635,7 +756,7 @@ pub fn sync_cycle_for_source(
 
     state.mark_cycle_status(cycle.id, "planning")?;
     let source_snapshot = source_endpoint
-        .snapshot(&source.excludes)
+        .snapshot(&source.excludes, cfg.app.sync.checksum)
         .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
     state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
 
@@ -648,6 +769,7 @@ pub fn sync_cycle_for_source(
             cycle.id,
             &source_snapshot,
             &source.excludes,
+            &cfg.app.sync,
         ) {
             Ok(()) => {
                 progressed = true;
@@ -832,13 +954,7 @@ fn sync_cycle_with_transfer(
     };
 
     if source_info.kind != "dir" {
-        warn!(
-            source = source.id,
-            cycle_id = cycle.id,
-            kind = source_info.kind,
-            "incremental transfer supports directory sources only; falling back to rsync"
-        );
-        return sync_cycle_with_rsync(cfg, state, source, cycle);
+        return sync_cycle_file_with_transfer(cfg, state, source, cycle, &source_info);
     }
 
     let mut all_verified = true;
@@ -905,6 +1021,8 @@ fn sync_cycle_with_transfer(
         &source_info.base,
         TransferSnapshotMode::Source,
         &source.excludes,
+        cfg.app.sync.checksum,
+        transfer_timeout(&cfg.app.sync),
     )
     .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
     state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
@@ -945,6 +1063,7 @@ fn sync_cycle_with_transfer(
             cycle.id,
             &source_snapshot,
             &source.excludes,
+            &cfg.app.sync,
         ) {
             Ok(()) => {
                 progressed = true;
@@ -995,8 +1114,10 @@ fn sync_directory_with_transfer(
     cycle_id: i64,
     source_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
 ) -> Result<()> {
-    prepare_dir_on_machine(dst_machine_id, dst_machine, dst_root, None, None)?;
+    let timeout = transfer_timeout(sync);
+    prepare_dir_on_machine(dst_machine_id, dst_machine, dst_root, None, None, timeout)?;
     let source_map = map_entries(source_snapshot);
     let dst_snapshot = snapshot_on_machine(
         dst_machine_id,
@@ -1004,6 +1125,8 @@ fn sync_directory_with_transfer(
         dst_root,
         TransferSnapshotMode::Destination,
         &[],
+        sync.checksum,
+        timeout,
     )?;
     let dst_map = map_entries(&dst_snapshot);
 
@@ -1016,6 +1139,7 @@ fn sync_directory_with_transfer(
                     dst_root,
                     &entry.rel_path,
                     cycle_id,
+                    timeout,
                 )
                 .with_context(|| {
                     format!(
@@ -1037,6 +1161,7 @@ fn sync_directory_with_transfer(
             dst_root,
             Some(&entry.rel_path),
             Some(entry.mode),
+            timeout,
         )?;
     }
 
@@ -1045,7 +1170,7 @@ fn sync_directory_with_transfer(
         .filter(|entry| entry.file_type == "file" || entry.file_type == "symlink")
     {
         let needs_copy = match dst_map.get(&entry.rel_path) {
-            Some(existing) => !entries_match(entry, existing),
+            Some(existing) => !entries_match(entry, existing, sync.checksum),
             None => true,
         };
         if !needs_copy {
@@ -1059,19 +1184,31 @@ fn sync_directory_with_transfer(
             dst_root,
             cycle_id,
             entry,
+            sync,
         )
         .with_context(|| format!("failed to transfer {}", entry.rel_path))?;
     }
 
-    let mut extra_paths: Vec<String> = dst_map
-        .keys()
-        .filter(|rel| !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes))
-        .cloned()
-        .collect();
-    extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
-    for rel in extra_paths {
-        remove_path_on_machine(dst_machine_id, dst_machine, dst_root, &rel, cycle_id)
+    if sync.mirror {
+        let mut extra_paths: Vec<String> = dst_map
+            .keys()
+            .filter(|rel| {
+                !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
+            })
+            .cloned()
+            .collect();
+        extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
+        for rel in extra_paths {
+            remove_path_on_machine(
+                dst_machine_id,
+                dst_machine,
+                dst_root,
+                &rel,
+                cycle_id,
+                timeout,
+            )
             .with_context(|| format!("failed to remove extra destination path {rel}"))?;
+        }
     }
 
     let actual = snapshot_on_machine(
@@ -1080,180 +1217,35 @@ fn sync_directory_with_transfer(
         dst_root,
         TransferSnapshotMode::Destination,
         &[],
+        sync.checksum,
+        timeout,
     )?;
-    verify_snapshot_entries(source_snapshot, &actual, excludes)?;
+    verify_snapshot_entries(source_snapshot, &actual, excludes, sync)?;
     Ok(())
 }
 
-fn path_info_on_machine(
-    machine_id: &str,
-    machine: &crate::core::config::MachineConfig,
-    path: &Path,
-) -> Result<TransferPathInfo> {
-    let req = TransferPathInfoRequest {
-        path: path.to_path_buf(),
-    };
-    if machine_id == "local" {
-        transfer_path_info(req)
-    } else {
-        remote_post_json(
-            machine,
-            "/api/transfer/path-info",
-            &req,
-            TRANSFER_HTTP_TIMEOUT,
-        )
-    }
-}
-
-fn snapshot_on_machine(
-    machine_id: &str,
-    machine: &crate::core::config::MachineConfig,
-    root: &Path,
-    mode: TransferSnapshotMode,
-    excludes: &[PathBuf],
-) -> Result<Vec<SnapshotEntry>> {
-    let req = TransferSnapshotRequest {
-        root: root.to_path_buf(),
-        mode,
-        excludes: excludes.to_vec(),
-    };
-    if machine_id == "local" {
-        transfer_snapshot(req)
-    } else {
-        remote_post_json(
-            machine,
-            "/api/transfer/snapshot",
-            &req,
-            TRANSFER_HTTP_TIMEOUT,
-        )
-    }
-}
-
-fn prepare_dir_on_machine(
-    machine_id: &str,
-    machine: &crate::core::config::MachineConfig,
-    root: &Path,
-    rel_path: Option<&str>,
-    mode: Option<u32>,
-) -> Result<()> {
-    let req = TransferPrepareDirRequest {
-        root: root.to_path_buf(),
-        rel_path: rel_path.map(ToString::to_string),
-        mode,
-    };
-    let ack = if machine_id == "local" {
-        transfer_prepare_dir(req)?
-    } else {
-        remote_post_json(
-            machine,
-            "/api/transfer/prepare-dir",
-            &req,
-            TRANSFER_HTTP_TIMEOUT,
-        )?
-    };
-    if !ack.ok {
-        bail!("peer rejected prepare directory request");
-    }
-    Ok(())
-}
-
-fn remove_path_on_machine(
-    machine_id: &str,
-    machine: &crate::core::config::MachineConfig,
-    root: &Path,
-    rel_path: &str,
-    cycle_id: i64,
-) -> Result<()> {
-    let req = TransferRemovePathRequest {
-        root: root.to_path_buf(),
-        rel_path: rel_path.to_string(),
-        cycle_id,
-    };
-    let ack = if machine_id == "local" {
-        transfer_remove_path(req)?
-    } else {
-        remote_post_json(
-            machine,
-            "/api/transfer/remove-path",
-            &req,
-            TRANSFER_HTTP_TIMEOUT,
-        )?
-    };
-    if !ack.ok {
-        bail!("peer rejected remove path request");
-    }
-    Ok(())
-}
-
-fn push_entry_between_machines(
-    source_machine_id: &str,
-    source_machine: &crate::core::config::MachineConfig,
-    source_root: &Path,
-    dst_machine: &crate::core::config::MachineConfig,
-    dst_root: &Path,
-    cycle_id: i64,
-    entry: &SnapshotEntry,
-) -> Result<()> {
-    let req = TransferPushFileRequest {
-        source_root: source_root.to_path_buf(),
-        rel_path: entry.rel_path.clone(),
-        entry: entry.clone(),
-        destination: dst_machine.clone(),
-        destination_root: dst_root.to_path_buf(),
-        cycle_id,
-    };
-    let ack = if source_machine_id == "local" {
-        transfer_push_file(req)?
-    } else {
-        remote_post_json(
-            source_machine,
-            "/api/transfer/push-file",
-            &req,
-            TRANSFER_HTTP_TIMEOUT,
-        )?
-    };
-    if !ack.ok {
-        bail!("peer rejected file push request");
-    }
-    Ok(())
-}
-
-fn verify_snapshot_entries(
-    expected: &[SnapshotEntry],
-    actual: &[SnapshotEntry],
-    excludes: &[PathBuf],
-) -> Result<()> {
-    let expected = map_entries(expected);
-    let actual = map_entries(actual);
-    for (rel, want) in &expected {
-        match actual.get(rel) {
-            Some(got) if entries_match(want, got) => {}
-            Some(_) => bail!("destination mismatch at {rel}"),
-            None => bail!("destination missing {rel}"),
-        }
-    }
-    for rel in actual.keys() {
-        if is_rel_excluded(Path::new(rel), excludes) {
-            continue;
-        }
-        if !expected.contains_key(rel) {
-            bail!("destination has extra path {rel}");
-        }
-    }
-    Ok(())
-}
-
-fn sync_cycle_with_rsync(
+fn sync_cycle_file_with_transfer(
     cfg: &AppConfig,
     state: &mut State,
     source: &SourceGroupConfig,
     cycle: &Cycle,
+    source_info: &TransferPathInfo,
 ) -> Result<SyncCycleOutcome> {
-    info!(
-        source = source.id,
-        cycle_id = cycle.id,
-        "rsync cycle started"
-    );
+    let source_machine_id = machine_id_or_local(&source.machine_id);
+    let source_machine = find_machine(cfg, source_machine_id)
+        .ok_or_else(|| anyhow!("unknown source machine: {source_machine_id}"))?;
+    let mut source_snapshot = snapshot_on_machine(
+        source_machine_id,
+        &source_machine,
+        &source_info.base,
+        TransferSnapshotMode::Source,
+        &source.excludes,
+        cfg.app.sync.checksum,
+        transfer_timeout(&cfg.app.sync),
+    )?;
+    source_snapshot.retain(|entry| entry.rel_path == source_info.name);
+    state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
+
     let mut all_verified = true;
     let mut targeted_count = 0_usize;
     let mut blocked_count = 0_usize;
@@ -1266,17 +1258,6 @@ fn sync_cycle_with_rsync(
             continue;
         }
         targeted_count += 1;
-        let last_verified = state.destination_last_verified(&source.id, &dst.id)?;
-        if last_verified >= Some(cycle.id) {
-            state.upsert_destination_status(
-                &source.id,
-                &dst.id,
-                Some(cycle.id),
-                "green",
-                "verified",
-            )?;
-            continue;
-        }
         if let Some(blocker) = sync_order_blocker(cfg, state, &source.id, &dst.id)? {
             all_verified = false;
             blocked_count += 1;
@@ -1289,8 +1270,32 @@ fn sync_cycle_with_rsync(
             )?;
             continue;
         }
+        let dst_machine_id = machine_id_or_local(&dst.machine_id);
+        let Some(dst_machine) = find_machine(cfg, dst_machine_id) else {
+            all_verified = false;
+            had_unblocked_failure = true;
+            state.upsert_destination_status(
+                &source.id,
+                &dst.id,
+                None,
+                "red",
+                "unknown_destination_machine",
+            )?;
+            continue;
+        };
 
-        match sync_rsync_endpoint(cfg, source, dst) {
+        let result = sync_file_with_transfer(
+            source_machine_id,
+            &source_machine,
+            &source_info.base,
+            dst_machine_id,
+            &dst_machine,
+            &dst.path,
+            cycle.id,
+            &source_snapshot,
+            &cfg.app.sync,
+        );
+        match result {
             Ok(()) => {
                 progressed = true;
                 state.clear_destination_issues(&source.id, &dst.id)?;
@@ -1330,172 +1335,224 @@ fn sync_cycle_with_rsync(
     })
 }
 
-fn sync_rsync_endpoint(
-    cfg: &AppConfig,
-    source: &SourceGroupConfig,
-    dst: &DestinationConfig,
-) -> Result<()> {
-    let source_machine_id = machine_id_or_local(&source.machine_id);
-    let dst_machine_id = machine_id_or_local(&dst.machine_id);
-    let source_machine = find_machine(cfg, source_machine_id)
-        .ok_or_else(|| anyhow!("unknown source machine: {source_machine_id}"))?;
-    let dst_machine = find_machine(cfg, dst_machine_id)
-        .ok_or_else(|| anyhow!("unknown destination machine: {dst_machine_id}"))?;
-    let source_spec = format!("{}/", rsync_endpoint(&source_machine, &source.src));
-    let dst_path = join_machine_path(
-        &dst.path,
-        &cross_platform_file_name(&source.src).unwrap_or_else(|| "source".to_string()),
-        &dst_machine,
-    );
-    let dst_spec = format!("{}/", rsync_endpoint(&dst_machine, &dst_path));
-
-    if source_machine_id != "local" && dst_machine_id != "local" {
-        return sync_remote_to_remote(cfg, &source_machine, &source.src, &dst_machine, &dst_path);
-    }
-
-    let mut command = Command::new("rsync");
-    command.args(rsync_args(&cfg.app.rsync));
-    if source_machine_id != "local" && source_machine.ssh_port != 22 {
-        command
-            .arg("-e")
-            .arg(format!("ssh -p {}", source_machine.ssh_port));
-    } else if dst_machine_id != "local" && dst_machine.ssh_port != 22 {
-        command
-            .arg("-e")
-            .arg(format!("ssh -p {}", dst_machine.ssh_port));
-    }
-    command.arg(source_spec).arg(dst_spec);
-    let status = command.status().context("failed to execute rsync")?;
-    if !status.success() {
-        bail!("rsync failed with status {status}");
-    }
-    Ok(())
-}
-
-fn sync_remote_to_remote(
-    cfg: &AppConfig,
+fn sync_file_with_transfer(
+    source_machine_id: &str,
     source_machine: &crate::core::config::MachineConfig,
-    source_path: &Path,
+    source_root: &Path,
+    dst_machine_id: &str,
     dst_machine: &crate::core::config::MachineConfig,
-    dst_path: &Path,
+    dst_root: &Path,
+    cycle_id: i64,
+    source_snapshot: &[SnapshotEntry],
+    sync: &NativeSyncConfig,
 ) -> Result<()> {
-    if !source_machine.os.eq_ignore_ascii_case("windows") {
-        let source_spec = trailing_rsync_path(rsync_path(source_machine, source_path));
-        let dst_spec = trailing_rsync_path(rsync_endpoint(dst_machine, dst_path));
-        return run_remote_rsync(
-            cfg,
-            source_machine,
-            &source_spec,
-            &dst_spec,
-            dst_machine.ssh_port,
-        );
-    }
-
-    if !dst_machine.os.eq_ignore_ascii_case("windows") {
-        let source_spec = trailing_rsync_path(rsync_endpoint(source_machine, source_path));
-        let dst_spec = trailing_rsync_path(rsync_path(dst_machine, dst_path));
-        return run_remote_rsync(
-            cfg,
+    let timeout = transfer_timeout(sync);
+    prepare_dir_on_machine(dst_machine_id, dst_machine, dst_root, None, None, timeout)?;
+    for entry in source_snapshot {
+        let dst_snapshot = snapshot_on_machine(
+            dst_machine_id,
             dst_machine,
-            &source_spec,
-            &dst_spec,
-            source_machine.ssh_port,
-        );
+            dst_root,
+            TransferSnapshotMode::Destination,
+            &[],
+            sync.checksum,
+            timeout,
+        )?;
+        let dst_map = map_entries(&dst_snapshot);
+        let needs_copy = match dst_map.get(&entry.rel_path) {
+            Some(existing) => !entries_match(entry, existing, sync.checksum),
+            None => true,
+        };
+        if needs_copy {
+            if let Some(existing) = dst_map.get(&entry.rel_path) {
+                if existing.file_type != entry.file_type {
+                    remove_path_on_machine(
+                        dst_machine_id,
+                        dst_machine,
+                        dst_root,
+                        &entry.rel_path,
+                        cycle_id,
+                        timeout,
+                    )?;
+                }
+            }
+            push_entry_between_machines(
+                source_machine_id,
+                source_machine,
+                source_root,
+                dst_machine,
+                dst_root,
+                cycle_id,
+                entry,
+                sync,
+            )?;
+        }
     }
-
-    let source_spec = trailing_rsync_path(rsync_path(source_machine, source_path));
-    let dst_spec = trailing_rsync_path(rsync_endpoint(dst_machine, dst_path));
-    run_remote_rsync(
-        cfg,
-        source_machine,
-        &source_spec,
-        &dst_spec,
-        dst_machine.ssh_port,
-    )
+    let actual = snapshot_on_machine(
+        dst_machine_id,
+        dst_machine,
+        dst_root,
+        TransferSnapshotMode::Destination,
+        &[],
+        sync.checksum,
+        timeout,
+    )?;
+    verify_snapshot_entries(source_snapshot, &actual, &[], sync)?;
+    Ok(())
 }
 
-fn run_remote_rsync(
-    cfg: &AppConfig,
-    runner: &crate::core::config::MachineConfig,
-    source_spec: &str,
-    dst_spec: &str,
-    peer_ssh_port: u16,
-) -> Result<()> {
-    let remote_command =
-        remote_rsync_command(runner, &cfg.app.rsync, source_spec, dst_spec, peer_ssh_port);
-    let mut command = Command::new("ssh");
-    if runner.ssh_port != 22 {
-        command.arg("-p").arg(runner.ssh_port.to_string());
+fn path_info_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    path: &Path,
+) -> Result<TransferPathInfo> {
+    let req = TransferPathInfoRequest {
+        path: path.to_path_buf(),
+    };
+    if machine_id == "local" {
+        transfer_path_info(req)
+    } else {
+        remote_post_json(
+            machine,
+            "/api/transfer/path-info",
+            &req,
+            Duration::from_secs(DEFAULT_TRANSFER_TIMEOUT_SECS),
+        )
     }
-    command.arg(ssh_target(runner)).arg(remote_command);
-    let status = command
-        .status()
-        .context("failed to execute ssh for remote-to-remote rsync")?;
-    if !status.success() {
-        bail!("remote-to-remote rsync failed with status {status}");
+}
+
+fn snapshot_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    mode: TransferSnapshotMode,
+    excludes: &[PathBuf],
+    checksum: bool,
+    timeout: Duration,
+) -> Result<Vec<SnapshotEntry>> {
+    let req = TransferSnapshotRequest {
+        root: root.to_path_buf(),
+        mode,
+        excludes: excludes.to_vec(),
+        checksum,
+    };
+    if machine_id == "local" {
+        transfer_snapshot(req)
+    } else {
+        remote_post_json(machine, "/api/transfer/snapshot", &req, timeout)
+    }
+}
+
+fn prepare_dir_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    rel_path: Option<&str>,
+    mode: Option<u32>,
+    timeout: Duration,
+) -> Result<()> {
+    let req = TransferPrepareDirRequest {
+        root: root.to_path_buf(),
+        rel_path: rel_path.map(ToString::to_string),
+        mode,
+    };
+    let ack = if machine_id == "local" {
+        transfer_prepare_dir(req)?
+    } else {
+        remote_post_json(machine, "/api/transfer/prepare-dir", &req, timeout)?
+    };
+    if !ack.ok {
+        bail!("peer rejected prepare directory request");
     }
     Ok(())
 }
 
-fn remote_rsync_command(
-    runner: &crate::core::config::MachineConfig,
-    rsync: &RsyncConfig,
-    source_spec: &str,
-    dst_spec: &str,
-    peer_ssh_port: u16,
-) -> String {
-    let mut parts = vec!["rsync".to_string()];
-    parts.extend(rsync_args(rsync));
-    if peer_ssh_port != 22 {
-        parts.push("-e".to_string());
-        parts.push(remote_shell_quote(
-            runner,
-            &format!("ssh -p {peer_ssh_port}"),
-        ));
-    }
-    parts.push(remote_shell_quote(runner, source_spec));
-    parts.push(remote_shell_quote(runner, dst_spec));
-    parts.join(" ")
-}
-
-fn rsync_args(rsync: &RsyncConfig) -> Vec<String> {
-    let mut args = Vec::new();
-    if rsync.archive {
-        args.push("-a".to_string());
-    }
-    if rsync.delete {
-        args.push("--delete".to_string());
-    }
-    args.push("--whole-file".to_string());
-    if rsync.checksum {
-        args.push("--checksum".to_string());
-    }
-    if rsync.debug_logs {
-        args.push("--itemize-changes".to_string());
-    }
-    if rsync.timeout_secs > 0 {
-        args.push(format!("--timeout={}", rsync.timeout_secs));
-    }
-    if rsync.bwlimit_kbps > 0 {
-        args.push(format!("--bwlimit={}", rsync.bwlimit_kbps));
-    }
-    args.extend(rsync.extra_args.iter().cloned());
-    args
-}
-
-fn remote_shell_quote(runner: &crate::core::config::MachineConfig, value: &str) -> String {
-    if runner.os.eq_ignore_ascii_case("windows") {
-        format!("\"{}\"", value.replace('"', "\\\""))
+fn remove_path_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    rel_path: &str,
+    cycle_id: i64,
+    timeout: Duration,
+) -> Result<()> {
+    let req = TransferRemovePathRequest {
+        root: root.to_path_buf(),
+        rel_path: rel_path.to_string(),
+        cycle_id,
+    };
+    let ack = if machine_id == "local" {
+        transfer_remove_path(req)?
     } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
+        remote_post_json(machine, "/api/transfer/remove-path", &req, timeout)?
+    };
+    if !ack.ok {
+        bail!("peer rejected remove path request");
     }
+    Ok(())
 }
 
-fn trailing_rsync_path(mut value: String) -> String {
-    if !value.ends_with('/') {
-        value.push('/');
+fn push_entry_between_machines(
+    source_machine_id: &str,
+    source_machine: &crate::core::config::MachineConfig,
+    source_root: &Path,
+    dst_machine: &crate::core::config::MachineConfig,
+    dst_root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    sync: &NativeSyncConfig,
+) -> Result<()> {
+    let req = TransferPushFileRequest {
+        source_root: source_root.to_path_buf(),
+        rel_path: entry.rel_path.clone(),
+        entry: entry.clone(),
+        destination: dst_machine.clone(),
+        destination_root: dst_root.to_path_buf(),
+        cycle_id,
+        transfer_timeout_secs: sync.transfer_timeout_secs.max(1),
+        bwlimit_kbps: sync.bwlimit_kbps,
+    };
+    let ack = if source_machine_id == "local" {
+        transfer_push_file(req)?
+    } else {
+        remote_post_json(
+            source_machine,
+            "/api/transfer/push-file",
+            &req,
+            transfer_timeout(sync),
+        )?
+    };
+    if !ack.ok {
+        bail!("peer rejected file push request");
     }
-    value
+    Ok(())
+}
+
+fn verify_snapshot_entries(
+    expected: &[SnapshotEntry],
+    actual: &[SnapshotEntry],
+    excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
+) -> Result<()> {
+    let expected = map_entries(expected);
+    let actual = map_entries(actual);
+    for (rel, want) in &expected {
+        match actual.get(rel) {
+            Some(got) if entries_match(want, got, sync.checksum) => {}
+            Some(_) => bail!("destination mismatch at {rel}"),
+            None => bail!("destination missing {rel}"),
+        }
+    }
+    if sync.mirror {
+        for rel in actual.keys() {
+            if is_rel_excluded(Path::new(rel), excludes) {
+                continue;
+            }
+            if !expected.contains_key(rel) {
+                bail!("destination has extra path {rel}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cross_platform_file_name(path: &Path) -> Option<String> {
@@ -1840,15 +1897,17 @@ impl SourceEndpoint {
         bail!("source path is neither a file nor a directory");
     }
 
-    fn snapshot(&self, excludes: &[PathBuf]) -> Result<Vec<SnapshotEntry>> {
+    fn snapshot(&self, excludes: &[PathBuf], checksum: bool) -> Result<Vec<SnapshotEntry>> {
         match self {
-            Self::Dir { root } => take_snapshot_with_excludes(root, SnapshotMode::Source, excludes),
+            Self::Dir { root } => {
+                take_snapshot_with_excludes(root, SnapshotMode::Source, excludes, checksum)
+            }
             Self::File { path } => {
                 let rel_path = file_name_string(path)?;
                 if is_rel_excluded(Path::new(&rel_path), excludes) {
                     return Ok(Vec::new());
                 }
-                Ok(vec![snapshot_entry(path, rel_path)?])
+                Ok(vec![snapshot_entry(path, rel_path, checksum)?])
             }
         }
     }
@@ -1944,10 +2003,18 @@ fn sync_endpoint(
     cycle_id: i64,
     source_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
 ) -> Result<()> {
     match (source, dst) {
         (SourceEndpoint::Dir { root: src_root }, DestinationEndpoint::Dir { root: dst_root }) => {
-            sync_destination(src_root, dst_root, cycle_id, source_snapshot, excludes)
+            sync_destination(
+                src_root,
+                dst_root,
+                cycle_id,
+                source_snapshot,
+                excludes,
+                sync,
+            )
         }
         (SourceEndpoint::Dir { .. }, DestinationEndpoint::File { .. }) => {
             bail!("directory source cannot sync to a destination file")
@@ -1957,7 +2024,7 @@ fn sync_endpoint(
             if is_rel_excluded(Path::new(&rel_path), excludes) {
                 return Ok(());
             }
-            sync_file_to_path(path, root, &root.join(rel_path), cycle_id)
+            sync_file_to_path(path, root, &root.join(rel_path), cycle_id, sync)
         }
         (SourceEndpoint::File { path }, DestinationEndpoint::File { path: dst_path }) => {
             let rel_path = file_name_string(path)?;
@@ -1967,7 +2034,7 @@ fn sync_endpoint(
             let parent = dst_path
                 .parent()
                 .ok_or_else(|| anyhow!("destination file path has no parent"))?;
-            sync_file_to_path(path, parent, dst_path, cycle_id)
+            sync_file_to_path(path, parent, dst_path, cycle_id, sync)
         }
     }
 }
@@ -1978,6 +2045,7 @@ fn sync_destination(
     cycle_id: i64,
     source_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
 ) -> Result<()> {
     fs::create_dir_all(dst_root).with_context(|| {
         format!(
@@ -1988,7 +2056,8 @@ fn sync_destination(
     let result = (|| {
         let mut changing_paths = BTreeSet::new();
         let source_map = map_entries(source_snapshot);
-        let dst_snapshot = take_snapshot(dst_root, SnapshotMode::Destination)?;
+        let dst_snapshot =
+            take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
         let dst_map = map_entries(&dst_snapshot);
 
         for entry in source_snapshot.iter().filter(|e| e.file_type == "dir") {
@@ -2006,7 +2075,7 @@ fn sync_destination(
             .filter(|e| e.file_type == "file" || e.file_type == "symlink")
         {
             let needs_copy = match dst_map.get(&entry.rel_path) {
-                Some(existing) => !entries_match(entry, existing),
+                Some(existing) => !entries_match(entry, existing, sync.checksum),
                 None => true,
             };
             if !needs_copy {
@@ -2023,20 +2092,22 @@ fn sync_destination(
             }
         }
 
-        let mut extra_paths: Vec<String> = dst_map
-            .keys()
-            .filter(|rel| {
-                !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
-            })
-            .cloned()
-            .collect();
-        extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
-        for rel in extra_paths {
-            move_to_trash(dst_root, &rel, cycle_id)
-                .with_context(|| format!("failed to remove extra destination path {rel}"))?;
+        if sync.mirror {
+            let mut extra_paths: Vec<String> = dst_map
+                .keys()
+                .filter(|rel| {
+                    !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
+                })
+                .cloned()
+                .collect();
+            extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
+            for rel in extra_paths {
+                move_to_trash(dst_root, &rel, cycle_id)
+                    .with_context(|| format!("failed to remove extra destination path {rel}"))?;
+            }
         }
 
-        verify_destination(dst_root, source_snapshot, &changing_paths, excludes)?;
+        verify_destination(dst_root, source_snapshot, &changing_paths, excludes, sync)?;
         if !changing_paths.is_empty() {
             return Err(source_changing_error(&changing_paths));
         }
@@ -2051,6 +2122,7 @@ fn sync_file_to_path(
     dst_root: &Path,
     final_path: &Path,
     cycle_id: i64,
+    sync: &NativeSyncConfig,
 ) -> Result<()> {
     let result = (|| {
         if final_path.exists() && final_path.is_dir() {
@@ -2060,21 +2132,25 @@ fn sync_file_to_path(
             );
         }
         let rel_path = file_name_string(final_path)?;
-        let entry = snapshot_entry(src_path, rel_path)?;
+        let entry = snapshot_entry(src_path, rel_path, sync.checksum)?;
         let existing = if final_path.exists() || fs::symlink_metadata(final_path).is_ok() {
-            Some(snapshot_entry(final_path, entry.rel_path.clone())?)
+            Some(snapshot_entry(
+                final_path,
+                entry.rel_path.clone(),
+                sync.checksum,
+            )?)
         } else {
             None
         };
         let needs_copy = existing
             .as_ref()
-            .map(|existing| !entries_match(&entry, existing))
+            .map(|existing| !entries_match(&entry, existing, sync.checksum))
             .unwrap_or(true);
 
         if needs_copy {
             copy_single_entry(src_path, dst_root, cycle_id, &entry, final_path)?;
         }
-        verify_file_target(final_path, &entry)?;
+        verify_file_target(final_path, &entry, sync.checksum)?;
         Ok(())
     })();
     cleanup_tmp_cycle(dst_root, cycle_id);
@@ -2099,25 +2175,26 @@ fn copy_single_entry(
     }
 }
 
-fn verify_file_target(final_path: &Path, expected: &SnapshotEntry) -> Result<()> {
+fn verify_file_target(final_path: &Path, expected: &SnapshotEntry, checksum: bool) -> Result<()> {
     if !final_path.exists() && fs::symlink_metadata(final_path).is_err() {
         bail!("destination missing {}", final_path.display());
     }
-    let actual = snapshot_entry(final_path, expected.rel_path.clone())?;
-    if !entries_match(expected, &actual) {
+    let actual = snapshot_entry(final_path, expected.rel_path.clone(), checksum)?;
+    if !entries_match(expected, &actual, checksum) {
         bail!("destination mismatch at {}", final_path.display());
     }
     Ok(())
 }
 
 pub fn take_snapshot(root: &Path, mode: SnapshotMode) -> Result<Vec<SnapshotEntry>> {
-    take_snapshot_with_excludes(root, mode, &[])
+    take_snapshot_with_excludes(root, mode, &[], true)
 }
 
 fn take_snapshot_with_excludes(
     root: &Path,
     mode: SnapshotMode,
     excludes: &[PathBuf],
+    checksum: bool,
 ) -> Result<Vec<SnapshotEntry>> {
     let mut entries = Vec::new();
     for item in WalkDir::new(root)
@@ -2135,19 +2212,23 @@ fn take_snapshot_with_excludes(
             .strip_prefix(root)
             .with_context(|| format!("failed to strip root from {}", path.display()))?;
         let rel_path = rel_to_string(rel)?;
-        if let Some(entry) = snapshot_entry_if_supported(path, rel_path)? {
+        if let Some(entry) = snapshot_entry_if_supported(path, rel_path, checksum)? {
             entries.push(entry);
         }
     }
     Ok(entries)
 }
 
-fn snapshot_entry(path: &Path, rel_path: String) -> Result<SnapshotEntry> {
-    snapshot_entry_if_supported(path, rel_path.clone())?
+fn snapshot_entry(path: &Path, rel_path: String, checksum: bool) -> Result<SnapshotEntry> {
+    snapshot_entry_if_supported(path, rel_path.clone(), checksum)?
         .ok_or_else(|| anyhow!("unsupported file type at {}", path.display()))
 }
 
-fn snapshot_entry_if_supported(path: &Path, rel_path: String) -> Result<Option<SnapshotEntry>> {
+fn snapshot_entry_if_supported(
+    path: &Path,
+    rel_path: String,
+    checksum: bool,
+) -> Result<Option<SnapshotEntry>> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to read metadata {}", path.display()))?;
     let file_type = if metadata.file_type().is_symlink() {
@@ -2160,7 +2241,7 @@ fn snapshot_entry_if_supported(path: &Path, rel_path: String) -> Result<Option<S
         return Ok(None);
     };
     let hash = match file_type {
-        "file" => Some(hash_file(path)?),
+        "file" if checksum => Some(hash_file(path)?),
         "symlink" => Some(hash_symlink(path)?),
         _ => None,
     };
@@ -2240,10 +2321,12 @@ fn copy_file(
     }
     fs::copy(src, &tmp)
         .with_context(|| format!("failed to copy {} to {}", src.display(), tmp.display()))?;
-    let actual_hash = hash_file(&tmp)?;
-    if Some(actual_hash) != entry.hash {
-        remove_any(&tmp).ok();
-        bail!("source changed while copying {}", entry.rel_path);
+    if let Some(expected_hash) = &entry.hash {
+        let actual_hash = hash_file(&tmp)?;
+        if &actual_hash != expected_hash {
+            remove_any(&tmp).ok();
+            bail!("source changed while copying {}", entry.rel_path);
+        }
     }
     set_mode(&tmp, entry.mode).ok();
     let mtime = FileTime::from_unix_time(
@@ -2333,38 +2416,43 @@ fn verify_destination(
     source_snapshot: &[SnapshotEntry],
     ignored_paths: &BTreeSet<String>,
     excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
 ) -> Result<()> {
     let expected = map_entries(source_snapshot);
-    let actual_snapshot = take_snapshot(dst_root, SnapshotMode::Destination)?;
+    let actual_snapshot =
+        take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
     let actual = map_entries(&actual_snapshot);
     for (rel, want) in &expected {
         if ignored_paths.contains(rel) {
             continue;
         }
         match actual.get(rel) {
-            Some(got) if entries_match(want, got) => {}
+            Some(got) if entries_match(want, got, sync.checksum) => {}
             Some(_) => bail!("destination mismatch at {rel}"),
             None => bail!("destination missing {rel}"),
         }
     }
-    for rel in actual.keys() {
-        if is_rel_excluded(Path::new(rel), excludes) {
-            continue;
-        }
-        if !expected.contains_key(rel) {
-            bail!("destination has extra path {rel}");
+    if sync.mirror {
+        for rel in actual.keys() {
+            if is_rel_excluded(Path::new(rel), excludes) {
+                continue;
+            }
+            if !expected.contains_key(rel) {
+                bail!("destination has extra path {rel}");
+            }
         }
     }
     Ok(())
 }
 
-fn entries_match(left: &SnapshotEntry, right: &SnapshotEntry) -> bool {
+fn entries_match(left: &SnapshotEntry, right: &SnapshotEntry, checksum: bool) -> bool {
     if left.file_type != right.file_type {
         return false;
     }
     match left.file_type.as_str() {
         "dir" => true,
-        "file" => left.size == right.size && left.hash == right.hash,
+        "file" if checksum => left.size == right.size && left.hash == right.hash,
+        "file" => left.size == right.size && left.mtime_ns == right.mtime_ns,
         "symlink" => left.hash == right.hash,
         _ => false,
     }
@@ -2644,41 +2732,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_remote_to_remote_rsync_command() {
-        let mut runner = MachineConfig::local();
-        runner.id = "nas-a".to_string();
-        runner.os = "linux".to_string();
-        let command = remote_rsync_command(
-            &runner,
-            &RsyncConfig::default(),
-            "/src/data/",
-            "root@nas-b:/dst/data/",
-            10022,
-        );
-        assert_eq!(
-            command,
-            "rsync -a --delete --whole-file -e 'ssh -p 10022' '/src/data/' 'root@nas-b:/dst/data/'"
-        );
-    }
-
-    #[test]
-    fn builds_rsync_command_with_configured_args() {
-        let mut runner = MachineConfig::local();
-        runner.id = "nas-a".to_string();
-        runner.os = "linux".to_string();
-        let mut rsync = RsyncConfig::default();
-        rsync.checksum = true;
-        rsync.debug_logs = true;
-        rsync.timeout_secs = 30;
-        rsync.bwlimit_kbps = 2048;
-        let command = remote_rsync_command(&runner, &rsync, "/src/data/", "/dst/data/", 22);
-        assert_eq!(
-            command,
-            "rsync -a --delete --whole-file --checksum --itemize-changes --timeout=30 --bwlimit=2048 '/src/data/' '/dst/data/'"
-        );
-    }
-
-    #[test]
     fn parses_destination_sync_request_modes() {
         assert_eq!(
             "incremental".parse::<SyncRequestMode>().unwrap(),
@@ -2692,7 +2745,7 @@ mod tests {
     }
 
     #[test]
-    fn transfer_receive_file_path_encodes_windows_paths() {
+    fn transfer_receive_file_chunk_path_encodes_windows_paths() {
         let entry = SnapshotEntry {
             rel_path: "dir/hello world.txt".to_string(),
             file_type: "file".to_string(),
@@ -2702,12 +2755,12 @@ mod tests {
             hash: Some("abc+123".to_string()),
         };
 
-        let path = receive_file_api_path(Path::new("C:\\sync root"), 42, &entry);
+        let path = receive_file_chunk_api_path(Path::new("C:\\sync root"), 42, &entry, 7);
 
-        assert!(path.starts_with("/api/transfer/receive-file?"));
+        assert!(path.starts_with("/api/transfer/receive-file-chunk?"));
         assert!(path.contains("root=C%3A%5Csync%20root"));
         assert!(path.contains("rel_path=dir%2Fhello%20world.txt"));
-        assert!(path.contains("hash=abc%2B123"));
+        assert!(path.contains("offset=7"));
     }
 
     #[test]
@@ -2723,24 +2776,57 @@ mod tests {
     }
 
     #[test]
-    fn transfer_receive_file_writes_and_verifies_file() {
-        let temp = temp_dir("transfer_receive_file");
+    fn chunked_transfer_resumes_and_finishes_file() {
+        let temp = temp_dir("chunked_transfer_resume");
         let root = temp.join("dst");
-        let bytes = b"hello over tcp";
+        let bytes = b"hello chunked resume";
         let hash = blake3::hash(bytes).to_hex().to_string();
+        let entry = SnapshotEntry {
+            rel_path: "nested/hello.txt".to_string(),
+            file_type: "file".to_string(),
+            size: bytes.len() as i64,
+            mtime_ns: 123,
+            mode: 0o644,
+            hash: Some(hash),
+        };
 
-        transfer_receive_file(
-            TransferReceiveFileQuery {
+        transfer_receive_file_chunk(
+            TransferReceiveFileChunkQuery {
                 root: root.to_string_lossy().to_string(),
-                rel_path: "nested/hello.txt".to_string(),
-                cycle_id: 9,
-                size: bytes.len() as i64,
-                mtime_ns: 0,
-                mode: 0o644,
-                hash: Some(hash),
+                rel_path: entry.rel_path.clone(),
+                cycle_id: 11,
+                size: entry.size,
+                offset: 0,
             },
-            bytes,
+            &bytes[..6],
         )
+        .unwrap();
+        let offset = transfer_file_offset(TransferFileOffsetRequest {
+            root: root.clone(),
+            rel_path: entry.rel_path.clone(),
+            cycle_id: 11,
+            size: entry.size,
+        })
+        .unwrap()
+        .offset;
+        assert_eq!(offset, 6);
+
+        transfer_receive_file_chunk(
+            TransferReceiveFileChunkQuery {
+                root: root.to_string_lossy().to_string(),
+                rel_path: entry.rel_path.clone(),
+                cycle_id: 11,
+                size: entry.size,
+                offset,
+            },
+            &bytes[offset as usize..],
+        )
+        .unwrap();
+        transfer_finish_file(TransferFinishFileRequest {
+            root: root.clone(),
+            cycle_id: 11,
+            entry,
+        })
         .unwrap();
 
         assert_eq!(
@@ -2764,6 +2850,7 @@ mod tests {
             7,
             &[],
             &[],
+            &NativeSyncConfig::default(),
         )
         .unwrap();
 
@@ -2785,6 +2872,7 @@ mod tests {
             7,
             &[],
             &[],
+            &NativeSyncConfig::default(),
         )
         .unwrap();
 

@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -721,15 +721,6 @@ pub fn encode_query_component(value: &str) -> String {
     out
 }
 
-pub fn ssh_target(machine: &MachineConfig) -> String {
-    let user = if machine.ssh_user.trim().is_empty() {
-        String::new()
-    } else {
-        format!("{}@", machine.ssh_user.trim())
-    };
-    format!("{user}{}", machine.host)
-}
-
 fn ping_machine(machine: &MachineConfig) -> bool {
     remote_get_json::<MachineHealth>(machine, "/api/health", Duration::from_millis(700)).is_ok()
 }
@@ -1014,55 +1005,11 @@ fn pooled_tcp_connection_count() -> usize {
         .unwrap_or(0)
 }
 
-pub fn rsync_endpoint(machine: &MachineConfig, path: &Path) -> String {
-    let path = rsync_path(machine, path);
-    if machine.id == "local" {
-        path
-    } else {
-        format!("{}:{path}", ssh_target(machine))
-    }
-}
-
-pub fn rsync_path(machine: &MachineConfig, path: &Path) -> String {
-    let value = path.to_string_lossy();
-    if machine.os.eq_ignore_ascii_case("windows") {
-        return windows_path_to_cygwin(&value);
-    }
-    value.to_string()
-}
-
-fn windows_path_to_cygwin(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
-    let bytes = normalized.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-        let drive = (bytes[0] as char).to_ascii_lowercase();
-        let rest = normalized[2..].trim_start_matches('/');
-        if rest.is_empty() {
-            format!("/cygdrive/{drive}")
-        } else {
-            format!("/cygdrive/{drive}/{rest}")
-        }
-    } else {
-        normalized
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
-
-    #[test]
-    fn converts_windows_drive_paths_for_rsync() {
-        let mut machine = MachineConfig::local();
-        machine.os = "windows".to_string();
-        assert_eq!(
-            rsync_path(&machine, Path::new("C:\\Users\\me\\data")),
-            "/cygdrive/c/Users/me/data"
-        );
-        assert_eq!(rsync_path(&machine, Path::new("D:\\")), "/cygdrive/d");
-    }
 
     #[test]
     fn merge_discovered_keeps_multiple_local_ids_by_host() {

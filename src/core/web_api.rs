@@ -20,10 +20,11 @@ use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_respon
 use crate::core::state::{DestinationView, SnapshotEntry};
 use crate::core::sync::{
     SyncRequestMode, TransferAck, TransferPathInfo, TransferPathInfoRequest,
-    TransferPrepareDirRequest, TransferPushFileRequest, TransferReceiveFileQuery,
+    TransferPrepareDirRequest, TransferPushFileRequest, TransferReceiveFileChunkQuery,
     TransferReceiveSymlinkRequest, TransferRemovePathRequest, TransferSnapshotRequest,
-    transfer_path_info, transfer_prepare_dir, transfer_push_file, transfer_receive_file,
-    transfer_receive_symlink, transfer_remove_path, transfer_snapshot,
+    transfer_file_offset, transfer_finish_file, transfer_path_info, transfer_prepare_dir,
+    transfer_push_file, transfer_receive_file_chunk, transfer_receive_symlink,
+    transfer_remove_path, transfer_snapshot,
 };
 
 pub fn router(backend: Backend) -> Router {
@@ -44,10 +45,12 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/transfer/path-info", post(api_transfer_path_info))
         .route("/api/transfer/prepare-dir", post(api_transfer_prepare_dir))
         .route("/api/transfer/remove-path", post(api_transfer_remove_path))
+        .route("/api/transfer/file-offset", post(api_transfer_file_offset))
         .route(
-            "/api/transfer/receive-file",
-            post(api_transfer_receive_file),
+            "/api/transfer/receive-file-chunk",
+            post(api_transfer_receive_file_chunk),
         )
+        .route("/api/transfer/finish-file", post(api_transfer_finish_file))
         .route(
             "/api/transfer/receive-symlink",
             post(api_transfer_receive_symlink),
@@ -209,11 +212,23 @@ async fn api_transfer_remove_path(
     Ok(Json(transfer_remove_path(req)?))
 }
 
-async fn api_transfer_receive_file(
-    Query(query): Query<TransferReceiveFileQuery>,
+async fn api_transfer_file_offset(
+    Json(req): Json<crate::core::sync::TransferFileOffsetRequest>,
+) -> Result<Json<crate::core::sync::TransferFileOffset>, ApiError> {
+    Ok(Json(transfer_file_offset(req)?))
+}
+
+async fn api_transfer_receive_file_chunk(
+    Query(query): Query<TransferReceiveFileChunkQuery>,
     body: Bytes,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_receive_file(query, &body)?))
+    Ok(Json(transfer_receive_file_chunk(query, &body)?))
+}
+
+async fn api_transfer_finish_file(
+    Json(req): Json<crate::core::sync::TransferFinishFileRequest>,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_finish_file(req)?))
 }
 
 async fn api_transfer_receive_symlink(

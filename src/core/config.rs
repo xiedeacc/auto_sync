@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_TCP_CONNECTION_POOL_SIZE: usize = 100;
-pub const DEFAULT_RSYNC_TIMEOUT_SECS: u64 = 0;
+pub const DEFAULT_TRANSFER_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -29,21 +29,17 @@ pub struct AppSection {
     pub status_log_interval_secs: u64,
     pub web_bind: String,
     pub tcp_connection_pool_size: usize,
-    pub rsync: RsyncConfig,
+    pub sync: NativeSyncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct RsyncConfig {
-    pub archive: bool,
-    pub delete: bool,
+pub struct NativeSyncConfig {
+    pub mirror: bool,
     pub checksum: bool,
-    #[serde(alias = "itemize_changes")]
     pub debug_logs: bool,
-    pub timeout_secs: u64,
+    pub transfer_timeout_secs: u64,
     pub bwlimit_kbps: u64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,21 +185,19 @@ impl Default for AppSection {
             status_log_interval_secs: 300,
             web_bind: "0.0.0.0:18765".to_string(),
             tcp_connection_pool_size: DEFAULT_TCP_CONNECTION_POOL_SIZE,
-            rsync: RsyncConfig::default(),
+            sync: NativeSyncConfig::default(),
         }
     }
 }
 
-impl Default for RsyncConfig {
+impl Default for NativeSyncConfig {
     fn default() -> Self {
         Self {
-            archive: true,
-            delete: true,
+            mirror: true,
             checksum: false,
             debug_logs: false,
-            timeout_secs: DEFAULT_RSYNC_TIMEOUT_SECS,
+            transfer_timeout_secs: DEFAULT_TRANSFER_TIMEOUT_SECS,
             bwlimit_kbps: 0,
-            extra_args: Vec::new(),
         }
     }
 }
@@ -346,7 +340,9 @@ pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<AppConfig> {
 pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
     let mut cfg = cfg.clone();
     cfg.app.web_bind = cfg.app.web_bind.trim().to_string();
-    cfg.app.rsync.extra_args = clean_rsync_args(&cfg.app.rsync.extra_args);
+    if cfg.app.sync.transfer_timeout_secs == 0 {
+        cfg.app.sync.transfer_timeout_secs = DEFAULT_TRANSFER_TIMEOUT_SECS;
+    }
     cfg.machines = clean_machines(&cfg.machines);
     for source in &mut cfg.source_groups {
         if source.machine_id.trim().is_empty() {
@@ -379,17 +375,6 @@ pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
             && order_edges.insert((before, after))
     });
     cfg
-}
-
-fn clean_rsync_args(args: &[String]) -> Vec<String> {
-    let mut cleaned = Vec::new();
-    for arg in args {
-        let arg = arg.trim();
-        if !arg.is_empty() {
-            cleaned.push(arg.to_string());
-        }
-    }
-    cleaned
 }
 
 fn clean_machines(machines: &[MachineConfig]) -> Vec<MachineConfig> {
@@ -514,9 +499,6 @@ fn clean_excludes(excludes: &[PathBuf]) -> Vec<PathBuf> {
 
 impl AppConfig {
     pub fn validate(&self) -> Result<()> {
-        for arg in &self.app.rsync.extra_args {
-            validate_rsync_arg(arg)?;
-        }
         let mut source_ids = HashSet::new();
         let mut task_ids = HashSet::new();
         let machine_ids: HashSet<String> = clean_machines(&self.machines)
@@ -598,31 +580,6 @@ impl AppConfig {
         validate_sync_order(&self.sync_order, &task_ids)?;
         Ok(())
     }
-}
-
-fn validate_rsync_arg(arg: &str) -> Result<()> {
-    let arg = arg.trim();
-    if arg.is_empty() {
-        return Ok(());
-    }
-    if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
-        bail!("invalid rsync argument: control characters are not allowed");
-    }
-    let forbidden = [
-        "-e",
-        "--rsh",
-        "--rsync-path",
-        "--files-from",
-        "--include-from",
-        "--exclude-from",
-    ];
-    if forbidden
-        .iter()
-        .any(|prefix| arg == *prefix || arg.starts_with(&format!("{prefix}=")))
-    {
-        bail!("unsupported rsync argument in app.rsync.extra_args: {arg}");
-    }
-    Ok(())
 }
 
 pub fn machine_id_or_local(value: &str) -> &str {

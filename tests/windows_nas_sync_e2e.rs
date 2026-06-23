@@ -138,8 +138,6 @@ struct TestEnv {
 
 impl TestEnv {
     fn reset(test_name: &str) -> Result<Self> {
-        prepend_windows_runtime_path();
-
         let local_root = PathBuf::from(
             std::env::var("AUTO_SYNC_E2E_WINDOWS_ROOT")
                 .unwrap_or_else(|_| r"C:\Users\tiger\auto_sync_test".to_string()),
@@ -237,7 +235,7 @@ impl TestEnv {
     }
 
     fn preflight(&self) -> Result<()> {
-        self.remote_sh("command -v rsync >/dev/null && command -v ssh >/dev/null")?;
+        self.remote_sh("command -v ssh >/dev/null")?;
         let addr = format!("{}:{}", self.nas_host, self.nas_web_port);
         let socket = addr.parse()?;
         std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(3))
@@ -312,27 +310,6 @@ impl Drop for TestEnv {
         let _ = remove_dir_if_exists(&self.local_root);
         let _ = remove_file_if_exists(&self.state_db);
         let _ = self.remote_sh(&format!("rm -rf {}", shell_quote(&self.remote_dest_root)));
-    }
-}
-
-fn prepend_windows_runtime_path() {
-    let candidates = [
-        r"C:\auto_sync\runtime\cwrsync\cwrsync_6.2.5_x64_free\bin",
-        r"D:\code\auto_sync\bin\windows\cwrsync\cwrsync_6.2.5_x64_free\bin",
-    ];
-    let mut additions = Vec::new();
-    for candidate in candidates {
-        if Path::new(candidate).exists() {
-            additions.push(candidate.to_string());
-        }
-    }
-    if additions.is_empty() {
-        return;
-    }
-    let current = std::env::var("PATH").unwrap_or_default();
-    let next = format!("{};{current}", additions.join(";"));
-    unsafe {
-        std::env::set_var("PATH", next);
     }
 }
 

@@ -1,7 +1,7 @@
 # auto_sync
 
 Rust directory sync tool for Linux headless/Web UI deployments, with LAN peer
-discovery and rsync transport for Linux and Windows peers.
+discovery and native TCP transfer for Linux and Windows peers.
 
 The GUI is implemented with Tauri and uses WebKitGTK on Linux.
 Headless deployments can use the Web UI.
@@ -13,21 +13,23 @@ UDP `18766`; the Web API listens on the configured `web_bind` port, commonly
 `18765`. Manual machines can also be added with host, web port, SSH user, SSH
 port, and OS.
 
-Cross-machine sync uses `rsync`. Local-to-remote and remote-to-local are run
-from the controller. Remote-to-remote is run by SSHing into one remote machine
-and running `rsync` there, so that runner must be able to SSH to the peer.
+Cross-machine sync uses the auto_sync Web API and a keep-alive TCP connection
+pool. Full sync and reconcile build source and destination snapshots, transfer
+only mismatched files and symlinks, optionally mirror-delete destination extras,
+and verify the destination after transfer.
 
-Windows peers require OpenSSH plus rsync in PATH. Download the bundled fallback
-runtime archives with:
+Windows deployment can use the system OpenSSH Server optional feature, with a
+bundled OpenSSH fallback for machines that do not have it. Download the bundled
+fallback archive with:
 
 ```bash
 scripts/download_windows_runtime.sh
 ```
 
-The script places OpenSSH and cwRsync under `bin/windows/`, including extracted
-folders and `SHA256SUMS`. The Windows runtime directory is tracked in git. Local
-Windows deployment prefers the Windows OpenSSH Server optional feature when it
-is available, and falls back to the bundled OpenSSH runtime when it is not.
+The script places OpenSSH under `bin/windows/`, including extracted folders and
+`SHA256SUMS`. The Windows runtime directory is tracked in git. Local Windows
+deployment prefers the Windows OpenSSH Server optional feature when it is
+available, and falls back to the bundled OpenSSH runtime when it is not.
 
 ## Build
 
@@ -72,12 +74,12 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 `deploy_tiger.sh` deploys to localhost. `deploy_nas.sh` deploys to the NAS with
 systemd. `deploy_windows.ps1` is run locally on Windows, builds release
-binaries, installs them under `C:\auto_sync`, installs cwRsync, ensures `sshd`
-is available, installs the `auto_syncd` service with Automatic startup, and
-requests administrator privileges when service or machine PATH changes are
-needed. The Windows daemon uses the NTFS USN Journal for realtime local source
-change detection and keeps periodic full reconciliation as a fallback for
-journal gaps, journal resets, and first-run verification. The GUI and Web UI
-share this daemon-backed state instead of running separate watcher logic.
+binaries, installs them under `C:\auto_sync`, ensures `sshd` is available,
+installs the `auto_syncd` service with Automatic startup, and requests
+administrator privileges when service or machine PATH changes are needed. The
+Windows daemon uses the NTFS USN Journal for realtime local source change
+detection and keeps periodic full reconciliation as a fallback for journal
+gaps, journal resets, and first-run verification. The GUI and Web UI share this
+daemon-backed state instead of running separate watcher logic.
 `deploy_openwrt.sh` cross-compiles aarch64 OpenWrt binaries, installs procd
 init scripts, and deploys to `/usr/local/auto_sync`.

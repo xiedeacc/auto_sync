@@ -44,13 +44,11 @@ const el = {
   settingsModal: document.getElementById("settings-modal"),
   settingsClose: document.getElementById("settings-close"),
   settingsSave: document.getElementById("settings-save"),
-  settingsRsyncArchive: document.getElementById("settings-rsync-archive"),
-  settingsRsyncDelete: document.getElementById("settings-rsync-delete"),
-  settingsRsyncChecksum: document.getElementById("settings-rsync-checksum"),
-  settingsRsyncDebug: document.getElementById("settings-rsync-debug"),
-  settingsRsyncTimeout: document.getElementById("settings-rsync-timeout"),
-  settingsRsyncBwlimit: document.getElementById("settings-rsync-bwlimit"),
-  settingsRsyncExtra: document.getElementById("settings-rsync-extra"),
+  settingsSyncMirror: document.getElementById("settings-sync-mirror"),
+  settingsSyncChecksum: document.getElementById("settings-sync-checksum"),
+  settingsSyncDebug: document.getElementById("settings-sync-debug"),
+  settingsSyncTimeout: document.getElementById("settings-sync-timeout"),
+  settingsSyncBwlimit: document.getElementById("settings-sync-bwlimit"),
   settingsTcpPool: document.getElementById("settings-tcp-pool"),
   machineModal: document.getElementById("machine-modal"),
   machineClose: document.getElementById("machine-close"),
@@ -845,25 +843,18 @@ function normalizeAppConfig(app) {
     status_log_interval_secs: Number(app.status_log_interval_secs || 300),
     web_bind: trimPathValue(app.web_bind) || "0.0.0.0:18765",
     tcp_connection_pool_size: Number(app.tcp_connection_pool_size ?? 100),
-    rsync: normalizeRsyncConfig(app.rsync || {}),
+    sync: normalizeNativeSyncConfig(app.sync || {}),
   };
 }
 
-function normalizeRsyncConfig(rsync) {
+function normalizeNativeSyncConfig(sync) {
   return {
-    archive: rsync.archive !== false,
-    delete: rsync.delete !== false,
-    checksum: rsync.checksum === true,
-    debug_logs: rsync.debug_logs === true || rsync.itemize_changes === true,
-    timeout_secs: Number(rsync.timeout_secs || 0),
-    bwlimit_kbps: Number(rsync.bwlimit_kbps || 0),
-    extra_args: cleanRsyncArgs(rsync.extra_args || []),
+    mirror: sync.mirror !== false,
+    checksum: sync.checksum === true,
+    debug_logs: sync.debug_logs === true,
+    transfer_timeout_secs: Number(sync.transfer_timeout_secs || 120),
+    bwlimit_kbps: Number(sync.bwlimit_kbps || 0),
   };
-}
-
-function cleanRsyncArgs(values) {
-  const args = Array.isArray(values) ? values : String(values || "").split(/\s+/);
-  return args.map((value) => String(value || "").trim()).filter(Boolean);
 }
 
 function normalizeMachines(values) {
@@ -1241,14 +1232,12 @@ function openSettingsModal(event) {
   preventDefault(event);
   updateCfgFromForm();
   cfg.app = normalizeAppConfig(cfg.app || {});
-  const rsync = cfg.app.rsync;
-  el.settingsRsyncArchive.checked = rsync.archive;
-  el.settingsRsyncDelete.checked = rsync.delete;
-  el.settingsRsyncChecksum.checked = rsync.checksum;
-  el.settingsRsyncDebug.checked = rsync.debug_logs;
-  el.settingsRsyncTimeout.value = String(rsync.timeout_secs || 0);
-  el.settingsRsyncBwlimit.value = String(rsync.bwlimit_kbps || 0);
-  el.settingsRsyncExtra.value = (rsync.extra_args || []).join(" ");
+  const sync = cfg.app.sync;
+  el.settingsSyncMirror.checked = sync.mirror;
+  el.settingsSyncChecksum.checked = sync.checksum;
+  el.settingsSyncDebug.checked = sync.debug_logs;
+  el.settingsSyncTimeout.value = String(sync.transfer_timeout_secs || 120);
+  el.settingsSyncBwlimit.value = String(sync.bwlimit_kbps || 0);
   el.settingsTcpPool.value = String(cfg.app.tcp_connection_pool_size ?? 100);
   el.settingsModal.hidden = false;
 }
@@ -1259,22 +1248,14 @@ function closeSettingsModal() {
 
 async function saveSettings() {
   updateCfgFromForm();
-  const extraArgs = cleanRsyncArgs(el.settingsRsyncExtra.value);
-  const forbidden = extraArgs.find((arg) => arg === "-e" || arg.startsWith("--rsh") || arg.startsWith("--rsync-path"));
-  if (forbidden) {
-    setMessage(`Unsupported rsync arg: ${forbidden}`);
-    return;
-  }
   cfg.app = normalizeAppConfig(cfg.app || {});
   cfg.app.tcp_connection_pool_size = clampInteger(el.settingsTcpPool.value, 0, 10000);
-  cfg.app.rsync = normalizeRsyncConfig({
-    archive: el.settingsRsyncArchive.checked,
-    delete: el.settingsRsyncDelete.checked,
-    checksum: el.settingsRsyncChecksum.checked,
-    debug_logs: el.settingsRsyncDebug.checked,
-    timeout_secs: clampInteger(el.settingsRsyncTimeout.value, 0, 86400),
-    bwlimit_kbps: clampInteger(el.settingsRsyncBwlimit.value, 0, 10_000_000),
-    extra_args: extraArgs,
+  cfg.app.sync = normalizeNativeSyncConfig({
+    mirror: el.settingsSyncMirror.checked,
+    checksum: el.settingsSyncChecksum.checked,
+    debug_logs: el.settingsSyncDebug.checked,
+    transfer_timeout_secs: clampInteger(el.settingsSyncTimeout.value, 1, 86400),
+    bwlimit_kbps: clampInteger(el.settingsSyncBwlimit.value, 0, 10_000_000),
   });
   await autoSaveConfig();
   closeSettingsModal();

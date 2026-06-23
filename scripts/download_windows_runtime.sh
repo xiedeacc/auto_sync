@@ -7,9 +7,6 @@ cd "$ROOT_DIR"
 OUT_DIR="${OUT_DIR:-bin/windows}"
 OPENSSH_URL="${OPENSSH_URL:-https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64.zip}"
 OPENSSH_SHA256="${OPENSSH_SHA256:-23f50f3458c4c5d0b12217c6a5ddfde0137210a30fa870e98b29827f7b43aba5}"
-CWRSYNC_NUPKG_URL="${CWRSYNC_NUPKG_URL:-https://community.chocolatey.org/api/v2/package/rsync/6.2.5}"
-CWRSYNC_ZIP_NAME="${CWRSYNC_ZIP_NAME:-cwrsync_6.2.5_x64_free.zip}"
-CWRSYNC_SHA256="${CWRSYNC_SHA256:-a1b93795911a8c25c53f76ab8656445de46d97da982f07d9451406b1a608cd57}"
 
 require_tool() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -42,18 +39,13 @@ trap 'rm -rf "$tmp_dir"' EXIT
 curl -fL "$OPENSSH_URL" -o "$OUT_DIR/OpenSSH-Win64.zip"
 verify_sha256 "$OUT_DIR/OpenSSH-Win64.zip" "$OPENSSH_SHA256"
 
-curl -fL "$CWRSYNC_NUPKG_URL" -o "$tmp_dir/rsync.nupkg"
-unzip -p "$tmp_dir/rsync.nupkg" "tools/$CWRSYNC_ZIP_NAME" > "$OUT_DIR/$CWRSYNC_ZIP_NAME"
-verify_sha256 "$OUT_DIR/$CWRSYNC_ZIP_NAME" "$CWRSYNC_SHA256"
-
-rm -rf "$OUT_DIR/openssh" "$OUT_DIR/cwrsync"
-mkdir -p "$OUT_DIR/openssh" "$OUT_DIR/cwrsync"
+rm -rf "$OUT_DIR/openssh"
+mkdir -p "$OUT_DIR/openssh"
 unzip -q "$OUT_DIR/OpenSSH-Win64.zip" -d "$OUT_DIR/openssh"
-unzip -q "$OUT_DIR/$CWRSYNC_ZIP_NAME" -d "$OUT_DIR/cwrsync"
 
 (
   cd "$OUT_DIR"
-  sha256sum OpenSSH-Win64.zip "$CWRSYNC_ZIP_NAME" > SHA256SUMS
+  sha256sum OpenSSH-Win64.zip > SHA256SUMS
 )
 
 cat > "$OUT_DIR/README.txt" <<EOF
@@ -63,17 +55,11 @@ OpenSSH:
   OpenSSH-Win64.zip
   Source: $OPENSSH_URL
 
-rsync:
-  $CWRSYNC_ZIP_NAME
-  Source package: $CWRSYNC_NUPKG_URL
-
 Extracted folders:
   openssh/
-  cwrsync/
 
-On Windows, put the extracted OpenSSH and cwRsync bin directories in PATH for
-the auto_sync rsync transport, or copy their executables into a shared tool
-directory.
+Windows deployment prefers the system OpenSSH installation and uses this
+bundled OpenSSH only as a fallback.
 EOF
 
 echo "Windows runtime downloaded to $OUT_DIR"

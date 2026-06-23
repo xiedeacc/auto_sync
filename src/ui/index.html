@@ -103,25 +103,19 @@
       </div>
       <div class="settings-grid">
         <div class="settings-section">
-          <h3>Rsync</h3>
-          <label class="check-row"><input id="settings-rsync-archive" type="checkbox"> Archive</label>
-          <label class="check-row"><input id="settings-rsync-delete" type="checkbox"> Mirror</label>
-          <label class="check-row"><input id="settings-rsync-checksum" type="checkbox"> Checksum</label>
-          <label class="check-row"><input id="settings-rsync-debug" type="checkbox"> Debug logs</label>
+          <h3>Sync</h3>
+          <label class="check-row"><input id="settings-sync-mirror" type="checkbox"> Mirror</label>
+          <label class="check-row"><input id="settings-sync-checksum" type="checkbox"> Checksum</label>
+          <label class="check-row"><input id="settings-sync-debug" type="checkbox"> Debug logs</label>
         </div>
         <div class="settings-section">
           <h3>Limits</h3>
-          <label for="settings-rsync-timeout">Rsync timeout seconds</label>
-          <input id="settings-rsync-timeout" type="number" min="0" step="1">
-          <label for="settings-rsync-bwlimit">Rsync bandwidth KB/s</label>
-          <input id="settings-rsync-bwlimit" type="number" min="0" step="1">
+          <label for="settings-sync-timeout">Transfer timeout seconds</label>
+          <input id="settings-sync-timeout" type="number" min="1" step="1">
+          <label for="settings-sync-bwlimit">Bandwidth KB/s</label>
+          <input id="settings-sync-bwlimit" type="number" min="0" step="1">
           <label for="settings-tcp-pool">TCP connection pool</label>
           <input id="settings-tcp-pool" type="number" min="0" step="1">
-        </div>
-        <div class="settings-section settings-wide">
-          <h3>Extra</h3>
-          <label for="settings-rsync-extra">Rsync extra args</label>
-          <input id="settings-rsync-extra" placeholder="--partial --inplace">
         </div>
       </div>
       <div class="folder-actions">
