@@ -10,3 +10,4 @@
   2. Deploy this Windows machine with `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`.
   3. Deploy NAS directly on NAS: `ssh -p 10022 root@192.168.2.247 "cd /root/src/rust/auto_sync && git pull && scripts/deploy_local.sh"`.
 - Do not deploy to tiger and do not use Windows-to-Linux cross-compilation for the normal NAS deployment path; build Linux x64 binaries on NAS.
+- At this stage, do not deploy to OpenWrt (do not run `scripts/deploy_openwrt.sh` or otherwise push to the OpenWrt router); only Windows and NAS are in scope.
