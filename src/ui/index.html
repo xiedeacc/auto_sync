@@ -14,6 +14,7 @@
     </div>
     <button id="machine-status" class="machine-status" type="button" title="Manage LAN machines" onclick="window.autoSyncOpenMachines(event)">Machines -/-</button>
     <div class="toolbar">
+      <button id="readme" type="button" title="Sync mode behavior">Readme</button>
       <button id="config" type="button" title="Show current configuration">Config</button>
       <button id="refresh" type="button" title="Refresh status">Refresh</button>
     </div>
@@ -93,6 +94,32 @@
         <button id="config-close" class="icon" title="Close">x</button>
       </div>
       <pre id="config-view" class="config-view"></pre>
+    </div>
+  </div>
+
+  <div id="readme-modal" class="modal" hidden>
+    <div class="modal-panel readme-modal-panel">
+      <div class="modal-head">
+        <h2>Readme</h2>
+        <button id="readme-close" class="icon" title="Close">x</button>
+      </div>
+      <div class="readme-body">
+        <section>
+          <h3>Destination Sync</h3>
+          <p><strong>Incremental</strong> 会关闭当前 source cycle，并且只同步当前选中的 destination。它不会额外设置 full rescan 标记，但传输前仍会比较当前 source 和 destination 快照。</p>
+          <p><strong>Full</strong> 也只作用于当前选中的 destination，同时会把本轮 cycle 标记为需要完整重扫。它会做完整 source/destination reconcile，然后只复制缺失或不一致的文件。</p>
+        </section>
+        <section>
+          <h3>Restart Recovery</h3>
+          <p>进程重启后，两种模式都会比较当前 source 和当前 destination。目标端已经存在且匹配的文件会跳过；缺失文件、不一致文件、类型变化，以及未完成的临时传输都会被修复。</p>
+          <p>Full 不是删除后全部重传，而是完整校验加修复。开启 Mirror 时，destination 中多出来且 source 不存在的路径会被删除。</p>
+        </section>
+        <section>
+          <h3>Example</h3>
+          <p>对于 <code>\\?\C:\Users\tiger\Documents\xwechat_files</code> 到 <code>nas:/opt</code>，实际 destination root 通常是 <code>/opt/xwechat_files</code>。</p>
+          <p>如果重启前已经同步了一部分，Incremental 会继续补齐缺口并修复不一致；Full 会扫描整棵树、验证目标端、修复差异，并在 Mirror 开启时删除额外文件。</p>
+        </section>
+      </div>
     </div>
   </div>
 

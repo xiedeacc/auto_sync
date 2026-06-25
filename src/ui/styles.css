@@ -852,6 +852,10 @@ th {
   width: min(900px, calc(100vw - 48px));
 }
 
+.readme-modal-panel {
+  width: min(860px, calc(100vw - 48px));
+}
+
 .settings-modal-panel {
   width: min(760px, calc(100vw - 48px));
 }
@@ -903,6 +907,41 @@ th {
 .folder-actions {
   justify-content: flex-end;
   margin: 10px 0;
+}
+
+.readme-body {
+  display: grid;
+  gap: 12px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.readme-body section {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.readme-body section:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.readme-body p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.readme-body strong {
+  color: var(--text);
+}
+
+.readme-body code {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .settings-grid {

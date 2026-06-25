@@ -23,6 +23,9 @@ const el = {
   configPath: document.getElementById("config-path"),
   sourcePanel: document.getElementById("source-panel"),
   message: document.getElementById("message"),
+  readme: document.getElementById("readme"),
+  readmeModal: document.getElementById("readme-modal"),
+  readmeClose: document.getElementById("readme-close"),
   config: document.getElementById("config"),
   statusConfig: document.getElementById("status-config"),
   statusText: document.getElementById("status-text"),
@@ -1290,6 +1293,14 @@ function closeScheduleModal(apply) {
   scheduleEditor = null;
 }
 
+function openReadmeModal() {
+  el.readmeModal.hidden = false;
+}
+
+function closeReadmeModal() {
+  el.readmeModal.hidden = true;
+}
+
 function openConfigModal() {
   updateCfgFromForm();
   el.configView.textContent = JSON.stringify(cfg, null, 2);
@@ -1733,6 +1744,7 @@ async function runBusy(message, fn, options = {}) {
 
 function setBusy(nextBusy) {
   busy = nextBusy;
+  el.readme.disabled = busy;
   el.config.disabled = busy;
   el.statusConfig.disabled = busy;
   el.settingsSave.disabled = busy;
@@ -1835,6 +1847,7 @@ function bindButtonClick(button, handler) {
   });
 }
 
+bindButtonClick(el.readme, openReadmeModal);
 bindButtonClick(el.config, openConfigModal);
 bindButtonClick(el.statusConfig, openSettingsModal);
 bindButtonClick(el.refresh, () => runBusy("", loadAll));
@@ -1873,6 +1886,7 @@ el.folderMachine.onchange = () => {
 el.scheduleClose.onclick = () => closeScheduleModal(false);
 el.scheduleApply.onclick = () => closeScheduleModal(true);
 el.cycleMode.onchange = updateScheduleModalFields;
+el.readmeClose.onclick = closeReadmeModal;
 el.configClose.onclick = closeConfigModal;
 el.settingsClose.onclick = closeSettingsModal;
 el.settingsSave.onclick = () => saveSettings().catch((error) => setMessage(String(error)));
