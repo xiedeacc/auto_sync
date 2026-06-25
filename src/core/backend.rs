@@ -16,7 +16,8 @@ use crate::core::machines::{
     remote_get_json,
 };
 use crate::core::progress::{
-    TransferProgressView, configure_progress_file, current_transfer_progress,
+    ScanProgressView, TransferProgressView, configure_progress_file, current_scan_progress,
+    current_transfer_progress,
 };
 use crate::core::state::{DestinationView, State as DbState};
 use crate::core::sync::{
@@ -127,6 +128,7 @@ impl Backend {
     pub fn runtime_status(&self) -> RuntimeStatus {
         RuntimeStatus {
             transfer: current_transfer_progress(),
+            scan: current_scan_progress(),
             build: BuildInfo::current(),
         }
     }
@@ -242,6 +244,7 @@ impl Backend {
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeStatus {
     pub transfer: Option<TransferProgressView>,
+    pub scan: Option<ScanProgressView>,
     pub build: BuildInfo,
 }
 

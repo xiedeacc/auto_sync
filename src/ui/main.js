@@ -263,6 +263,15 @@ function updateStatusBar() {
       </span>
     `;
     el.statusText.title = title;
+  } else if (runtimeStatus && runtimeStatus.scan) {
+    const scan = runtimeStatus.scan;
+    const current = displayPath(scan.current_path || scan.root_path || "source");
+    const root = displayPath(scan.root_path || current);
+    const count = Number(scan.entries_seen || 0);
+    const suffix = count ? ` · ${count} entries` : "";
+    const title = `Scanning: ${current}\nRoot: ${root}${count ? `\nEntries: ${count}` : ""}`;
+    el.statusText.textContent = `Scanning ${current}${suffix}`;
+    el.statusText.title = title;
   } else {
     const message = statusBusyMessage || el.message.textContent || "Ready";
     el.statusText.textContent = message;

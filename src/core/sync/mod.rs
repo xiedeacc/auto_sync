@@ -2239,6 +2239,8 @@ fn take_snapshot_with_excludes(
     checksum: bool,
 ) -> Result<Vec<SnapshotEntry>> {
     let mut entries = Vec::new();
+    let scan_progress = progress::start_scan(root);
+    let mut entries_seen = 0_u64;
     for item in WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
@@ -2249,6 +2251,12 @@ fn take_snapshot_with_excludes(
         let path = item.path();
         if path == root {
             continue;
+        }
+        entries_seen += 1;
+        if item.file_type().is_dir() {
+            scan_progress.update(path, entries_seen);
+        } else if entries_seen % 256 == 0 {
+            scan_progress.update(path.parent().unwrap_or(root), entries_seen);
         }
         let rel = path
             .strip_prefix(root)
