@@ -38,6 +38,62 @@ if [[ "${EUID}" -ne 0 ]]; then
   SUDO=(sudo)
 fi
 
+ensure_linux_build_environment() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "deploy_local.sh must run on Linux." >&2
+    exit 1
+  fi
+
+  local need_apt=0
+  local packages=(
+    build-essential
+    ca-certificates
+    curl
+    git
+    libssl-dev
+    pkg-config
+  )
+
+  command -v cc >/dev/null 2>&1 || need_apt=1
+  command -v curl >/dev/null 2>&1 || need_apt=1
+  command -v git >/dev/null 2>&1 || need_apt=1
+  command -v pkg-config >/dev/null 2>&1 || need_apt=1
+  pkg-config --exists openssl >/dev/null 2>&1 || need_apt=1
+
+  if [[ "$need_apt" -eq 1 ]]; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "Missing build dependencies and apt-get is not available. Install: ${packages[*]}" >&2
+      exit 1
+    fi
+    echo "Installing missing Linux build dependencies ..."
+    "${SUDO[@]}" apt-get update
+    env DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get install -y "${packages[@]}"
+  else
+    echo "Linux build dependencies already set up"
+  fi
+
+  if [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+  fi
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "Installing Rust stable toolchain ..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+      sh -s -- -y --profile minimal --default-toolchain stable
+  fi
+
+  if [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+  fi
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "cargo is unavailable after setup." >&2
+    exit 1
+  fi
+}
+
 has_gui_environment() {
   [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && return 0
   [[ -d /usr/share/xsessions ]] && compgen -G "/usr/share/xsessions/*.desktop" >/dev/null && return 0
@@ -45,6 +101,8 @@ has_gui_environment() {
   command -v Xorg >/dev/null 2>&1 && return 0
   return 1
 }
+
+ensure_linux_build_environment
 
 if has_gui_environment; then
   cargo build --release --bins
