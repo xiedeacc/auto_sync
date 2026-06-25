@@ -46,7 +46,11 @@ has_gui_environment() {
   return 1
 }
 
-cargo build --release --bins
+if has_gui_environment; then
+  cargo build --release --bins
+else
+  cargo build --release --no-default-features --bin auto_syncd --bin auto_syncctl --bin auto_sync_web
+fi
 mkdir -p bin
 install -m 0755 target/release/auto_syncd bin/auto_syncd
 install -m 0755 target/release/auto_syncctl bin/auto_syncctl

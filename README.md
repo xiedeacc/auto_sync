@@ -18,18 +18,9 @@ pool. Full sync and reconcile build source and destination snapshots, transfer
 only mismatched files and symlinks, optionally mirror-delete destination extras,
 and verify the destination after transfer.
 
-Windows deployment can use the system OpenSSH Server optional feature, with a
-bundled OpenSSH fallback for machines that do not have it. Download the bundled
-fallback archive with:
-
-```bash
-scripts/download_windows_runtime.sh
-```
-
-The script places OpenSSH under `bin/windows/`, including extracted folders and
-`SHA256SUMS`. The Windows runtime directory is tracked in git. Local Windows
-deployment prefers the Windows OpenSSH Server optional feature when it is
-available, and falls back to the bundled OpenSSH runtime when it is not.
+Windows deployment can use the system OpenSSH Server optional feature when
+requested, but the daemon itself is installed as a current-user Startup
+launcher rather than a Windows service.
 
 ## Build
 
@@ -66,17 +57,20 @@ installs headless mode only; with a GUI it also installs `auto_sync_gui`.
 Machine deploy helpers:
 
 ```bash
-scripts/deploy_tiger.sh
-scripts/deploy_nas.sh --host 192.168.3.178 --port 10022 --user root
 pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1
+ssh -p 10022 root@192.168.2.247 'bash -s' < scripts/bootstrap_nas_ubuntu.sh
+ssh -p 10022 root@192.168.2.247 'cd /root/src/rust/auto_sync && git pull && scripts/deploy_local.sh'
 scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 ```
 
-`deploy_tiger.sh` deploys to localhost. `deploy_nas.sh` deploys to the NAS with
-systemd. `deploy_windows.ps1` is run locally on Windows, builds release
-binaries, installs them under `C:\auto_sync`, ensures `sshd` is available,
-installs the `auto_syncd` service with Automatic startup, and requests
-administrator privileges when service or machine PATH changes are needed. The
+`deploy_windows.ps1` is run locally on Windows, builds release binaries into
+the repository `bin\` directory, keeps config under `conf\`, and creates a
+current-user Startup launcher for `auto_syncd` instead of installing it as a
+Windows service. OpenSSH setup is opt-in via `-InstallSshd`. NAS is Ubuntu x64
+and builds on NAS itself under `/root/src/rust/auto_sync`; use
+`bootstrap_nas_ubuntu.sh` once to install the build environment and clone the
+repo, then use `git pull` plus `scripts/deploy_local.sh` on NAS for
+deployments. The
 Windows daemon uses the NTFS USN Journal for realtime local source change
 detection and keeps periodic full reconciliation as a fallback for journal
 gaps, journal resets, and first-run verification. The GUI and Web UI share this

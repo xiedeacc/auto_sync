@@ -1,5 +1,5 @@
 param(
-    [string]$InstallDir = "C:\auto_sync",
+    [string]$InstallDir = "",
     [string]$RuntimeDir = "",
     [string]$Config = "",
     [string]$AuthorizedKeyFile = "",
@@ -10,6 +10,7 @@ param(
     [switch]$UseBundledOpenSsh,
     [switch]$UserPath,
     [switch]$SkipService,
+    [switch]$SkipStartup,
     [switch]$NoElevate
 )
 
@@ -63,6 +64,7 @@ function Invoke-ElevatedSelf {
     if ($UseBundledOpenSsh) { $args += "-UseBundledOpenSsh" }
     if ($UserPath) { $args += "-UserPath" }
     if ($SkipService) { $args += "-SkipService" }
+    if ($SkipStartup) { $args += "-SkipStartup" }
 
     $argLine = ($args | ForEach-Object { ConvertTo-CommandLineArgument $_ }) -join " "
     Write-Host "Administrator privileges are required; requesting elevation with $powerShellExe ..."
@@ -148,6 +150,13 @@ function Copy-ReleaseBinaries {
             throw "Missing build artifact: $source"
         }
         Copy-Item -LiteralPath $source -Destination (Join-Path $BinDir $binary) -Force
+    }
+}
+
+function Stop-AutoSyncProcesses {
+    foreach ($name in @("auto_syncd", "auto_syncctl", "auto_sync_web", "auto_sync_gui")) {
+        Get-Process -Name $name -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -581,36 +590,56 @@ function Ensure-AuthorizedKey {
     }
 }
 
-function Ensure-AutoSyncDaemonService {
+function Disable-AutoSyncDaemonServiceIfPossible {
+    $service = Get-Service -Name "auto_syncd" -ErrorAction SilentlyContinue
+    if (-not $service) {
+        return $null
+    }
+    if (-not (Test-IsAdministrator)) {
+        Write-Warning "Existing auto_syncd Windows service is still registered. Run this script once as Administrator to disable the old service."
+        return "requires-admin"
+    }
+    if ($service.Status -ne "Stopped") {
+        Stop-Service -Name "auto_syncd" -Force -ErrorAction SilentlyContinue
+    }
+    & sc.exe config auto_syncd start= disabled | Out-Null
+    "disabled"
+}
+
+function Ensure-AutoSyncStartup {
     param(
         [string]$BinDir,
         [string]$ConfigPath
     )
 
-    $serviceName = "auto_syncd"
     $daemonExe = Join-Path $BinDir "auto_syncd.exe"
     if (-not (Test-Path -LiteralPath $daemonExe)) {
         throw "Missing daemon binary: $daemonExe"
     }
-    $binaryPath = "`"$daemonExe`" --config `"$ConfigPath`""
-    $existing = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
-    if ($existing) {
-        if ($existing.State -eq "Running") {
-            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-        }
-        & sc.exe config $serviceName binPath= $binaryPath start= auto | Out-Null
-        Set-Service -Name $serviceName -StartupType Automatic
+
+    $startupDir = [Environment]::GetFolderPath("Startup")
+    if ([string]::IsNullOrWhiteSpace($startupDir)) {
+        throw "Could not locate current user's Startup folder."
     }
-    else {
-        New-Service `
-            -Name $serviceName `
-            -DisplayName "auto_sync daemon" `
-            -BinaryPathName $binaryPath `
-            -Description "auto_sync realtime watcher and sync scheduler" `
-            -StartupType Automatic | Out-Null
+    New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
+    $launcher = Join-Path $startupDir "auto_syncd-start.vbs"
+    $escapedExe = $daemonExe.Replace('"', '""')
+    $escapedConfig = $ConfigPath.Replace('"', '""')
+    $script = @(
+        'Set shell = CreateObject("WScript.Shell")',
+        "shell.Run """"""$escapedExe"""" --config """"$escapedConfig"""""", 0, False"
+    )
+    Set-Content -LiteralPath $launcher -Value $script -Encoding ascii
+
+    Start-Process -FilePath $daemonExe `
+        -ArgumentList @("--config", $ConfigPath) `
+        -WorkingDirectory (Split-Path -Parent $BinDir) `
+        -WindowStyle Hidden
+
+    [PSCustomObject]@{
+        Launcher = $launcher
+        Process = "started"
     }
-    Start-Service -Name $serviceName
-    Get-Service -Name $serviceName
 }
 
 if ($InstallSshd -and $SkipSshd) {
@@ -623,6 +652,9 @@ $rootDir = Split-Path -Parent $scriptDir
 if ([string]::IsNullOrWhiteSpace($RuntimeDir)) {
     $RuntimeDir = Join-Path $rootDir "bin\windows"
 }
+if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+    $InstallDir = $rootDir
+}
 if ([string]::IsNullOrWhiteSpace($Config)) {
     $Config = Join-Path $rootDir "conf\auto_sync.toml"
 }
@@ -630,9 +662,10 @@ if ([string]::IsNullOrWhiteSpace($AuthorizedKeyFile)) {
     $AuthorizedKeyFile = Join-Path $HOME ".ssh\id_ed25519.pub"
 }
 
-$ensureSshd = -not $SkipSshd
-$ensureService = -not $SkipService
-$needsAdmin = (-not $UserPath) -or $ensureSshd -or $ensureService
+$ensureSshd = $InstallSshd -and -not $SkipSshd
+$ensureStartup = -not $SkipStartup
+$useMachinePath = (-not $UserPath) -and (Test-IsAdministrator)
+$needsAdmin = $ensureSshd -or $useMachinePath
 if ($needsAdmin -and -not (Test-IsAdministrator)) {
     if ($NoElevate) {
         throw "Administrator privileges are required. Re-run without -NoElevate or start PowerShell as Administrator."
@@ -647,6 +680,7 @@ $targetConfig = Join-Path $confDir "auto_sync.toml"
 $targetRuntime = Join-Path $InstallDir "runtime"
 
 New-Item -ItemType Directory -Force -Path $InstallDir, $binDir, $confDir, $logDir | Out-Null
+Stop-AutoSyncProcesses
 Copy-ReleaseBinaries -RootDir $rootDir -BinDir $binDir
 $configAction = Initialize-Config -SourceConfig $Config -TargetConfig $targetConfig
 $runtime = Install-WindowsRuntime -RuntimeDir $RuntimeDir -TargetRuntime $targetRuntime
@@ -663,12 +697,13 @@ else {
     }
 }
 
-$pathScope = if ($UserPath) { "User" } else { "Machine" }
+$pathScope = if ($useMachinePath) { "Machine" } else { "User" }
 Add-PathEntries -Scope $pathScope -Paths @($openSshBinForPath, $binDir)
 $authorizedKeyResult = Ensure-AuthorizedKey -PublicKeyFile $AuthorizedKeyFile
-$daemonService = $null
-if ($ensureService) {
-    $daemonService = Ensure-AutoSyncDaemonService -BinDir $binDir -ConfigPath $targetConfig
+$disabledService = Disable-AutoSyncDaemonServiceIfPossible
+$startupResult = $null
+if ($ensureStartup) {
+    $startupResult = Ensure-AutoSyncStartup -BinDir $binDir -ConfigPath $targetConfig
 }
 
 Write-Host "auto_sync installed under $InstallDir"
@@ -687,11 +722,15 @@ if ($sshResult) {
 else {
     Write-Host "sshd setup skipped by -SkipSshd"
 }
-if ($daemonService) {
-    Write-Host "auto_syncd service: $($daemonService.Status)"
+if ($disabledService) {
+    Write-Host "auto_syncd service: $disabledService"
+}
+if ($startupResult) {
+    Write-Host "auto_syncd startup launcher: $($startupResult.Launcher)"
+    Write-Host "auto_syncd process: $($startupResult.Process)"
 }
 else {
-    Write-Host "auto_syncd service setup skipped by -SkipService"
+    Write-Host "auto_syncd startup setup skipped by -SkipStartup"
 }
 if ($authorizedKeyResult) {
     Write-Host "authorized_keys: $($authorizedKeyResult.Path) ($($authorizedKeyResult.Action))"
