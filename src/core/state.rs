@@ -66,6 +66,9 @@ impl State {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open state db {}", path.display()))?;
+        // Multiple openers (scheduler + web/UI) may touch this DB; wait rather
+        // than fail immediately on a transient writer lock.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;

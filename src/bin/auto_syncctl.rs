@@ -137,25 +137,16 @@ fn deploy_nas(
     // Stop running services before overwriting binaries so scp doesn't fail on
     // a busy (in-use) file. Ignore errors so the first-ever deploy, when the
     // units don't exist yet, still succeeds.
+    // Stop and retire the old split services (daemon + separate web) before
+    // overwriting binaries; the unified auto_sync.service replaces both.
     run(Command::new("ssh").args([
         "-p",
         &ssh_port,
         &target,
-        "systemctl stop auto_sync.service auto_sync_web.service 2>/dev/null || true",
+        "systemctl disable --now auto_sync_web.service 2>/dev/null; rm -f /etc/systemd/system/auto_sync_web.service; systemctl stop auto_sync.service 2>/dev/null || true",
     ]))?;
 
-    let remote_has_gui = Command::new("ssh")
-        .args([
-            "-p",
-            &ssh_port,
-            &target,
-            "([ -d /usr/share/xsessions ] && ls /usr/share/xsessions/*.desktop >/dev/null 2>&1) || ([ -d /usr/share/wayland-sessions ] && ls /usr/share/wayland-sessions/*.desktop >/dev/null 2>&1) || command -v Xorg >/dev/null 2>&1",
-        ])
-        .status()
-        .context("failed to detect remote GUI environment")?
-        .success();
-
-    for binary in ["auto_syncd", "auto_syncctl", "auto_sync_web"] {
+    for binary in ["auto_sync", "auto_syncctl"] {
         let local = PathBuf::from("bin").join(binary);
         if !local.exists() {
             bail!(
@@ -170,24 +161,16 @@ fn deploy_nas(
             &format!("{target}:{}/bin/{binary}", install_dir.display()),
         ]))?;
     }
-    let gui_binary = PathBuf::from("bin").join("auto_sync_gui");
-    if remote_has_gui && gui_binary.exists() {
-        run(Command::new("scp").args([
-            "-P",
-            &ssh_port,
-            gui_binary.to_string_lossy().as_ref(),
-            &format!("{target}:{}/bin/auto_sync_gui", install_dir.display()),
-        ]))?;
-        println!("remote GUI environment detected; installed auto_sync_gui");
-    } else {
-        run(Command::new("ssh").args([
-            "-p",
-            &ssh_port,
-            &target,
-            &format!("rm -f {}/bin/auto_sync_gui", install_dir.display()),
-        ]))?;
-        println!("remote has no GUI environment; installed headless mode only");
-    }
+    // Remove stale binaries from the previous multi-binary layout.
+    run(Command::new("ssh").args([
+        "-p",
+        &ssh_port,
+        &target,
+        &format!(
+            "rm -f {0}/bin/auto_syncd {0}/bin/auto_sync_web {0}/bin/auto_sync_gui",
+            install_dir.display()
+        ),
+    ]))?;
 
     // Only seed the config on first deploy; never overwrite an existing one so
     // edits made on the NAS survive redeploys.
@@ -217,20 +200,11 @@ fn deploy_nas(
         tmp_unit.to_string_lossy().as_ref(),
         &format!("{target}:/etc/systemd/system/auto_sync.service"),
     ]))?;
-    let web_unit = web_systemd_unit(install_dir);
-    let tmp_web_unit = PathBuf::from("conf/auto_sync_web.service");
-    fs::write(&tmp_web_unit, web_unit)?;
-    run(Command::new("scp").args([
-        "-P",
-        &ssh_port,
-        tmp_web_unit.to_string_lossy().as_ref(),
-        &format!("{target}:/etc/systemd/system/auto_sync_web.service"),
-    ]))?;
     run(Command::new("ssh").args([
         "-p",
         &ssh_port,
         &target,
-        "systemctl daemon-reload && systemctl enable --now auto_sync.service auto_sync_web.service && systemctl status --no-pager auto_sync.service auto_sync_web.service",
+        "systemctl daemon-reload && systemctl enable --now auto_sync.service && systemctl status --no-pager auto_sync.service",
     ]))?;
     Ok(())
 }
@@ -243,29 +217,6 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn web_systemd_unit(install_dir: &Path) -> String {
-    format!(
-        r#"[Unit]
-Description=auto_sync Web UI
-After=network-online.target auto_sync.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory={dir}
-ExecStart={dir}/bin/auto_sync_web --config {dir}/conf/auto_sync.toml
-Restart=always
-RestartSec=5
-User=root
-Group=root
-
-[Install]
-WantedBy=multi-user.target
-"#,
-        dir = install_dir.display()
-    )
-}
-
 fn systemd_unit(install_dir: &Path) -> String {
     format!(
         r#"[Unit]
@@ -276,7 +227,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory={dir}
-ExecStart={dir}/bin/auto_syncd --config {dir}/conf/auto_sync.toml
+ExecStart={dir}/bin/auto_sync --config {dir}/conf/auto_sync.toml
 Restart=always
 RestartSec=5
 User=root

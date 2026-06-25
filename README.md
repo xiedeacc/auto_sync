@@ -19,25 +19,30 @@ only mismatched files and symlinks, optionally mirror-delete destination extras,
 and verify the destination after transfer.
 
 Windows deployment can use the system OpenSSH Server optional feature when
-requested, but the daemon and GUI are launched through a current-user Startup
-launcher rather than a Windows service.
+requested, but `auto_sync` is launched through a current-user Startup launcher
+rather than a Windows service.
 
 ## Build
 
+A single runtime binary `auto_sync` runs the scheduler, file watcher and web
+server in one process, and also opens the desktop window when a display is
+available. Build with the desktop (Tauri) feature for GUI hosts, or
+`--no-default-features` for a headless web-only build.
+
 ```bash
-cargo build --release
-install -m 0755 target/release/auto_syncd bin/auto_syncd
+# Desktop-capable build (default features include the GUI):
+cargo build --release --bin auto_sync --bin auto_syncctl
+# Headless (web only, no Tauri/webkit dependency):
+cargo build --release --no-default-features --bin auto_sync --bin auto_syncctl
+install -m 0755 target/release/auto_sync bin/auto_sync
 install -m 0755 target/release/auto_syncctl bin/auto_syncctl
-install -m 0755 target/release/auto_sync_gui bin/auto_sync_gui
-install -m 0755 target/release/auto_sync_web bin/auto_sync_web
 ```
 
 ## Run
 
 ```bash
-bin/auto_sync_gui --config conf/auto_sync.toml
-bin/auto_sync_web --config conf/auto_sync.toml --bind 0.0.0.0:18765
-bin/auto_syncd --config conf/auto_sync.toml
+bin/auto_sync --config conf/auto_sync.toml            # scheduler + web (+ desktop if available)
+bin/auto_sync --config conf/auto_sync.toml --no-gui   # force web-only
 bin/auto_syncctl --config conf/auto_sync.toml status
 bin/auto_syncctl --config conf/auto_sync.toml sync-now --close-current
 ```
@@ -48,13 +53,13 @@ Local Linux systemd deploy:
 scripts/deploy_local.sh
 ```
 
-The local deploy script builds release binaries, installs them to
+The local deploy script builds the release binary, installs it to
 `/usr/local/auto_sync`, seeds the config only if it does not already exist,
-installs systemd units, and starts `auto_sync.service` plus
-`auto_sync_web.service` on Linux. It first checks the Ubuntu/Debian build
-environment and installs missing build dependencies plus Rust stable only when
-needed. On Linux hosts without a GUI environment it installs headless mode only;
-with a GUI it also installs `auto_sync_gui`.
+installs the systemd unit, and starts the single `auto_sync.service` on Linux.
+It first checks the Ubuntu/Debian build environment and installs missing build
+dependencies plus Rust stable only when needed. On Linux hosts without a GUI
+environment it builds the headless (web-only) variant; with a GUI it builds with
+desktop support.
 
 Machine deploy helpers:
 
@@ -64,10 +69,10 @@ ssh -p 10022 root@192.168.2.247 'cd /root/src/rust/auto_sync && git pull && scri
 scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 ```
 
-`deploy_windows.ps1` is run locally on Windows, builds release binaries into
+`deploy_windows.ps1` is run locally on Windows, builds the release binary into
 the repository `bin\` directory, keeps config under `conf\`, and creates a
-current-user Startup launcher for both `auto_syncd` and `auto_sync_gui` instead
-of installing `auto_syncd` as a Windows service. OpenSSH setup is opt-in via
+current-user Startup launcher for the single `auto_sync` process instead
+of installing it as a Windows service. OpenSSH setup is opt-in via
 `-InstallSshd`. NAS is Ubuntu x64 and builds on NAS itself under
 `/root/src/rust/auto_sync`; use `git pull` plus `scripts/deploy_local.sh` on
 NAS for deployments. `deploy_local.sh` installs missing Ubuntu/Debian build

@@ -104,34 +104,35 @@ has_gui_environment() {
 
 ensure_linux_build_environment
 
+# One unified binary. Build with the desktop (Tauri) feature only when a GUI is
+# present; otherwise build headless so hosts like the NAS need no webkit/Tauri.
 if has_gui_environment; then
-  cargo build --release --bins
+  cargo build --release --bin auto_sync --bin auto_syncctl
+  echo "GUI environment detected; built auto_sync with desktop support"
 else
-  cargo build --release --no-default-features --bin auto_syncd --bin auto_syncctl --bin auto_sync_web
+  cargo build --release --no-default-features --bin auto_sync --bin auto_syncctl
+  echo "No GUI environment detected; built headless auto_sync (web only)"
 fi
 mkdir -p bin
-install -m 0755 target/release/auto_syncd bin/auto_syncd
+install -m 0755 target/release/auto_sync bin/auto_sync
 install -m 0755 target/release/auto_syncctl bin/auto_syncctl
-install -m 0755 target/release/auto_sync_web bin/auto_sync_web
-if has_gui_environment && [[ -x target/release/auto_sync_gui ]]; then
-  install -m 0755 target/release/auto_sync_gui bin/auto_sync_gui
-fi
 
 "${SUDO[@]}" install -d -m 0755 \
   "$INSTALL_DIR/bin" \
   "$INSTALL_DIR/conf" \
   "$INSTALL_DIR/conf/state" \
   "$INSTALL_DIR/logs"
-"${SUDO[@]}" install -m 0755 bin/auto_syncd "$INSTALL_DIR/bin/auto_syncd"
+
+# Retire the old split layout (separate daemon + web service/binaries).
+"${SUDO[@]}" systemctl disable --now auto_sync_web.service 2>/dev/null || true
+"${SUDO[@]}" rm -f /etc/systemd/system/auto_sync_web.service
+"${SUDO[@]}" rm -f \
+  "$INSTALL_DIR/bin/auto_syncd" \
+  "$INSTALL_DIR/bin/auto_sync_web" \
+  "$INSTALL_DIR/bin/auto_sync_gui"
+
+"${SUDO[@]}" install -m 0755 bin/auto_sync "$INSTALL_DIR/bin/auto_sync"
 "${SUDO[@]}" install -m 0755 bin/auto_syncctl "$INSTALL_DIR/bin/auto_syncctl"
-"${SUDO[@]}" install -m 0755 bin/auto_sync_web "$INSTALL_DIR/bin/auto_sync_web"
-if has_gui_environment && [[ -x bin/auto_sync_gui ]]; then
-  "${SUDO[@]}" install -m 0755 bin/auto_sync_gui "$INSTALL_DIR/bin/auto_sync_gui"
-  echo "GUI environment detected; installed auto_sync_gui"
-else
-  "${SUDO[@]}" rm -f "$INSTALL_DIR/bin/auto_sync_gui"
-  echo "No GUI environment detected; installed headless mode only"
-fi
 
 if "${SUDO[@]}" test -f "$INSTALL_DIR/conf/auto_sync.toml"; then
   echo "local config $INSTALL_DIR/conf/auto_sync.toml already exists; leaving it untouched"
@@ -143,28 +144,9 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 bin/auto_syncctl print-systemd --install-dir "$INSTALL_DIR" > "$tmp_dir/auto_sync.service"
-cat > "$tmp_dir/auto_sync_web.service" <<EOF
-[Unit]
-Description=auto_sync Web UI
-After=network-online.target auto_sync.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/bin/auto_sync_web --config $INSTALL_DIR/conf/auto_sync.toml
-Restart=always
-RestartSec=5
-User=root
-Group=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
 
 "${SUDO[@]}" install -m 0644 "$tmp_dir/auto_sync.service" /etc/systemd/system/auto_sync.service
-"${SUDO[@]}" install -m 0644 "$tmp_dir/auto_sync_web.service" /etc/systemd/system/auto_sync_web.service
 "${SUDO[@]}" systemctl daemon-reload
-"${SUDO[@]}" systemctl enable auto_sync.service auto_sync_web.service
-"${SUDO[@]}" systemctl restart auto_sync.service auto_sync_web.service
-"${SUDO[@]}" systemctl status --no-pager auto_sync.service auto_sync_web.service
+"${SUDO[@]}" systemctl enable auto_sync.service
+"${SUDO[@]}" systemctl restart auto_sync.service
+"${SUDO[@]}" systemctl status --no-pager auto_sync.service

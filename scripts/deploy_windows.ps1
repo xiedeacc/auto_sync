@@ -135,7 +135,7 @@ function Copy-ReleaseBinaries {
     if (-not $NoBuild) {
         Push-Location $RootDir
         try {
-            cargo build --release --bins
+            cargo build --release --bin auto_sync --bin auto_syncctl
         }
         finally {
             Pop-Location
@@ -144,17 +144,21 @@ function Copy-ReleaseBinaries {
 
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
     $artifactDir = Join-Path $RootDir "target\release"
-    foreach ($binary in @("auto_syncd.exe", "auto_syncctl.exe", "auto_sync_web.exe", "auto_sync_gui.exe")) {
+    foreach ($binary in @("auto_sync.exe", "auto_syncctl.exe")) {
         $source = Join-Path $artifactDir $binary
         if (-not (Test-Path -LiteralPath $source)) {
             throw "Missing build artifact: $source"
         }
         Copy-Item -LiteralPath $source -Destination (Join-Path $BinDir $binary) -Force
     }
+    # Remove stale binaries from the previous multi-binary layout.
+    foreach ($stale in @("auto_syncd.exe", "auto_sync_web.exe", "auto_sync_gui.exe")) {
+        Remove-Item -LiteralPath (Join-Path $BinDir $stale) -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Stop-AutoSyncProcesses {
-    foreach ($name in @("auto_syncd", "auto_syncctl", "auto_sync_web", "auto_sync_gui")) {
+    foreach ($name in @("auto_sync", "auto_syncd", "auto_syncctl", "auto_sync_web", "auto_sync_gui")) {
         Get-Process -Name $name -ErrorAction SilentlyContinue |
             Stop-Process -Force -ErrorAction SilentlyContinue
     }
@@ -612,13 +616,9 @@ function Ensure-AutoSyncStartup {
         [string]$ConfigPath
     )
 
-    $daemonExe = Join-Path $BinDir "auto_syncd.exe"
-    $guiExe = Join-Path $BinDir "auto_sync_gui.exe"
-    if (-not (Test-Path -LiteralPath $daemonExe)) {
-        throw "Missing daemon binary: $daemonExe"
-    }
-    if (-not (Test-Path -LiteralPath $guiExe)) {
-        throw "Missing GUI binary: $guiExe"
+    $autoSyncExe = Join-Path $BinDir "auto_sync.exe"
+    if (-not (Test-Path -LiteralPath $autoSyncExe)) {
+        throw "Missing binary: $autoSyncExe"
     }
 
     $startupDir = [Environment]::GetFolderPath("Startup")
@@ -628,27 +628,23 @@ function Ensure-AutoSyncStartup {
     New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
     Remove-Item -LiteralPath (Join-Path $startupDir "auto_syncd-start.vbs") -Force -ErrorAction SilentlyContinue
     $launcher = Join-Path $startupDir "auto_sync-start.vbs"
-    $escapedDaemonExe = $daemonExe.Replace('"', '""')
-    $escapedGuiExe = $guiExe.Replace('"', '""')
+    $escapedExe = $autoSyncExe.Replace('"', '""')
     $escapedConfig = $ConfigPath.Replace('"', '""')
+    # One process: scheduler + watcher + web + desktop window (auto_sync opens
+    # the GUI itself when a desktop session is available).
     $script = @(
         'Set shell = CreateObject("WScript.Shell")',
-        "shell.Run """"""$escapedDaemonExe"""" --config """"$escapedConfig"""""", 0, False",
-        "shell.Run """"""$escapedGuiExe"""" --config """"$escapedConfig"""""", 1, False"
+        "shell.Run """"""$escapedExe"""" --config """"$escapedConfig"""""", 0, False"
     )
     Set-Content -LiteralPath $launcher -Value $script -Encoding ascii
 
-    Start-Process -FilePath $daemonExe `
-        -ArgumentList @("--config", $ConfigPath) `
-        -WorkingDirectory (Split-Path -Parent $BinDir) `
-        -WindowStyle Hidden
-    Start-Process -FilePath $guiExe `
+    Start-Process -FilePath $autoSyncExe `
         -ArgumentList @("--config", $ConfigPath) `
         -WorkingDirectory (Split-Path -Parent $BinDir)
 
     [PSCustomObject]@{
         Launcher = $launcher
-        Processes = "auto_syncd, auto_sync_gui started"
+        Processes = "auto_sync started"
     }
 }
 

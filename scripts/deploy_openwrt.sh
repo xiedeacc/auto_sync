@@ -80,13 +80,11 @@ build_openwrt_binaries() {
 
   cargo build --release --target "$TARGET" \
     --no-default-features \
-    --bin auto_syncd \
-    --bin auto_sync_web \
+    --bin auto_sync \
     --bin auto_syncctl
 
   mkdir -p "$OUT_DIR"
-  install -m 0755 "target/$TARGET/release/auto_syncd" "$OUT_DIR/auto_syncd"
-  install -m 0755 "target/$TARGET/release/auto_sync_web" "$OUT_DIR/auto_sync_web"
+  install -m 0755 "target/$TARGET/release/auto_sync" "$OUT_DIR/auto_sync"
   install -m 0755 "target/$TARGET/release/auto_syncctl" "$OUT_DIR/auto_syncctl"
 
   echo "OpenWrt aarch64 binaries staged in $OUT_DIR"
@@ -155,12 +153,12 @@ if [[ -z "$BINARY_DIR" ]]; then
     BINARY_DIR="bin/openwrt"
   else
     echo "No OpenWrt binaries found for arch '$arch'." >&2
-    echo "Put auto_syncd, auto_sync_web, and auto_syncctl under bin/openwrt/$arch or pass --binary-dir." >&2
+    echo "Put auto_sync and auto_syncctl under bin/openwrt/$arch or pass --binary-dir." >&2
     exit 1
   fi
 fi
 
-for binary in auto_syncd auto_sync_web auto_syncctl; do
+for binary in auto_sync auto_syncctl; do
   if [[ ! -x "$BINARY_DIR/$binary" ]]; then
     echo "$BINARY_DIR/$binary is missing or not executable" >&2
     exit 1
@@ -169,9 +167,10 @@ done
 
 ssh -p "$PORT" "$target" "mkdir -p '$INSTALL_DIR/bin' '$INSTALL_DIR/conf' '$INSTALL_DIR/conf/state' '$INSTALL_DIR/logs'"
 
-ssh -p "$PORT" "$target" "/etc/init.d/auto_sync stop >/dev/null 2>&1 || true; /etc/init.d/auto_sync_web stop >/dev/null 2>&1 || true"
+# Stop and retire the old split services/binaries.
+ssh -p "$PORT" "$target" "/etc/init.d/auto_sync stop >/dev/null 2>&1 || true; /etc/init.d/auto_sync_web stop >/dev/null 2>&1 || true; /etc/init.d/auto_sync_web disable >/dev/null 2>&1 || true; rm -f /etc/init.d/auto_sync_web ${INSTALL_DIR}/bin/auto_syncd ${INSTALL_DIR}/bin/auto_sync_web ${INSTALL_DIR}/bin/auto_sync_gui"
 
-for binary in auto_syncd auto_sync_web auto_syncctl; do
+for binary in auto_sync auto_syncctl; do
   scp -O -P "$PORT" "$BINARY_DIR/$binary" "${target}:${INSTALL_DIR}/bin/${binary}"
 done
 
@@ -191,22 +190,7 @@ USE_PROCD=1
 
 start_service() {
   procd_open_instance
-  procd_set_param command $INSTALL_DIR/bin/auto_syncd --config $INSTALL_DIR/conf/auto_sync.toml
-  procd_set_param respawn 5 5 0
-  procd_set_param stdout 1
-  procd_set_param stderr 1
-  procd_close_instance
-}
-EOF
-
-cat > "$tmp_dir/auto_sync_web" <<EOF
-#!/bin/sh /etc/rc.common
-START=96
-USE_PROCD=1
-
-start_service() {
-  procd_open_instance
-  procd_set_param command $INSTALL_DIR/bin/auto_sync_web --config $INSTALL_DIR/conf/auto_sync.toml
+  procd_set_param command $INSTALL_DIR/bin/auto_sync --config $INSTALL_DIR/conf/auto_sync.toml
   procd_set_param respawn 5 5 0
   procd_set_param stdout 1
   procd_set_param stderr 1
@@ -215,9 +199,8 @@ start_service() {
 EOF
 
 scp -O -P "$PORT" "$tmp_dir/auto_sync" "${target}:/etc/init.d/auto_sync"
-scp -O -P "$PORT" "$tmp_dir/auto_sync_web" "${target}:/etc/init.d/auto_sync_web"
 
-ssh -p "$PORT" "$target" "chmod +x /etc/init.d/auto_sync /etc/init.d/auto_sync_web"
+ssh -p "$PORT" "$target" "chmod +x /etc/init.d/auto_sync"
 ssh -p "$PORT" "$target" "if command -v opkg >/dev/null 2>&1; then opkg update && opkg install openssh-client || true; fi"
-ssh -p "$PORT" "$target" "/etc/init.d/auto_sync enable && /etc/init.d/auto_sync_web enable && /etc/init.d/auto_sync start && /etc/init.d/auto_sync_web start"
-ssh -p "$PORT" "$target" "/etc/init.d/auto_sync status || true; /etc/init.d/auto_sync_web status || true"
+ssh -p "$PORT" "$target" "/etc/init.d/auto_sync enable && /etc/init.d/auto_sync start"
+ssh -p "$PORT" "$target" "/etc/init.d/auto_sync status || true"

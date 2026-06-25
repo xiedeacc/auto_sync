@@ -1,10 +1,10 @@
 # Project Rules
 
-- For every local code-change loop, stop old `auto_sync` processes first:
-  `auto_syncd`, `auto_syncctl`, `auto_sync_web`, and `auto_sync_gui`.
+- The project ships a single runtime binary `auto_sync` (scheduler + watcher + web, plus the desktop window when a display is available) and the `auto_syncctl` CLI. The old `auto_syncd` / `auto_sync_gui` / `auto_sync_web` binaries were merged into `auto_sync`.
+- For every local code-change loop, stop old `auto_sync` processes first: `auto_sync` (and any legacy `auto_syncd`, `auto_sync_web`, `auto_sync_gui`).
 - After stopping old processes, run an incremental debug build: `cargo build --bins`.
 - On Windows, before starting any `auto_sync` process, copy the freshly compiled binaries into `D:\code\auto_sync\bin` and start them only from that `bin\` directory, never directly from `target\debug\` or `target\release\`.
-- Use the Windows deploy script for full local deployment: `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`. On Windows, deploy binaries into the repository `bin\` directory and use a current-user Startup launcher for both `auto_syncd` and `auto_sync_gui`; always start both from `bin\` after deployment, and do not install or start `auto_syncd` as a Windows service.
+- Use the Windows deploy script for full local deployment: `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`. On Windows, deploy binaries into the repository `bin\` directory and use a current-user Startup launcher for the single `auto_sync` process; always start it from `bin\` after deployment, and do not install or start `auto_sync` as a Windows service.
 - When the user asks to deploy or when real remote E2E tests/debugging need the latest code, always use this update path:
   1. On Windows, commit all intended repository changes and push them.
   2. Deploy this Windows machine with `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`.

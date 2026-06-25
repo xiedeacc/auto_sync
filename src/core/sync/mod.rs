@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -43,7 +43,17 @@ const DELTA_MIN_SIZE: u64 = 256 * 1024;
 /// Never load a delta basis larger than this into memory; fall back to chunked.
 const DELTA_MAX_SIZE: u64 = 1024 * 1024 * 1024;
 
+/// Serializes every run of the sync engine within a process. With the daemon,
+/// web server and (optional) desktop UI now sharing one process, the scheduled
+/// tick and a manually triggered sync must never drive the engine concurrently.
+static SYNC_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub fn sync_gate() -> &'static Mutex<()> {
+    SYNC_GATE.get_or_init(|| Mutex::new(()))
+}
+
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
+    let _serialized = sync_gate().lock().unwrap_or_else(|err| err.into_inner());
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
     progress::configure_progress_file(&cfg.app.data_db);
     state.ensure_config(cfg)?;

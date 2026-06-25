@@ -5,21 +5,12 @@ edition = "2024"
 license = "MIT"
 
 [[bin]]
-name = "auto_syncd"
-path = "src/bin/auto_syncd.rs"
+name = "auto_sync"
+path = "src/bin/auto_sync.rs"
 
 [[bin]]
 name = "auto_syncctl"
 path = "src/bin/auto_syncctl.rs"
-
-[[bin]]
-name = "auto_sync_gui"
-path = "src/bin/auto_sync_gui.rs"
-required-features = ["gui"]
-
-[[bin]]
-name = "auto_sync_web"
-path = "src/bin/auto_sync_web.rs"
 
 [dependencies]
 anyhow = "1"
