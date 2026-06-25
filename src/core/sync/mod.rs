@@ -8,6 +8,9 @@ use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,8 +24,8 @@ use crate::core::config::{
     SourceGroupConfig, SyncTaskRef, machine_id_or_local,
 };
 use crate::core::machines::{
-    configure_tcp_connection_pool, encode_query_component, find_machine, remote_post_bytes,
-    remote_post_json,
+    configure_tcp_connection_pool, encode_query_component, find_machine, remote_get_json,
+    remote_post_bytes, remote_post_json,
 };
 use crate::core::progress;
 use crate::core::state::{Cycle, SnapshotEntry, State};
@@ -220,6 +223,18 @@ pub struct TransferPushFileRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferAck {
     pub ok: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PeerRuntimeStatus {
+    scan: Option<PeerScanProgress>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PeerScanProgress {
+    root_path: String,
+    current_path: String,
+    entries_seen: u64,
 }
 
 fn default_transfer_timeout_secs() -> u64 {
@@ -1460,8 +1475,44 @@ fn snapshot_on_machine(
     if machine_id == "local" {
         transfer_snapshot(req)
     } else {
-        remote_post_json(machine, "/api/transfer/snapshot", &req, timeout)
+        remote_snapshot_with_progress(machine, root, &req, timeout)
     }
+}
+
+fn remote_snapshot_with_progress(
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    req: &TransferSnapshotRequest,
+    timeout: Duration,
+) -> Result<Vec<SnapshotEntry>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let poll_stop = Arc::clone(&stop);
+    let poll_machine = machine.clone();
+    let poll_root = root.to_path_buf();
+    let poller = thread::spawn(move || {
+        let scan_progress = progress::start_scan(&poll_root);
+        while !poll_stop.load(Ordering::Relaxed) {
+            if let Ok(status) = remote_get_json::<PeerRuntimeStatus>(
+                &poll_machine,
+                "/api/runtime-status",
+                Duration::from_secs(1),
+            ) {
+                if let Some(scan) = status.scan {
+                    let current = if scan.current_path.is_empty() {
+                        scan.root_path
+                    } else {
+                        scan.current_path
+                    };
+                    scan_progress.update(Path::new(&current), scan.entries_seen);
+                }
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+    let result = remote_post_json(machine, "/api/transfer/snapshot", req, timeout);
+    stop.store(true, Ordering::Relaxed);
+    let _ = poller.join();
+    result
 }
 
 fn prepare_dir_on_machine(
