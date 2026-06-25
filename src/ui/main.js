@@ -450,7 +450,7 @@ async function removeMachine(machineId) {
 }
 
 function render() {
-  el.configPath.textContent = isTauriRuntime() ? "Tauri GUI" : "Headless Web UI";
+  el.configPath.textContent = "";
   renderSourcePanel();
 }
 
@@ -794,7 +794,7 @@ function renderSyncRows(source, group) {
         updateStatusUi();
         return;
       }
-      runBusy("Scanning for changes...", async () => {
+      runBusy(destinationSyncStatusMessage(source, mode), async () => {
         await saveConfig();
         statuses = await invoke("sync_destination_now", {
           sourceId: source.id,
@@ -1744,7 +1744,6 @@ async function runBusy(message, fn, options = {}) {
 
 function setBusy(nextBusy) {
   busy = nextBusy;
-  el.readme.disabled = busy;
   el.config.disabled = busy;
   el.statusConfig.disabled = busy;
   el.settingsSave.disabled = busy;
@@ -1756,6 +1755,14 @@ function setMessage(text) {
   const value = text || "";
   el.message.textContent = value;
   updateStatusBar();
+}
+
+function destinationSyncStatusMessage(source, mode) {
+  if (mode !== "full") {
+    return "Scanning for changes...";
+  }
+  const path = source && source.src ? source.src : "source";
+  return `Scanning ${path} (dir)`;
 }
 
 function formatTransferProgress(transfer) {
@@ -1820,10 +1827,6 @@ function getTauriInvoke() {
     return window.__TAURI__.core.invoke;
   }
   return null;
-}
-
-function isTauriRuntime() {
-  return Boolean(getTauriInvoke()) || location.hostname === "tauri.localhost";
 }
 
 function escapeHtml(value) {
