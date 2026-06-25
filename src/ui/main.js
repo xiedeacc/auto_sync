@@ -270,7 +270,8 @@ function updateStatusBar() {
     const count = Number(scan.entries_seen || 0);
     const suffix = count ? ` · ${count} entries` : "";
     const title = `Scanning: ${current}\nRoot: ${root}${count ? `\nEntries: ${count}` : ""}`;
-    el.statusText.textContent = `Scanning ${current}${suffix}`;
+    const label = `Scanning ${compactStatusPath(current, 86)}${suffix}`;
+    el.statusText.innerHTML = `<span class="status-scan" title="${escapeAttr(title)}">${escapeHtml(label)}</span>`;
     el.statusText.title = title;
   } else {
     const message = statusBusyMessage || el.message.textContent || "Ready";
@@ -1770,13 +1771,66 @@ function destinationSyncStatusMessage(source, mode) {
   if (mode !== "full") {
     return "Scanning for changes...";
   }
-  const path = source && source.src ? source.src : "source";
-  return `Scanning ${displayPath(path)}`;
+  return "Scanning...";
 }
 
 function displayPath(value) {
   const path = String(valueOr(value, ""));
   return path.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\/, "");
+}
+
+function compactStatusPath(value, maxChars) {
+  const path = displayPath(value);
+  if (path.length <= maxChars) {
+    return path;
+  }
+  const separator = path.includes("\\") ? "\\" : "/";
+  let prefix = "";
+  let rest = path;
+  const drive = path.match(/^[A-Za-z]:\\/);
+  if (drive) {
+    prefix = drive[0];
+    rest = path.slice(prefix.length);
+  } else if (path.startsWith("\\\\")) {
+    const parts = path.slice(2).split(/[\\/]+/);
+    if (parts.length >= 2) {
+      prefix = `\\\\${parts[0]}\\${parts[1]}\\`;
+      rest = parts.slice(2).join(separator);
+    }
+  } else if (path.startsWith("/")) {
+    prefix = "/";
+    rest = path.slice(1);
+  }
+
+  const parts = rest.split(/[\\/]+/).filter(Boolean);
+  if (parts.length <= 2) {
+    return `${path.slice(0, Math.max(0, maxChars - 3))}...`;
+  }
+
+  let headCount = Math.min(4, parts.length - 1);
+  let tailCount = Math.min(3, parts.length - headCount);
+  let compact = renderCompactPath(prefix, parts, separator, headCount, tailCount);
+  while (compact.length > maxChars && headCount > 1) {
+    headCount -= 1;
+    compact = renderCompactPath(prefix, parts, separator, headCount, tailCount);
+  }
+  while (compact.length > maxChars && tailCount > 1) {
+    tailCount -= 1;
+    compact = renderCompactPath(prefix, parts, separator, headCount, tailCount);
+  }
+  if (compact.length <= maxChars) {
+    return compact;
+  }
+  const tail = parts[parts.length - 1];
+  const headBudget = Math.max(0, maxChars - tail.length - separator.length - 3);
+  return `${path.slice(0, headBudget)}...${separator}${tail}`;
+}
+
+function renderCompactPath(prefix, parts, separator, headCount, tailCount) {
+  const head = parts.slice(0, headCount).join(separator);
+  const tail = parts.slice(parts.length - tailCount).join(separator);
+  const left = head ? `${prefix}${head}` : prefix.replace(/[\\/]$/, "");
+  return `${left}${separator}...${separator}${tail}`;
 }
 
 function formatTransferProgress(transfer) {

@@ -808,6 +808,15 @@ th {
   font-variant-numeric: tabular-nums;
 }
 
+.status-scan {
+  display: inline-block;
+  max-width: min(var(--panel-width), 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+
 .empty {
   color: var(--muted);
   padding: 20px 0;
