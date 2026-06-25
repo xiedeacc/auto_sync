@@ -217,6 +217,68 @@ pub fn start_scan(root_path: &Path) -> ScanProgressGuard {
     ScanProgressGuard { token }
 }
 
+/// Begin an aggregate transfer that accumulates bytes across many concurrent
+/// files (e.g. a parallel worker pool). Workers report via [`record_transfer`].
+pub fn begin_transfer(
+    destination_id: &str,
+    destination_path: &Path,
+    total_bytes: u64,
+) -> TransferProgressGuard {
+    let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let now = Instant::now();
+    let mut progress = progress_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *progress = Some(TransferProgressState {
+        token,
+        destination_id: destination_id.to_string(),
+        destination_path: destination_path.to_string_lossy().to_string(),
+        rel_path: String::new(),
+        transferred_bytes: 0,
+        total_bytes,
+        bytes_per_sec: 0,
+        last_bytes: 0,
+        started_at: now,
+        last_sample_at: now,
+        updated_at: now,
+        updated_at_ms: now_ms(),
+    });
+    if let Some(state) = progress.as_ref() {
+        write_progress_file(&state.view());
+    }
+    TransferProgressGuard { token }
+}
+
+/// Add `added` bytes to the active aggregate transfer and note the current file.
+/// Safe to call from many threads; a no-op if no aggregate transfer is active.
+pub fn record_transfer(rel_path: &str, added: u64) {
+    let mut progress = progress_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let Some(state) = progress.as_mut() else {
+        return;
+    };
+    state.transferred_bytes = state.transferred_bytes.saturating_add(added);
+    if state.total_bytes > 0 {
+        state.transferred_bytes = state.transferred_bytes.min(state.total_bytes);
+    }
+    if !rel_path.is_empty() {
+        state.rel_path = rel_path.to_string();
+    }
+    let now = Instant::now();
+    state.updated_at = now;
+    state.updated_at_ms = now_ms();
+    let elapsed = now.duration_since(state.last_sample_at);
+    if elapsed >= Duration::from_millis(250) {
+        let byte_delta = state.transferred_bytes.saturating_sub(state.last_bytes);
+        let millis = elapsed.as_millis().max(1);
+        state.bytes_per_sec = ((byte_delta as u128) * 1000 / millis) as u64;
+        state.last_bytes = state.transferred_bytes;
+        state.last_sample_at = now;
+        write_progress_file(&state.view());
+    }
+}
+
 pub fn current_transfer_progress() -> Option<TransferProgressView> {
     let mut progress = progress_lock()
         .lock()

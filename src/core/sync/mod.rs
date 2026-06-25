@@ -772,16 +772,10 @@ fn send_file_tcp(
     if offset > total_size {
         offset = 0;
     }
+    let _ = destination_id;
     let mut file = File::open(src).with_context(|| format!("failed to read {}", src.display()))?;
     file.seek(SeekFrom::Start(offset))?;
     let mut sent = offset;
-    let progress = progress::start_transfer(
-        destination_id,
-        destination_root,
-        &entry.rel_path,
-        total_size,
-        sent,
-    );
     let mut buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
     while sent < total_size {
         let remaining = (total_size - sent).min(TRANSFER_CHUNK_SIZE as u64) as usize;
@@ -795,7 +789,7 @@ fn send_file_tcp(
             bail!("peer rejected TCP file chunk");
         }
         sent += n as u64;
-        progress.update(sent);
+        progress::record_transfer(&entry.rel_path, n as u64);
         throttle_after_transfer(n, bwlimit_kbps);
     }
     let finish = TransferFinishFileRequest {
@@ -832,19 +826,13 @@ fn send_put_file_tcp(
             bytes.len()
         );
     }
-    let progress = progress::start_transfer(
-        destination_id,
-        destination_root,
-        &entry.rel_path,
-        total_size,
-        0,
-    );
+    let _ = destination_id;
     let path = put_file_api_path(destination_root, cycle_id, entry);
     let ack: TransferAck = remote_post_bytes(destination, &path, &bytes, timeout)?;
     if !ack.ok {
         bail!("peer rejected put-file transfer");
     }
-    progress.update(total_size);
+    progress::record_transfer(&entry.rel_path, total_size);
     throttle_after_transfer(bytes.len(), bwlimit_kbps);
     Ok(())
 }
@@ -907,19 +895,12 @@ fn send_file_delta(
         );
     }
     let full_hash = blake3::hash(&new_data).to_hex().to_string();
-    let progress = progress::start_transfer(
-        destination_id,
-        destination_root,
-        &entry.rel_path,
-        entry.size.max(0) as u64,
-        0,
-    );
     let path = apply_delta_api_path(destination_root, cycle_id, entry, &full_hash);
     let ack: TransferAck = remote_post_bytes(destination, &path, &delta_bytes, timeout)?;
     if !ack.ok {
         bail!("peer rejected delta transfer for {}", entry.rel_path);
     }
-    progress.update(entry.size.max(0) as u64);
+    progress::record_transfer(&entry.rel_path, entry.size.max(0) as u64);
     throttle_after_transfer(delta_bytes.len(), bwlimit_kbps);
     Ok(())
 }
@@ -1810,6 +1791,8 @@ fn sync_file_with_transfer(
             } else {
                 use_delta = false;
             }
+            let _transfer =
+                progress::begin_transfer(destination_id, dst_root, entry.size.max(0) as u64);
             push_entry_between_machines(
                 source_machine_id,
                 source_machine,
@@ -2103,6 +2086,12 @@ fn push_entries_parallel(
     if entries.is_empty() {
         return Ok(0);
     }
+    let total_bytes: u64 = entries
+        .iter()
+        .filter(|(entry, _)| entry.file_type == "file")
+        .map(|(entry, _)| entry.size.max(0) as u64)
+        .sum();
+    let _transfer = progress::begin_transfer(destination_id, dst_root, total_bytes);
     let workers = resolve_parallelism(sync.max_parallel_transfers, entries.len());
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
