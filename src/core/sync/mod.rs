@@ -8,10 +8,10 @@ use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use filetime::{FileTime, set_file_mtime};
@@ -20,8 +20,8 @@ use tracing::{error, info, warn};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::core::config::{
-    AppConfig, DEFAULT_TRANSFER_TIMEOUT_SECS, DestinationConfig, NativeSyncConfig, SnapshotBackend,
-    SourceGroupConfig, SyncTaskRef, machine_id_or_local,
+    AppConfig, DEFAULT_MAX_PARALLEL_TRANSFERS, DEFAULT_TRANSFER_TIMEOUT_SECS, DestinationConfig,
+    NativeSyncConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef, machine_id_or_local,
 };
 use crate::core::machines::{
     configure_tcp_connection_pool, encode_query_component, find_machine, remote_get_json,
@@ -31,10 +31,17 @@ use crate::core::progress;
 use crate::core::state::{Cycle, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
 
+pub mod delta;
+
 const INTERNAL_TMP: &str = ".auto_sync_tmp";
 const INTERNAL_TRASH: &str = ".auto_sync_trash";
 const INTERNAL_PROBE: &str = ".auto_sync_probe";
 const TRANSFER_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+/// Files at least this large that already exist on the destination are sent as
+/// an rsync-style delta (only changed regions) instead of being re-sent whole.
+const DELTA_MIN_SIZE: u64 = 256 * 1024;
+/// Never load a delta basis larger than this into memory; fall back to chunked.
+const DELTA_MAX_SIZE: u64 = 1024 * 1024 * 1024;
 
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
@@ -218,11 +225,80 @@ pub struct TransferPushFileRequest {
     pub transfer_timeout_secs: u64,
     #[serde(default)]
     pub bwlimit_kbps: u64,
+    /// The destination already holds a copy of this path, so an rsync-style
+    /// delta against it may avoid re-sending unchanged regions.
+    #[serde(default)]
+    pub use_delta: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferAck {
     pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferDirSpec {
+    pub rel_path: String,
+    pub mode: u32,
+}
+
+/// Create many directories on the destination in a single request, eliminating
+/// one HTTP round-trip per directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferPrepareDirsRequest {
+    pub root: PathBuf,
+    pub dirs: Vec<TransferDirSpec>,
+}
+
+/// Remove many destination paths in a single request. Paths are removed in the
+/// order given (callers pass deepest-first so directories empty before removal).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferRemovePathsRequest {
+    pub root: PathBuf,
+    pub rel_paths: Vec<String>,
+    pub cycle_id: i64,
+}
+
+/// Remove the destination's per-cycle temp directory once the cycle's transfers
+/// are complete (replaces the previous per-file cleanup, which is unsafe under
+/// parallel transfers).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferCleanupTmpRequest {
+    pub root: PathBuf,
+    pub cycle_id: i64,
+}
+
+/// Request the destination's per-block checksums for an existing file so the
+/// source can compute a delta. Returns empty blocks when the file is absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferBlockSumsRequest {
+    pub root: PathBuf,
+    pub rel_path: String,
+}
+
+/// Query for applying a delta. The encoded delta is the request body; the old
+/// file already on the destination supplies the copied regions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferApplyDeltaQuery {
+    pub root: String,
+    pub rel_path: String,
+    pub cycle_id: i64,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub mode: u32,
+    pub full_hash: String,
+}
+
+/// Query for the single-round-trip small-file fast path. The file bytes are the
+/// request body; metadata travels in the query string.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferPutFileQuery {
+    pub root: String,
+    pub rel_path: String,
+    pub cycle_id: i64,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -317,6 +393,40 @@ pub fn transfer_remove_path(req: TransferRemovePathRequest) -> Result<TransferAc
     Ok(transfer_ack())
 }
 
+pub fn transfer_cleanup_tmp(req: TransferCleanupTmpRequest) -> Result<TransferAck> {
+    reject_dangerous_destination(&req.root)?;
+    cleanup_tmp_cycle(&req.root, req.cycle_id);
+    Ok(transfer_ack())
+}
+
+pub fn transfer_prepare_dirs(req: TransferPrepareDirsRequest) -> Result<TransferAck> {
+    reject_dangerous_destination(&req.root)?;
+    for dir in &req.dirs {
+        let path = if dir.rel_path.is_empty() {
+            req.root.clone()
+        } else {
+            safe_join_rel(&req.root, &dir.rel_path)?
+        };
+        fs::create_dir_all(&path)
+            .with_context(|| format!("failed to create directory {}", path.display()))?;
+        set_mode(&path, dir.mode).ok();
+    }
+    Ok(transfer_ack())
+}
+
+pub fn transfer_remove_paths(req: TransferRemovePathsRequest) -> Result<TransferAck> {
+    reject_dangerous_destination(&req.root)?;
+    for rel_path in &req.rel_paths {
+        let path = safe_join_rel(&req.root, rel_path)?;
+        if !path.exists() && fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        move_to_trash(&req.root, rel_path, req.cycle_id)
+            .with_context(|| format!("failed to remove destination path {rel_path}"))?;
+    }
+    Ok(transfer_ack())
+}
+
 pub fn transfer_file_offset(req: TransferFileOffsetRequest) -> Result<TransferFileOffset> {
     reject_dangerous_destination(&req.root)?;
     let tmp = tmp_path(&req.root, req.cycle_id, &req.rel_path);
@@ -403,6 +513,99 @@ pub fn transfer_finish_file(req: TransferFinishFileRequest) -> Result<TransferAc
     Ok(transfer_ack())
 }
 
+/// Single-round-trip small-file write: the whole file body is delivered in one
+/// request and finished immediately (no separate offset/chunk/finish calls).
+pub fn transfer_put_file(query: TransferPutFileQuery, bytes: &[u8]) -> Result<TransferAck> {
+    let root = PathBuf::from(&query.root);
+    reject_dangerous_destination(&root)?;
+    let size = query.size.max(0) as u64;
+    if bytes.len() as u64 != size {
+        bail!(
+            "put-file size mismatch for {}: got {}, expected {}",
+            query.rel_path,
+            bytes.len(),
+            size
+        );
+    }
+    let entry = SnapshotEntry {
+        rel_path: query.rel_path.clone(),
+        file_type: "file".to_string(),
+        size: query.size,
+        mtime_ns: query.mtime_ns,
+        mode: query.mode,
+        hash: None,
+    };
+    let final_path = safe_join_rel(&root, &entry.rel_path)?;
+    let tmp = tmp_path(&root, query.cycle_id, &entry.rel_path);
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&tmp, bytes).with_context(|| format!("failed to write temp file {}", tmp.display()))?;
+    finish_received_file(&root, query.cycle_id, &entry, &tmp, &final_path)?;
+    Ok(transfer_ack())
+}
+
+pub fn transfer_block_sums(req: TransferBlockSumsRequest) -> Result<delta::BlockSums> {
+    reject_dangerous_destination(&req.root)?;
+    let path = safe_join_rel(&req.root, &req.rel_path)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => {
+            return Ok(delta::BlockSums {
+                block_len: 0,
+                file_size: 0,
+                blocks: Vec::new(),
+            });
+        }
+    };
+    let data = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let block_len = delta::block_len_for(metadata.len());
+    Ok(delta::BlockSums {
+        block_len: block_len as u32,
+        file_size: data.len() as u64,
+        blocks: delta::compute_block_sums(&data, block_len),
+    })
+}
+
+pub fn transfer_apply_delta(query: TransferApplyDeltaQuery, delta_bytes: &[u8]) -> Result<TransferAck> {
+    let root = PathBuf::from(&query.root);
+    reject_dangerous_destination(&root)?;
+    let final_path = safe_join_rel(&root, &query.rel_path)?;
+    let old_path = final_path.clone();
+    let tmp = tmp_path(&root, query.cycle_id, &query.rel_path);
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    {
+        let mut old = File::open(&old_path)
+            .with_context(|| format!("missing delta basis file {}", old_path.display()))?;
+        let mut out = File::create(&tmp)
+            .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
+        delta::apply_delta(&mut old, delta_bytes, &mut out)?;
+        out.flush()?;
+    }
+    let len = fs::metadata(&tmp)?.len();
+    if len != query.size.max(0) as u64 {
+        remove_any(&tmp).ok();
+        bail!(
+            "delta result size mismatch for {}: got {}, expected {}",
+            query.rel_path,
+            len,
+            query.size
+        );
+    }
+    let entry = SnapshotEntry {
+        rel_path: query.rel_path.clone(),
+        file_type: "file".to_string(),
+        size: query.size,
+        mtime_ns: query.mtime_ns,
+        mode: query.mode,
+        hash: Some(query.full_hash.clone()),
+    };
+    finish_received_file(&root, query.cycle_id, &entry, &tmp, &final_path)?;
+    Ok(transfer_ack())
+}
+
 pub fn transfer_receive_symlink(req: TransferReceiveSymlinkRequest) -> Result<TransferAck> {
     let entry = SnapshotEntry {
         rel_path: req.rel_path,
@@ -418,17 +621,37 @@ pub fn transfer_receive_symlink(req: TransferReceiveSymlinkRequest) -> Result<Tr
 
 pub fn transfer_push_file(req: TransferPushFileRequest) -> Result<TransferAck> {
     let src = safe_join_rel(&req.source_root, &req.rel_path)?;
+    let timeout = Duration::from_secs(req.transfer_timeout_secs.max(1));
     match req.entry.file_type.as_str() {
-        "file" => send_file_tcp(
-            &req.destination,
-            &req.destination_root,
-            &req.destination_id,
-            req.cycle_id,
-            &req.entry,
-            &src,
-            Duration::from_secs(req.transfer_timeout_secs.max(1)),
-            req.bwlimit_kbps,
-        )?,
+        "file" => {
+            let size = req.entry.size.max(0) as u64;
+            let use_delta = req.use_delta
+                && req.entry.hash.is_none()
+                && (DELTA_MIN_SIZE..=DELTA_MAX_SIZE).contains(&size);
+            if use_delta {
+                send_file_delta(
+                    &req.destination,
+                    &req.destination_root,
+                    &req.destination_id,
+                    req.cycle_id,
+                    &req.entry,
+                    &src,
+                    timeout,
+                    req.bwlimit_kbps,
+                )?;
+            } else {
+                send_file_tcp(
+                    &req.destination,
+                    &req.destination_root,
+                    &req.destination_id,
+                    req.cycle_id,
+                    &req.entry,
+                    &src,
+                    timeout,
+                    req.bwlimit_kbps,
+                )?;
+            }
+        }
         "symlink" => {
             send_symlink_tcp(
                 &req.destination,
@@ -503,7 +726,7 @@ fn finish_received_file(
     }
     replace_path(tmp, final_path)?;
     fsync_parent(final_path).ok();
-    cleanup_tmp_cycle(dst_root, cycle_id);
+    let _ = (dst_root, cycle_id);
     Ok(())
 }
 
@@ -517,6 +740,22 @@ fn send_file_tcp(
     timeout: Duration,
     bwlimit_kbps: u64,
 ) -> Result<()> {
+    let total_size = entry.size.max(0) as u64;
+    // Small-file fast path: deliver the whole file in a single round-trip
+    // instead of file-offset + chunk + finish. Skipped when a checksum hash is
+    // present (the chunked path verifies it) so behaviour is unchanged.
+    if total_size <= TRANSFER_CHUNK_SIZE as u64 && entry.hash.is_none() {
+        return send_put_file_tcp(
+            destination,
+            destination_root,
+            destination_id,
+            cycle_id,
+            entry,
+            src,
+            timeout,
+            bwlimit_kbps,
+        );
+    }
     let offset_req = TransferFileOffsetRequest {
         root: destination_root.to_path_buf(),
         rel_path: entry.rel_path.clone(),
@@ -530,7 +769,6 @@ fn send_file_tcp(
         timeout,
     )?;
     let mut offset = offset_response.offset;
-    let total_size = entry.size.max(0) as u64;
     if offset > total_size {
         offset = 0;
     }
@@ -571,6 +809,149 @@ fn send_file_tcp(
         bail!("peer rejected TCP file transfer");
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_put_file_tcp(
+    destination: &crate::core::config::MachineConfig,
+    destination_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    src: &Path,
+    timeout: Duration,
+    bwlimit_kbps: u64,
+) -> Result<()> {
+    let total_size = entry.size.max(0) as u64;
+    let bytes = fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
+    if bytes.len() as u64 != total_size {
+        bail!(
+            "source changed size while sending {} (expected {}, read {})",
+            entry.rel_path,
+            total_size,
+            bytes.len()
+        );
+    }
+    let progress = progress::start_transfer(
+        destination_id,
+        destination_root,
+        &entry.rel_path,
+        total_size,
+        0,
+    );
+    let path = put_file_api_path(destination_root, cycle_id, entry);
+    let ack: TransferAck = remote_post_bytes(destination, &path, &bytes, timeout)?;
+    if !ack.ok {
+        bail!("peer rejected put-file transfer");
+    }
+    progress.update(total_size);
+    throttle_after_transfer(bytes.len(), bwlimit_kbps);
+    Ok(())
+}
+
+/// Send a changed file as an rsync-style delta against the copy the destination
+/// already holds. Falls back to a full transfer when the destination has no
+/// usable basis or the delta would not be smaller.
+#[allow(clippy::too_many_arguments)]
+fn send_file_delta(
+    destination: &crate::core::config::MachineConfig,
+    destination_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    src: &Path,
+    timeout: Duration,
+    bwlimit_kbps: u64,
+) -> Result<()> {
+    let sums_req = TransferBlockSumsRequest {
+        root: destination_root.to_path_buf(),
+        rel_path: entry.rel_path.clone(),
+    };
+    let sums: delta::BlockSums =
+        remote_post_json(destination, "/api/transfer/block-sums", &sums_req, timeout)?;
+    if sums.blocks.is_empty() {
+        return send_file_tcp(
+            destination,
+            destination_root,
+            destination_id,
+            cycle_id,
+            entry,
+            src,
+            timeout,
+            bwlimit_kbps,
+        );
+    }
+
+    let new_data = fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
+    if new_data.len() as u64 != entry.size.max(0) as u64 {
+        bail!(
+            "source changed size while sending {} (expected {}, read {})",
+            entry.rel_path,
+            entry.size,
+            new_data.len()
+        );
+    }
+    let delta_bytes = delta::build_delta(&new_data, &sums);
+    // If the delta saves little, a plain chunked transfer avoids the basis read
+    // on the destination; fall back unless we beat ~90% of the file size.
+    if delta_bytes.len() as u64 >= new_data.len() as u64 / 10 * 9 {
+        return send_file_tcp(
+            destination,
+            destination_root,
+            destination_id,
+            cycle_id,
+            entry,
+            src,
+            timeout,
+            bwlimit_kbps,
+        );
+    }
+    let full_hash = blake3::hash(&new_data).to_hex().to_string();
+    let progress = progress::start_transfer(
+        destination_id,
+        destination_root,
+        &entry.rel_path,
+        entry.size.max(0) as u64,
+        0,
+    );
+    let path = apply_delta_api_path(destination_root, cycle_id, entry, &full_hash);
+    let ack: TransferAck = remote_post_bytes(destination, &path, &delta_bytes, timeout)?;
+    if !ack.ok {
+        bail!("peer rejected delta transfer for {}", entry.rel_path);
+    }
+    progress.update(entry.size.max(0) as u64);
+    throttle_after_transfer(delta_bytes.len(), bwlimit_kbps);
+    Ok(())
+}
+
+fn apply_delta_api_path(
+    root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    full_hash: &str,
+) -> String {
+    format!(
+        "/api/transfer/apply-delta?root={}&rel_path={}&cycle_id={}&size={}&mtime_ns={}&mode={}&full_hash={}",
+        encode_query_component(&root.to_string_lossy()),
+        encode_query_component(&entry.rel_path),
+        cycle_id,
+        entry.size,
+        entry.mtime_ns,
+        entry.mode,
+        encode_query_component(full_hash)
+    )
+}
+
+fn put_file_api_path(root: &Path, cycle_id: i64, entry: &SnapshotEntry) -> String {
+    format!(
+        "/api/transfer/put-file?root={}&rel_path={}&cycle_id={}&size={}&mtime_ns={}&mode={}",
+        encode_query_component(&root.to_string_lossy()),
+        encode_query_component(&entry.rel_path),
+        cycle_id,
+        entry.size,
+        entry.mtime_ns,
+        entry.mode
+    )
 }
 
 fn send_symlink_tcp(
@@ -1162,66 +1543,80 @@ fn sync_directory_with_transfer(
     )?;
     let dst_map = map_entries(&dst_snapshot);
 
-    for entry in source_snapshot {
-        if let Some(existing) = dst_map.get(&entry.rel_path) {
-            if existing.file_type != entry.file_type {
-                remove_path_on_machine(
-                    dst_machine_id,
-                    dst_machine,
-                    dst_root,
-                    &entry.rel_path,
-                    cycle_id,
-                    timeout,
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to replace destination path type for {}",
-                        entry.rel_path
-                    )
-                })?;
-            }
-        }
-    }
+    // 1. Remove destination entries whose type no longer matches the source
+    //    (e.g. a file that is now a directory). Deepest paths first.
+    let mut type_mismatch: Vec<String> = source_snapshot
+        .iter()
+        .filter(|entry| {
+            dst_map
+                .get(&entry.rel_path)
+                .is_some_and(|existing| existing.file_type != entry.file_type)
+        })
+        .map(|entry| entry.rel_path.clone())
+        .collect();
+    type_mismatch.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
+    remove_paths_on_machine(
+        dst_machine_id,
+        dst_machine,
+        dst_root,
+        &type_mismatch,
+        cycle_id,
+        timeout,
+    )
+    .context("failed to replace destination paths whose type changed")?;
 
-    for entry in source_snapshot
+    // 2. Create every needed directory in one bulk request (parents first),
+    //    replacing one HTTP round-trip per directory.
+    let mut dirs: Vec<TransferDirSpec> = source_snapshot
         .iter()
         .filter(|entry| entry.file_type == "dir")
-    {
-        prepare_dir_on_machine(
-            dst_machine_id,
-            dst_machine,
-            dst_root,
-            Some(&entry.rel_path),
-            Some(entry.mode),
-            timeout,
-        )?;
-    }
+        .map(|entry| TransferDirSpec {
+            rel_path: entry.rel_path.clone(),
+            mode: entry.mode,
+        })
+        .collect();
+    dirs.sort_by(|a, b| {
+        path_depth(&a.rel_path)
+            .cmp(&path_depth(&b.rel_path))
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+    prepare_dirs_on_machine(dst_machine_id, dst_machine, dst_root, &dirs, timeout)
+        .context("failed to create destination directories")?;
 
-    for entry in source_snapshot
+    // 3. Transfer changed/missing files and symlinks concurrently. A file that
+    //    already exists on the destination (same type) is eligible for an
+    //    rsync-style delta against the copy that is there.
+    let pending: Vec<(&SnapshotEntry, bool)> = source_snapshot
         .iter()
         .filter(|entry| entry.file_type == "file" || entry.file_type == "symlink")
-    {
-        let needs_copy = match dst_map.get(&entry.rel_path) {
-            Some(existing) => !entries_match(entry, existing, sync.checksum),
-            None => true,
-        };
-        if !needs_copy {
-            continue;
-        }
-        push_entry_between_machines(
-            source_machine_id,
-            source_machine,
-            source_root,
-            dst_machine,
-            dst_root,
-            destination_id,
-            cycle_id,
-            entry,
-            sync,
-        )
-        .with_context(|| format!("failed to transfer {}", entry.rel_path))?;
-    }
+        .filter_map(|entry| match dst_map.get(&entry.rel_path) {
+            Some(existing) if entries_match(entry, existing, sync) => None,
+            Some(existing) => Some((entry, existing.file_type == "file" && entry.file_type == "file")),
+            None => Some((entry, false)),
+        })
+        .collect();
+    let transfer_started = Instant::now();
+    let transferred = push_entries_parallel(
+        source_machine_id,
+        source_machine,
+        source_root,
+        dst_machine,
+        dst_root,
+        destination_id,
+        cycle_id,
+        &pending,
+        sync,
+    )?;
+    info!(
+        destination = destination_id,
+        cycle_id,
+        dirs = dirs.len(),
+        files = transferred,
+        elapsed_ms = transfer_started.elapsed().as_millis() as u64,
+        "destination transfer phase complete"
+    );
 
+    // 4. Mirror: remove destination paths the source no longer has (deepest first).
     if sync.mirror {
         let mut extra_paths: Vec<String> = dst_map
             .keys()
@@ -1231,18 +1626,18 @@ fn sync_directory_with_transfer(
             .cloned()
             .collect();
         extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
-        for rel in extra_paths {
-            remove_path_on_machine(
-                dst_machine_id,
-                dst_machine,
-                dst_root,
-                &rel,
-                cycle_id,
-                timeout,
-            )
-            .with_context(|| format!("failed to remove extra destination path {rel}"))?;
-        }
+        remove_paths_on_machine(
+            dst_machine_id,
+            dst_machine,
+            dst_root,
+            &extra_paths,
+            cycle_id,
+            timeout,
+        )
+        .context("failed to remove extra destination paths")?;
     }
+
+    cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, timeout).ok();
 
     let actual = snapshot_on_machine(
         dst_machine_id,
@@ -1395,10 +1790,11 @@ fn sync_file_with_transfer(
         )?;
         let dst_map = map_entries(&dst_snapshot);
         let needs_copy = match dst_map.get(&entry.rel_path) {
-            Some(existing) => !entries_match(entry, existing, sync.checksum),
+            Some(existing) => !entries_match(entry, existing, sync),
             None => true,
         };
         if needs_copy {
+            let mut use_delta = entry.file_type == "file";
             if let Some(existing) = dst_map.get(&entry.rel_path) {
                 if existing.file_type != entry.file_type {
                     remove_path_on_machine(
@@ -1409,7 +1805,10 @@ fn sync_file_with_transfer(
                         cycle_id,
                         timeout,
                     )?;
+                    use_delta = false;
                 }
+            } else {
+                use_delta = false;
             }
             push_entry_between_machines(
                 source_machine_id,
@@ -1420,6 +1819,7 @@ fn sync_file_with_transfer(
                 destination_id,
                 cycle_id,
                 entry,
+                use_delta,
                 sync,
             )?;
         }
@@ -1563,6 +1963,79 @@ fn remove_path_on_machine(
     Ok(())
 }
 
+/// Maximum number of directory/path entries packed into a single bulk request.
+const BULK_BATCH_SIZE: usize = 20_000;
+
+fn prepare_dirs_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    dirs: &[TransferDirSpec],
+    timeout: Duration,
+) -> Result<()> {
+    for chunk in dirs.chunks(BULK_BATCH_SIZE) {
+        let req = TransferPrepareDirsRequest {
+            root: root.to_path_buf(),
+            dirs: chunk.to_vec(),
+        };
+        let ack = if machine_id == "local" {
+            transfer_prepare_dirs(req)?
+        } else {
+            remote_post_json(machine, "/api/transfer/prepare-dirs", &req, timeout)?
+        };
+        if !ack.ok {
+            bail!("peer rejected prepare directories request");
+        }
+    }
+    Ok(())
+}
+
+fn remove_paths_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    rel_paths: &[String],
+    cycle_id: i64,
+    timeout: Duration,
+) -> Result<()> {
+    for chunk in rel_paths.chunks(BULK_BATCH_SIZE) {
+        let req = TransferRemovePathsRequest {
+            root: root.to_path_buf(),
+            rel_paths: chunk.to_vec(),
+            cycle_id,
+        };
+        let ack = if machine_id == "local" {
+            transfer_remove_paths(req)?
+        } else {
+            remote_post_json(machine, "/api/transfer/remove-paths", &req, timeout)?
+        };
+        if !ack.ok {
+            bail!("peer rejected remove paths request");
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_tmp_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    cycle_id: i64,
+    timeout: Duration,
+) -> Result<()> {
+    let req = TransferCleanupTmpRequest {
+        root: root.to_path_buf(),
+        cycle_id,
+    };
+    if machine_id == "local" {
+        transfer_cleanup_tmp(req)?;
+    } else {
+        let _: TransferAck = remote_post_json(machine, "/api/transfer/cleanup-tmp", &req, timeout)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn push_entry_between_machines(
     source_machine_id: &str,
     source_machine: &crate::core::config::MachineConfig,
@@ -1572,6 +2045,7 @@ fn push_entry_between_machines(
     destination_id: &str,
     cycle_id: i64,
     entry: &SnapshotEntry,
+    use_delta: bool,
     sync: &NativeSyncConfig,
 ) -> Result<()> {
     let req = TransferPushFileRequest {
@@ -1584,6 +2058,7 @@ fn push_entry_between_machines(
         cycle_id,
         transfer_timeout_secs: sync.transfer_timeout_secs.max(1),
         bwlimit_kbps: sync.bwlimit_kbps,
+        use_delta,
     };
     let ack = if source_machine_id == "local" {
         transfer_push_file(req)?
@@ -1601,6 +2076,90 @@ fn push_entry_between_machines(
     Ok(())
 }
 
+fn resolve_parallelism(configured: usize, work_items: usize) -> usize {
+    let requested = if configured == 0 {
+        DEFAULT_MAX_PARALLEL_TRANSFERS
+    } else {
+        configured
+    };
+    requested.clamp(1, work_items.max(1))
+}
+
+/// Transfer the given entries to the destination using a bounded worker pool.
+/// Returns the number of entries transferred. On the first failure the workers
+/// stop pulling new work and that error is returned.
+#[allow(clippy::too_many_arguments)]
+fn push_entries_parallel(
+    source_machine_id: &str,
+    source_machine: &crate::core::config::MachineConfig,
+    source_root: &Path,
+    dst_machine: &crate::core::config::MachineConfig,
+    dst_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    entries: &[(&SnapshotEntry, bool)],
+    sync: &NativeSyncConfig,
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let workers = resolve_parallelism(sync.max_parallel_transfers, entries.len());
+    let next = AtomicUsize::new(0);
+    let done = AtomicU64::new(0);
+    let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    if first_error
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .is_some()
+                    {
+                        break;
+                    }
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= entries.len() {
+                        break;
+                    }
+                    let (entry, use_delta) = entries[idx];
+                    match push_entry_between_machines(
+                        source_machine_id,
+                        source_machine,
+                        source_root,
+                        dst_machine,
+                        dst_root,
+                        destination_id,
+                        cycle_id,
+                        entry,
+                        use_delta,
+                        sync,
+                    )
+                    .with_context(|| format!("failed to transfer {}", entry.rel_path))
+                    {
+                        Ok(()) => {
+                            done.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            let mut slot = first_error.lock().unwrap_or_else(|e| e.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(err);
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(err) = first_error.into_inner().unwrap_or_else(|err| err.into_inner()) {
+        return Err(err);
+    }
+    Ok(done.load(Ordering::Relaxed) as usize)
+}
+
 fn verify_snapshot_entries(
     expected: &[SnapshotEntry],
     actual: &[SnapshotEntry],
@@ -1611,7 +2170,7 @@ fn verify_snapshot_entries(
     let actual = map_entries(actual);
     for (rel, want) in &expected {
         match actual.get(rel) {
-            Some(got) if entries_match(want, got, sync.checksum) => {}
+            Some(got) if entries_match(want, got, sync) => {}
             Some(_) => bail!("destination mismatch at {rel}"),
             None => bail!("destination missing {rel}"),
         }
@@ -2159,7 +2718,7 @@ fn sync_destination(
             .filter(|e| e.file_type == "file" || e.file_type == "symlink")
         {
             let needs_copy = match dst_map.get(&entry.rel_path) {
-                Some(existing) => !entries_match(entry, existing, sync.checksum),
+                Some(existing) => !entries_match(entry, existing, sync),
                 None => true,
             };
             if !needs_copy {
@@ -2229,7 +2788,7 @@ fn sync_file_to_path(
         };
         let needs_copy = existing
             .as_ref()
-            .map(|existing| !entries_match(&entry, existing, sync.checksum))
+            .map(|existing| !entries_match(&entry, existing, sync))
             .unwrap_or(true);
 
         if needs_copy {
@@ -2242,7 +2801,7 @@ fn sync_file_to_path(
                 final_path,
             )?;
         }
-        verify_file_target(final_path, &entry, sync.checksum)?;
+        verify_file_target(final_path, &entry, sync)?;
         Ok(())
     })();
     cleanup_tmp_cycle(dst_root, cycle_id);
@@ -2268,12 +2827,16 @@ fn copy_single_entry(
     }
 }
 
-fn verify_file_target(final_path: &Path, expected: &SnapshotEntry, checksum: bool) -> Result<()> {
+fn verify_file_target(
+    final_path: &Path,
+    expected: &SnapshotEntry,
+    sync: &NativeSyncConfig,
+) -> Result<()> {
     if !final_path.exists() && fs::symlink_metadata(final_path).is_err() {
         bail!("destination missing {}", final_path.display());
     }
-    let actual = snapshot_entry(final_path, expected.rel_path.clone(), checksum)?;
-    if !entries_match(expected, &actual, checksum) {
+    let actual = snapshot_entry(final_path, expected.rel_path.clone(), sync.checksum)?;
+    if !entries_match(expected, &actual, sync) {
         bail!("destination mismatch at {}", final_path.display());
     }
     Ok(())
@@ -2558,7 +3121,7 @@ fn verify_destination(
             continue;
         }
         match actual.get(rel) {
-            Some(got) if entries_match(want, got, sync.checksum) => {}
+            Some(got) if entries_match(want, got, sync) => {}
             Some(_) => bail!("destination mismatch at {rel}"),
             None => bail!("destination missing {rel}"),
         }
@@ -2576,17 +3139,22 @@ fn verify_destination(
     Ok(())
 }
 
-fn entries_match(left: &SnapshotEntry, right: &SnapshotEntry, checksum: bool) -> bool {
+fn entries_match(left: &SnapshotEntry, right: &SnapshotEntry, sync: &NativeSyncConfig) -> bool {
     if left.file_type != right.file_type {
         return false;
     }
     match left.file_type.as_str() {
         "dir" => true,
-        "file" if checksum => left.size == right.size && left.hash == right.hash,
-        "file" => left.size == right.size && left.mtime_ns == right.mtime_ns,
+        "file" if sync.checksum => left.size == right.size && left.hash == right.hash,
+        "file" => left.size == right.size && mtimes_match(left.mtime_ns, right.mtime_ns, sync),
         "symlink" => left.hash == right.hash,
         _ => false,
     }
+}
+
+fn mtimes_match(left_ns: i64, right_ns: i64, sync: &NativeSyncConfig) -> bool {
+    let window_ns = (sync.modify_window_secs as i128) * 1_000_000_000;
+    (left_ns as i128 - right_ns as i128).abs() <= window_ns
 }
 
 fn map_entries(entries: &[SnapshotEntry]) -> BTreeMap<String, SnapshotEntry> {

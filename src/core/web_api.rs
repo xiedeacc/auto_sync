@@ -19,12 +19,15 @@ use crate::core::config::{AppConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
 use crate::core::state::{DestinationView, SnapshotEntry};
 use crate::core::sync::{
-    SyncRequestMode, TransferAck, TransferPathInfo, TransferPathInfoRequest,
-    TransferPrepareDirRequest, TransferPushFileRequest, TransferReceiveFileChunkQuery,
-    TransferReceiveSymlinkRequest, TransferRemovePathRequest, TransferSnapshotRequest,
-    transfer_file_offset, transfer_finish_file, transfer_path_info, transfer_prepare_dir,
-    transfer_push_file, transfer_receive_file_chunk, transfer_receive_symlink,
-    transfer_remove_path, transfer_snapshot,
+    SyncRequestMode, TransferAck, TransferApplyDeltaQuery, TransferBlockSumsRequest,
+    TransferCleanupTmpRequest, TransferPathInfo, TransferPathInfoRequest, TransferPrepareDirRequest,
+    TransferPrepareDirsRequest, TransferPushFileRequest, TransferPutFileQuery,
+    TransferReceiveFileChunkQuery, TransferReceiveSymlinkRequest, TransferRemovePathRequest,
+    TransferRemovePathsRequest, TransferSnapshotRequest, transfer_apply_delta, transfer_block_sums,
+    transfer_cleanup_tmp, transfer_file_offset, transfer_finish_file, transfer_path_info,
+    transfer_prepare_dir, transfer_prepare_dirs, transfer_push_file, transfer_put_file,
+    transfer_receive_file_chunk, transfer_receive_symlink, transfer_remove_path,
+    transfer_remove_paths, transfer_snapshot,
 };
 
 pub fn router(backend: Backend) -> Router {
@@ -45,8 +48,14 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/transfer/snapshot", post(api_transfer_snapshot))
         .route("/api/transfer/path-info", post(api_transfer_path_info))
         .route("/api/transfer/prepare-dir", post(api_transfer_prepare_dir))
+        .route("/api/transfer/prepare-dirs", post(api_transfer_prepare_dirs))
         .route("/api/transfer/remove-path", post(api_transfer_remove_path))
+        .route("/api/transfer/remove-paths", post(api_transfer_remove_paths))
+        .route("/api/transfer/cleanup-tmp", post(api_transfer_cleanup_tmp))
         .route("/api/transfer/file-offset", post(api_transfer_file_offset))
+        .route("/api/transfer/put-file", post(api_transfer_put_file))
+        .route("/api/transfer/block-sums", post(api_transfer_block_sums))
+        .route("/api/transfer/apply-delta", post(api_transfer_apply_delta))
         .route(
             "/api/transfer/receive-file-chunk",
             post(api_transfer_receive_file_chunk),
@@ -213,10 +222,48 @@ async fn api_transfer_prepare_dir(
     Ok(Json(transfer_prepare_dir(req)?))
 }
 
+async fn api_transfer_prepare_dirs(
+    Json(req): Json<TransferPrepareDirsRequest>,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_prepare_dirs(req)?))
+}
+
 async fn api_transfer_remove_path(
     Json(req): Json<TransferRemovePathRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
     Ok(Json(transfer_remove_path(req)?))
+}
+
+async fn api_transfer_remove_paths(
+    Json(req): Json<TransferRemovePathsRequest>,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_remove_paths(req)?))
+}
+
+async fn api_transfer_cleanup_tmp(
+    Json(req): Json<TransferCleanupTmpRequest>,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_cleanup_tmp(req)?))
+}
+
+async fn api_transfer_put_file(
+    Query(query): Query<TransferPutFileQuery>,
+    body: Bytes,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_put_file(query, &body)?))
+}
+
+async fn api_transfer_block_sums(
+    Json(req): Json<TransferBlockSumsRequest>,
+) -> Result<Json<crate::core::sync::delta::BlockSums>, ApiError> {
+    Ok(Json(transfer_block_sums(req)?))
+}
+
+async fn api_transfer_apply_delta(
+    Query(query): Query<TransferApplyDeltaQuery>,
+    body: Bytes,
+) -> Result<Json<TransferAck>, ApiError> {
+    Ok(Json(transfer_apply_delta(query, &body)?))
 }
 
 async fn api_transfer_file_offset(

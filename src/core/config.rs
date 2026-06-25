@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_TCP_CONNECTION_POOL_SIZE: usize = 100;
 pub const DEFAULT_TRANSFER_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_MAX_PARALLEL_TRANSFERS: usize = 16;
+pub const DEFAULT_MODIFY_WINDOW_SECS: u64 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -40,6 +42,13 @@ pub struct NativeSyncConfig {
     pub debug_logs: bool,
     pub transfer_timeout_secs: u64,
     pub bwlimit_kbps: u64,
+    /// Number of files transferred concurrently to a destination. 0 = auto.
+    pub max_parallel_transfers: usize,
+    /// Files whose size matches and whose mtime differs by at most this many
+    /// seconds are treated as identical (rsync-style modify-window). This keeps
+    /// cross-platform timestamp granularity (Windows ↔ Linux/ZFS) from forcing
+    /// endless re-transfers. Only used when checksum is disabled.
+    pub modify_window_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +207,8 @@ impl Default for NativeSyncConfig {
             debug_logs: false,
             transfer_timeout_secs: DEFAULT_TRANSFER_TIMEOUT_SECS,
             bwlimit_kbps: 0,
+            max_parallel_transfers: DEFAULT_MAX_PARALLEL_TRANSFERS,
+            modify_window_secs: DEFAULT_MODIFY_WINDOW_SECS,
         }
     }
 }
