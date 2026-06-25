@@ -613,8 +613,12 @@ function Ensure-AutoSyncStartup {
     )
 
     $daemonExe = Join-Path $BinDir "auto_syncd.exe"
+    $guiExe = Join-Path $BinDir "auto_sync_gui.exe"
     if (-not (Test-Path -LiteralPath $daemonExe)) {
         throw "Missing daemon binary: $daemonExe"
+    }
+    if (-not (Test-Path -LiteralPath $guiExe)) {
+        throw "Missing GUI binary: $guiExe"
     }
 
     $startupDir = [Environment]::GetFolderPath("Startup")
@@ -622,12 +626,15 @@ function Ensure-AutoSyncStartup {
         throw "Could not locate current user's Startup folder."
     }
     New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
-    $launcher = Join-Path $startupDir "auto_syncd-start.vbs"
-    $escapedExe = $daemonExe.Replace('"', '""')
+    Remove-Item -LiteralPath (Join-Path $startupDir "auto_syncd-start.vbs") -Force -ErrorAction SilentlyContinue
+    $launcher = Join-Path $startupDir "auto_sync-start.vbs"
+    $escapedDaemonExe = $daemonExe.Replace('"', '""')
+    $escapedGuiExe = $guiExe.Replace('"', '""')
     $escapedConfig = $ConfigPath.Replace('"', '""')
     $script = @(
         'Set shell = CreateObject("WScript.Shell")',
-        "shell.Run """"""$escapedExe"""" --config """"$escapedConfig"""""", 0, False"
+        "shell.Run """"""$escapedDaemonExe"""" --config """"$escapedConfig"""""", 0, False",
+        "shell.Run """"""$escapedGuiExe"""" --config """"$escapedConfig"""""", 1, False"
     )
     Set-Content -LiteralPath $launcher -Value $script -Encoding ascii
 
@@ -635,10 +642,13 @@ function Ensure-AutoSyncStartup {
         -ArgumentList @("--config", $ConfigPath) `
         -WorkingDirectory (Split-Path -Parent $BinDir) `
         -WindowStyle Hidden
+    Start-Process -FilePath $guiExe `
+        -ArgumentList @("--config", $ConfigPath) `
+        -WorkingDirectory (Split-Path -Parent $BinDir)
 
     [PSCustomObject]@{
         Launcher = $launcher
-        Process = "started"
+        Processes = "auto_syncd, auto_sync_gui started"
     }
 }
 
@@ -726,11 +736,11 @@ if ($disabledService) {
     Write-Host "auto_syncd service: $disabledService"
 }
 if ($startupResult) {
-    Write-Host "auto_syncd startup launcher: $($startupResult.Launcher)"
-    Write-Host "auto_syncd process: $($startupResult.Process)"
+    Write-Host "auto_sync startup launcher: $($startupResult.Launcher)"
+    Write-Host "auto_sync processes: $($startupResult.Processes)"
 }
 else {
-    Write-Host "auto_syncd startup setup skipped by -SkipStartup"
+    Write-Host "auto_sync startup setup skipped by -SkipStartup"
 }
 if ($authorizedKeyResult) {
     Write-Host "authorized_keys: $($authorizedKeyResult.Path) ($($authorizedKeyResult.Action))"

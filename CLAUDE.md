@@ -4,7 +4,7 @@
   `auto_syncd`, `auto_syncctl`, `auto_sync_web`, and `auto_sync_gui`.
 - After stopping old processes, run an incremental debug build: `cargo build --bins`.
 - On Windows, before starting any `auto_sync` process, copy the freshly compiled binaries into `D:\code\auto_sync\bin` and start them only from that `bin\` directory, never directly from `target\debug\` or `target\release\`.
-- Use the Windows deploy script for full local deployment: `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`. On Windows, deploy binaries into the repository `bin\` directory and use a current-user Startup launcher for `auto_syncd`; do not install or start `auto_syncd` as a Windows service.
+- Use the Windows deploy script for full local deployment: `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`. On Windows, deploy binaries into the repository `bin\` directory and use a current-user Startup launcher for both `auto_syncd` and `auto_sync_gui`; always start both from `bin\` after deployment, and do not install or start `auto_syncd` as a Windows service.
 - When the user asks to deploy or when real remote E2E tests/debugging need the latest code, always use this update path:
   1. On Windows, commit all intended repository changes and push them.
   2. Deploy this Windows machine with `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`.

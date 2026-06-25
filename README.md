@@ -19,7 +19,7 @@ only mismatched files and symlinks, optionally mirror-delete destination extras,
 and verify the destination after transfer.
 
 Windows deployment can use the system OpenSSH Server optional feature when
-requested, but the daemon itself is installed as a current-user Startup
+requested, but the daemon and GUI are launched through a current-user Startup
 launcher rather than a Windows service.
 
 ## Build
@@ -65,9 +65,10 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 `deploy_windows.ps1` is run locally on Windows, builds release binaries into
 the repository `bin\` directory, keeps config under `conf\`, and creates a
-current-user Startup launcher for `auto_syncd` instead of installing it as a
-Windows service. OpenSSH setup is opt-in via `-InstallSshd`. NAS is Ubuntu x64
-and builds on NAS itself under `/root/src/rust/auto_sync`; use
+current-user Startup launcher for both `auto_syncd` and `auto_sync_gui` instead
+of installing `auto_syncd` as a Windows service. OpenSSH setup is opt-in via
+`-InstallSshd`. NAS is Ubuntu x64 and builds on NAS itself under
+`/root/src/rust/auto_sync`; use
 `bootstrap_nas_ubuntu.sh` once to install the build environment and clone the
 repo, then use `git pull` plus `scripts/deploy_local.sh` on NAS for
 deployments. The
