@@ -56,6 +56,7 @@ struct ScanProgressState {
     current_path: String,
     entries_seen: u64,
     updated_at: Instant,
+    last_write_at: Instant,
     updated_at_ms: u128,
 }
 
@@ -107,9 +108,13 @@ impl ScanProgressGuard {
         }
         state.current_path = current_path.to_string_lossy().to_string();
         state.entries_seen = entries_seen;
-        state.updated_at = Instant::now();
+        let now = Instant::now();
+        state.updated_at = now;
         state.updated_at_ms = now_ms();
-        write_scan_progress_file(&state.view());
+        if now.duration_since(state.last_write_at) >= Duration::from_millis(250) {
+            state.last_write_at = now;
+            write_scan_progress_file(&state.view());
+        }
     }
 }
 
@@ -203,6 +208,7 @@ pub fn start_scan(root_path: &Path) -> ScanProgressGuard {
         current_path: root_path,
         entries_seen: 0,
         updated_at: now,
+        last_write_at: now,
         updated_at_ms: now_ms(),
     });
     if let Some(state) = progress.as_ref() {

@@ -2253,11 +2253,12 @@ fn take_snapshot_with_excludes(
             continue;
         }
         entries_seen += 1;
-        if item.file_type().is_dir() {
-            scan_progress.update(path, entries_seen);
-        } else if entries_seen % 256 == 0 {
-            scan_progress.update(path.parent().unwrap_or(root), entries_seen);
-        }
+        let scan_path = if item.file_type().is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(root)
+        };
+        scan_progress.update(scan_path, entries_seen);
         let rel = path
             .strip_prefix(root)
             .with_context(|| format!("failed to strip root from {}", path.display()))?;

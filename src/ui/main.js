@@ -5,6 +5,7 @@ const RUNTIME_STATUS_POLL_MS = 1000;
 let cfg = null;
 let statuses = [];
 let runtimeStatus = null;
+let lastRuntimeScan = null;
 let machineStatus = { online: 1, total: 1, machines: [] };
 let busy = false;
 let statusBusyMessage = "";
@@ -251,6 +252,7 @@ function updateStatusBar() {
   if (transfer) {
     const destination = transfer.destination_id || transfer.destination_path || "-";
     const file = transfer.rel_path || "-";
+    const fileLabel = compactStatusPath(file, 56);
     const speed = formatBytesPerSecond(transfer.bytes_per_sec || 0);
     const progress = formatTransferProgress(transfer);
     const title = `Destination: ${destination}\nFile: ${file}\nSpeed: ${speed}${progress ? `\n${progress}` : ""}`;
@@ -258,22 +260,23 @@ function updateStatusBar() {
       <span class="status-transfer" title="${escapeAttr(title)}">
         <span class="status-transfer-part status-transfer-label">Backing up</span>
         <span class="status-transfer-part">${escapeHtml(destination)}</span>
-        <span class="status-transfer-part status-transfer-main">${escapeHtml(file)}</span>
+        <span class="status-transfer-part status-transfer-main">${escapeHtml(fileLabel)}</span>
         <span class="status-transfer-part status-transfer-speed">${escapeHtml(speed)}</span>
       </span>
     `;
     el.statusText.title = title;
   } else if (runtimeStatus && runtimeStatus.scan) {
-    const scan = runtimeStatus.scan;
-    const current = displayPath(scan.current_path || scan.root_path || "source");
-    const root = displayPath(scan.root_path || current);
-    const count = Number(scan.entries_seen || 0);
-    const suffix = count ? ` · ${count} entries` : "";
-    const title = `Scanning: ${current}\nRoot: ${root}${count ? `\nEntries: ${count}` : ""}`;
-    const label = `Scanning ${compactStatusPath(current, 86)}${suffix}`;
-    el.statusText.innerHTML = `<span class="status-scan" title="${escapeAttr(title)}">${escapeHtml(label)}</span>`;
-    el.statusText.title = title;
+    lastRuntimeScan = {
+      ...runtimeStatus.scan,
+      received_at_ms: Date.now(),
+    };
+    renderScanLikeStatus("Scanning", lastRuntimeScan);
+  } else if (busy && lastRuntimeScan) {
+    renderScanLikeStatus("Syncing", lastRuntimeScan);
   } else {
+    if (!busy) {
+      lastRuntimeScan = null;
+    }
     const message = statusBusyMessage || el.message.textContent || "Ready";
     el.statusText.textContent = message;
     el.statusText.title = message;
@@ -285,6 +288,17 @@ function updateStatusBar() {
   const buildText = `${commit} · ${time}`;
   el.statusBuild.textContent = buildText;
   el.statusBuild.title = buildText;
+}
+
+function renderScanLikeStatus(verb, scan) {
+  const current = displayPath(scan.current_path || scan.root_path || "source");
+  const root = displayPath(scan.root_path || current);
+  const count = Number(scan.entries_seen || 0);
+  const suffix = count ? ` · ${count} entries` : "";
+  const title = `${verb}: ${current}\nRoot: ${root}${count ? `\nEntries: ${count}` : ""}`;
+  const label = `${verb} ${compactStatusPath(current, 86)}${suffix}`;
+  el.statusText.innerHTML = `<span class="status-scan" title="${escapeAttr(title)}">${escapeHtml(label)}</span>`;
+  el.statusText.title = title;
 }
 
 function updateMachineStatusUi() {
