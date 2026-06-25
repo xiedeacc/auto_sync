@@ -520,7 +520,7 @@ function renderSourcePanel() {
           <label>ID</label>
           <label>Source Path</label>
           <input value="${escapeAttr(source.id)}" data-field="source-id">
-          <input class="path-picker" value="${escapeAttr(source.src)}" data-field="source-src" readonly title="${escapeAttr(machineLabel(source.machine_id))}">
+          <input class="path-picker" value="${escapeAttr(displayPath(source.src))}" data-field="source-src" readonly title="${escapeAttr(machineLabel(source.machine_id))}">
         </div>
         <div class="row-right source-right">
           <label>Latest Cycle</label>
@@ -1762,7 +1762,12 @@ function destinationSyncStatusMessage(source, mode) {
     return "Scanning for changes...";
   }
   const path = source && source.src ? source.src : "source";
-  return `Scanning ${path} (dir)`;
+  return `Scanning ${displayPath(path)}`;
+}
+
+function displayPath(value) {
+  const path = String(valueOr(value, ""));
+  return path.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\/, "");
 }
 
 function formatTransferProgress(transfer) {
