@@ -55,6 +55,7 @@ pub fn sync_gate() -> &'static Mutex<()> {
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     let _serialized = sync_gate().lock().unwrap_or_else(|err| err.into_inner());
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
+    configure_fsync(cfg.app.sync.fsync);
     progress::configure_progress_file(&cfg.app.data_db);
     state.ensure_config(cfg)?;
     loop {
@@ -3278,11 +3279,30 @@ fn create_symlink(src: &Path, target: &Path, tmp: &Path) -> io::Result<()> {
     }
 }
 
+/// Whether received files are fsync'd for durability. Off by default; an fsync
+/// per file is the dominant cost on sync filesystems like ZFS (see `fsync` in
+/// [`NativeSyncConfig`]). Set per process from config via [`configure_fsync`].
+static FSYNC_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn configure_fsync(enabled: bool) {
+    FSYNC_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+fn fsync_enabled() -> bool {
+    FSYNC_ENABLED.load(Ordering::Relaxed)
+}
+
 fn fsync_file(path: &Path) -> io::Result<()> {
+    if !fsync_enabled() {
+        return Ok(());
+    }
     File::open(path)?.sync_all()
 }
 
 fn fsync_parent(path: &Path) -> io::Result<()> {
+    if !fsync_enabled() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }

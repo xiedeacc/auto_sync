@@ -52,6 +52,10 @@ fn main() -> Result<()> {
     let _log_guard = init_logging(&cfg.app.log_dir, "auto_sync")?;
     info!(config = %args.config.display(), "auto_sync starting");
 
+    // Apply receiver-side policy up front so the web server (the destination of
+    // pushes) honours it even though it never runs the scheduler loop.
+    auto_sync::core::sync::configure_fsync(cfg.app.sync.fsync);
+
     let config_path = args
         .config
         .canonicalize()
