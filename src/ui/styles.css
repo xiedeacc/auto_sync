@@ -728,7 +728,8 @@ th {
   bottom: 0;
   z-index: 900;
   height: 42px;
-  display: flex;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) minmax(150px, auto);
   align-items: center;
   gap: 10px;
   padding: 0 12px;
@@ -765,6 +766,46 @@ th {
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-align: center;
+}
+
+.status-build {
+  min-width: 0;
+  max-width: 260px;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-transfer {
+  min-width: 0;
+  display: inline-grid;
+  grid-template-columns: minmax(52px, max-content) minmax(72px, 16ch) minmax(96px, 32ch) max-content;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  max-width: 100%;
+}
+
+.status-transfer-part {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-transfer-label {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.status-transfer-speed {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
 }
 
 .empty {
@@ -981,5 +1022,18 @@ th {
 
   .machine-form-actions button {
     flex: 1;
+  }
+
+  .status-bar {
+    grid-template-columns: 32px minmax(0, 1fr) minmax(96px, 28vw);
+  }
+
+  .status-transfer {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .status-transfer-part:not(.status-transfer-main) {
+    display: none;
   }
 }

@@ -1,12 +1,17 @@
 const invoke = invokeBackend;
 const STATUS_POLL_MS = 3000;
+const RUNTIME_STATUS_POLL_MS = 1000;
 
 let cfg = null;
 let statuses = [];
+let runtimeStatus = null;
 let machineStatus = { online: 1, total: 1, machines: [] };
 let busy = false;
+let statusBusyMessage = "";
 let statusPolling = false;
 let statusPollTimer = null;
+let runtimeStatusPollTimer = null;
+let runtimeStatusPolling = false;
 let folderPicker = null;
 let scheduleEditor = null;
 let excludeEditor = null;
@@ -21,6 +26,7 @@ const el = {
   config: document.getElementById("config"),
   statusConfig: document.getElementById("status-config"),
   statusText: document.getElementById("status-text"),
+  statusBuild: document.getElementById("status-build"),
   refresh: document.getElementById("refresh"),
   machineStatus: document.getElementById("machine-status"),
   folderModal: document.getElementById("folder-modal"),
@@ -94,6 +100,12 @@ async function loadAll() {
     errors.push(String(error));
   }
   try {
+    await loadRuntimeStatus();
+  } catch (error) {
+    runtimeStatus = null;
+    errors.push(String(error));
+  }
+  try {
     await loadMachines(false);
   } catch (error) {
     machineStatus = { online: 0, total: 0, machines: [] };
@@ -111,16 +123,23 @@ async function loadStatus() {
   statuses = await invoke("get_status");
 }
 
+async function loadRuntimeStatus() {
+  runtimeStatus = await invoke("get_runtime_status");
+  updateStatusBar();
+}
+
 async function loadMachines(discover = false) {
   machineStatus = await invoke(discover ? "discover_machines" : "get_machines");
   updateMachineStatusUi();
 }
 
 function startStatusPolling() {
-  if (statusPollTimer) {
-    return;
+  if (!statusPollTimer) {
+    statusPollTimer = setInterval(refreshStatusOnly, STATUS_POLL_MS);
   }
-  statusPollTimer = setInterval(refreshStatusOnly, STATUS_POLL_MS);
+  if (!runtimeStatusPollTimer) {
+    runtimeStatusPollTimer = setInterval(refreshRuntimeStatusOnly, RUNTIME_STATUS_POLL_MS);
+  }
 }
 
 async function refreshStatusOnly() {
@@ -134,6 +153,13 @@ async function refreshStatusOnly() {
       statuses = await invoke("get_status");
     } catch (error) {
       statuses = [];
+      errors.push(String(error));
+    }
+    try {
+      await loadRuntimeStatus();
+    } catch (error) {
+      runtimeStatus = null;
+      updateStatusBar();
       errors.push(String(error));
     }
     try {
@@ -151,6 +177,21 @@ async function refreshStatusOnly() {
     }
   } finally {
     statusPolling = false;
+  }
+}
+
+async function refreshRuntimeStatusOnly() {
+  if (runtimeStatusPolling) {
+    return;
+  }
+  runtimeStatusPolling = true;
+  try {
+    await loadRuntimeStatus();
+  } catch (_) {
+    runtimeStatus = null;
+    updateStatusBar();
+  } finally {
+    runtimeStatusPolling = false;
   }
 }
 
@@ -200,6 +241,37 @@ function updateStatusUi() {
         : (blocked ? blockedByLabel(status) : "Sync destination");
     }
   }
+}
+
+function updateStatusBar() {
+  const transfer = runtimeStatus && runtimeStatus.transfer;
+  if (transfer) {
+    const destination = transfer.destination_id || transfer.destination_path || "-";
+    const file = transfer.rel_path || "-";
+    const speed = formatBytesPerSecond(transfer.bytes_per_sec || 0);
+    const progress = formatTransferProgress(transfer);
+    const title = `Destination: ${destination}\nFile: ${file}\nSpeed: ${speed}${progress ? `\n${progress}` : ""}`;
+    el.statusText.innerHTML = `
+      <span class="status-transfer" title="${escapeAttr(title)}">
+        <span class="status-transfer-part status-transfer-label">Backing up</span>
+        <span class="status-transfer-part">${escapeHtml(destination)}</span>
+        <span class="status-transfer-part status-transfer-main">${escapeHtml(file)}</span>
+        <span class="status-transfer-part status-transfer-speed">${escapeHtml(speed)}</span>
+      </span>
+    `;
+    el.statusText.title = title;
+  } else {
+    const message = statusBusyMessage || el.message.textContent || "Ready";
+    el.statusText.textContent = message;
+    el.statusText.title = message;
+  }
+
+  const build = runtimeStatus && runtimeStatus.build;
+  const commit = (build && build.commit) || "unknown";
+  const time = (build && build.commit_time_beijing) || "unknown";
+  const buildText = `${commit} · ${time}`;
+  el.statusBuild.textContent = buildText;
+  el.statusBuild.title = buildText;
 }
 
 function updateMachineStatusUi() {
@@ -621,12 +693,12 @@ function bindSourceControls(source, sourceIndex, group) {
       updateStatusUi();
       return;
     }
-    runBusy("Syncing...", async () => {
+    runBusy("Scanning for changes...", async () => {
       await saveConfig();
       statuses = await invoke("sync_source_now", { sourceId: source.id });
       setMessage("");
       render();
-    });
+    }, { showMainMessage: false });
   };
   el.sourcePanel.querySelector('[data-action="add-source"]').onclick = addSource;
   el.sourcePanel.querySelector('[data-action="sync-all"]').onclick = syncAllNow;
@@ -719,7 +791,7 @@ function renderSyncRows(source, group) {
         updateStatusUi();
         return;
       }
-      runBusy("Syncing...", async () => {
+      runBusy("Scanning for changes...", async () => {
         await saveConfig();
         statuses = await invoke("sync_destination_now", {
           sourceId: source.id,
@@ -728,7 +800,7 @@ function renderSyncRows(source, group) {
         });
         setMessage("");
         render();
-      });
+      }, { showMainMessage: false });
     };
     body.appendChild(row);
   });
@@ -1630,24 +1702,32 @@ async function autoSaveConfig() {
 }
 
 async function syncAllNow() {
-  await runBusy("Syncing...", async () => {
+  await runBusy("Scanning for changes...", async () => {
     await saveConfig();
     statuses = await invoke("sync_now");
     setMessage("");
     render();
-  });
+  }, { showMainMessage: false });
 }
 
-async function runBusy(message, fn) {
+async function runBusy(message, fn, options = {}) {
   if (busy) return;
+  const showMainMessage = options.showMainMessage !== false;
   try {
     setBusy(true);
-    setMessage(message || "");
+    statusBusyMessage = message || "";
+    if (showMainMessage) {
+      setMessage(message || "");
+    } else {
+      updateStatusBar();
+    }
     await fn();
   } catch (error) {
     setMessage(String(error));
   } finally {
+    statusBusyMessage = "";
     setBusy(false);
+    updateStatusBar();
   }
 }
 
@@ -1663,8 +1743,33 @@ function setBusy(nextBusy) {
 function setMessage(text) {
   const value = text || "";
   el.message.textContent = value;
-  el.statusText.textContent = value || "Ready";
-  el.statusText.title = value || "Ready";
+  updateStatusBar();
+}
+
+function formatTransferProgress(transfer) {
+  const total = Number(transfer.total_bytes || 0);
+  if (!total) {
+    return "";
+  }
+  const transferred = Number(transfer.transferred_bytes || 0);
+  const percent = Math.min(100, Math.max(0, (transferred / total) * 100));
+  return `${formatBytes(transferred)} / ${formatBytes(total)} (${percent.toFixed(0)}%)`;
+}
+
+function formatBytesPerSecond(value) {
+  return `${formatBytes(value)}/s`;
+}
+
+function formatBytes(value) {
+  let size = Math.max(0, Number(value || 0));
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 || size >= 100 ? 0 : size >= 10 ? 1 : 2;
+  return `${size.toFixed(digits)} ${units[unit]}`;
 }
 
 function defaultUiConfig() {
@@ -1804,6 +1909,7 @@ async function invokeWeb(command, payload = {}) {
     add_machine: ["POST", "/api/machines"],
     remove_machine: ["DELETE", "/api/machines"],
     get_status: ["GET", "/api/status"],
+    get_runtime_status: ["GET", "/api/runtime-status"],
     sync_now: ["POST", "/api/sync-now"],
     sync_source_now: ["POST", "/api/sync-source-now"],
     sync_destination_now: ["POST", "/api/sync-destination-now"],

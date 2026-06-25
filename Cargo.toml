@@ -52,6 +52,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [build-dependencies]
+chrono = { version = "0.4", features = ["clock"] }
 tauri-build = { version = "2", optional = true }
 
 [features]

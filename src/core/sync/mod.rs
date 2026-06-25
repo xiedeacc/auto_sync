@@ -24,6 +24,7 @@ use crate::core::machines::{
     configure_tcp_connection_pool, encode_query_component, find_machine, remote_post_bytes,
     remote_post_json,
 };
+use crate::core::progress;
 use crate::core::state::{Cycle, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
 
@@ -34,6 +35,7 @@ const TRANSFER_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
+    progress::configure_progress_file(&cfg.app.data_db);
     state.ensure_config(cfg)?;
     loop {
         let mut progressed = false;
@@ -206,6 +208,8 @@ pub struct TransferPushFileRequest {
     pub entry: SnapshotEntry,
     pub destination: crate::core::config::MachineConfig,
     pub destination_root: PathBuf,
+    #[serde(default)]
+    pub destination_id: String,
     pub cycle_id: i64,
     #[serde(default = "default_transfer_timeout_secs")]
     pub transfer_timeout_secs: u64,
@@ -403,6 +407,7 @@ pub fn transfer_push_file(req: TransferPushFileRequest) -> Result<TransferAck> {
         "file" => send_file_tcp(
             &req.destination,
             &req.destination_root,
+            &req.destination_id,
             req.cycle_id,
             &req.entry,
             &src,
@@ -490,6 +495,7 @@ fn finish_received_file(
 fn send_file_tcp(
     destination: &crate::core::config::MachineConfig,
     destination_root: &Path,
+    destination_id: &str,
     cycle_id: i64,
     entry: &SnapshotEntry,
     src: &Path,
@@ -516,6 +522,13 @@ fn send_file_tcp(
     let mut file = File::open(src).with_context(|| format!("failed to read {}", src.display()))?;
     file.seek(SeekFrom::Start(offset))?;
     let mut sent = offset;
+    let progress = progress::start_transfer(
+        destination_id,
+        destination_root,
+        &entry.rel_path,
+        total_size,
+        sent,
+    );
     let mut buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
     while sent < total_size {
         let remaining = (total_size - sent).min(TRANSFER_CHUNK_SIZE as u64) as usize;
@@ -529,6 +542,7 @@ fn send_file_tcp(
             bail!("peer rejected TCP file chunk");
         }
         sent += n as u64;
+        progress.update(sent);
         throttle_after_transfer(n, bwlimit_kbps);
     }
     let finish = TransferFinishFileRequest {
@@ -766,6 +780,7 @@ pub fn sync_cycle_for_source(
         match sync_endpoint(
             &source_endpoint,
             &dst_endpoint,
+            &dst.id,
             cycle.id,
             &source_snapshot,
             &source.excludes,
@@ -1060,6 +1075,7 @@ fn sync_cycle_with_transfer(
             dst_machine_id,
             &dst_machine,
             &dst_root,
+            &dst.id,
             cycle.id,
             &source_snapshot,
             &source.excludes,
@@ -1111,6 +1127,7 @@ fn sync_directory_with_transfer(
     dst_machine_id: &str,
     dst_machine: &crate::core::config::MachineConfig,
     dst_root: &Path,
+    destination_id: &str,
     cycle_id: i64,
     source_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
@@ -1182,6 +1199,7 @@ fn sync_directory_with_transfer(
             source_root,
             dst_machine,
             dst_root,
+            destination_id,
             cycle_id,
             entry,
             sync,
@@ -1291,6 +1309,7 @@ fn sync_cycle_file_with_transfer(
             dst_machine_id,
             &dst_machine,
             &dst.path,
+            &dst.id,
             cycle.id,
             &source_snapshot,
             &cfg.app.sync,
@@ -1342,6 +1361,7 @@ fn sync_file_with_transfer(
     dst_machine_id: &str,
     dst_machine: &crate::core::config::MachineConfig,
     dst_root: &Path,
+    destination_id: &str,
     cycle_id: i64,
     source_snapshot: &[SnapshotEntry],
     sync: &NativeSyncConfig,
@@ -1382,6 +1402,7 @@ fn sync_file_with_transfer(
                 source_root,
                 dst_machine,
                 dst_root,
+                destination_id,
                 cycle_id,
                 entry,
                 sync,
@@ -1497,6 +1518,7 @@ fn push_entry_between_machines(
     source_root: &Path,
     dst_machine: &crate::core::config::MachineConfig,
     dst_root: &Path,
+    destination_id: &str,
     cycle_id: i64,
     entry: &SnapshotEntry,
     sync: &NativeSyncConfig,
@@ -1507,6 +1529,7 @@ fn push_entry_between_machines(
         entry: entry.clone(),
         destination: dst_machine.clone(),
         destination_root: dst_root.to_path_buf(),
+        destination_id: destination_id.to_string(),
         cycle_id,
         transfer_timeout_secs: sync.transfer_timeout_secs.max(1),
         bwlimit_kbps: sync.bwlimit_kbps,
@@ -2000,6 +2023,7 @@ fn normalize_existing_or_raw(path: &Path) -> PathBuf {
 fn sync_endpoint(
     source: &SourceEndpoint,
     dst: &DestinationEndpoint,
+    destination_id: &str,
     cycle_id: i64,
     source_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
@@ -2010,6 +2034,7 @@ fn sync_endpoint(
             sync_destination(
                 src_root,
                 dst_root,
+                destination_id,
                 cycle_id,
                 source_snapshot,
                 excludes,
@@ -2024,7 +2049,14 @@ fn sync_endpoint(
             if is_rel_excluded(Path::new(&rel_path), excludes) {
                 return Ok(());
             }
-            sync_file_to_path(path, root, &root.join(rel_path), cycle_id, sync)
+            sync_file_to_path(
+                path,
+                root,
+                &root.join(rel_path),
+                destination_id,
+                cycle_id,
+                sync,
+            )
         }
         (SourceEndpoint::File { path }, DestinationEndpoint::File { path: dst_path }) => {
             let rel_path = file_name_string(path)?;
@@ -2034,7 +2066,7 @@ fn sync_endpoint(
             let parent = dst_path
                 .parent()
                 .ok_or_else(|| anyhow!("destination file path has no parent"))?;
-            sync_file_to_path(path, parent, dst_path, cycle_id, sync)
+            sync_file_to_path(path, parent, dst_path, destination_id, cycle_id, sync)
         }
     }
 }
@@ -2042,6 +2074,7 @@ fn sync_endpoint(
 fn sync_destination(
     src_root: &Path,
     dst_root: &Path,
+    destination_id: &str,
     cycle_id: i64,
     source_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
@@ -2081,7 +2114,7 @@ fn sync_destination(
             if !needs_copy {
                 continue;
             }
-            if let Err(err) = copy_entry(src_root, dst_root, cycle_id, entry)
+            if let Err(err) = copy_entry(src_root, dst_root, destination_id, cycle_id, entry)
                 .with_context(|| format!("failed to copy {}", entry.rel_path))
             {
                 let paths = source_changed_paths(&err);
@@ -2121,6 +2154,7 @@ fn sync_file_to_path(
     src_path: &Path,
     dst_root: &Path,
     final_path: &Path,
+    destination_id: &str,
     cycle_id: i64,
     sync: &NativeSyncConfig,
 ) -> Result<()> {
@@ -2148,7 +2182,14 @@ fn sync_file_to_path(
             .unwrap_or(true);
 
         if needs_copy {
-            copy_single_entry(src_path, dst_root, cycle_id, &entry, final_path)?;
+            copy_single_entry(
+                src_path,
+                dst_root,
+                destination_id,
+                cycle_id,
+                &entry,
+                final_path,
+            )?;
         }
         verify_file_target(final_path, &entry, sync.checksum)?;
         Ok(())
@@ -2160,6 +2201,7 @@ fn sync_file_to_path(
 fn copy_single_entry(
     src: &Path,
     dst_root: &Path,
+    destination_id: &str,
     cycle_id: i64,
     entry: &SnapshotEntry,
     final_path: &Path,
@@ -2169,7 +2211,7 @@ fn copy_single_entry(
             .with_context(|| format!("failed to create parent {}", parent.display()))?;
     }
     match entry.file_type.as_str() {
-        "file" => copy_file(src, dst_root, cycle_id, entry, final_path),
+        "file" => copy_file(src, dst_root, destination_id, cycle_id, entry, final_path),
         "symlink" => copy_symlink(src, dst_root, cycle_id, entry, final_path),
         other => Err(anyhow!("unsupported single source type {other}")),
     }
@@ -2288,6 +2330,7 @@ fn is_rel_excluded(rel: &Path, excludes: &[PathBuf]) -> bool {
 fn copy_entry(
     src_root: &Path,
     dst_root: &Path,
+    destination_id: &str,
     cycle_id: i64,
     entry: &SnapshotEntry,
 ) -> Result<()> {
@@ -2299,7 +2342,7 @@ fn copy_entry(
     }
 
     match entry.file_type.as_str() {
-        "file" => copy_file(&src, dst_root, cycle_id, entry, &final_path),
+        "file" => copy_file(&src, dst_root, destination_id, cycle_id, entry, &final_path),
         "symlink" => copy_symlink(&src, dst_root, cycle_id, entry, &final_path),
         other => Err(anyhow!("unsupported entry type {other}")),
     }
@@ -2308,6 +2351,7 @@ fn copy_entry(
 fn copy_file(
     src: &Path,
     dst_root: &Path,
+    destination_id: &str,
     cycle_id: i64,
     entry: &SnapshotEntry,
     final_path: &Path,
@@ -2319,7 +2363,7 @@ fn copy_file(
     if tmp.exists() {
         remove_any(&tmp)?;
     }
-    fs::copy(src, &tmp)
+    copy_file_with_progress(src, dst_root, destination_id, entry, &tmp)
         .with_context(|| format!("failed to copy {} to {}", src.display(), tmp.display()))?;
     if let Some(expected_hash) = &entry.hash {
         let actual_hash = hash_file(&tmp)?;
@@ -2337,6 +2381,33 @@ fn copy_file(
     fsync_file(&tmp).ok();
     replace_path(&tmp, final_path)?;
     fsync_parent(final_path).ok();
+    Ok(())
+}
+
+fn copy_file_with_progress(
+    src: &Path,
+    dst_root: &Path,
+    destination_id: &str,
+    entry: &SnapshotEntry,
+    tmp: &Path,
+) -> Result<()> {
+    let total_size = entry.size.max(0) as u64;
+    let progress =
+        progress::start_transfer(destination_id, dst_root, &entry.rel_path, total_size, 0);
+    let mut reader = File::open(src)?;
+    let mut writer = File::create(tmp)?;
+    let mut copied = 0_u64;
+    let mut buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        copied += n as u64;
+        progress.update(copied);
+    }
+    writer.flush().ok();
     Ok(())
 }
 
@@ -2847,6 +2918,7 @@ mod tests {
         sync_endpoint(
             &SourceEndpoint::File { path: src.clone() },
             &DestinationEndpoint::Dir { root: dst.clone() },
+            "test_dst",
             7,
             &[],
             &[],
@@ -2869,6 +2941,7 @@ mod tests {
         sync_endpoint(
             &SourceEndpoint::File { path: src.clone() },
             &DestinationEndpoint::File { path: dst.clone() },
+            "test_dst",
             7,
             &[],
             &[],

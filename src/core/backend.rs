@@ -15,6 +15,9 @@ use crate::core::machines::{
     encode_query_component, find_machine, local_health, machine_id_from_path, merge_discovered,
     remote_get_json,
 };
+use crate::core::progress::{
+    TransferProgressView, configure_progress_file, current_transfer_progress,
+};
 use crate::core::state::{DestinationView, State as DbState};
 use crate::core::sync::{
     SyncRequestMode, sync_all_now, sync_destination_now_with_mode, sync_source_now,
@@ -119,6 +122,13 @@ impl Backend {
         let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         state_db.destination_views(&cfg)
+    }
+
+    pub fn runtime_status(&self) -> RuntimeStatus {
+        RuntimeStatus {
+            transfer: current_transfer_progress(),
+            build: BuildInfo::current(),
+        }
     }
 
     pub fn sync_now(&self) -> Result<Vec<DestinationView>> {
@@ -229,6 +239,31 @@ impl Backend {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeStatus {
+    pub transfer: Option<TransferProgressView>,
+    pub build: BuildInfo,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildInfo {
+    pub commit: String,
+    pub commit_time_beijing: String,
+}
+
+impl BuildInfo {
+    fn current() -> Self {
+        Self {
+            commit: option_env!("AUTO_SYNC_GIT_COMMIT_SHORT")
+                .unwrap_or("unknown")
+                .to_string(),
+            commit_time_beijing: option_env!("AUTO_SYNC_GIT_COMMIT_TIME_BEIJING")
+                .unwrap_or("unknown")
+                .to_string(),
+        }
+    }
+}
+
 fn preserve_current_machines(config_path: &Path, cfg: &AppConfig) -> AppConfig {
     let mut cfg = cfg.clone();
     if let Ok(current) = load_config(config_path) {
@@ -239,6 +274,7 @@ fn preserve_current_machines(config_path: &Path, cfg: &AppConfig) -> AppConfig {
 
 fn apply_runtime_config(cfg: &AppConfig) {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
+    configure_progress_file(&cfg.app.data_db);
 }
 
 #[derive(Debug, Serialize, Deserialize)]

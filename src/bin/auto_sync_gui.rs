@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use auto_sync::core::backend::{Backend, BrowseResponse};
+use auto_sync::core::backend::{Backend, BrowseResponse, RuntimeStatus};
 use auto_sync::core::config::{AppConfig, MachineConfig, load_or_create_config};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::machines::MachineStatus;
@@ -64,6 +64,11 @@ fn remove_machine(
 #[tauri::command]
 fn get_status(backend: tauri::State<'_, Backend>) -> Result<Vec<DestinationView>, String> {
     backend.status().map_err(error_text)
+}
+
+#[tauri::command]
+fn get_runtime_status(backend: tauri::State<'_, Backend>) -> Result<RuntimeStatus, String> {
+    Ok(backend.runtime_status())
 }
 
 #[tauri::command]
@@ -132,6 +137,7 @@ fn main() -> Result<()> {
             add_machine,
             remove_machine,
             get_status,
+            get_runtime_status,
             sync_now,
             sync_source_now,
             sync_destination_now,
