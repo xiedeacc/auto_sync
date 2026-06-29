@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,7 @@ pub struct Backend {
     config_path: Arc<PathBuf>,
     port: u16,
     machine_cache: Arc<Mutex<MachineCache>>,
+    zfs_write_sampler: Arc<Mutex<ZfsPoolWriteSampler>>,
 }
 
 #[derive(Default)]
@@ -48,6 +51,7 @@ impl Backend {
             config_path: Arc::new(config_path),
             port,
             machine_cache: Arc::new(Mutex::new(MachineCache::default())),
+            zfs_write_sampler: Arc::new(Mutex::new(ZfsPoolWriteSampler::default())),
         };
         backend.spawn_machine_discovery_worker();
         backend
@@ -162,11 +166,16 @@ impl Backend {
     }
 
     pub fn runtime_status(&self) -> RuntimeStatus {
+        let disk_writes = load_config(&self.config_path)
+            .ok()
+            .map(|cfg| self.destination_disk_writes(&cfg))
+            .unwrap_or_default();
         RuntimeStatus {
             syncing: sync_is_running(),
             sync_kind: current_sync_kind(),
             transfer: current_transfer_progress(),
             scan: current_scan_progress(),
+            disk_writes,
             build: BuildInfo::current(),
         }
     }
@@ -181,7 +190,7 @@ impl Backend {
             runtime: Some(self.runtime_status()),
             error: None,
         }];
-        for (machine_id, machine) in remote_source_machine_refs(&cfg) {
+        for (machine_id, machine) in remote_runtime_machine_refs(&cfg) {
             match remote_get_json::<RuntimeStatus>(
                 &machine,
                 "/api/runtime-status",
@@ -204,6 +213,33 @@ impl Backend {
             }
         }
         Ok(SyncActivityStatus { machines })
+    }
+
+    fn destination_disk_writes(&self, cfg: &AppConfig) -> Vec<DiskWriteView> {
+        let mut sampler = self
+            .zfs_write_sampler
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mut views = Vec::new();
+        for source in &cfg.source_groups {
+            for dst in source.destinations.iter().filter(|dst| dst.enabled) {
+                if machine_id_or_local(&dst.machine_id) != "local" {
+                    continue;
+                }
+                let Some(pool) = zfs_pool_for_path(&dst.path) else {
+                    continue;
+                };
+                let bytes_per_sec = sampler.write_bytes_per_sec(&pool).unwrap_or(0);
+                views.push(DiskWriteView {
+                    destination_id: dst.id.clone(),
+                    destination_path: dst.path.to_string_lossy().to_string(),
+                    pool,
+                    write_bytes_per_sec: bytes_per_sec,
+                    updated_at_ms: now_ms(),
+                });
+            }
+        }
+        views
     }
 
     pub fn sync_now(&self) -> Result<Vec<DestinationView>> {
@@ -546,6 +582,30 @@ fn remote_source_machine_refs(cfg: &AppConfig) -> Vec<(String, MachineConfig)> {
     machines
 }
 
+fn remote_runtime_machine_refs(cfg: &AppConfig) -> Vec<(String, MachineConfig)> {
+    let mut machines = remote_source_machine_refs(cfg);
+    for source in &cfg.source_groups {
+        for dst in source.destinations.iter().filter(|dst| dst.enabled) {
+            let machine_id = machine_id_or_local(&dst.machine_id);
+            if machine_id == "local" {
+                continue;
+            }
+            if machines
+                .iter()
+                .any(|(_, machine): &(String, MachineConfig)| {
+                    machine_matches_reference(machine, machine_id)
+                })
+            {
+                continue;
+            }
+            if let Some(machine) = find_machine(cfg, machine_id) {
+                machines.push((machine_id.to_string(), machine));
+            }
+        }
+    }
+    machines
+}
+
 fn offline_views_for_source(source: &SourceGroupConfig, reason: &str) -> Vec<DestinationView> {
     source
         .destinations
@@ -634,9 +694,20 @@ pub struct RuntimeStatus {
     pub syncing: bool,
     #[serde(default)]
     pub sync_kind: Option<String>,
+    #[serde(default)]
+    pub disk_writes: Vec<DiskWriteView>,
     pub transfer: Option<TransferProgressView>,
     pub scan: Option<ScanProgressView>,
     pub build: BuildInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskWriteView {
+    pub destination_id: String,
+    pub destination_path: String,
+    pub pool: String,
+    pub write_bytes_per_sec: u64,
+    pub updated_at_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -670,6 +741,152 @@ impl BuildInfo {
                 .to_string(),
         }
     }
+}
+
+#[derive(Default)]
+struct ZfsPoolWriteSampler {
+    samples: HashMap<String, ZfsPoolWriteSample>,
+}
+
+#[derive(Debug, Clone)]
+struct ZfsPoolWriteSample {
+    written_bytes: u64,
+    sampled_at: Instant,
+    bytes_per_sec: u64,
+}
+
+impl ZfsPoolWriteSampler {
+    fn write_bytes_per_sec(&mut self, pool: &str) -> Option<u64> {
+        if let Some(sample) = self.samples.get(pool) {
+            if sample.sampled_at.elapsed() < Duration::from_millis(800) {
+                return Some(sample.bytes_per_sec);
+            }
+        }
+
+        if let Some(written_bytes) = read_zfs_pool_written_bytes(pool) {
+            let now = Instant::now();
+            let bytes_per_sec = self
+                .samples
+                .get(pool)
+                .map(|previous| {
+                    let elapsed = now.duration_since(previous.sampled_at);
+                    if elapsed < Duration::from_millis(200) {
+                        previous.bytes_per_sec
+                    } else {
+                        let millis = elapsed.as_millis().max(1);
+                        (written_bytes.saturating_sub(previous.written_bytes) as u128 * 1000
+                            / millis) as u64
+                    }
+                })
+                .unwrap_or(0);
+            self.samples.insert(
+                pool.to_string(),
+                ZfsPoolWriteSample {
+                    written_bytes,
+                    sampled_at: now,
+                    bytes_per_sec,
+                },
+            );
+            return Some(bytes_per_sec);
+        }
+
+        let bytes_per_sec = read_zpool_iostat_write_bytes_per_sec(pool)?;
+        self.samples.insert(
+            pool.to_string(),
+            ZfsPoolWriteSample {
+                written_bytes: 0,
+                sampled_at: Instant::now(),
+                bytes_per_sec,
+            },
+        );
+        Some(bytes_per_sec)
+    }
+}
+
+fn zfs_pool_for_path(path: &Path) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let output = Command::new("findmnt")
+        .arg("-T")
+        .arg(path)
+        .args(["-n", "-o", "SOURCE,FSTYPE"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    zfs_pool_from_findmnt_output(&text)
+}
+
+fn zfs_pool_from_findmnt_output(output: &str) -> Option<String> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?;
+    let mut parts = line.split_whitespace();
+    let source = parts.next()?;
+    let fstype = parts.next()?;
+    if fstype != "zfs" {
+        return None;
+    }
+    let pool = source.split('/').next().unwrap_or(source).trim();
+    if pool.is_empty() {
+        None
+    } else {
+        Some(pool.to_string())
+    }
+}
+
+fn read_zfs_pool_written_bytes(pool: &str) -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let path = Path::new("/proc/spl/kstat/zfs").join(pool).join("io");
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_zfs_kstat_written_bytes(&text)
+}
+
+fn parse_zfs_kstat_written_bytes(text: &str) -> Option<u64> {
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("nwritten") {
+            let _type = parts.next()?;
+            return parts.next()?.parse().ok();
+        }
+    }
+    None
+}
+
+fn read_zpool_iostat_write_bytes_per_sec(pool: &str) -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let output = Command::new("zpool")
+        .args(["iostat", "-Hp", pool, "1", "2"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_zpool_iostat_write_bytes_per_sec(&text, pool)
+}
+
+fn parse_zpool_iostat_write_bytes_per_sec(text: &str, pool: &str) -> Option<u64> {
+    text.lines().rev().find_map(|line| {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 7 && parts[0] == pool {
+            parts[6].parse::<u64>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn non_empty_machine_match(machine: &MachineConfig, value: &str) -> bool {
@@ -836,6 +1053,34 @@ fn entry_kind_order(kind: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_zfs_pool_from_findmnt_output() {
+        assert_eq!(
+            zfs_pool_from_findmnt_output("zfs_pool zfs\n").as_deref(),
+            Some("zfs_pool")
+        );
+        assert_eq!(
+            zfs_pool_from_findmnt_output("tank/photos zfs\n").as_deref(),
+            Some("tank")
+        );
+        assert_eq!(zfs_pool_from_findmnt_output("/dev/sda1 ext4\n"), None);
+    }
+
+    #[test]
+    fn parses_zfs_kstat_written_bytes() {
+        let text = "7 1 0x01 12 576 123\nname type data\nnread 4 10\nnwritten 4 987654\n";
+        assert_eq!(parse_zfs_kstat_written_bytes(text), Some(987654));
+    }
+
+    #[test]
+    fn parses_zpool_iostat_write_bandwidth() {
+        let text = "zfs_pool\t1\t2\t0\t0\t63\t383574\nzfs_pool\t1\t2\t0\t494\t0\t407451521\n";
+        assert_eq!(
+            parse_zpool_iostat_write_bytes_per_sec(text, "zfs_pool"),
+            Some(407451521)
+        );
+    }
 
     #[test]
     fn preserves_disk_machines_when_saving_stale_config() {
