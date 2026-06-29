@@ -111,6 +111,17 @@ has_gui_environment() {
   return 1
 }
 
+install_if_different() {
+  local mode="$1"
+  local src="$2"
+  local dst="$3"
+  if [[ "$(readlink -f "$src")" == "$(readlink -f "$dst" 2>/dev/null || printf '%s' "$dst")" ]]; then
+    "${SUDO[@]}" chmod "$mode" "$dst"
+    return
+  fi
+  "${SUDO[@]}" install -m "$mode" "$src" "$dst"
+}
+
 ensure_linux_build_environment
 
 # One unified binary. Build with the desktop (Tauri) feature only when a GUI is
@@ -140,8 +151,8 @@ install -m 0755 target/release/auto_syncctl bin/auto_syncctl
   "$INSTALL_DIR/bin/auto_sync_web" \
   "$INSTALL_DIR/bin/auto_sync_gui"
 
-"${SUDO[@]}" install -m 0755 bin/auto_sync "$INSTALL_DIR/bin/auto_sync"
-"${SUDO[@]}" install -m 0755 bin/auto_syncctl "$INSTALL_DIR/bin/auto_syncctl"
+install_if_different 0755 bin/auto_sync "$INSTALL_DIR/bin/auto_sync"
+install_if_different 0755 bin/auto_syncctl "$INSTALL_DIR/bin/auto_syncctl"
 
 "${SUDO[@]}" install -m 0644 "$CONFIG" "$INSTALL_DIR/conf/auto_sync.toml"
 echo "Installed local config $INSTALL_DIR/conf/auto_sync.toml from $CONFIG"
