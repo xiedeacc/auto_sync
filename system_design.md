@@ -481,6 +481,7 @@ Realtime + ZFS：
 Realtime 快速同步语义：
 
 - fanotify 触发的 realtime 快速同步可以直接更新正式 dst，以提供接近实时的体验。
+- Windows realtime 优先使用 USN Journal；如果当前进程权限或环境无法查询 USN Journal，则降级到 `ReadDirectoryChangesW` 递归目录 watcher，仍然按相对路径写入 `event_log` 触发增量同步。
 - realtime 快速同步完成只能说明“事件提示队列已处理”，不能证明 dst 与最新 snapshot 完全一致。
 - 只有 snapshot/diff reconcile 完成并校验通过后，才能推进 `last_verified_cycle_id` 并显示绿点。
 - 如果 realtime 写入与后续 snapshot diff 结果冲突，以 snapshot diff/reconcile 为准修正 dst。

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::mem;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr;
 use std::slice;
@@ -21,8 +21,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_LIST_DIRECTORY,
+    FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY,
+    FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING, ReadDirectoryChangesW,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -42,6 +45,8 @@ use crate::core::state::State;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const USN_BUFFER_SIZE: usize = 1024 * 1024;
+const DIRECTORY_CHANGE_BUFFER_SIZE: usize = 256 * 1024;
+const FILE_NOTIFY_INFORMATION_HEADER_SIZE: usize = 12;
 
 pub fn spawn_source_watcher_thread(
     cfg: AppConfig,
@@ -105,21 +110,34 @@ fn run_resilient_source_watcher(
                 warn!(
                     source = source.id,
                     error = %format_error_chain(&err),
-                    "Windows USN watcher session stopped"
+                    "Windows USN watcher session stopped; falling back to directory watcher"
                 );
-                if !reported_unavailable {
-                    if let Err(record_err) =
-                        record_rescan_event(&db_path, &source.id, "usn_unavailable")
-                    {
-                        error!(
+                match run_directory_changes_session(&source, &db_path, &shutdown) {
+                    Ok(()) => break,
+                    Err(fallback_err) => {
+                        warn!(
                             source = source.id,
-                            error = %record_err,
-                            "failed to persist Windows USN fallback event"
+                            error = %format_error_chain(&fallback_err),
+                            "Windows directory watcher session stopped"
                         );
+                        if !reported_unavailable {
+                            if let Err(record_err) = record_rescan_event(
+                                &db_path,
+                                &source.id,
+                                "windows_watcher_unavailable",
+                                true,
+                            ) {
+                                error!(
+                                    source = source.id,
+                                    error = %record_err,
+                                    "failed to persist Windows watcher fallback event"
+                                );
+                            }
+                            reported_unavailable = true;
+                        }
+                        sleep_until_retry(&shutdown);
                     }
-                    reported_unavailable = true;
                 }
-                sleep_until_retry(&shutdown);
             }
         }
     }
@@ -242,10 +260,185 @@ fn initial_next_usn(
     }
 }
 
-fn record_rescan_event(db_path: &Path, source_id: &str, kind: &str) -> Result<()> {
+fn run_directory_changes_session(
+    source: &SourceGroupConfig,
+    db_path: &Path,
+    shutdown: &AtomicBool,
+) -> Result<()> {
     let state = State::open(db_path)?;
-    state.record_event(source_id, 0, kind, None, false)?;
+    state.ensure_open_cycle(&source.id, Utc::now())?;
+
+    let watch = SourceWatch::new(source)?;
+    let (watch_root, file_filter) = if watch.is_file {
+        let parent = watch
+            .root
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("file source has no parent: {}", watch.root.display()))?
+            .to_path_buf();
+        let file_name = watch
+            .root
+            .file_name()
+            .ok_or_else(|| {
+                anyhow::anyhow!("file source has no file name: {}", watch.root.display())
+            })?
+            .to_os_string();
+        (parent, Some(file_name))
+    } else {
+        (watch.root.clone(), None)
+    };
+    let handle = DirectoryWatchHandle::open(&watch_root)
+        .with_context(|| format!("failed to watch directory {}", watch_root.display()))?;
+    let mut buffer = vec![0_u8; DIRECTORY_CHANGE_BUFFER_SIZE];
+    info!(
+        source = source.id,
+        root = %watch_root.display(),
+        "Windows directory watcher started"
+    );
+
+    while !shutdown.load(Ordering::SeqCst) {
+        let records = read_directory_changes(handle.raw(), &mut buffer)?;
+        if records.is_empty() {
+            state.record_event(&source.id, 0, "directory_change_overflow", None, true)?;
+            continue;
+        }
+        for record in records {
+            if let Some(filter) = &file_filter {
+                if record.rel_path.as_os_str() != filter {
+                    continue;
+                }
+            }
+            let rel_text = path_to_event_string(&record.rel_path);
+            state.record_event(
+                &source.id,
+                record.action as u64,
+                directory_action_to_kind(record.action),
+                rel_text.as_deref(),
+                false,
+            )?;
+        }
+    }
     Ok(())
+}
+
+fn record_rescan_event(
+    db_path: &Path,
+    source_id: &str,
+    kind: &str,
+    rescan_required: bool,
+) -> Result<()> {
+    let state = State::open(db_path)?;
+    state.record_event(source_id, 0, kind, None, rescan_required)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DirectoryChangeRecord {
+    action: u32,
+    rel_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct DirectoryWatchHandle(HANDLE);
+
+impl DirectoryWatchHandle {
+    fn open(path: &Path) -> Result<Self> {
+        let handle = create_file(
+            path.as_os_str(),
+            FILE_LIST_DIRECTORY,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )?;
+        Ok(Self(handle))
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for DirectoryWatchHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+fn read_directory_changes(handle: HANDLE, buffer: &mut [u8]) -> Result<Vec<DirectoryChangeRecord>> {
+    let mut bytes = 0_u32;
+    let ok = unsafe {
+        ReadDirectoryChangesW(
+            handle,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            1,
+            directory_notify_filter(),
+            &mut bytes,
+            ptr::null_mut(),
+            None,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error()).context("ReadDirectoryChangesW failed");
+    }
+    if bytes == 0 {
+        return Ok(Vec::new());
+    }
+    parse_directory_change_buffer(&buffer[..bytes as usize])
+}
+
+fn parse_directory_change_buffer(bytes: &[u8]) -> Result<Vec<DirectoryChangeRecord>> {
+    let mut offset = 0_usize;
+    let mut records = Vec::new();
+    loop {
+        if offset + FILE_NOTIFY_INFORMATION_HEADER_SIZE > bytes.len() {
+            bail!("directory change record exceeds buffer");
+        }
+        let next_entry_offset =
+            unsafe { ptr::read_unaligned(bytes[offset..].as_ptr().cast::<u32>()) };
+        let action = unsafe { ptr::read_unaligned(bytes[offset + 4..].as_ptr().cast::<u32>()) };
+        let name_bytes =
+            unsafe { ptr::read_unaligned(bytes[offset + 8..].as_ptr().cast::<u32>()) } as usize;
+        if name_bytes % 2 != 0 {
+            bail!("directory change record has invalid file name length");
+        }
+        let name_offset = offset + FILE_NOTIFY_INFORMATION_HEADER_SIZE;
+        if name_offset + name_bytes > bytes.len() {
+            bail!("directory change file name exceeds buffer");
+        }
+        let name_ptr = unsafe { bytes.as_ptr().add(name_offset).cast::<u16>() };
+        let name = std::ffi::OsString::from_wide(unsafe {
+            slice::from_raw_parts(name_ptr, name_bytes / 2)
+        });
+        records.push(DirectoryChangeRecord {
+            action,
+            rel_path: PathBuf::from(name),
+        });
+        if next_entry_offset == 0 {
+            break;
+        }
+        offset += next_entry_offset as usize;
+    }
+    Ok(records)
+}
+
+fn directory_notify_filter() -> u32 {
+    FILE_NOTIFY_CHANGE_FILE_NAME
+        | FILE_NOTIFY_CHANGE_DIR_NAME
+        | FILE_NOTIFY_CHANGE_ATTRIBUTES
+        | FILE_NOTIFY_CHANGE_SIZE
+        | FILE_NOTIFY_CHANGE_LAST_WRITE
+        | FILE_NOTIFY_CHANGE_CREATION
+        | FILE_NOTIFY_CHANGE_SECURITY
+}
+
+fn directory_action_to_kind(action: u32) -> &'static str {
+    match action {
+        1 => "create",
+        2 => "delete",
+        4 => "rename_old",
+        5 => "rename_new",
+        _ => "modify",
+    }
 }
 
 #[derive(Debug)]
@@ -700,5 +893,34 @@ mod tests {
         assert_eq!(reason_to_kind(USN_REASON_RENAME_OLD_NAME), "rename_old");
         assert_eq!(reason_to_kind(USN_REASON_RENAME_NEW_NAME), "rename_new");
         assert_eq!(reason_to_kind(USN_REASON_DATA_EXTEND), "modify");
+    }
+
+    #[test]
+    fn parses_directory_change_records() {
+        let mut bytes = directory_change_record_bytes(1, "a.txt", 24);
+        bytes.extend(directory_change_record_bytes(2, "nested\\b.txt", 0));
+
+        let records = parse_directory_change_buffer(&bytes).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(directory_action_to_kind(records[0].action), "create");
+        assert_eq!(records[0].rel_path, PathBuf::from("a.txt"));
+        assert_eq!(directory_action_to_kind(records[1].action), "delete");
+        assert_eq!(records[1].rel_path, PathBuf::from("nested\\b.txt"));
+    }
+
+    fn directory_change_record_bytes(action: u32, name: &str, next_offset: u32) -> Vec<u8> {
+        let wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+        let mut bytes = Vec::new();
+        bytes.extend(next_offset.to_le_bytes());
+        bytes.extend(action.to_le_bytes());
+        bytes.extend(((wide.len() * 2) as u32).to_le_bytes());
+        for unit in wide {
+            bytes.extend(unit.to_le_bytes());
+        }
+        if next_offset > 0 {
+            bytes.resize(next_offset as usize, 0);
+        }
+        bytes
     }
 }
