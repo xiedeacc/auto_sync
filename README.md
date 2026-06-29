@@ -54,7 +54,7 @@ scripts/deploy_local.sh
 ```
 
 The local deploy script builds the release binary, installs it to
-`/usr/local/auto_sync`, installs `conf/auto_sync.linux.toml` as the local config,
+`/opt/auto_sync`, installs `conf/auto_sync.linux.toml` as the local config,
 installs the systemd unit, and starts the single `auto_sync.service` on Linux.
 It first checks the Ubuntu/Debian build environment and installs missing build
 dependencies plus Rust stable only when needed. On Linux hosts without a GUI
@@ -66,7 +66,7 @@ Machine deploy helpers:
 
 ```bash
 pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1
-ssh -p 10022 root@192.168.2.247 'cd /root/src/rust/auto_sync && git pull && scripts/deploy_local.sh'
+ssh -p 10022 root@192.168.2.247 'cd /opt/auto_sync && git pull && scripts/deploy_local.sh'
 scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 ```
 
@@ -75,7 +75,7 @@ the repository `bin\` directory, keeps config under `conf\`, and creates a
 current-user Startup launcher for the single `auto_sync` process instead
 of installing it as a Windows service. OpenSSH setup is opt-in via
 `-InstallSshd`. NAS is Ubuntu x64 and builds on NAS itself under
-`/root/src/rust/auto_sync`; use `git pull` plus `scripts/deploy_local.sh` on
+`/opt/auto_sync`; use `git pull` plus `scripts/deploy_local.sh` on
 NAS for deployments. `deploy_local.sh` installs missing Ubuntu/Debian build
 dependencies and Rust stable on first run, then skips setup on later runs. The
 Windows daemon uses the NTFS USN Journal for realtime local source change
@@ -84,4 +84,4 @@ gaps, journal resets, and first-run verification. The GUI and Web UI share this
 daemon-backed state instead of running separate watcher logic.
 `deploy_openwrt.sh` cross-compiles aarch64 OpenWrt binaries when needed,
 installs the `conf/auto_sync.procd` procd init script, and deploys to
-`/usr/local/auto_sync`.
+`/opt/auto_sync`.

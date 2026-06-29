@@ -28,7 +28,7 @@ enum CommandKind {
         close_current: bool,
     },
     PrintSystemd {
-        #[arg(long, default_value = "/usr/local/auto_sync")]
+        #[arg(long, default_value = "/opt/auto_sync")]
         install_dir: PathBuf,
     },
     DeployNas {
@@ -38,7 +38,7 @@ enum CommandKind {
         port: u16,
         #[arg(long, default_value = "root")]
         user: String,
-        #[arg(long, default_value = "/usr/local/auto_sync")]
+        #[arg(long, default_value = "/opt/auto_sync")]
         install_dir: PathBuf,
     },
 }

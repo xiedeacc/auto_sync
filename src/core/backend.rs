@@ -462,7 +462,7 @@ mod tests {
             ssh_user: "Administrator".to_string(),
             ssh_port: 22,
             os: "windows".to_string(),
-            install_dir: PathBuf::from("/usr/local/auto_sync"),
+            install_dir: PathBuf::from("/opt/auto_sync"),
             enabled: true,
             manual: true,
         });

@@ -11,6 +11,6 @@
   1. On Windows, commit all intended repository changes and push them.
   2. After the push succeeds, deploy this Windows machine and NAS in parallel when possible:
      - Windows: `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`.
-     - NAS directly on NAS: `ssh -p 10022 root@192.168.2.247 "cd /root/src/rust/auto_sync && git pull && scripts/deploy_local.sh"`.
+     - NAS directly on NAS: `ssh -p 10022 root@192.168.2.247 "cd /opt/auto_sync && git pull && scripts/deploy_local.sh --install-dir /opt/auto_sync"`.
      If parallel execution is not available, run the same two commands sequentially.
 - Do not deploy to tiger and do not use Windows-to-Linux cross-compilation for the normal NAS deployment path; build Linux x64 binaries on NAS.

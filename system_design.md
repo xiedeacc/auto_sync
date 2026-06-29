@@ -188,7 +188,7 @@ port = 18765
 ssh_user = "root"
 ssh_port = 10022
 os = "linux"
-install_dir = "/usr/local/auto_sync"
+install_dir = "/opt/auto_sync"
 ```
 
 配置原则：
@@ -298,10 +298,13 @@ Linux 后台进程对 `schedule.mode = "realtime"` 的 source 使用 fanotify。
 
 当前实现说明：
 
-- 第一版实现使用 fanotify fd-path 模式，注册当前环境稳定接受的 `FAN_MODIFY | FAN_CLOSE_WRITE`。
+- 当前 Linux watcher 优先使用 FID/name 模式：`FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME | FAN_REPORT_TARGET_FID`。
+- FID/name 模式注册 `FAN_MODIFY | FAN_CLOSE_WRITE | FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO | FAN_DELETE_SELF | FAN_MOVE_SELF | FAN_ONDIR`，用于覆盖 modify/create/delete/move 以及目录自身变化。
+- watcher 启动时为 source 下所有文件和目录建立 `file handle -> path` 表；带 name 的事件用 parent directory handle + name 拼路径，不带 name 的 target FID 事件用对象 handle 查路径。新建文件/目录被解析后会补充进 handle 表，新建目录还会递归注册 mark。
+- 如果 FID/name 模式或 filesystem mark 不可用，会回退到传统 fd-path 模式；fd-path 模式只注册 `FAN_MODIFY | FAN_CLOSE_WRITE`。
 - 若 filesystem/mount mark 不可用，会回退到对 src 目录树逐目录注册 inode mark。
-- 删除、rename 和部分元数据变化不依赖事件流保证正确性，而是由周期关闭时的源目录快照和 dst 全量校验兜底。
-- 后续如果需要精确持久化 create/delete/move 的目录项名称，可升级到 `FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME` 模式，并实现 file handle/name 解析。
+- 无法解析路径的 FID/name 附属记录不会把 realtime cycle 标记为 Full/rescan；realtime 自动同步仍只按已解析的 event path 做增量同步。queue overflow 仍会写入需要 reconcile 的事件。
+- 删除、rename 和部分元数据变化不依赖事件流保证最终正确性，而是由周期关闭时的源目录快照和 dst 校验/reconcile 兜底。
 
 建议 fanotify 策略：
 
@@ -574,7 +577,7 @@ ssh -p 10022 root@192.168.3.178
 建议安装路径：
 
 ```text
-/usr/local/auto_sync/
+/opt/auto_sync/
   bin/
   conf/
   logs/
@@ -585,13 +588,13 @@ ssh -p 10022 root@192.168.3.178
 1. 通过 SSH 执行 `uname -m`、`uname -s`，检测架构和 init 系统（systemd 或 OpenWrt procd）。
 2. 根据架构选择、交叉编译，或在目标 Linux 机器本机编译二进制。
 3. 上传 `bin/auto_sync`、`bin/auto_syncctl`、`conf/auto_sync.linux.toml`，并按 init 系统安装 systemd unit 或 `conf/auto_sync.procd`。
-4. 执行权限设置：`chmod +x /usr/local/auto_sync/bin/*`。
+4. 执行权限设置：`chmod +x /opt/auto_sync/bin/*`。
 5. 如果支持 systemd，安装并启动 `auto_sync.service`；如果是 OpenWrt，安装并启动 `/etc/init.d/auto_sync`。
 6. 通过 `auto_syncctl status` 验证状态。
 
 配置部署原则：
 
-- Linux 部署把 `conf/auto_sync.linux.toml` 安装为 `/usr/local/auto_sync/conf/auto_sync.toml`。
+- Linux 部署把 `conf/auto_sync.linux.toml` 安装为 `/opt/auto_sync/conf/auto_sync.toml`。
 - OpenWrt 部署把 `conf/auto_sync.procd` 渲染为 `/etc/init.d/auto_sync`。
 - 覆盖配置必须使用显式参数，例如 `--overwrite-config`，并先保存时间戳备份。
 
@@ -605,8 +608,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/usr/local/auto_sync
-ExecStart=/usr/local/auto_sync/bin/auto_syncd --config /usr/local/auto_sync/conf/auto_sync.toml
+WorkingDirectory=/opt/auto_sync
+ExecStart=/opt/auto_sync/bin/auto_syncd --config /opt/auto_sync/conf/auto_sync.toml
 Restart=always
 RestartSec=5
 User=root

@@ -215,7 +215,7 @@ fn build_config(state_db: &Path, source_root: &Path, dest_parent: &Path, port: u
         ssh_user: String::new(),
         ssh_port: 22,
         os,
-        install_dir: std::path::PathBuf::from("/usr/local/auto_sync"),
+        install_dir: std::path::PathBuf::from("/opt/auto_sync"),
         enabled: true,
         manual: true,
     };

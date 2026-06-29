@@ -326,7 +326,7 @@ impl Default for DeployTarget {
             host: String::new(),
             port: 22,
             user: "root".to_string(),
-            install_dir: PathBuf::from("/usr/local/auto_sync"),
+            install_dir: PathBuf::from("/opt/auto_sync"),
         }
     }
 }
@@ -546,7 +546,7 @@ fn default_install_dir_for_os(os: &str) -> PathBuf {
     if os.eq_ignore_ascii_case("windows") {
         PathBuf::from("C:/auto_sync")
     } else {
-        PathBuf::from("/usr/local/auto_sync")
+        PathBuf::from("/opt/auto_sync")
     }
 }
 
@@ -1196,7 +1196,7 @@ web_port = 18767
             host: "192.0.2.10".to_string(),
             port: 10022,
             user: "root".to_string(),
-            install_dir: PathBuf::from("/usr/local/auto_sync"),
+            install_dir: PathBuf::from("/opt/auto_sync"),
         });
 
         let cleaned = clean_config_for_save(&cfg);
@@ -1210,7 +1210,7 @@ web_port = 18767
         assert_eq!(nas.port, 18765);
         assert_eq!(nas.ssh_user, "root");
         assert_eq!(nas.ssh_port, 10022);
-        assert_eq!(nas.install_dir, PathBuf::from("/usr/local/auto_sync"));
+        assert_eq!(nas.install_dir, PathBuf::from("/opt/auto_sync"));
     }
 
     #[test]
@@ -1225,7 +1225,7 @@ web_port = 18767
             ssh_user: "root".to_string(),
             ssh_port: 22,
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/usr/local/auto_sync"),
+            install_dir: PathBuf::from("/opt/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1238,7 +1238,7 @@ web_port = 18767
             ssh_user: "root".to_string(),
             ssh_port: 22,
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/usr/local/auto_sync"),
+            install_dir: PathBuf::from("/opt/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1261,7 +1261,7 @@ web_port = 18767
             ssh_user: String::new(),
             ssh_port: 22,
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/usr/local/auto_sync"),
+            install_dir: PathBuf::from("/opt/auto_sync"),
             enabled: true,
             manual: true,
         });

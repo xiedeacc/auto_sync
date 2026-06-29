@@ -37,6 +37,8 @@ fn fanotify_full_sync_then_realtime_incremental_syncs_event_paths() -> Result<()
     init_trace();
     let env = TestEnv::new("fanotify_incremental")?;
     write_bytes(env.src.join("changed.txt"), b"v1")?;
+    write_bytes(env.src.join("delete_me.txt"), b"delete")?;
+    write_bytes(env.src.join("move_me.txt"), b"move")?;
     write_bytes(env.src.join("untouched.txt"), b"untouched")?;
     fs::create_dir_all(env.src.join("existing_dir"))?;
 
@@ -57,9 +59,19 @@ fn fanotify_full_sync_then_realtime_incremental_syncs_event_paths() -> Result<()
 
     write_bytes(env.src.join("changed.txt"), b"v2 changed on zfs")?;
     write_bytes(env.src.join("existing_dir/new.txt"), b"new")?;
+    fs::create_dir_all(env.src.join("empty_created_dir"))?;
+    fs::remove_file(env.src.join("delete_me.txt"))?;
+    fs::rename(env.src.join("move_me.txt"), env.src.join("moved.txt"))?;
     wait_for_event_paths(
         &state,
-        &["changed.txt", "existing_dir/new.txt"],
+        &[
+            "changed.txt",
+            "existing_dir/new.txt",
+            "empty_created_dir",
+            "delete_me.txt",
+            "move_me.txt",
+            "moved.txt",
+        ],
         Duration::from_secs(10),
     )?;
 
@@ -72,6 +84,10 @@ fn fanotify_full_sync_then_realtime_incremental_syncs_event_paths() -> Result<()
         b"v2 changed on zfs",
     )?;
     assert_file(&env.effective_dst().join("existing_dir/new.txt"), b"new")?;
+    assert!(env.effective_dst().join("empty_created_dir").is_dir());
+    assert!(!env.effective_dst().join("delete_me.txt").exists());
+    assert!(!env.effective_dst().join("move_me.txt").exists());
+    assert_file(&env.effective_dst().join("moved.txt"), b"move")?;
     assert_file(&env.effective_dst().join("untouched.txt"), b"untouched")?;
     assert_file(&env.effective_dst().join("destination-only.txt"), b"extra")?;
     assert_green(&state, &cfg)?;

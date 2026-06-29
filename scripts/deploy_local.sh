@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 CONFIG="${CONFIG:-}"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/auto_sync}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/auto_sync}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

@@ -206,7 +206,7 @@ impl TestEnv {
             ssh_user: self.nas_user.clone(),
             ssh_port: self.nas_port,
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/usr/local/auto_sync"),
+            install_dir: PathBuf::from("/opt/auto_sync"),
             enabled: true,
             manual: true,
         };
