@@ -172,14 +172,11 @@ function Initialize-Config {
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TargetConfig) | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path (Split-Path -Parent $TargetConfig) "state") | Out-Null
-    if (Test-Path -LiteralPath $TargetConfig) {
-        return "left-existing"
-    }
     if (-not (Test-Path -LiteralPath $SourceConfig)) {
         throw "Missing config template: $SourceConfig"
     }
     Copy-Item -LiteralPath $SourceConfig -Destination $TargetConfig -Force
-    "seeded"
+    "copied-from-source"
 }
 
 function Install-WindowsRuntime {
@@ -662,7 +659,7 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $InstallDir = $rootDir
 }
 if ([string]::IsNullOrWhiteSpace($Config)) {
-    $Config = Join-Path $rootDir "conf\auto_sync.toml"
+    $Config = Join-Path $rootDir "conf\auto_sync.windows.toml"
 }
 if ([string]::IsNullOrWhiteSpace($AuthorizedKeyFile)) {
     $AuthorizedKeyFile = Join-Path $HOME ".ssh\id_ed25519.pub"

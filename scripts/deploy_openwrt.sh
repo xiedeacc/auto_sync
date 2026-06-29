@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-CONFIG="${CONFIG:-conf/auto_sync.toml}"
+CONFIG="${CONFIG:-conf/auto_sync.openwrt.toml}"
 HOST="${HOST:-192.168.2.1}"
 PORT="${PORT:-10022}"
 USER="${USER:-root}"
@@ -140,6 +140,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ ! -f "$CONFIG" ]]; then
+  echo "Config file not found: $CONFIG" >&2
+  exit 1
+fi
+
 target="${USER}@${HOST}"
 arch="$(ssh -p "$PORT" "$target" "uname -m" | tr -d '\r')"
 
@@ -174,11 +179,8 @@ for binary in auto_sync auto_syncctl; do
   scp -O -P "$PORT" "$BINARY_DIR/$binary" "${target}:${INSTALL_DIR}/bin/${binary}"
 done
 
-if ssh -p "$PORT" "$target" "test -f '$INSTALL_DIR/conf/auto_sync.toml'"; then
-  echo "OpenWrt config $INSTALL_DIR/conf/auto_sync.toml already exists; leaving it untouched"
-else
-  scp -O -P "$PORT" "$CONFIG" "${target}:${INSTALL_DIR}/conf/auto_sync.toml"
-fi
+scp -O -P "$PORT" "$CONFIG" "${target}:${INSTALL_DIR}/conf/auto_sync.toml"
+echo "Installed OpenWrt config $INSTALL_DIR/conf/auto_sync.toml from $CONFIG"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT

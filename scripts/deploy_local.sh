@@ -4,8 +4,29 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-CONFIG="${CONFIG:-conf/auto_sync.toml}"
+CONFIG="${CONFIG:-}"
+DEPLOY_PROFILE="${DEPLOY_PROFILE:-}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/auto_sync}"
+
+detect_deploy_profile() {
+  local name lower ips
+  name="$(hostname 2>/dev/null || true)"
+  lower="${name,,}"
+  if [[ "$lower" == *tiger* ]]; then
+    printf '%s\n' "tiger"
+    return
+  fi
+  if [[ "$lower" == *nas* ]]; then
+    printf '%s\n' "nas"
+    return
+  fi
+  ips="$(hostname -I 2>/dev/null || true)"
+  if [[ " $ips " == *" 192.168.2.247 "* ]]; then
+    printf '%s\n' "nas"
+    return
+  fi
+  printf '%s\n' "nas"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -13,12 +34,16 @@ while [[ $# -gt 0 ]]; do
       CONFIG="$2"
       shift 2
       ;;
+    --profile)
+      DEPLOY_PROFILE="$2"
+      shift 2
+      ;;
     --install-dir)
       INSTALL_DIR="$2"
       shift 2
       ;;
     -h|--help)
-      echo "Usage: scripts/deploy_local.sh [--config PATH] [--install-dir DIR]"
+      echo "Usage: scripts/deploy_local.sh [--config PATH] [--profile tiger|nas] [--install-dir DIR]"
       exit 0
       ;;
     *)
@@ -27,6 +52,18 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -z "$CONFIG" ]]; then
+  if [[ -z "$DEPLOY_PROFILE" ]]; then
+    DEPLOY_PROFILE="$(detect_deploy_profile)"
+  fi
+  CONFIG="conf/auto_sync.${DEPLOY_PROFILE}.toml"
+fi
+
+if [[ ! -f "$CONFIG" ]]; then
+  echo "Config file not found: $CONFIG" >&2
+  exit 1
+fi
 
 if ! command -v systemctl >/dev/null 2>&1; then
   echo "systemctl is required for Linux local deployment" >&2
@@ -134,11 +171,8 @@ install -m 0755 target/release/auto_syncctl bin/auto_syncctl
 "${SUDO[@]}" install -m 0755 bin/auto_sync "$INSTALL_DIR/bin/auto_sync"
 "${SUDO[@]}" install -m 0755 bin/auto_syncctl "$INSTALL_DIR/bin/auto_syncctl"
 
-if "${SUDO[@]}" test -f "$INSTALL_DIR/conf/auto_sync.toml"; then
-  echo "local config $INSTALL_DIR/conf/auto_sync.toml already exists; leaving it untouched"
-else
-  "${SUDO[@]}" install -m 0644 "$CONFIG" "$INSTALL_DIR/conf/auto_sync.toml"
-fi
+"${SUDO[@]}" install -m 0644 "$CONFIG" "$INSTALL_DIR/conf/auto_sync.toml"
+echo "Installed local config $INSTALL_DIR/conf/auto_sync.toml from $CONFIG"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
