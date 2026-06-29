@@ -180,6 +180,7 @@ impl TestEnv {
             id: SOURCE_ID.to_string(),
             machine_id: "local".to_string(),
             src: self.src.clone(),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,

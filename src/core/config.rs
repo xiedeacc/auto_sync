@@ -91,6 +91,8 @@ pub struct SourceGroupConfig {
     #[serde(skip_serializing_if = "is_local_machine")]
     pub machine_id: String,
     pub src: PathBuf,
+    #[serde(default = "default_source_add_directory")]
+    pub add_directory: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excludes: Vec<PathBuf>,
     pub enabled: bool,
@@ -254,6 +256,7 @@ impl Default for SourceGroupConfig {
             id: String::new(),
             machine_id: "local".to_string(),
             src: PathBuf::new(),
+            add_directory: default_source_add_directory(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -536,6 +539,10 @@ fn local_machine_from_config(machines: &[MachineConfig]) -> MachineConfig {
 
 fn default_app_port() -> u16 {
     18765
+}
+
+fn default_source_add_directory() -> bool {
+    true
 }
 
 pub fn default_machine_port() -> u16 {
@@ -1033,6 +1040,7 @@ mod tests {
             id: "main".to_string(),
             machine_id: "local".to_string(),
             src: PathBuf::from("/data/src"),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -1062,6 +1070,7 @@ mod tests {
             id: "main".to_string(),
             machine_id: "local".to_string(),
             src,
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -1086,6 +1095,7 @@ mod tests {
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src: PathBuf::from(" /data/src "),
+            add_directory: true,
             excludes: vec![
                 PathBuf::from(" log "),
                 PathBuf::from("cache/tmp"),
@@ -1126,6 +1136,7 @@ mod tests {
             id: "src_2".to_string(),
             machine_id: "local".to_string(),
             src: PathBuf::new(),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -1185,6 +1196,20 @@ web_port = 18767
 
         assert_eq!(cfg.app.port, 18766);
         assert_eq!(cfg.machines[0].port, 18767);
+    }
+
+    #[test]
+    fn legacy_source_defaults_to_adding_directory() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[[source_groups]]
+id = "src_1"
+src = "/zfs"
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg.source_groups[0].add_directory);
     }
 
     #[test]
@@ -1352,6 +1377,7 @@ web_port = 18767
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src: PathBuf::from("/data/src_1"),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -1369,6 +1395,7 @@ web_port = 18767
             id: "src_2".to_string(),
             machine_id: "local".to_string(),
             src: PathBuf::from("/data/src_2"),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,

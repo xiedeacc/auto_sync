@@ -40,6 +40,8 @@ const el = {
   folderList: document.getElementById("folder-list"),
   folderUp: document.getElementById("folder-up"),
   folderSelect: document.getElementById("folder-select"),
+  folderAddDirectoryRow: document.getElementById("folder-add-directory-row"),
+  folderAddDirectory: document.getElementById("folder-add-directory"),
   folderClose: document.getElementById("folder-close"),
   folderError: document.getElementById("folder-error"),
   scheduleModal: document.getElementById("schedule-modal"),
@@ -501,6 +503,7 @@ function addSource() {
     id: nextSourceId(),
     machine_id: "local",
     src: "",
+    add_directory: false,
     enabled: true,
     mode: "mirror",
     excludes: [],
@@ -710,10 +713,13 @@ function bindSourceControls(source, sourceIndex, group) {
     }
     const selected = await pickPath(source.src || defaultPathForMachine(source.machine_id), {
       machineId: source.machine_id || "local",
+      showAddDirectory: true,
+      addDirectory: !!source.add_directory,
     });
     if (selected) {
       source.machine_id = selected.machine_id;
       source.src = selected.path;
+      source.add_directory = !!selected.add_directory;
       await autoSaveConfig();
       renderSourcePanel();
     }
@@ -956,6 +962,7 @@ function normalizeConfig(nextCfg) {
   for (const source of nextCfg.source_groups || []) {
     source.id = normalizeSourceId(source.id);
     source.machine_id = machineIdOrLocal(source.machine_id);
+    source.add_directory = source.add_directory !== false;
     source.excludes = cleanExcludeList(source.excludes || []);
     for (const dst of source.destinations || []) {
       dst.machine_id = machineIdOrLocal(dst.machine_id);
@@ -1761,7 +1768,13 @@ async function pickPath(startPath = "/", options = {}) {
       machineId: machineIdOrLocal(options.machineId),
       requestId: 0,
       validate: options.validate || null,
+      showAddDirectory: options.showAddDirectory === true,
+      addDirectory: options.addDirectory === true,
     };
+    if (el.folderAddDirectoryRow && el.folderAddDirectory) {
+      el.folderAddDirectoryRow.hidden = !folderPicker.showAddDirectory;
+      el.folderAddDirectory.checked = folderPicker.addDirectory;
+    }
     setFolderError("");
     renderFolderMachineOptions();
     el.folderModal.hidden = false;
@@ -1837,6 +1850,9 @@ function closeFolderModal(value) {
     folderPicker.resolve(value ? {
       machine_id: value.machine_id || folderPicker.machineId,
       path: value.path || value,
+      add_directory: folderPicker.showAddDirectory && el.folderAddDirectory
+        ? el.folderAddDirectory.checked
+        : undefined,
     } : null);
     folderPicker = null;
   }
@@ -1853,6 +1869,7 @@ function updateCfgFromForm() {
   cfg.source_groups = (cfg.source_groups || []).map((source) => {
     source.machine_id = machineIdOrLocal(source.machine_id);
     source.src = trimPathValue(source.src);
+    source.add_directory = source.add_directory === true;
     source.excludes = cleanExcludeList(source.excludes || []);
     source.enabled = true;
     source.mode = "mirror";

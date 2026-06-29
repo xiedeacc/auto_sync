@@ -1228,6 +1228,7 @@ mod tests {
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src,
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,

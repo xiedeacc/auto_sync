@@ -130,6 +130,7 @@ status_log_interval_secs = 300
 [[source_groups]]
 id = "photos"
 src = "/data/photos"
+add_directory = false        # false: sync contents into dst root; true: dst/photos
 enabled = true
 mode = "mirror"             # mirror 为默认；archive 预留
 

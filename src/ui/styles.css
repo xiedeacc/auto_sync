@@ -936,6 +936,20 @@ th {
   margin-bottom: 9px;
 }
 
+.folder-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.folder-checkbox-row input {
+  width: 16px;
+  height: 16px;
+}
+
 .folder-actions {
   justify-content: flex-end;
   margin: 10px 0;

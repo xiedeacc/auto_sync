@@ -1769,7 +1769,8 @@ fn sync_cycle_with_transfer(
                             continue;
                         }
                     };
-                    let dst_root = join_machine_path(&dst.path, &source_info.name, &dst_machine);
+                    let dst_root =
+                        destination_root_for_source(source, &source_info, &dst.path, &dst_machine);
                     match sync_directory_event_paths_with_transfer(
                         source_machine_id,
                         &source_machine,
@@ -1876,7 +1877,7 @@ fn sync_cycle_with_transfer(
                 continue;
             }
         };
-        let dst_root = join_machine_path(&dst.path, &source_info.name, &dst_machine);
+        let dst_root = destination_root_for_source(source, &source_info, &dst.path, &dst_machine);
         info!(
             source = source.id,
             destination = dst.id,
@@ -2896,6 +2897,19 @@ fn join_machine_path(
     PathBuf::from(format!("{trimmed}{sep}{leaf}"))
 }
 
+fn destination_root_for_source(
+    source: &SourceGroupConfig,
+    source_info: &TransferPathInfo,
+    dst_path: &Path,
+    dst_machine: &crate::core::config::MachineConfig,
+) -> PathBuf {
+    if source.add_directory {
+        join_machine_path(dst_path, &source_info.name, dst_machine)
+    } else {
+        dst_path.to_path_buf()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SourceReadView {
     endpoint: SourceEndpoint,
@@ -2917,8 +2931,9 @@ impl SourceReadView {
                 match ZfsSnapshot::create(source, cycle_id) {
                     Ok(snapshot) => {
                         let endpoint = match live_endpoint {
-                            SourceEndpoint::Dir { .. } => SourceEndpoint::Dir {
+                            SourceEndpoint::Dir { add_directory, .. } => SourceEndpoint::Dir {
                                 root: snapshot.source_path.clone(),
+                                add_directory: *add_directory,
                             },
                             SourceEndpoint::File { .. } => SourceEndpoint::File {
                                 path: snapshot.source_path.clone(),
@@ -3182,7 +3197,7 @@ fn sanitize_snapshot_component(value: &str) -> String {
 
 #[derive(Debug, Clone)]
 enum SourceEndpoint {
-    Dir { root: PathBuf },
+    Dir { root: PathBuf, add_directory: bool },
     File { path: PathBuf },
 }
 
@@ -3193,6 +3208,7 @@ impl SourceEndpoint {
         if metadata.is_dir() {
             return Ok(Self::Dir {
                 root: source.src.clone(),
+                add_directory: source.add_directory,
             });
         }
         if metadata.is_file() || metadata.file_type().is_symlink() {
@@ -3205,7 +3221,7 @@ impl SourceEndpoint {
 
     fn snapshot(&self, excludes: &[PathBuf], checksum: bool) -> Result<Vec<SnapshotEntry>> {
         match self {
-            Self::Dir { root } => {
+            Self::Dir { root, .. } => {
                 take_snapshot_with_excludes(root, SnapshotMode::Source, excludes, checksum)
             }
             Self::File { path } => {
@@ -3229,9 +3245,17 @@ impl DestinationEndpoint {
     fn resolve(source: &SourceEndpoint, dst: &DestinationConfig) -> Result<Self> {
         reject_dangerous_destination(&dst.path)?;
         match source {
-            SourceEndpoint::Dir { root: src_root } => {
+            SourceEndpoint::Dir {
+                root: src_root,
+                add_directory,
+            } => {
                 if dst.path.exists() && !dst.path.is_dir() {
                     bail!("directory source cannot sync to non-directory destination");
+                }
+                if !add_directory {
+                    return Ok(Self::Dir {
+                        root: dst.path.clone(),
+                    });
                 }
                 let dir_name = src_root.file_name().ok_or_else(|| {
                     anyhow::anyhow!("source directory has no name: {}", src_root.display())
@@ -3313,17 +3337,18 @@ fn sync_endpoint(
     sync: &NativeSyncConfig,
 ) -> Result<()> {
     match (source, dst) {
-        (SourceEndpoint::Dir { root: src_root }, DestinationEndpoint::Dir { root: dst_root }) => {
-            sync_destination(
-                src_root,
-                dst_root,
-                destination_id,
-                cycle_id,
-                source_snapshot,
-                excludes,
-                sync,
-            )
-        }
+        (
+            SourceEndpoint::Dir { root: src_root, .. },
+            DestinationEndpoint::Dir { root: dst_root },
+        ) => sync_destination(
+            src_root,
+            dst_root,
+            destination_id,
+            cycle_id,
+            source_snapshot,
+            excludes,
+            sync,
+        ),
         (SourceEndpoint::Dir { .. }, DestinationEndpoint::File { .. }) => {
             bail!("directory source cannot sync to a destination file")
         }
@@ -3444,17 +3469,18 @@ fn sync_endpoint_event_paths(
     sync: &NativeSyncConfig,
 ) -> Result<()> {
     match (source, dst) {
-        (SourceEndpoint::Dir { root: src_root }, DestinationEndpoint::Dir { root: dst_root }) => {
-            sync_destination_event_paths(
-                src_root,
-                dst_root,
-                destination_id,
-                cycle_id,
-                rel_paths,
-                excludes,
-                sync,
-            )
-        }
+        (
+            SourceEndpoint::Dir { root: src_root, .. },
+            DestinationEndpoint::Dir { root: dst_root },
+        ) => sync_destination_event_paths(
+            src_root,
+            dst_root,
+            destination_id,
+            cycle_id,
+            rel_paths,
+            excludes,
+            sync,
+        ),
         (SourceEndpoint::Dir { .. }, DestinationEndpoint::File { .. }) => {
             bail!("directory source cannot sync to a destination file")
         }
@@ -4434,6 +4460,32 @@ mod tests {
     }
 
     #[test]
+    fn directory_destination_root_can_flatten_or_add_source_directory() {
+        let mut linux = MachineConfig::local();
+        linux.os = "linux".to_string();
+        let source_info = TransferPathInfo {
+            kind: "dir".to_string(),
+            base: PathBuf::from("/zfs"),
+            name: "zfs".to_string(),
+        };
+        let mut source = SourceGroupConfig {
+            add_directory: false,
+            ..SourceGroupConfig::default()
+        };
+
+        assert_eq!(
+            destination_root_for_source(&source, &source_info, Path::new("/zfs_pool"), &linux),
+            PathBuf::from("/zfs_pool")
+        );
+
+        source.add_directory = true;
+        assert_eq!(
+            destination_root_for_source(&source, &source_info, Path::new("/zfs_pool"), &linux),
+            PathBuf::from("/zfs_pool/zfs")
+        );
+    }
+
+    #[test]
     fn relative_paths_are_normalized_for_cross_platform_transfer() {
         assert_eq!(
             rel_to_string(Path::new("nested\\child.txt")).unwrap(),
@@ -4644,7 +4696,10 @@ mod tests {
         let source_snapshot =
             take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap();
         sync_endpoint(
-            &SourceEndpoint::Dir { root: src.clone() },
+            &SourceEndpoint::Dir {
+                root: src.clone(),
+                add_directory: true,
+            },
             &DestinationEndpoint::Dir { root: dst.clone() },
             "test_dst",
             7,
@@ -4687,7 +4742,10 @@ mod tests {
         fs::write(&dst, b"old").unwrap();
 
         let result = DestinationEndpoint::resolve(
-            &SourceEndpoint::Dir { root: src },
+            &SourceEndpoint::Dir {
+                root: src,
+                add_directory: true,
+            },
             &DestinationConfig {
                 id: "dst_1".to_string(),
                 machine_id: "local".to_string(),
@@ -4707,6 +4765,7 @@ mod tests {
         let result = DestinationEndpoint::resolve(
             &SourceEndpoint::Dir {
                 root: PathBuf::from("/tmp/source"),
+                add_directory: true,
             },
             &DestinationConfig {
                 id: "dst_1".to_string(),
@@ -4761,6 +4820,7 @@ mod tests {
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src: src.clone(),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -4812,6 +4872,7 @@ mod tests {
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src: src.clone(),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -4886,6 +4947,7 @@ mod tests {
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src: src.clone(),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -4955,6 +5017,49 @@ mod tests {
     }
 
     #[test]
+    fn directory_source_can_sync_flat_into_destination_root() {
+        let temp = temp_dir("flat_directory_destination");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("hello.txt"), b"hello").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            add_directory: false,
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+                sync: None,
+            }],
+        });
+
+        let mut state = State::open(&db).unwrap();
+        sync_all_now(&cfg, &mut state).unwrap();
+
+        assert_eq!(fs::read(dst.join("hello.txt")).unwrap(), b"hello");
+        assert!(!dst.join("src").join("hello.txt").exists());
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
     fn realtime_destination_manual_full_request_runs_full_sync() {
         let temp = temp_dir("realtime_manual_full_runs_full");
         let src = temp.join("src");
@@ -4971,6 +5076,7 @@ mod tests {
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src: src.clone(),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5037,6 +5143,7 @@ mod tests {
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src: src.clone(),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5125,6 +5232,7 @@ mod tests {
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src: src.clone(),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5196,6 +5304,7 @@ mod tests {
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src: src.clone(),
+            add_directory: true,
             excludes: vec![],
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5262,6 +5371,7 @@ mod tests {
             id: "src_1".to_string(),
             machine_id: "local".to_string(),
             src: src.clone(),
+            add_directory: true,
             excludes: vec![PathBuf::from("skip.txt"), PathBuf::from("skip_dir")],
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5315,6 +5425,7 @@ mod tests {
             id: "after_src".to_string(),
             machine_id: "local".to_string(),
             src: after_src.clone(),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5335,6 +5446,7 @@ mod tests {
             id: "before_src".to_string(),
             machine_id: "local".to_string(),
             src: before_src.clone(),
+            add_directory: true,
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
