@@ -14,7 +14,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use tracing::info;
 
-use crate::core::backend::{Backend, BrowseResponse, DelegatedSourceGroupsRequest, RuntimeStatus};
+use crate::core::backend::{
+    Backend, BrowseResponse, DelegatedSourceGroupsRequest, RuntimeStatus, SyncActivityStatus,
+};
 use crate::core::config::{AppConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
 use crate::core::state::{DestinationView, SnapshotEntry};
@@ -47,6 +49,7 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/machines/discover", get(api_discover_machines))
         .route("/api/status", get(api_status))
         .route("/api/runtime-status", get(api_runtime_status))
+        .route("/api/sync-activity", get(api_sync_activity))
         .route("/api/sync-now", post(api_sync_now))
         .route("/api/sync-source-now", post(api_sync_source_now))
         .route("/api/sync-destination-now", post(api_sync_destination_now))
@@ -187,6 +190,12 @@ async fn api_runtime_status(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<RuntimeStatus>, ApiError> {
     Ok(Json(backend.runtime_status()))
+}
+
+async fn api_sync_activity(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<SyncActivityStatus>, ApiError> {
+    Ok(Json(backend.sync_activity()?))
 }
 
 async fn api_sync_now(

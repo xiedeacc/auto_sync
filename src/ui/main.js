@@ -1,10 +1,11 @@
 const invoke = invokeBackend;
-const STATUS_POLL_MS = 3000;
+const STATUS_POLL_MS = 5000;
 const RUNTIME_STATUS_POLL_MS = 1000;
 
 let cfg = null;
 let statuses = [];
 let runtimeStatus = null;
+let syncActivity = { machines: [] };
 let lastRuntimeScan = null;
 let machineStatus = { online: 1, total: 1, machines: [] };
 let busy = false;
@@ -18,6 +19,7 @@ let folderPicker = null;
 let scheduleEditor = null;
 let excludeEditor = null;
 let dstSyncEditor = null;
+let dstLogViewer = null;
 let latestDestinationSchedule = defaultDestinationSchedule();
 let activeSourceTab = "sources";
 let machineHostLocked = false;
@@ -90,6 +92,10 @@ const el = {
   issueClose: document.getElementById("issue-close"),
   issueSummary: document.getElementById("issue-summary"),
   issueList: document.getElementById("issue-list"),
+  dstLogModal: document.getElementById("dst-log-modal"),
+  dstLogClose: document.getElementById("dst-log-close"),
+  dstLogSummary: document.getElementById("dst-log-summary"),
+  dstLogList: document.getElementById("dst-log-list"),
   excludeModal: document.getElementById("exclude-modal"),
   excludeClose: document.getElementById("exclude-close"),
   excludeAdd: document.getElementById("exclude-add"),
@@ -124,6 +130,12 @@ async function loadAll() {
     errors.push(String(error));
   }
   try {
+    await loadSyncActivity();
+  } catch (error) {
+    syncActivity = { machines: [] };
+    errors.push(String(error));
+  }
+  try {
     await loadMachines(false);
   } catch (error) {
     machineStatus = { online: 0, total: 0, machines: [] };
@@ -144,6 +156,13 @@ async function loadStatus() {
 async function loadRuntimeStatus() {
   runtimeStatus = await invoke("get_runtime_status");
   updateStatusBar();
+  renderDestinationLogModal();
+}
+
+async function loadSyncActivity() {
+  syncActivity = await invoke("get_sync_activity");
+  updateStatusUi();
+  renderDestinationLogModal();
 }
 
 async function loadMachines(discover = false) {
@@ -178,6 +197,12 @@ async function refreshStatusOnly() {
     } catch (error) {
       runtimeStatus = null;
       updateStatusBar();
+      errors.push(String(error));
+    }
+    try {
+      await loadSyncActivity();
+    } catch (error) {
+      syncActivity = { machines: [] };
       errors.push(String(error));
     }
     try {
@@ -224,15 +249,19 @@ function updateStatusUi() {
     if (sourceSync) {
       const unavailable = sourceHasUnavailableDestination(sourceId);
       const blocked = sourceHasBlockedDestination(sourceId);
-      sourceSync.disabled = busy || blocked || unavailable;
+      const activity = activityForSourceId(sourceId);
+      const syncing = activityIsSyncing(activity);
+      sourceSync.disabled = busy || blocked || unavailable || syncing;
       sourceSync.title = unavailable
         ? "Destination unavailable"
-        : (blocked ? "Blocked by sync order" : "Sync source");
+        : (blocked ? "Blocked by sync order" : (syncing ? activitySyncingLabel(activity) : "Sync source"));
     }
   }
 
   for (const row of el.sourcePanel.querySelectorAll(".destination-row")) {
-    const status = statusFor(row.dataset.sourceId, row.dataset.destinationId);
+    const sourceId = row.dataset.sourceId;
+    const destinationId = row.dataset.destinationId;
+    const status = statusFor(sourceId, destinationId);
     const unavailable = isDestinationUnavailable(status);
     row.classList.toggle("destination-unavailable", unavailable);
     const cycle = row.querySelector(".destination-cycle");
@@ -253,10 +282,18 @@ function updateStatusUi() {
     const syncSelect = row.querySelector('[data-action="sync-dst"]');
     if (syncSelect) {
       const blocked = isSyncOrderBlocked(status);
-      syncSelect.disabled = busy || blocked || unavailable;
+      const activity = activityForSourceId(sourceId);
+      const syncing = activityIsSyncing(activity);
+      syncSelect.disabled = busy || blocked || unavailable || syncing;
       syncSelect.title = unavailable
         ? unavailableLabel(status)
-        : (blocked ? blockedByLabel(status) : "Sync");
+        : (blocked ? blockedByLabel(status) : (syncing ? activitySyncingLabel(activity) : "Sync"));
+    }
+    const logButton = row.querySelector('[data-action="show-dst-log"]');
+    if (logButton) {
+      const activity = activityForSourceId(sourceId);
+      logButton.classList.toggle("is-syncing", activityIsSyncing(activity));
+      logButton.title = activityIsSyncing(activity) ? activitySyncingLabel(activity) : "Destination log";
     }
   }
 }
@@ -743,6 +780,12 @@ function bindSourceControls(source, sourceIndex, group) {
       updateStatusUi();
       return;
     }
+    const activity = activityForSource(source);
+    if (activityIsSyncing(activity)) {
+      setMessage(activitySyncingLabel(activity));
+      updateStatusUi();
+      return;
+    }
     runBusy("Checking changes...", async () => {
       await saveConfig();
       statuses = await invoke("sync_source_now", { sourceId: source.id });
@@ -780,10 +823,12 @@ function renderSyncRows(source, group) {
         <input class="path-picker dst-path" value="${escapeAttr(machinePathLabel(dst.machine_id, dst.path))}" data-field="dst-path" readonly title="${escapeAttr(machineLabel(dst.machine_id))}">
       </div>
       <div class="row-right destination-right">
+        <label>Log</label>
         <label>Schedule</label>
         <label>Cycle</label>
         <span aria-hidden="true"></span>
         <label class="actions-label">Sync</label>
+        <button class="destination-log-button icon" data-action="show-dst-log" title="Destination log">i</button>
         <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
         <input class="destination-readonly destination-cycle" value="${escapeAttr(cycleDisplay(status))}" readonly>
         <button class="sync-config-button icon" data-action="edit-dst-sync" title="${escapeAttr(destinationSyncTitle(dst))}">&#9881;</button>
@@ -833,6 +878,9 @@ function renderSyncRows(source, group) {
         openIssueModal(latestStatus);
       }
     };
+    row.querySelector('[data-action="show-dst-log"]').onclick = () => {
+      openDestinationLogModal(source, dst);
+    };
     row.querySelector('[data-action="sync-dst"]').onchange = (event) => {
       const mode = event.currentTarget.value;
       event.currentTarget.value = "";
@@ -847,6 +895,12 @@ function renderSyncRows(source, group) {
       }
       if (isSyncOrderBlocked(latestStatus)) {
         setMessage(blockedByLabel(latestStatus));
+        updateStatusUi();
+        return;
+      }
+      const activity = activityForSource(source);
+      if (activityIsSyncing(activity)) {
+        setMessage(activitySyncingLabel(activity));
         updateStatusUi();
         return;
       }
@@ -1613,6 +1667,70 @@ function closeIssueModal() {
   el.issueModal.hidden = true;
 }
 
+function openDestinationLogModal(source, dst) {
+  dstLogViewer = {
+    sourceId: source.id,
+    destinationId: dst.id,
+  };
+  renderDestinationLogModal();
+  el.dstLogModal.hidden = false;
+}
+
+function closeDestinationLogModal() {
+  el.dstLogModal.hidden = true;
+  dstLogViewer = null;
+}
+
+function renderDestinationLogModal() {
+  if (!dstLogViewer || !el.dstLogModal || el.dstLogModal.hidden) {
+    return;
+  }
+  const source = findSourceById(dstLogViewer.sourceId);
+  const dst = source && (source.destinations || []).find((item) => item.id === dstLogViewer.destinationId);
+  if (!source || !dst) {
+    el.dstLogSummary.textContent = "Destination no longer exists";
+    el.dstLogList.innerHTML = "";
+    return;
+  }
+  const status = statusFor(source.id, dst.id);
+  const activity = activityForSource(source);
+  const runtime = activityRuntime(activity, source);
+  const transfer = matchingTransfer(runtime, dst);
+  const scan = runtime && runtime.scan;
+  const rows = [
+    ["Task", `${source.id} -> ${dst.id}`],
+    ["Path", machinePathLabel(dst.machine_id, dst.path)],
+    ["Status", destinationStatusText(status)],
+    ["Cycle", cycleDisplay(status)],
+    ["Machine", activity ? activity.label : executionMachineLabel(source)],
+  ];
+  if (activity && activity.error) {
+    rows.push(["Runtime", activity.error]);
+  } else if (runtime && runtime.syncing) {
+    rows.push(["Runtime", "syncing"]);
+  } else {
+    rows.push(["Runtime", "idle"]);
+  }
+  if (transfer) {
+    rows.push(["File", transfer.rel_path || "-"]);
+    rows.push(["Speed", formatBytesPerSecond(transfer.bytes_per_sec || 0)]);
+    rows.push(["Progress", formatTransferProgress(transfer) || "-"]);
+  } else if (scan) {
+    rows.push(["Scanning", scan.current_path || scan.root_path || "-"]);
+    rows.push(["Entries", String(Number(scan.entries_seen || 0))]);
+  } else {
+    rows.push(["Current file", "-"]);
+    rows.push(["Speed", "-"]);
+  }
+  el.dstLogSummary.textContent = `${source.id} -> ${dst.id}`;
+  el.dstLogList.innerHTML = rows.map(([key, value]) => `
+    <div class="dst-log-row">
+      <div class="dst-log-key">${escapeHtml(key)}</div>
+      <div class="dst-log-value">${escapeHtml(value || "-")}</div>
+    </div>
+  `).join("");
+}
+
 function openExcludeModal(source) {
   source.excludes = cleanExcludeList(source.excludes || []);
   excludeEditor = { source };
@@ -1689,6 +1807,86 @@ function statusFor(sourceId, destinationId) {
   return statuses.find((status) =>
     normalizeSourceId(status.source_id) === sourceId && status.destination_id === destinationId
   );
+}
+
+function findSourceById(sourceId) {
+  return ((cfg && cfg.source_groups) || []).find((source) => source.id === sourceId);
+}
+
+function activityForSourceId(sourceId) {
+  const source = findSourceById(sourceId);
+  return activityForSource(source);
+}
+
+function activityForSource(source) {
+  if (!source) {
+    return null;
+  }
+  const machineId = machineIdOrLocal(source.machine_id);
+  const key = machineReferenceKey(machineId);
+  const machines = (syncActivity && syncActivity.machines) || [];
+  if (machineId === "local") {
+    return machines.find((machine) => machine.local || machine.machine_id === "local") || {
+      machine_id: "local",
+      label: "local",
+      local: true,
+      runtime: runtimeStatus,
+      error: null,
+    };
+  }
+  return machines.find((machine) => machineReferenceKey(machine.machine_id) === key)
+    || machines.find((machine) => machineReferenceKey(machine.label) === key)
+    || null;
+}
+
+function activityRuntime(activity, source) {
+  if (activity && activity.local) {
+    return runtimeStatus || activity.runtime;
+  }
+  if (activity && activity.runtime) {
+    return activity.runtime;
+  }
+  if (source && machineIdOrLocal(source.machine_id) === "local") {
+    return runtimeStatus;
+  }
+  return null;
+}
+
+function activityIsSyncing(activity) {
+  return Boolean(activity && activity.runtime && activity.runtime.syncing);
+}
+
+function activitySyncingLabel(activity) {
+  const label = (activity && activity.label) || "machine";
+  return `Sync already in progress on ${label}`;
+}
+
+function matchingTransfer(runtime, dst) {
+  const transfer = runtime && runtime.transfer;
+  if (!transfer || !dst) {
+    return null;
+  }
+  return transfer.destination_id === dst.id ? transfer : null;
+}
+
+function destinationStatusText(status) {
+  if (!status) {
+    return "unknown";
+  }
+  const reason = String(status.status_reason || "").trim();
+  return reason ? `${status.status}: ${reason}` : status.status;
+}
+
+function executionMachineLabel(source) {
+  if (!source) {
+    return "-";
+  }
+  const machineId = machineIdOrLocal(source.machine_id);
+  if (machineId === "local") {
+    return "local";
+  }
+  const machine = findMachineByReference(machineId);
+  return machine ? machinePrimaryName(machine) : machineId;
 }
 
 function sourceHasBlockedDestination(sourceId) {
@@ -2223,6 +2421,7 @@ el.machineClose.onclick = closeMachineModal;
 el.machineDiscover.onclick = () => discoverMachines().catch((error) => setMessage(String(error)));
 el.machineAdd.onclick = () => addMachine().catch((error) => setMessage(String(error)));
 el.issueClose.onclick = closeIssueModal;
+el.dstLogClose.onclick = closeDestinationLogModal;
 el.excludeClose.onclick = closeExcludeModal;
 el.excludeAdd.onclick = () => addExcludePath().catch((error) => setMessage(String(error)));
 
@@ -2253,6 +2452,7 @@ async function invokeWeb(command, payload = {}) {
     remove_machine: ["DELETE", "/api/machines"],
     get_status: ["GET", "/api/status"],
     get_runtime_status: ["GET", "/api/runtime-status"],
+    get_sync_activity: ["GET", "/api/sync-activity"],
     sync_now: ["POST", "/api/sync-now"],
     sync_source_now: ["POST", "/api/sync-source-now"],
     sync_destination_now: ["POST", "/api/sync-destination-now"],

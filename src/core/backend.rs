@@ -170,6 +170,41 @@ impl Backend {
         }
     }
 
+    pub fn sync_activity(&self) -> Result<SyncActivityStatus> {
+        let cfg = load_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
+        let mut machines = vec![MachineRuntimeView {
+            machine_id: "local".to_string(),
+            label: "local".to_string(),
+            local: true,
+            runtime: Some(self.runtime_status()),
+            error: None,
+        }];
+        for (machine_id, machine) in remote_source_machine_refs(&cfg) {
+            match remote_get_json::<RuntimeStatus>(
+                &machine,
+                "/api/runtime-status",
+                Duration::from_secs(3),
+            ) {
+                Ok(runtime) => machines.push(MachineRuntimeView {
+                    machine_id,
+                    label: machine_label(&machine),
+                    local: false,
+                    runtime: Some(runtime),
+                    error: None,
+                }),
+                Err(err) => machines.push(MachineRuntimeView {
+                    machine_id,
+                    label: machine_label(&machine),
+                    local: false,
+                    runtime: None,
+                    error: Some(err.to_string()),
+                }),
+            }
+        }
+        Ok(SyncActivityStatus { machines })
+    }
+
     pub fn sync_now(&self) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
@@ -481,6 +516,13 @@ fn source_execution_machine(cfg: &AppConfig, source_id: &str) -> Result<Option<M
 }
 
 fn remote_source_machines(cfg: &AppConfig) -> Vec<MachineConfig> {
+    remote_source_machine_refs(cfg)
+        .into_iter()
+        .map(|(_, machine)| machine)
+        .collect()
+}
+
+fn remote_source_machine_refs(cfg: &AppConfig) -> Vec<(String, MachineConfig)> {
     let mut machines = Vec::new();
     for source in cfg
         .source_groups
@@ -490,12 +532,14 @@ fn remote_source_machines(cfg: &AppConfig) -> Vec<MachineConfig> {
         let machine_id = machine_id_or_local(&source.machine_id);
         if machines
             .iter()
-            .any(|machine: &MachineConfig| machine_matches_reference(machine, machine_id))
+            .any(|(_, machine): &(String, MachineConfig)| {
+                machine_matches_reference(machine, machine_id)
+            })
         {
             continue;
         }
         if let Some(machine) = find_machine(cfg, machine_id) {
-            machines.push(machine);
+            machines.push((machine_id.to_string(), machine));
         }
     }
     machines
@@ -590,6 +634,20 @@ pub struct RuntimeStatus {
     pub transfer: Option<TransferProgressView>,
     pub scan: Option<ScanProgressView>,
     pub build: BuildInfo,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncActivityStatus {
+    pub machines: Vec<MachineRuntimeView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MachineRuntimeView {
+    pub machine_id: String,
+    pub label: String,
+    pub local: bool,
+    pub runtime: Option<RuntimeStatus>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

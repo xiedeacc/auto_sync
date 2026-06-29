@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -17,7 +17,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use filetime::{FileTime, set_file_mtime};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
-use walkdir::{DirEntry, WalkDir};
 
 use crate::core::config::{
     AppConfig, DEFAULT_MAX_PARALLEL_TRANSFERS, DEFAULT_TRANSFER_TIMEOUT_SECS, DestinationConfig,
@@ -3804,19 +3803,11 @@ fn take_snapshot_with_excludes(
     let mut entries = Vec::new();
     let scan_progress = progress::start_scan(root);
     let mut entries_seen = 0_u64;
-    for item in WalkDir::new(root)
-        .follow_links(false)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|entry| should_visit(root, entry, mode, excludes))
-    {
-        let item = item?;
-        let path = item.path();
-        if path == root {
-            continue;
-        }
+    for_each_breadth_first_snapshot_path(root, root, mode, excludes, |path| {
         entries_seen += 1;
-        let scan_path = if item.file_type().is_dir() {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to read metadata {}", path.display()))?;
+        let scan_path = if metadata.is_dir() {
             path
         } else {
             path.parent().unwrap_or(root)
@@ -3829,7 +3820,8 @@ fn take_snapshot_with_excludes(
         if let Some(entry) = snapshot_entry_if_supported(path, rel_path, checksum)? {
             entries.push(entry);
         }
-    }
+        Ok(())
+    })?;
     Ok(entries)
 }
 
@@ -3872,14 +3864,7 @@ fn collect_snapshot_path(
     if metadata.is_dir() {
         let scan_progress = progress::start_scan(path);
         let mut entries_seen = 0_u64;
-        for item in WalkDir::new(path)
-            .follow_links(false)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|entry| should_visit(root, entry, mode, excludes))
-        {
-            let item = item?;
-            let item_path = item.path();
+        for_each_breadth_first_snapshot_path(root, path, mode, excludes, |item_path| {
             entries_seen += 1;
             scan_progress.update(item_path, entries_seen);
             let rel = item_path
@@ -3889,7 +3874,8 @@ fn collect_snapshot_path(
             if let Some(entry) = snapshot_entry_if_supported(item_path, rel_path, checksum)? {
                 entries.insert(entry.rel_path.clone(), entry);
             }
-        }
+            Ok(())
+        })?;
         return Ok(());
     }
 
@@ -3945,11 +3931,70 @@ pub enum SnapshotMode {
     Destination,
 }
 
-fn should_visit(root: &Path, entry: &DirEntry, mode: SnapshotMode, excludes: &[PathBuf]) -> bool {
-    if matches!(mode, SnapshotMode::Source) {
-        return !entry_is_excluded(root, entry.path(), excludes);
+fn for_each_breadth_first_snapshot_path<F>(
+    root: &Path,
+    start: &Path,
+    mode: SnapshotMode,
+    excludes: &[PathBuf],
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    let start_metadata = fs::symlink_metadata(start)
+        .with_context(|| format!("failed to read metadata {}", start.display()))?;
+    if !start_metadata.is_dir() {
+        if start != root {
+            visit(start)?;
+        }
+        return Ok(());
     }
-    let name = entry.file_name().to_string_lossy();
+    let mut queue = VecDeque::from([start.to_path_buf()]);
+    while let Some(dir) = queue.pop_front() {
+        let mut children = sorted_read_dir(&dir)?;
+        for child in children.drain(..) {
+            if !should_visit_path(root, &child, mode, excludes) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&child)
+                .with_context(|| format!("failed to read metadata {}", child.display()))?;
+            let is_dir = metadata.is_dir();
+            visit(&child)?;
+            if is_dir {
+                queue.push_back(child);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sorted_read_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut children = Vec::new();
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("failed to read directory {}", dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("failed to read directory entry in {}", dir.display()))?;
+        children.push(entry.path());
+    }
+    children.sort_by(|left, right| file_name_sort_key(left).cmp(&file_name_sort_key(right)));
+    Ok(children)
+}
+
+fn file_name_sort_key(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn should_visit_path(root: &Path, path: &Path, mode: SnapshotMode, excludes: &[PathBuf]) -> bool {
+    if matches!(mode, SnapshotMode::Source) {
+        return !entry_is_excluded(root, path, excludes);
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
     name != INTERNAL_TMP && name != INTERNAL_TRASH && name != INTERNAL_PROBE
 }
 
@@ -4781,6 +4826,21 @@ mod tests {
             child_mtime,
             &NativeSyncConfig::default()
         ));
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn snapshot_scans_breadth_first() {
+        let temp = temp_dir("snapshot_breadth_first");
+        let src = temp.join("src");
+        fs::create_dir_all(src.join("a")).unwrap();
+        fs::write(src.join("b.txt"), b"b").unwrap();
+        fs::write(src.join("a").join("deep.txt"), b"deep").unwrap();
+
+        let snapshot = take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap();
+        let paths: Vec<String> = snapshot.into_iter().map(|entry| entry.rel_path).collect();
+
+        assert_eq!(paths, vec!["a", "b.txt", "a/deep.txt"]);
         fs::remove_dir_all(temp).ok();
     }
 

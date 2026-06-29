@@ -312,7 +312,7 @@ th {
 }
 
 .destination-right {
-  grid-template-columns: 100px 100px 34px 104px 34px;
+  grid-template-columns: 34px 100px 100px 34px 104px 34px;
 }
 
 .actions-label {
@@ -363,6 +363,12 @@ th {
 .sync-config-button {
   width: 34px;
   min-width: 34px;
+}
+
+.destination-log-button {
+  width: 34px;
+  min-width: 34px;
+  font-weight: 700;
 }
 
 .destination-row.destination-unavailable .destination-sync-select {
@@ -903,6 +909,10 @@ th {
   width: min(820px, calc(100vw - 48px));
 }
 
+.dst-log-modal-panel {
+  width: min(860px, calc(100vw - 48px));
+}
+
 .exclude-modal-panel {
   width: min(780px, calc(100vw - 48px));
 }
@@ -922,6 +932,32 @@ th {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   overflow-wrap: anywhere;
+}
+
+.dst-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+}
+
+.dst-log-row {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.dst-log-key {
+  color: var(--muted);
+}
+
+.dst-log-value {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
 }
 
 .folder-machine-row {

@@ -35,6 +35,7 @@ use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+use auto_sync::core::backend::SyncActivityStatus;
 #[cfg(feature = "gui")]
 use auto_sync::core::backend::{BrowseResponse, RuntimeStatus};
 #[cfg(feature = "gui")]
@@ -293,6 +294,7 @@ fn run_with_desktop(backend: Backend, addr: SocketAddr) {
             remove_machine,
             get_status,
             get_runtime_status,
+            get_sync_activity,
             sync_now,
             sync_source_now,
             sync_destination_now,
@@ -493,6 +495,12 @@ fn get_status(backend: tauri::State<'_, Backend>) -> Result<Vec<DestinationView>
 #[tauri::command]
 fn get_runtime_status(backend: tauri::State<'_, Backend>) -> Result<RuntimeStatus, String> {
     Ok(backend.runtime_status())
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+fn get_sync_activity(backend: tauri::State<'_, Backend>) -> Result<SyncActivityStatus, String> {
+    backend.sync_activity().map_err(error_text)
 }
 
 #[cfg(feature = "gui")]
