@@ -253,7 +253,7 @@ function updateStatusUi() {
       syncSelect.disabled = busy || blocked || unavailable;
       syncSelect.title = unavailable
         ? unavailableLabel(status)
-        : (blocked ? blockedByLabel(status) : "Sync destination");
+        : (blocked ? blockedByLabel(status) : "Sync");
     }
   }
 }
@@ -772,12 +772,12 @@ function renderSyncRows(source, group) {
       <div class="row-right destination-right">
         <label>Schedule</label>
         <label>Cycle</label>
-        <label>Options</label>
-        <label class="actions-label">Actions</label>
+        <span aria-hidden="true"></span>
+        <label class="actions-label">Sync</label>
         <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
         <input class="destination-readonly destination-cycle" value="${escapeAttr(cycleDisplay(status))}" readonly>
         <button class="sync-config-button icon" data-action="edit-dst-sync" title="${escapeAttr(destinationSyncTitle(dst))}">&#9881;</button>
-        <select class="destination-sync-select" data-action="sync-dst" title="Sync destination">
+        <select class="destination-sync-select" data-action="sync-dst" title="Sync">
           <option value="">Sync...</option>
           <option value="incremental">Incremental</option>
           <option value="changed_since">Changed Since</option>
