@@ -1724,9 +1724,7 @@ function renderDestinationLogModal() {
   const status = statusFor(source.id, dst.id);
   const activity = activityForSource(source);
   const runtime = activityRuntime(activity, source);
-  const dstRuntime = runtimeForMachine(dst.machine_id);
   const transfer = matchingTransfer(runtime, dst);
-  const diskWrite = matchingDiskWrite(dstRuntime, dst);
   const scan = runtime && runtime.scan;
   const rows = [
     ["Task", `${source.id} -> ${dst.id}`],
@@ -1742,7 +1740,6 @@ function renderDestinationLogModal() {
   } else {
     rows.push(["Runtime", "idle"]);
   }
-  rows.push(["Dst Disk Write", formatDiskWrite(diskWrite)]);
   if (transfer) {
     rows.push(["File", transfer.rel_path || "-"]);
     rows.push(["Speed", formatBytesPerSecond(transfer.bytes_per_sec || 0)]);
@@ -1875,14 +1872,6 @@ function activityForMachine(machineIdValue) {
     || null;
 }
 
-function runtimeForMachine(machineId) {
-  const activity = activityForMachine(machineId);
-  if (activity && activity.local) {
-    return runtimeStatus || activity.runtime;
-  }
-  return activity && activity.runtime ? activity.runtime : null;
-}
-
 function activityRuntime(activity, source) {
   if (activity && activity.local) {
     return runtimeStatus || activity.runtime;
@@ -1911,19 +1900,6 @@ function matchingTransfer(runtime, dst) {
     return null;
   }
   return transfer.destination_id === dst.id ? transfer : null;
-}
-
-function matchingDiskWrite(runtime, dst) {
-  const writes = (runtime && runtime.disk_writes) || [];
-  if (!dst || !writes.length) {
-    return null;
-  }
-  const dstPath = comparablePath(dst.path);
-  return writes.find((write) =>
-    write.destination_id === dst.id && comparablePath(write.destination_path) === dstPath
-  ) || writes.find((write) => write.destination_id === dst.id)
-    || writes.find((write) => comparablePath(write.destination_path) === dstPath)
-    || null;
 }
 
 function destinationStatusText(status) {
@@ -2192,10 +2168,6 @@ function trimPathValue(value) {
   return String(valueOr(value, "")).trim();
 }
 
-function comparablePath(value) {
-  return trimPathValue(value).replace(/\\/g, "/").replace(/\/+$/, "");
-}
-
 function cleanExcludeList(values) {
   const seen = new Set();
   const cleaned = [];
@@ -2381,20 +2353,6 @@ function formatTransferProgress(transfer) {
   const transferred = Number(transfer.transferred_bytes || 0);
   const percent = Math.min(100, Math.max(0, (transferred / total) * 100));
   return `${formatBytes(transferred)} / ${formatBytes(total)} (${percent.toFixed(0)}%)`;
-}
-
-function formatDiskWrite(write) {
-  if (!write) {
-    return "-";
-  }
-  const label = String(write.label || write.pool || "").trim();
-  const kind = String(write.kind || "").trim().toUpperCase();
-  const speed = formatBytesPerSecond(write.write_bytes_per_sec || 0);
-  if (!label && !kind) {
-    return speed;
-  }
-  const name = [label, kind].filter(Boolean).join(" ");
-  return `${name}: ${speed}`;
 }
 
 function formatBytesPerSecond(value) {

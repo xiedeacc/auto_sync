@@ -1,13 +1,7 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-#[cfg(windows)]
-use std::{ffi::OsString, os::windows::ffi::OsStringExt};
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -40,7 +34,6 @@ pub struct Backend {
     config_path: Arc<PathBuf>,
     port: u16,
     machine_cache: Arc<Mutex<MachineCache>>,
-    disk_write_sampler: Arc<Mutex<DiskWriteSampler>>,
 }
 
 #[derive(Default)]
@@ -55,7 +48,6 @@ impl Backend {
             config_path: Arc::new(config_path),
             port,
             machine_cache: Arc::new(Mutex::new(MachineCache::default())),
-            disk_write_sampler: Arc::new(Mutex::new(DiskWriteSampler::default())),
         };
         backend.spawn_machine_discovery_worker();
         backend
@@ -170,16 +162,11 @@ impl Backend {
     }
 
     pub fn runtime_status(&self) -> RuntimeStatus {
-        let disk_writes = load_config(&self.config_path)
-            .ok()
-            .map(|cfg| self.destination_disk_writes(&cfg))
-            .unwrap_or_default();
         RuntimeStatus {
             syncing: sync_is_running(),
             sync_kind: current_sync_kind(),
             transfer: current_transfer_progress(),
             scan: current_scan_progress(),
-            disk_writes,
             build: BuildInfo::current(),
         }
     }
@@ -217,35 +204,6 @@ impl Backend {
             }
         }
         Ok(SyncActivityStatus { machines })
-    }
-
-    fn destination_disk_writes(&self, cfg: &AppConfig) -> Vec<DiskWriteView> {
-        let mut sampler = self
-            .disk_write_sampler
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let mut views = Vec::new();
-        for source in &cfg.source_groups {
-            for dst in source.destinations.iter().filter(|dst| dst.enabled) {
-                if machine_id_or_local(&dst.machine_id) != "local" {
-                    continue;
-                }
-                let Some(target) = disk_write_target_for_path(&dst.path) else {
-                    continue;
-                };
-                let bytes_per_sec = sampler.write_bytes_per_sec(&target).unwrap_or(0);
-                views.push(DiskWriteView {
-                    destination_id: dst.id.clone(),
-                    destination_path: dst.path.to_string_lossy().to_string(),
-                    pool: target.label.clone(),
-                    label: target.label,
-                    kind: target.kind,
-                    write_bytes_per_sec: bytes_per_sec,
-                    updated_at_ms: now_ms(),
-                });
-            }
-        }
-        views
     }
 
     pub fn sync_now(&self) -> Result<Vec<DestinationView>> {
@@ -700,24 +658,9 @@ pub struct RuntimeStatus {
     pub syncing: bool,
     #[serde(default)]
     pub sync_kind: Option<String>,
-    #[serde(default)]
-    pub disk_writes: Vec<DiskWriteView>,
     pub transfer: Option<TransferProgressView>,
     pub scan: Option<ScanProgressView>,
     pub build: BuildInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiskWriteView {
-    pub destination_id: String,
-    pub destination_path: String,
-    pub pool: String,
-    #[serde(default)]
-    pub label: String,
-    #[serde(default)]
-    pub kind: String,
-    pub write_bytes_per_sec: u64,
-    pub updated_at_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -751,353 +694,6 @@ impl BuildInfo {
                 .to_string(),
         }
     }
-}
-
-#[derive(Default)]
-struct DiskWriteSampler {
-    samples: HashMap<String, DiskWriteSample>,
-}
-
-#[derive(Debug, Clone)]
-struct DiskWriteSample {
-    written_bytes: u64,
-    sampled_at: Instant,
-    bytes_per_sec: u64,
-}
-
-#[derive(Debug, Clone)]
-struct DiskWriteTarget {
-    key: String,
-    label: String,
-    kind: String,
-    source: DiskWriteSource,
-}
-
-#[derive(Debug, Clone)]
-enum DiskWriteSource {
-    ZfsPool(String),
-    WindowsLogicalDisk(String),
-}
-
-impl DiskWriteSampler {
-    fn write_bytes_per_sec(&mut self, target: &DiskWriteTarget) -> Option<u64> {
-        if let Some(sample) = self.samples.get(&target.key) {
-            if sample.sampled_at.elapsed() < Duration::from_millis(800) {
-                return Some(sample.bytes_per_sec);
-            }
-        }
-
-        match &target.source {
-            DiskWriteSource::ZfsPool(pool) => self.zfs_pool_write_bytes_per_sec(&target.key, pool),
-            DiskWriteSource::WindowsLogicalDisk(drive) => self
-                .command_write_bytes_per_sec(&target.key, || {
-                    read_windows_logical_disk_write_bytes_per_sec(drive)
-                }),
-        }
-    }
-
-    fn zfs_pool_write_bytes_per_sec(&mut self, key: &str, pool: &str) -> Option<u64> {
-        if let Some(written_bytes) = read_zfs_pool_written_bytes(pool) {
-            return Some(self.counter_write_bytes_per_sec(key, written_bytes));
-        }
-        self.command_write_bytes_per_sec(key, || read_zpool_iostat_write_bytes_per_sec(pool))
-    }
-
-    fn counter_write_bytes_per_sec(&mut self, key: &str, written_bytes: u64) -> u64 {
-        let now = Instant::now();
-        let bytes_per_sec = self
-            .samples
-            .get(key)
-            .map(|previous| {
-                let elapsed = now.duration_since(previous.sampled_at);
-                if elapsed < Duration::from_millis(200) {
-                    previous.bytes_per_sec
-                } else {
-                    let millis = elapsed.as_millis().max(1);
-                    (written_bytes.saturating_sub(previous.written_bytes) as u128 * 1000 / millis)
-                        as u64
-                }
-            })
-            .unwrap_or(0);
-        self.samples.insert(
-            key.to_string(),
-            DiskWriteSample {
-                written_bytes,
-                sampled_at: now,
-                bytes_per_sec,
-            },
-        );
-        bytes_per_sec
-    }
-
-    fn command_write_bytes_per_sec(
-        &mut self,
-        key: &str,
-        read: impl FnOnce() -> Option<u64>,
-    ) -> Option<u64> {
-        let bytes_per_sec = read()?;
-        self.samples.insert(
-            key.to_string(),
-            DiskWriteSample {
-                written_bytes: 0,
-                sampled_at: Instant::now(),
-                bytes_per_sec,
-            },
-        );
-        Some(bytes_per_sec)
-    }
-}
-
-fn disk_write_target_for_path(path: &Path) -> Option<DiskWriteTarget> {
-    if let Some(pool) = zfs_pool_for_path(path) {
-        return Some(DiskWriteTarget {
-            key: format!("zfs:{pool}"),
-            label: pool.clone(),
-            kind: "zfs".to_string(),
-            source: DiskWriteSource::ZfsPool(pool),
-        });
-    }
-    if let Some(drive) = windows_ntfs_logical_disk_for_path(path) {
-        return Some(DiskWriteTarget {
-            key: format!("ntfs:{drive}"),
-            label: drive.clone(),
-            kind: "ntfs".to_string(),
-            source: DiskWriteSource::WindowsLogicalDisk(drive),
-        });
-    }
-    None
-}
-
-fn zfs_pool_for_path(path: &Path) -> Option<String> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let output = Command::new("findmnt")
-        .arg("-T")
-        .arg(path)
-        .args(["-n", "-o", "SOURCE,FSTYPE"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    zfs_pool_from_findmnt_output(&text)
-}
-
-fn zfs_pool_from_findmnt_output(output: &str) -> Option<String> {
-    let line = output.lines().find(|line| !line.trim().is_empty())?;
-    let mut parts = line.split_whitespace();
-    let source = parts.next()?;
-    let fstype = parts.next()?;
-    if fstype != "zfs" {
-        return None;
-    }
-    let pool = source.split('/').next().unwrap_or(source).trim();
-    if pool.is_empty() {
-        None
-    } else {
-        Some(pool.to_string())
-    }
-}
-
-fn read_zfs_pool_written_bytes(pool: &str) -> Option<u64> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let path = Path::new("/proc/spl/kstat/zfs").join(pool).join("io");
-    let text = std::fs::read_to_string(path).ok()?;
-    parse_zfs_kstat_written_bytes(&text)
-}
-
-fn parse_zfs_kstat_written_bytes(text: &str) -> Option<u64> {
-    for line in text.lines() {
-        let mut parts = line.split_whitespace();
-        if parts.next() == Some("nwritten") {
-            let _type = parts.next()?;
-            return parts.next()?.parse().ok();
-        }
-    }
-    None
-}
-
-fn read_zpool_iostat_write_bytes_per_sec(pool: &str) -> Option<u64> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let output = Command::new("zpool")
-        .args(["iostat", "-Hp", pool, "1", "2"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_zpool_iostat_write_bytes_per_sec(&text, pool)
-}
-
-fn parse_zpool_iostat_write_bytes_per_sec(text: &str, pool: &str) -> Option<u64> {
-    text.lines().rev().find_map(|line| {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 7 && parts[0] == pool {
-            parts[6].parse::<u64>().ok()
-        } else {
-            None
-        }
-    })
-}
-
-#[cfg(windows)]
-fn windows_ntfs_logical_disk_for_path(path: &Path) -> Option<String> {
-    let path_text = path.to_string_lossy();
-    let path_wide = wide_null(&path_text);
-    let mut root_buf = vec![0_u16; 260];
-    let ok = unsafe {
-        GetVolumePathNameW(
-            path_wide.as_ptr(),
-            root_buf.as_mut_ptr(),
-            root_buf.len() as u32,
-        )
-    };
-    if ok == 0 {
-        let drive = windows_drive_from_path(path)?;
-        let root = format!("{drive}\\");
-        return windows_volume_is_ntfs(&root).then_some(drive);
-    }
-    let root_len = root_buf
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(root_buf.len());
-    let root = OsString::from_wide(&root_buf[..root_len])
-        .to_string_lossy()
-        .to_string();
-    if !windows_volume_is_ntfs(&root) {
-        return None;
-    }
-    windows_logical_disk_from_volume_root(&root).or_else(|| windows_drive_from_path(path))
-}
-
-#[cfg(not(windows))]
-fn windows_ntfs_logical_disk_for_path(_path: &Path) -> Option<String> {
-    None
-}
-
-#[cfg(windows)]
-fn windows_volume_is_ntfs(root: &str) -> bool {
-    let root_wide = wide_null(root);
-    let mut fs_name = vec![0_u16; 64];
-    let ok = unsafe {
-        GetVolumeInformationW(
-            root_wide.as_ptr(),
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            fs_name.as_mut_ptr(),
-            fs_name.len() as u32,
-        )
-    };
-    if ok == 0 {
-        return false;
-    }
-    let len = fs_name
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(fs_name.len());
-    let name = OsString::from_wide(&fs_name[..len])
-        .to_string_lossy()
-        .to_string();
-    name.eq_ignore_ascii_case("ntfs")
-}
-
-#[cfg(windows)]
-fn windows_logical_disk_from_volume_root(root: &str) -> Option<String> {
-    let bytes = root.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-        return Some(format!("{}:", (bytes[0] as char).to_ascii_uppercase()));
-    }
-    None
-}
-
-#[cfg(windows)]
-fn windows_drive_from_path(path: &Path) -> Option<String> {
-    let text = path.to_string_lossy();
-    let bytes = text.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-        return Some(format!("{}:", (bytes[0] as char).to_ascii_uppercase()));
-    }
-    None
-}
-
-#[cfg(windows)]
-fn wide_null(value: &str) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    std::ffi::OsStr::new(value)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
-
-fn read_windows_logical_disk_write_bytes_per_sec(drive: &str) -> Option<u64> {
-    if !cfg!(windows) {
-        return None;
-    }
-    let counter = format!(r"\LogicalDisk({drive})\Disk Write Bytes/sec");
-    let output = Command::new("typeperf")
-        .arg(counter)
-        .args(["-sc", "1"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_typeperf_write_bytes_per_sec(&text)
-}
-
-fn parse_typeperf_write_bytes_per_sec(text: &str) -> Option<u64> {
-    text.lines().rev().find_map(|line| {
-        let fields = parse_simple_csv_line(line);
-        if fields.len() < 2 {
-            return None;
-        }
-        fields[1]
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .map(|value| value.max(0.0).round() as u64)
-    })
-}
-
-fn parse_simple_csv_line(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut chars = line.chars().peekable();
-    let mut quoted = false;
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                chars.next();
-                field.push('"');
-            }
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                fields.push(field);
-                field = String::new();
-            }
-            _ => field.push(ch),
-        }
-    }
-    fields.push(field);
-    fields
-}
-
-fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 fn non_empty_machine_match(machine: &MachineConfig, value: &str) -> bool {
@@ -1264,41 +860,6 @@ fn entry_kind_order(kind: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_zfs_pool_from_findmnt_output() {
-        assert_eq!(
-            zfs_pool_from_findmnt_output("zfs_pool zfs\n").as_deref(),
-            Some("zfs_pool")
-        );
-        assert_eq!(
-            zfs_pool_from_findmnt_output("tank/photos zfs\n").as_deref(),
-            Some("tank")
-        );
-        assert_eq!(zfs_pool_from_findmnt_output("/dev/sda1 ext4\n"), None);
-    }
-
-    #[test]
-    fn parses_zfs_kstat_written_bytes() {
-        let text = "7 1 0x01 12 576 123\nname type data\nnread 4 10\nnwritten 4 987654\n";
-        assert_eq!(parse_zfs_kstat_written_bytes(text), Some(987654));
-    }
-
-    #[test]
-    fn parses_zpool_iostat_write_bandwidth() {
-        let text = "zfs_pool\t1\t2\t0\t0\t63\t383574\nzfs_pool\t1\t2\t0\t494\t0\t407451521\n";
-        assert_eq!(
-            parse_zpool_iostat_write_bytes_per_sec(text, "zfs_pool"),
-            Some(407451521)
-        );
-    }
-
-    #[test]
-    fn parses_typeperf_write_bandwidth() {
-        let text = "\"(PDH-CSV 4.0)\",\"\\\\host\\LogicalDisk(C:)\\Disk Write Bytes/sec\"\n\
-                    \"06/30/2026 05:48:24.905\",\"1130120.331741\"\n";
-        assert_eq!(parse_typeperf_write_bytes_per_sec(text), Some(1130120));
-    }
 
     #[test]
     fn preserves_disk_machines_when_saving_stale_config() {
