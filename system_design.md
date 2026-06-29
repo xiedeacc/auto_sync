@@ -419,6 +419,15 @@ Realtime + ZFS：
 - 手动同步会为全部 source 或选定 source 关闭当前 open cycle，创建新的 target cycle，并让 enabled dst 追赶该 cycle。
 - 若目标离线或校验失败，不推进 `last_verified_cycle_id`，下一轮会继续重试该 target cycle。
 
+当前实现的 Changed Since sync：
+
+- Changed Since sync 只由用户在单个 destination 的 `Sync... -> Changed Since` 手动触发。它适合 source 已推进到较新的 cycle，而该 destination 还停在较旧 verified cycle，只想追赶旧 cycle 之后变化路径的场景。
+- 手动 Changed Since 会关闭该 source 当前 open cycle，只把当前 destination 的 `target_cycle_id` 指向这个新 cycle，并把 cycle 标记为 `manual_changed_since_rescan = 1`。它不会设置 `needs_full_rescan`，因此语义上不是 Full。
+- 执行时先对 source 做完整 snapshot/manifest 扫描，并将当前完整 `source_snapshot` 写入 `path_snapshot`。随后读取该 destination 的 `last_verified_cycle_id`，找到对应 source cycle 的时间点；时间取该 source cycle 的 `ends_at`，如果没有则回退到 `starts_at`，并转换成 Unix epoch nanoseconds。这个时间来自 source cycle，而不是当前机器执行同步时的 wall-clock。
+- 路径计划由当前完整 `source_snapshot` 和 last verified cycle 的历史 `path_snapshot` 生成：当前条目的 mtime 晚于上述 cycle 时间、当前条目相对历史 snapshot 有 metadata/content 变化、新增路径、以及历史 snapshot 中存在但当前 source 已不存在的路径，都会加入待同步相对路径集合。
+- 对待同步路径集合执行局部 source/destination snapshot、复制、类型替换、mirror 删除和局部校验。没有出现在该集合中的 destination-only 文件不会被扫描或删除；需要验证整棵目标树时使用 Full。
+- 如果 destination 从未 verified、找不到它的基线 source cycle，或基线 `path_snapshot` 没有可用条目，Changed Since 没有可靠的时间锚点，会降级为完整 reconcile。
+
 当前实现的 Full sync：
 
 - Full sync 只由用户在单个 destination 的 `Sync... -> Full` 手动触发。`Sync All`、source 级 `Sync`、destination 级 `Incremental`、以及 realtime watcher 自动触发都按 incremental 处理。

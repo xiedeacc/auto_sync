@@ -775,6 +775,7 @@ function renderSyncRows(source, group) {
         <select class="destination-sync-select" data-action="sync-dst" title="Sync destination">
           <option value="">Sync...</option>
           <option value="incremental">Incremental</option>
+          <option value="changed_since">Changed Since</option>
           <option value="full">Full</option>
         </select>
         <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
@@ -1886,6 +1887,9 @@ function setMessage(text) {
 }
 
 function destinationSyncStatusMessage(source, mode) {
+  if (mode === "changed_since") {
+    return "Scanning source changes...";
+  }
   if (mode !== "full") {
     return "Checking changes...";
   }

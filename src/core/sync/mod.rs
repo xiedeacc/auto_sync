@@ -114,8 +114,12 @@ pub fn sync_destination_now_with_mode(
     mode: SyncRequestMode,
 ) -> Result<()> {
     if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
-        if mode == SyncRequestMode::Full {
-            state.mark_cycle_manual_full_rescan(cycle.id)?;
+        match mode {
+            SyncRequestMode::Incremental => {}
+            SyncRequestMode::Full => state.mark_cycle_manual_full_rescan(cycle.id)?,
+            SyncRequestMode::ChangedSince => {
+                state.mark_cycle_manual_changed_since_rescan(cycle.id)?
+            }
         }
     }
     sync_all_pending(cfg, state)
@@ -126,6 +130,7 @@ pub enum SyncRequestMode {
     #[default]
     Incremental,
     Full,
+    ChangedSince,
 }
 
 impl FromStr for SyncRequestMode {
@@ -135,6 +140,9 @@ impl FromStr for SyncRequestMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "incremental" => Ok(Self::Incremental),
             "full" => Ok(Self::Full),
+            "changed_since" | "changed-since" | "since" | "since-last-verified" => {
+                Ok(Self::ChangedSince)
+            }
             other => bail!("unsupported sync mode: {other}"),
         }
     }
@@ -1277,17 +1285,43 @@ pub fn sync_cycle_for_source(
     state.mark_cycle_status(cycle.id, "syncing")?;
     for (dst_index, dst_endpoint) in ready_destinations {
         let dst = &source.destinations[dst_index];
-        match sync_endpoint(
-            &source_endpoint,
-            &dst_endpoint,
-            &dst.id,
-            cycle.id,
-            &source_snapshot,
-            &source.excludes,
-            &cfg.app.sync,
-        ) {
+        let changed_since_paths = if cycle.manual_changed_since_rescan {
+            changed_since_scan_paths(
+                state,
+                &source.id,
+                &dst.id,
+                &source_snapshot,
+                &source.excludes,
+            )?
+        } else {
+            None
+        };
+        let sync_result = if let Some(rel_paths) = changed_since_paths.as_ref() {
+            sync_endpoint_event_paths(
+                &source_endpoint,
+                &dst_endpoint,
+                &dst.id,
+                cycle.id,
+                rel_paths,
+                &source.excludes,
+                &cfg.app.sync,
+            )
+        } else {
+            sync_endpoint(
+                &source_endpoint,
+                &dst_endpoint,
+                &dst.id,
+                cycle.id,
+                &source_snapshot,
+                &source.excludes,
+                &cfg.app.sync,
+            )
+        };
+        match sync_result {
             Ok(()) => {
-                progressed = true;
+                progressed |= changed_since_paths
+                    .as_ref()
+                    .is_none_or(|paths| !paths.is_empty());
                 state.clear_destination_issues(&source.id, &dst.id)?;
                 state.upsert_destination_status(
                     &source.id,
@@ -1452,6 +1486,9 @@ fn realtime_incremental_plan(
     if cycle.manual_full_rescan {
         return Ok(None);
     }
+    if cycle.manual_changed_since_rescan {
+        return Ok(None);
+    }
     if actionable.is_empty() {
         return Ok(Some(RealtimeIncrementalPlan::Apply(Vec::new())));
     }
@@ -1479,6 +1516,68 @@ fn realtime_incremental_plan(
     Ok(Some(RealtimeIncrementalPlan::Apply(
         paths.into_iter().collect(),
     )))
+}
+
+fn changed_since_scan_paths(
+    state: &State,
+    source_id: &str,
+    destination_id: &str,
+    source_snapshot: &[SnapshotEntry],
+    excludes: &[PathBuf],
+) -> Result<Option<Vec<String>>> {
+    let Some(base_cycle_id) = state.destination_last_verified(source_id, destination_id)? else {
+        return Ok(None);
+    };
+    let Some(base_cycle) = state.cycle_by_id(source_id, base_cycle_id)? else {
+        return Ok(None);
+    };
+    let baseline = state.snapshot_entries(base_cycle_id, source_id)?;
+    if baseline.is_empty() {
+        return Ok(None);
+    }
+    let cutoff_ns = cycle_cutoff_mtime_ns(&base_cycle);
+    let baseline_map = map_entries(&baseline);
+    let source_map = map_entries(source_snapshot);
+    let mut paths = BTreeSet::new();
+
+    for entry in source_snapshot {
+        if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
+            continue;
+        }
+        let differs_from_baseline = baseline_map
+            .get(&entry.rel_path)
+            .is_none_or(|base| snapshot_entry_changed(base, entry));
+        if entry.mtime_ns > cutoff_ns || differs_from_baseline {
+            paths.insert(entry.rel_path.clone());
+        }
+    }
+
+    for entry in baseline {
+        if source_map.contains_key(&entry.rel_path)
+            || is_rel_excluded(Path::new(&entry.rel_path), excludes)
+        {
+            continue;
+        }
+        paths.insert(entry.rel_path);
+    }
+
+    Ok(Some(paths.into_iter().collect()))
+}
+
+fn cycle_cutoff_mtime_ns(cycle: &Cycle) -> i64 {
+    let value = cycle.ends_at.as_ref().unwrap_or(&cycle.starts_at);
+    value
+        .timestamp()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(value.timestamp_subsec_nanos() as i64)
+}
+
+fn snapshot_entry_changed(left: &SnapshotEntry, right: &SnapshotEntry) -> bool {
+    left.file_type != right.file_type
+        || left.size != right.size
+        || left.mtime_ns != right.mtime_ns
+        || left.mode != right.mode
+        || left.hash != right.hash
 }
 
 fn cycle_has_remote_target(
@@ -1738,21 +1837,51 @@ fn sync_cycle_with_transfer(
             cycle_id = cycle.id,
             "syncing destination with TCP incremental transfer"
         );
-        match sync_directory_with_transfer(
-            source_machine_id,
-            &source_machine,
-            &source_info.base,
-            dst_machine_id,
-            &dst_machine,
-            &dst_root,
-            &dst.id,
-            cycle.id,
-            &source_snapshot,
-            &source.excludes,
-            &cfg.app.sync,
-        ) {
+        let changed_since_paths = if cycle.manual_changed_since_rescan {
+            changed_since_scan_paths(
+                state,
+                &source.id,
+                &dst.id,
+                &source_snapshot,
+                &source.excludes,
+            )?
+        } else {
+            None
+        };
+        let sync_result = if let Some(rel_paths) = changed_since_paths.as_ref() {
+            sync_directory_event_paths_with_transfer(
+                source_machine_id,
+                &source_machine,
+                &source_info.base,
+                dst_machine_id,
+                &dst_machine,
+                &dst_root,
+                &dst.id,
+                cycle.id,
+                rel_paths,
+                &source.excludes,
+                &cfg.app.sync,
+            )
+        } else {
+            sync_directory_with_transfer(
+                source_machine_id,
+                &source_machine,
+                &source_info.base,
+                dst_machine_id,
+                &dst_machine,
+                &dst_root,
+                &dst.id,
+                cycle.id,
+                &source_snapshot,
+                &source.excludes,
+                &cfg.app.sync,
+            )
+        };
+        match sync_result {
             Ok(()) => {
-                progressed = true;
+                progressed |= changed_since_paths
+                    .as_ref()
+                    .is_none_or(|paths| !paths.is_empty());
                 state.clear_destination_issues(&source.id, &dst.id)?;
                 state.upsert_destination_status(
                     &source.id,
@@ -4193,6 +4322,14 @@ mod tests {
             "full".parse::<SyncRequestMode>().unwrap(),
             SyncRequestMode::Full
         );
+        assert_eq!(
+            "changed_since".parse::<SyncRequestMode>().unwrap(),
+            SyncRequestMode::ChangedSince
+        );
+        assert_eq!(
+            "since-last-verified".parse::<SyncRequestMode>().unwrap(),
+            SyncRequestMode::ChangedSince
+        );
         assert!("other".parse::<SyncRequestMode>().is_err());
     }
 
@@ -4680,6 +4817,94 @@ mod tests {
             .unwrap();
         assert_eq!(needs_full_rescan, 1);
         assert_eq!(manual_full_rescan, 1);
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn changed_since_destination_sync_updates_only_paths_changed_since_last_verified_cycle() {
+        let temp = temp_dir("changed_since_sync");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("changed.txt"), b"old").unwrap();
+        fs::write(src.join("removed.txt"), b"remove me").unwrap();
+        fs::write(src.join("untouched.txt"), b"untouched").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+            }],
+        });
+
+        let mut state = State::open(&db).unwrap();
+        sync_all_now(&cfg, &mut state).unwrap();
+        let effective_dst = dst.join("src");
+        let base_cycle_id = state
+            .destination_last_verified("src_1", "dst_1")
+            .unwrap()
+            .unwrap();
+        assert!(state.snapshot_count(base_cycle_id, "src_1").unwrap() > 0);
+
+        fs::write(src.join("changed.txt"), b"new").unwrap();
+        let future_mtime = FileTime::from_unix_time(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 60,
+            0,
+        );
+        set_file_mtime(src.join("changed.txt"), future_mtime).unwrap();
+        fs::remove_file(src.join("removed.txt")).unwrap();
+        fs::write(effective_dst.join("destination-only.txt"), b"extra").unwrap();
+
+        sync_destination_now_with_mode(
+            &cfg,
+            &mut state,
+            "src_1",
+            "dst_1",
+            SyncRequestMode::ChangedSince,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(effective_dst.join("changed.txt")).unwrap(), b"new");
+        assert!(!effective_dst.join("removed.txt").exists());
+        assert_eq!(
+            fs::read(effective_dst.join("untouched.txt")).unwrap(),
+            b"untouched"
+        );
+        assert_eq!(
+            fs::read(effective_dst.join("destination-only.txt")).unwrap(),
+            b"extra"
+        );
+
+        let view = state
+            .destination_views(&cfg)
+            .unwrap()
+            .into_iter()
+            .find(|view| view.destination_id == "dst_1")
+            .unwrap();
+        assert_eq!(view.status, "green");
+        assert!(view.last_verified_cycle_id > Some(base_cycle_id));
 
         fs::remove_dir_all(temp).ok();
     }
