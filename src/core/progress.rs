@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 const STALE_AFTER: Duration = Duration::from_secs(8);
+const EWMA_NEW_SAMPLE_PERCENT: u64 = 35;
 
 static TRANSFER_PROGRESS: OnceLock<Mutex<Option<TransferProgressState>>> = OnceLock::new();
 static SCAN_PROGRESS: OnceLock<Mutex<Option<ScanProgressState>>> = OnceLock::new();
@@ -84,7 +85,8 @@ impl TransferProgressGuard {
         if elapsed >= Duration::from_millis(250) || transferred_bytes >= state.total_bytes {
             let byte_delta = transferred_bytes.saturating_sub(state.last_bytes);
             let millis = elapsed.as_millis().max(1);
-            state.bytes_per_sec = ((byte_delta as u128) * 1000 / millis) as u64;
+            let sample = ((byte_delta as u128) * 1000 / millis) as u64;
+            state.bytes_per_sec = ewma_speed(state.bytes_per_sec, sample);
             state.last_bytes = transferred_bytes;
             state.last_sample_at = now;
         }
@@ -272,7 +274,8 @@ pub fn record_transfer(rel_path: &str, added: u64) {
     if elapsed >= Duration::from_millis(250) {
         let byte_delta = state.transferred_bytes.saturating_sub(state.last_bytes);
         let millis = elapsed.as_millis().max(1);
-        state.bytes_per_sec = ((byte_delta as u128) * 1000 / millis) as u64;
+        let sample = ((byte_delta as u128) * 1000 / millis) as u64;
+        state.bytes_per_sec = ewma_speed(state.bytes_per_sec, sample);
         state.last_bytes = state.transferred_bytes;
         state.last_sample_at = now;
         write_progress_file(&state.view());
@@ -445,4 +448,29 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn ewma_speed(previous: u64, sample: u64) -> u64 {
+    if previous == 0 {
+        return sample;
+    }
+    let old_percent = 100 - EWMA_NEW_SAMPLE_PERCENT;
+    ((previous as u128 * old_percent as u128 + sample as u128 * EWMA_NEW_SAMPLE_PERCENT as u128)
+        / 100) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ewma_speed;
+
+    #[test]
+    fn transfer_speed_ewma_uses_first_sample_directly() {
+        assert_eq!(ewma_speed(0, 1_000), 1_000);
+    }
+
+    #[test]
+    fn transfer_speed_ewma_smooths_new_samples() {
+        assert_eq!(ewma_speed(1_000, 2_000), 1_350);
+        assert_eq!(ewma_speed(2_000, 1_000), 1_650);
+    }
 }
