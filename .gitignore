@@ -1,5 +1,6 @@
 /target/
 /gen/
+/conf/auto_sync.toml
 /conf/state/
 /runtime/
 /logs/*
