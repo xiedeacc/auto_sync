@@ -55,7 +55,7 @@ fn fanotify_full_sync_then_realtime_incremental_syncs_event_paths() -> Result<()
     let watcher = WatcherGuard::start(&cfg, &env.db);
     thread::sleep(Duration::from_millis(500));
 
-    write_bytes(env.src.join("changed.txt"), b"v2")?;
+    write_bytes(env.src.join("changed.txt"), b"v2 changed on zfs")?;
     write_bytes(env.src.join("existing_dir/new.txt"), b"new")?;
     wait_for_event_paths(
         &state,
@@ -67,7 +67,10 @@ fn fanotify_full_sync_then_realtime_incremental_syncs_event_paths() -> Result<()
     sync_all_pending(&cfg, &mut state)?;
     drop(watcher);
 
-    assert_file(&env.effective_dst().join("changed.txt"), b"v2")?;
+    assert_file(
+        &env.effective_dst().join("changed.txt"),
+        b"v2 changed on zfs",
+    )?;
     assert_file(&env.effective_dst().join("existing_dir/new.txt"), b"new")?;
     assert_file(&env.effective_dst().join("untouched.txt"), b"untouched")?;
     assert_file(&env.effective_dst().join("destination-only.txt"), b"extra")?;
@@ -190,8 +193,8 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        let tmp = std::env::temp_dir();
-        if self.base.starts_with(&tmp)
+        let root = test_root();
+        if self.base.starts_with(&root)
             && self.base.file_name().is_some_and(|name| {
                 name.to_string_lossy()
                     .starts_with("auto_sync_linux_fanotify_")
@@ -270,10 +273,16 @@ fn unique_tmp_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    PathBuf::from("/tmp").join(format!(
+    test_root().join(format!(
         "auto_sync_linux_fanotify_{name}_{}_{nanos}",
         std::process::id()
     ))
+}
+
+fn test_root() -> PathBuf {
+    std::env::var_os("AUTO_SYNC_LINUX_FANOTIFY_TEST_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/zfs/tmp"))
 }
 
 fn write_bytes(path: PathBuf, value: &[u8]) -> Result<()> {
