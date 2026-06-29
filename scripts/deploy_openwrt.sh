@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-CONFIG="${CONFIG:-conf/auto_sync.openwrt.toml}"
+CONFIG="${CONFIG:-conf/auto_sync.linux.toml}"
+PROCD_INIT="${PROCD_INIT:-conf/auto_sync.procd}"
 HOST="${HOST:-192.168.2.1}"
 PORT="${PORT:-10022}"
 USER="${USER:-root}"
@@ -112,6 +113,10 @@ while [[ $# -gt 0 ]]; do
       INSTALL_DIR="$2"
       shift 2
       ;;
+    --procd-init)
+      PROCD_INIT="$2"
+      shift 2
+      ;;
     --binary-dir)
       BINARY_DIR="$2"
       shift 2
@@ -129,7 +134,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h|--help)
-      echo "Usage: scripts/deploy_openwrt.sh [--config PATH] [--host HOST] [--port PORT] [--user USER] [--install-dir DIR] [--binary-dir DIR] [--target TARGET] [--out-dir DIR] [--openwrt-toolchain DIR]"
+      echo "Usage: scripts/deploy_openwrt.sh [--config PATH] [--procd-init PATH] [--host HOST] [--port PORT] [--user USER] [--install-dir DIR] [--binary-dir DIR] [--target TARGET] [--out-dir DIR] [--openwrt-toolchain DIR]"
       echo "Defaults: --host 192.168.2.1 --port 10022 --user root --install-dir /usr/local/auto_sync"
       exit 0
       ;;
@@ -142,6 +147,10 @@ done
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "Config file not found: $CONFIG" >&2
+  exit 1
+fi
+if [[ ! -f "$PROCD_INIT" ]]; then
+  echo "procd init template not found: $PROCD_INIT" >&2
   exit 1
 fi
 
@@ -185,20 +194,7 @@ echo "Installed OpenWrt config $INSTALL_DIR/conf/auto_sync.toml from $CONFIG"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-cat > "$tmp_dir/auto_sync" <<EOF
-#!/bin/sh /etc/rc.common
-START=95
-USE_PROCD=1
-
-start_service() {
-  procd_open_instance
-  procd_set_param command $INSTALL_DIR/bin/auto_sync --config $INSTALL_DIR/conf/auto_sync.toml
-  procd_set_param respawn 5 5 0
-  procd_set_param stdout 1
-  procd_set_param stderr 1
-  procd_close_instance
-}
-EOF
+sed "s|@INSTALL_DIR@|$INSTALL_DIR|g" "$PROCD_INIT" > "$tmp_dir/auto_sync"
 
 scp -O -P "$PORT" "$tmp_dir/auto_sync" "${target}:/etc/init.d/auto_sync"
 

@@ -16,6 +16,17 @@ modify_window_secs = 1
 
 [[machines]]
 id = "local"
+name = "local"
+host = "0.0.0.0"
+web_port = 18765
+ssh_user = ""
+ssh_port = 22
+os = "linux"
+enabled = true
+manual = true
+
+[[machines]]
+id = "nas"
 alias_name = "nas"
 name = "tiger"
 host = "192.168.2.247"

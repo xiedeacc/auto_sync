@@ -54,12 +54,13 @@ scripts/deploy_local.sh
 ```
 
 The local deploy script builds the release binary, installs it to
-`/usr/local/auto_sync`, seeds the config only if it does not already exist,
+`/usr/local/auto_sync`, installs `conf/auto_sync.linux.toml` as the local config,
 installs the systemd unit, and starts the single `auto_sync.service` on Linux.
 It first checks the Ubuntu/Debian build environment and installs missing build
 dependencies plus Rust stable only when needed. On Linux hosts without a GUI
 environment it builds the headless (web-only) variant; with a GUI it builds with
-desktop support.
+desktop support. NAS, tiger Linux, and OpenWrt share the same Linux config
+template.
 
 Machine deploy helpers:
 
@@ -82,4 +83,5 @@ detection and keeps periodic full reconciliation as a fallback for journal
 gaps, journal resets, and first-run verification. The GUI and Web UI share this
 daemon-backed state instead of running separate watcher logic.
 `deploy_openwrt.sh` cross-compiles aarch64 OpenWrt binaries when needed,
-installs procd init scripts, and deploys to `/usr/local/auto_sync`.
+installs the `conf/auto_sync.procd` procd init script, and deploys to
+`/usr/local/auto_sync`.
