@@ -16,17 +16,6 @@ modify_window_secs = 1
 
 [[machines]]
 id = "local"
-name = "This machine"
-host = "192.168.2.166"
-web_port = 18765
-ssh_user = ""
-ssh_port = 22
-os = "windows"
-enabled = true
-manual = true
-
-[[machines]]
-id = "nas"
 alias_name = "nas"
 name = "nas"
 host = "192.168.2.247"
@@ -34,6 +23,17 @@ web_port = 18765
 ssh_user = "root"
 ssh_port = 10022
 os = "linux"
+enabled = true
+manual = true
+
+[[machines]]
+id = "windows"
+name = "windows"
+host = "192.168.2.166"
+web_port = 18765
+ssh_user = "Administrator"
+ssh_port = 22
+os = "windows"
 enabled = true
 manual = true
 
@@ -47,31 +47,6 @@ ssh_port = 10022
 os = "linux"
 enabled = true
 manual = true
-
-[[source_groups]]
-id = "src_1"
-src = '\\?\C:\Users\tiger\Documents\xwechat_files'
-enabled = true
-mode = "mirror"
-
-[source_groups.snapshot]
-backend = "auto"
-prefix = "auto_sync"
-reconcile_interval_secs = 900
-keep_extra_cycles = 2
-
-[[source_groups.destinations]]
-id = "dst_1"
-machine_id = "nas"
-path = "/opt"
-enabled = true
-
-[source_groups.destinations.schedule]
-mode = "realtime"
-time = "02:00"
-timezone = "local"
-weekday = "monday"
-sync_current_cycle_manually = false
 
 [[deploy.targets]]
 id = "tiger"
