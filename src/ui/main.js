@@ -2337,9 +2337,14 @@ function formatDiskWrite(write) {
   if (!write) {
     return "-";
   }
-  const pool = String(write.pool || "").trim();
+  const label = String(write.label || write.pool || "").trim();
+  const kind = String(write.kind || "").trim().toUpperCase();
   const speed = formatBytesPerSecond(write.write_bytes_per_sec || 0);
-  return pool ? `${pool}: ${speed}` : speed;
+  if (!label && !kind) {
+    return speed;
+  }
+  const name = [label, kind].filter(Boolean).join(" ");
+  return `${name}: ${speed}`;
 }
 
 function formatBytesPerSecond(value) {
