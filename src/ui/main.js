@@ -823,12 +823,12 @@ function renderSyncRows(source, group) {
         <input class="path-picker dst-path" value="${escapeAttr(machinePathLabel(dst.machine_id, dst.path))}" data-field="dst-path" readonly title="${escapeAttr(machineLabel(dst.machine_id))}">
       </div>
       <div class="row-right destination-right">
-        <label>Log</label>
+        <span aria-hidden="true"></span>
         <label>Schedule</label>
         <label>Cycle</label>
         <span aria-hidden="true"></span>
         <label class="actions-label">Sync</label>
-        <button class="destination-log-button icon" data-action="show-dst-log" title="Destination log">i</button>
+        <button class="destination-log-button" data-action="show-dst-log" title="Destination log">Log</button>
         <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
         <input class="destination-readonly destination-cycle" value="${escapeAttr(cycleDisplay(status))}" readonly>
         <button class="sync-config-button icon" data-action="edit-dst-sync" title="${escapeAttr(destinationSyncTitle(dst))}">&#9881;</button>
@@ -1699,15 +1699,15 @@ function renderDestinationLogModal() {
   const scan = runtime && runtime.scan;
   const rows = [
     ["Task", `${source.id} -> ${dst.id}`],
-    ["Path", machinePathLabel(dst.machine_id, dst.path)],
+    ["Source Path", machinePathLabel(source.machine_id, source.src)],
+    ["Destination Path", machinePathLabel(dst.machine_id, dst.path)],
     ["Status", destinationStatusText(status)],
     ["Cycle", cycleDisplay(status)],
-    ["Machine", activity ? activity.label : executionMachineLabel(source)],
   ];
   if (activity && activity.error) {
     rows.push(["Runtime", activity.error]);
   } else if (runtime && runtime.syncing) {
-    rows.push(["Runtime", "syncing"]);
+    rows.push(["Runtime", runtimeSyncLabel(runtime)]);
   } else {
     rows.push(["Runtime", "idle"]);
   }
@@ -1722,7 +1722,7 @@ function renderDestinationLogModal() {
     rows.push(["Current file", "-"]);
     rows.push(["Speed", "-"]);
   }
-  el.dstLogSummary.textContent = `${source.id} -> ${dst.id}`;
+  el.dstLogSummary.textContent = "";
   el.dstLogList.innerHTML = rows.map(([key, value]) => `
     <div class="dst-log-row">
       <div class="dst-log-key">${escapeHtml(key)}</div>
@@ -1877,16 +1877,18 @@ function destinationStatusText(status) {
   return reason ? `${status.status}: ${reason}` : status.status;
 }
 
-function executionMachineLabel(source) {
-  if (!source) {
-    return "-";
+function runtimeSyncLabel(runtime) {
+  const kind = String((runtime && runtime.sync_kind) || "").trim();
+  if (!kind) {
+    return "syncing";
   }
-  const machineId = machineIdOrLocal(source.machine_id);
-  if (machineId === "local") {
-    return "local";
-  }
-  const machine = findMachineByReference(machineId);
-  return machine ? machinePrimaryName(machine) : machineId;
+  const labels = {
+    incremental: "incremental",
+    full: "full",
+    changed_since: "changed since",
+    automatic: "automatic",
+  };
+  return `syncing (${labels[kind] || kind})`;
 }
 
 function sourceHasBlockedDestination(sourceId) {

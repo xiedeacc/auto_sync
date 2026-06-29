@@ -22,8 +22,8 @@ use crate::core::progress::{
 };
 use crate::core::state::{DestinationView, State as DbState};
 use crate::core::sync::{
-    SyncRequestMode, sync_is_running, try_sync_all_now, try_sync_destination_now_with_mode,
-    try_sync_source_now,
+    SyncRequestMode, current_sync_kind, sync_is_running, try_sync_all_now,
+    try_sync_destination_now_with_mode, try_sync_source_now,
 };
 
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -164,6 +164,7 @@ impl Backend {
     pub fn runtime_status(&self) -> RuntimeStatus {
         RuntimeStatus {
             syncing: sync_is_running(),
+            sync_kind: current_sync_kind(),
             transfer: current_transfer_progress(),
             scan: current_scan_progress(),
             build: BuildInfo::current(),
@@ -631,6 +632,8 @@ fn machine_label(machine: &MachineConfig) -> String {
 pub struct RuntimeStatus {
     #[serde(default)]
     pub syncing: bool,
+    #[serde(default)]
+    pub sync_kind: Option<String>,
     pub transfer: Option<TransferProgressView>,
     pub scan: Option<ScanProgressView>,
     pub build: BuildInfo,

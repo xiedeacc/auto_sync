@@ -312,7 +312,7 @@ th {
 }
 
 .destination-right {
-  grid-template-columns: 34px 100px 100px 34px 104px 34px;
+  grid-template-columns: 52px 100px 100px 34px 104px 34px;
 }
 
 .actions-label {
@@ -366,9 +366,10 @@ th {
 }
 
 .destination-log-button {
-  width: 34px;
-  min-width: 34px;
+  width: 52px;
+  min-width: 52px;
   font-weight: 700;
+  color: var(--accent);
 }
 
 .destination-row.destination-unavailable .destination-sync-select {
@@ -577,6 +578,10 @@ th {
   margin-bottom: 8px;
   color: var(--muted);
   font-size: 13px;
+}
+
+.issue-summary:empty {
+  display: none;
 }
 
 .issue-list {

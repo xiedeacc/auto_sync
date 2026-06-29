@@ -47,6 +47,20 @@ const DELTA_MAX_SIZE: u64 = 1024 * 1024 * 1024;
 /// web server and (optional) desktop UI now sharing one process, the scheduled
 /// tick and a manually triggered sync must never drive the engine concurrently.
 static SYNC_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+static SYNC_KIND: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+struct SyncKindGuard {
+    previous: Option<String>,
+}
+
+impl Drop for SyncKindGuard {
+    fn drop(&mut self) {
+        let mut kind = sync_kind_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *kind = self.previous.take();
+    }
+}
 
 pub fn sync_gate() -> &'static Mutex<()> {
     SYNC_GATE.get_or_init(|| Mutex::new(()))
@@ -56,8 +70,39 @@ pub fn sync_is_running() -> bool {
     sync_gate().try_lock().is_err()
 }
 
+pub fn current_sync_kind() -> Option<String> {
+    sync_kind_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+fn sync_kind_lock() -> &'static Mutex<Option<String>> {
+    SYNC_KIND.get_or_init(|| Mutex::new(None))
+}
+
+fn set_sync_kind(kind: &str) -> SyncKindGuard {
+    let mut current = sync_kind_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let previous = current.replace(kind.to_string());
+    SyncKindGuard { previous }
+}
+
+fn set_sync_kind_if_empty(kind: &str) -> SyncKindGuard {
+    let mut current = sync_kind_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let previous = current.clone();
+    if current.is_none() {
+        *current = Some(kind.to_string());
+    }
+    SyncKindGuard { previous }
+}
+
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     let _serialized = sync_gate().lock().unwrap_or_else(|err| err.into_inner());
+    let _kind = set_sync_kind_if_empty("automatic");
     sync_all_pending_inner(cfg, state)
 }
 
@@ -65,6 +110,7 @@ pub fn try_sync_all_now(cfg: &AppConfig, state: &mut State) -> Result<()> {
     let _serialized = sync_gate()
         .try_lock()
         .map_err(|_| anyhow!("sync already in progress"))?;
+    let _kind = set_sync_kind("incremental");
     state.force_target_all_destinations(cfg)?;
     sync_all_pending_inner(cfg, state)
 }
@@ -73,6 +119,7 @@ pub fn try_sync_source_now(cfg: &AppConfig, state: &mut State, source_id: &str) 
     let _serialized = sync_gate()
         .try_lock()
         .map_err(|_| anyhow!("sync already in progress"))?;
+    let _kind = set_sync_kind("incremental");
     state.force_target_source(cfg, source_id)?;
     sync_all_pending_inner(cfg, state)
 }
@@ -87,6 +134,7 @@ pub fn try_sync_destination_now_with_mode(
     let _serialized = sync_gate()
         .try_lock()
         .map_err(|_| anyhow!("sync already in progress"))?;
+    let _kind = set_sync_kind(sync_request_mode_wire_value(mode));
     if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
         match mode {
             SyncRequestMode::Incremental => {}
@@ -131,11 +179,13 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
 }
 
 pub fn sync_all_now(cfg: &AppConfig, state: &mut State) -> Result<()> {
+    let _kind = set_sync_kind("incremental");
     state.force_target_all_destinations(cfg)?;
     sync_all_pending(cfg, state)
 }
 
 pub fn sync_source_now(cfg: &AppConfig, state: &mut State, source_id: &str) -> Result<()> {
+    let _kind = set_sync_kind("incremental");
     state.force_target_source(cfg, source_id)?;
     sync_all_pending(cfg, state)
 }
@@ -162,6 +212,7 @@ pub fn sync_destination_now_with_mode(
     destination_id: &str,
     mode: SyncRequestMode,
 ) -> Result<()> {
+    let _kind = set_sync_kind(sync_request_mode_wire_value(mode));
     if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
         match mode {
             SyncRequestMode::Incremental => {}
@@ -180,6 +231,14 @@ pub enum SyncRequestMode {
     Incremental,
     Full,
     ChangedSince,
+}
+
+fn sync_request_mode_wire_value(mode: SyncRequestMode) -> &'static str {
+    match mode {
+        SyncRequestMode::Incremental => "incremental",
+        SyncRequestMode::Full => "full",
+        SyncRequestMode::ChangedSince => "changed_since",
+    }
 }
 
 impl FromStr for SyncRequestMode {
