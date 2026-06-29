@@ -271,12 +271,19 @@ pub struct TransferAck {
 pub struct TransferDirSpec {
     pub rel_path: String,
     pub mode: u32,
+    pub mtime_ns: i64,
 }
 
 /// Create many directories on the destination in a single request, eliminating
 /// one HTTP round-trip per directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferPrepareDirsRequest {
+    pub root: PathBuf,
+    pub dirs: Vec<TransferDirSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferSetDirMtimesRequest {
     pub root: PathBuf,
     pub dirs: Vec<TransferDirSpec>,
 }
@@ -467,6 +474,12 @@ pub fn transfer_prepare_dirs(req: TransferPrepareDirsRequest) -> Result<Transfer
             .with_context(|| format!("failed to create directory {}", path.display()))?;
         set_mode(&path, dir.mode).ok();
     }
+    Ok(transfer_ack())
+}
+
+pub fn transfer_set_dir_mtimes(req: TransferSetDirMtimesRequest) -> Result<TransferAck> {
+    reject_dangerous_destination(&req.root)?;
+    set_dir_mtimes(&req.root, &req.dirs)?;
     Ok(transfer_ack())
 }
 
@@ -1976,6 +1989,7 @@ fn sync_directory_with_transfer(
         .map(|entry| TransferDirSpec {
             rel_path: entry.rel_path.clone(),
             mode: entry.mode,
+            mtime_ns: entry.mtime_ns,
         })
         .collect();
     dirs.sort_by(|a, b| {
@@ -2039,6 +2053,9 @@ fn sync_directory_with_transfer(
         )
         .context("failed to remove extra destination paths")?;
     }
+
+    set_dir_mtimes_on_machine(dst_machine_id, dst_machine, dst_root, &dirs, timeout)
+        .context("failed to set destination directory mtimes")?;
 
     cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, timeout).ok();
 
@@ -2140,6 +2157,7 @@ fn sync_directory_event_paths_with_transfer(
         .map(|entry| TransferDirSpec {
             rel_path: entry.rel_path.clone(),
             mode: entry.mode,
+            mtime_ns: entry.mtime_ns,
         })
         .collect();
     dirs.sort_by(|a, b| {
@@ -2178,6 +2196,9 @@ fn sync_directory_event_paths_with_transfer(
         files = transferred,
         "destination realtime event transfer phase complete"
     );
+
+    set_dir_mtimes_on_machine(dst_machine_id, dst_machine, dst_root, &dirs, timeout)
+        .context("failed to set changed destination directory mtimes")?;
 
     cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, timeout).ok();
     let actual = snapshot_paths_on_machine(
@@ -2554,6 +2575,36 @@ fn prepare_dirs_on_machine(
         };
         if !ack.ok {
             bail!("peer rejected prepare directories request");
+        }
+    }
+    Ok(())
+}
+
+fn set_dir_mtimes_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    dirs: &[TransferDirSpec],
+    timeout: Duration,
+) -> Result<()> {
+    let mut dirs = dirs.to_vec();
+    dirs.sort_by(|a, b| {
+        path_depth(&b.rel_path)
+            .cmp(&path_depth(&a.rel_path))
+            .then_with(|| b.rel_path.cmp(&a.rel_path))
+    });
+    for chunk in dirs.chunks(BULK_BATCH_SIZE) {
+        let req = TransferSetDirMtimesRequest {
+            root: root.to_path_buf(),
+            dirs: chunk.to_vec(),
+        };
+        let ack = if machine_id == "local" {
+            transfer_set_dir_mtimes(req)?
+        } else {
+            remote_post_json(machine, "/api/transfer/set-dir-mtimes", &req, timeout)?
+        };
+        if !ack.ok {
+            bail!("peer rejected set directory mtimes request");
         }
     }
     Ok(())
@@ -3328,6 +3379,7 @@ fn sync_destination(
             }
         }
 
+        set_snapshot_dir_mtimes(dst_root, source_snapshot)?;
         verify_destination(dst_root, source_snapshot, &changing_paths, excludes, sync)?;
         if !changing_paths.is_empty() {
             return Err(source_changing_error(&changing_paths));
@@ -3533,6 +3585,7 @@ fn sync_changed_entries_local(
                 .with_context(|| format!("failed to remove changed destination path {rel}"))?;
         }
     }
+    set_snapshot_dir_mtimes(dst_root, source_snapshot)?;
     Ok(())
 }
 
@@ -3817,6 +3870,46 @@ fn copy_entry(
     }
 }
 
+fn set_snapshot_dir_mtimes(dst_root: &Path, source_snapshot: &[SnapshotEntry]) -> Result<()> {
+    let dirs: Vec<TransferDirSpec> = source_snapshot
+        .iter()
+        .filter(|entry| entry.file_type == "dir")
+        .map(|entry| TransferDirSpec {
+            rel_path: entry.rel_path.clone(),
+            mode: entry.mode,
+            mtime_ns: entry.mtime_ns,
+        })
+        .collect();
+    set_dir_mtimes(dst_root, &dirs)
+}
+
+fn set_dir_mtimes(root: &Path, dirs: &[TransferDirSpec]) -> Result<()> {
+    let mut dirs = dirs.to_vec();
+    dirs.sort_by(|a, b| {
+        path_depth(&b.rel_path)
+            .cmp(&path_depth(&a.rel_path))
+            .then_with(|| b.rel_path.cmp(&a.rel_path))
+    });
+    for dir in &dirs {
+        let path = if dir.rel_path.is_empty() {
+            root.to_path_buf()
+        } else {
+            safe_join_rel(root, &dir.rel_path)?
+        };
+        if !path.exists() {
+            continue;
+        }
+        set_mode(&path, dir.mode).ok();
+        let mtime = FileTime::from_unix_time(
+            dir.mtime_ns / 1_000_000_000,
+            (dir.mtime_ns % 1_000_000_000) as u32,
+        );
+        set_file_mtime(&path, mtime)
+            .with_context(|| format!("failed to set directory mtime {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn copy_file(
     src: &Path,
     dst_root: &Path,
@@ -3990,7 +4083,7 @@ fn entries_match(left: &SnapshotEntry, right: &SnapshotEntry, sync: &NativeSyncC
         return false;
     }
     match left.file_type.as_str() {
-        "dir" => true,
+        "dir" => mtimes_match(left.mtime_ns, right.mtime_ns, sync),
         "file" if sync.checksum => left.size == right.size && left.hash == right.hash,
         "file" => left.size == right.size && mtimes_match(left.mtime_ns, right.mtime_ns, sync),
         "symlink" => left.hash == right.hash,
@@ -4486,6 +4579,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read(dst).unwrap(), b"hello");
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn syncs_directory_mtime_after_children() {
+        let temp = temp_dir("dir_mtime");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let parent = src.join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(child.join("file.txt"), b"hello").unwrap();
+        let parent_time = FileTime::from_unix_time(1_700_000_100, 0);
+        let child_time = FileTime::from_unix_time(1_700_000_200, 0);
+        set_file_mtime(&parent, parent_time).unwrap();
+        set_file_mtime(&child, child_time).unwrap();
+
+        let source_snapshot =
+            take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap();
+        sync_endpoint(
+            &SourceEndpoint::Dir { root: src.clone() },
+            &DestinationEndpoint::Dir { root: dst.clone() },
+            "test_dst",
+            7,
+            &source_snapshot,
+            &[],
+            &NativeSyncConfig::default(),
+        )
+        .unwrap();
+
+        let parent_entry = source_snapshot
+            .iter()
+            .find(|entry| entry.rel_path == "parent")
+            .unwrap();
+        let child_entry = source_snapshot
+            .iter()
+            .find(|entry| entry.rel_path == "parent/child")
+            .unwrap();
+        let parent_mtime = metadata_mtime_ns(&fs::metadata(dst.join("parent")).unwrap()).unwrap();
+        let child_mtime =
+            metadata_mtime_ns(&fs::metadata(dst.join("parent").join("child")).unwrap()).unwrap();
+        assert!(mtimes_match(
+            parent_entry.mtime_ns,
+            parent_mtime,
+            &NativeSyncConfig::default()
+        ));
+        assert!(mtimes_match(
+            child_entry.mtime_ns,
+            child_mtime,
+            &NativeSyncConfig::default()
+        ));
         fs::remove_dir_all(temp).ok();
     }
 

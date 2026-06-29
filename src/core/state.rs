@@ -642,6 +642,17 @@ impl State {
             "UPDATE sync_cycle SET status=?1, updated_at=?2 WHERE id=?3",
             params![status, now_string(), cycle_id],
         )?;
+        if status == "verified" {
+            self.delete_cycle_startup_mtime_events(cycle_id)?;
+        }
+        Ok(())
+    }
+
+    fn delete_cycle_startup_mtime_events(&self, cycle_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM event_log WHERE cycle_id=?1 AND event_kind='startup_mtime_scan'",
+            params![cycle_id],
+        )?;
         Ok(())
     }
 
@@ -1269,6 +1280,30 @@ mod tests {
             state.advance_due_destination_targets(&cfg).unwrap().len(),
             1
         );
+
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn verified_cycle_deletes_only_startup_mtime_events() {
+        let temp = temp_dir("state_delete_startup_events");
+        let db = temp.join("state.sqlite");
+        let state = State::open(&db).unwrap();
+        let cycle_id = state.ensure_open_cycle("src_1", Utc::now()).unwrap();
+        state
+            .record_event("src_1", 0, "startup_mtime_scan", Some("a.txt"), false)
+            .unwrap();
+        state
+            .record_event("src_1", 0, "modify", Some("b.txt"), false)
+            .unwrap();
+
+        state.mark_cycle_status(cycle_id, "failed").unwrap();
+        assert_eq!(state.cycle_events("src_1", cycle_id).unwrap().len(), 2);
+
+        state.mark_cycle_status(cycle_id, "verified").unwrap();
+        let events = state.cycle_events("src_1", cycle_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_kind, "modify");
 
         std::fs::remove_dir_all(temp).ok();
     }

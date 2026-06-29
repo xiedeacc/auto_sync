@@ -468,6 +468,7 @@ Realtime + ZFS：
 - 拷贝完成后 fsync 文件和父目录。
 - 校验 size、mtime 和可选 hash；大文件可先 size+mtime，异常时再 hash。
 - 校验通过后原子 rename 到最终路径。
+- 目录 mtime 不在目录创建时设置；所有子文件/子目录复制、删除和 rename 完成后，按 deepest-first 顺序批量设置目录 mode/mtime，避免子项操作再次改变父目录 mtime。
 - 因为读取来自 snapshot，同一个 cycle 内 source fingerprint 必须稳定；若 snapshot 读取失败或 fingerprint 与 plan 不一致，该 cycle/task 标记 failed，不能改读 live source。
 
 正在增长文件策略：
@@ -484,6 +485,7 @@ Realtime 快速同步语义：
 - Windows realtime 优先使用 USN Journal；如果当前进程权限或环境无法查询 USN Journal，则降级到 `ReadDirectoryChangesW` 递归目录 watcher，仍然按相对路径写入 `event_log` 触发增量同步。
 - Windows 启动时默认要求 elevated 进程：如果当前进程不是管理员且还没有尝试过提权，`auto_sync` 会用 `runas` 重新拉起同一配置的 elevated 进程，并退出当前非 elevated 进程；用户需要在 UAC 中确认。若 elevated 启动失败，则继续以普通权限运行，并在 USN 不可用时使用 `ReadDirectoryChangesW` fallback。
 - 进程启动或 watcher 因配置变化重启时，会对本机 realtime source 做一次 mtime 补漏扫描：读取该 source 最近一次 `event_log.observed_at` 作为 cutoff，递归扫描 source 下文件和目录，mtime 晚于 cutoff 且 cutoff 之后没有同路径事件的条目会补写 `startup_mtime_scan` 增量事件。该机制只补 event-path 增量事件，不自动触发 Full sync。
+- `startup_mtime_scan` 事件只在其所在 cycle 被标记为 `verified` 后清理；多 dst 场景下，如果某个 dst 尚未完成该 cycle，这些补漏事件仍会保留。
 - realtime 快速同步完成只能说明“事件提示队列已处理”，不能证明 dst 与最新 snapshot 完全一致。
 - 只有 snapshot/diff reconcile 完成并校验通过后，才能推进 `last_verified_cycle_id` 并显示绿点。
 - 如果 realtime 写入与后续 snapshot diff 结果冲突，以 snapshot diff/reconcile 为准修正 dst。
