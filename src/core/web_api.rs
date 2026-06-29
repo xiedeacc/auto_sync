@@ -23,11 +23,12 @@ use crate::core::sync::{
     TransferCleanupTmpRequest, TransferPathInfo, TransferPathInfoRequest,
     TransferPrepareDirRequest, TransferPrepareDirsRequest, TransferPushFileRequest,
     TransferPutFileQuery, TransferReceiveFileChunkQuery, TransferReceiveSymlinkRequest,
-    TransferRemovePathRequest, TransferRemovePathsRequest, TransferSnapshotRequest,
-    transfer_apply_delta, transfer_block_sums, transfer_cleanup_tmp, transfer_file_offset,
-    transfer_finish_file, transfer_path_info, transfer_prepare_dir, transfer_prepare_dirs,
-    transfer_push_file, transfer_put_file, transfer_receive_file_chunk, transfer_receive_symlink,
-    transfer_remove_path, transfer_remove_paths, transfer_snapshot,
+    TransferRemovePathRequest, TransferRemovePathsRequest, TransferSnapshotPathsRequest,
+    TransferSnapshotRequest, transfer_apply_delta, transfer_block_sums, transfer_cleanup_tmp,
+    transfer_file_offset, transfer_finish_file, transfer_path_info, transfer_prepare_dir,
+    transfer_prepare_dirs, transfer_push_file, transfer_put_file, transfer_receive_file_chunk,
+    transfer_receive_symlink, transfer_remove_path, transfer_remove_paths, transfer_snapshot,
+    transfer_snapshot_paths,
 };
 
 pub fn router(backend: Backend) -> Router {
@@ -46,6 +47,10 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/sync-source-now", post(api_sync_source_now))
         .route("/api/sync-destination-now", post(api_sync_destination_now))
         .route("/api/transfer/snapshot", post(api_transfer_snapshot))
+        .route(
+            "/api/transfer/snapshot-paths",
+            post(api_transfer_snapshot_paths),
+        )
         .route("/api/transfer/path-info", post(api_transfer_path_info))
         .route("/api/transfer/prepare-dir", post(api_transfer_prepare_dir))
         .route(
@@ -214,6 +219,12 @@ async fn api_transfer_snapshot(
     Json(req): Json<TransferSnapshotRequest>,
 ) -> Result<Json<Vec<SnapshotEntry>>, ApiError> {
     Ok(Json(transfer_snapshot(req)?))
+}
+
+async fn api_transfer_snapshot_paths(
+    Json(req): Json<TransferSnapshotPathsRequest>,
+) -> Result<Json<Vec<SnapshotEntry>>, ApiError> {
+    Ok(Json(transfer_snapshot_paths(req)?))
 }
 
 async fn api_transfer_path_info(

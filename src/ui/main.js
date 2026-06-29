@@ -271,9 +271,9 @@ function updateStatusBar() {
       ...runtimeStatus.scan,
       received_at_ms: Date.now(),
     };
-    renderScanLikeStatus("Scanning", lastRuntimeScan);
+    renderScanLikeStatus("Checking changes", lastRuntimeScan);
   } else if (busy && lastRuntimeScan) {
-    renderScanLikeStatus("Syncing", lastRuntimeScan);
+    renderScanLikeStatus("Checking changes", lastRuntimeScan);
   } else {
     if (!busy) {
       lastRuntimeScan = null;
@@ -343,8 +343,8 @@ function renderMachineModal() {
         <div class="machine-row ${machine.id === selectedId ? "machine-row-selected" : ""}" data-id="${escapeAttr(machine.id)}" title="Edit machine">
           <span class="machine-dot ${machine.online ? "online" : ""}" title="${machine.online ? "Online" : "Offline"}"></span>
           <div class="machine-name-cell">
-            <div class="machine-name">${escapeHtml(displayMachineName(machine))}</div>
-            <div class="machine-meta">${escapeHtml(machineMeta(machine))}${machine.discovered ? " · discovered" : ""}</div>
+            <div class="machine-name">${escapeHtml(machinePrimaryName(machine))}</div>
+            <div class="machine-meta">${escapeHtml(machineSecondaryName(machine))}</div>
           </div>
           <div class="machine-cell" title="${escapeAttr(machine.host)}">${escapeHtml(machine.host)}</div>
           <div class="machine-cell">${escapeHtml(String(machine.web_port || "-"))}</div>
@@ -538,6 +538,10 @@ function renderSourcePanel() {
 
   const stack = body.querySelector("#sources-stack");
   cfg.source_groups.forEach((source, sourceIndex) => {
+    const sourcePathIsLocked = sourcePathLocked(source);
+    const sourcePathTitle = sourcePathIsLocked
+      ? "Source path is locked after adding a destination"
+      : machineLabel(source.machine_id);
     const group = document.createElement("div");
     group.className = "source-group";
     group.dataset.sourceId = source.id;
@@ -548,7 +552,7 @@ function renderSourcePanel() {
           <label>ID</label>
           <label>Source Path</label>
           <input value="${escapeAttr(source.id)}" data-field="source-id">
-          <input class="path-picker" value="${escapeAttr(machinePathLabel(source.machine_id, source.src))}" data-field="source-src" readonly title="${escapeAttr(machineLabel(source.machine_id))}">
+          <input class="path-picker ${sourcePathIsLocked ? "path-picker-locked" : ""}" value="${escapeAttr(machinePathLabel(source.machine_id, source.src))}" data-field="source-src" readonly ${sourcePathIsLocked ? "disabled" : ""} title="${escapeAttr(sourcePathTitle)}">
         </div>
         <div class="row-right source-right">
           <label>Latest Cycle</label>
@@ -695,6 +699,10 @@ function bindSourceControls(source, sourceIndex, group) {
     autoSaveConfig().catch((error) => setMessage(String(error)));
   };
   srcInput.onclick = async () => {
+    if (sourcePathLocked(source)) {
+      setMessage("Source path is locked after adding a destination");
+      return;
+    }
     const selected = await pickPath(source.src || defaultPathForMachine(source.machine_id), {
       machineId: source.machine_id || "local",
     });
@@ -724,7 +732,7 @@ function bindSourceControls(source, sourceIndex, group) {
       updateStatusUi();
       return;
     }
-    runBusy("Scanning for changes...", async () => {
+    runBusy("Checking changes...", async () => {
       await saveConfig();
       statuses = await invoke("sync_source_now", { sourceId: source.id });
       setMessage("");
@@ -875,6 +883,10 @@ function destinationPathError(source, path, ignoreDst = null, machineId = "local
     return `Destination path already exists: ${normalized}`;
   }
   return "";
+}
+
+function sourcePathLocked(source) {
+  return (source.destinations || []).length > 0;
 }
 
 function hasDestinationPath(source, path, ignoreDst = null, machineId = "local") {
@@ -1028,10 +1040,10 @@ function machineLabel(machineId = "local") {
   const id = machineIdOrLocal(machineId);
   const machines = (machineStatus && machineStatus.machines) || (cfg && cfg.machines) || [];
   const machine = findMachineByReference(id);
-  return machine ? `Machine: ${displayMachineName(machine)}` : `Machine: ${id}`;
+  return machine ? `Machine: ${machinePrimaryName(machine)}` : `Machine: ${id}`;
 }
 
-function displayMachineName(machine) {
+function machinePrimaryName(machine) {
   if (!machine) {
     return "";
   }
@@ -1039,20 +1051,27 @@ function displayMachineName(machine) {
   if (alias) {
     return alias;
   }
+  const hostname = machineHostname(machine);
+  if (hostname) {
+    return hostname;
+  }
   const host = trimPathValue(machine.host);
   if (host) {
     return host;
   }
-  return trimPathValue(machine.name) || machine.id || "";
+  return machine.id || "";
 }
 
-function machineMeta(machine) {
-  const parts = [machine.id];
-  const name = trimPathValue(machine.name);
-  if (name && name !== displayMachineName(machine)) {
-    parts.push(name);
+function machineSecondaryName(machine) {
+  return machineHostname(machine);
+}
+
+function machineHostname(machine) {
+  const name = trimPathValue(machine && machine.name);
+  if (!name || name === "local") {
+    return "";
   }
-  return parts.filter(Boolean).join(" · ");
+  return name;
 }
 
 function findMachineByReference(value = "local") {
@@ -1074,7 +1093,7 @@ function machinePathLabel(machineId, path) {
     return `local: ${displayPath(path)}`;
   }
   const machine = findMachineByReference(id);
-  const name = machine ? displayMachineName(machine) : id;
+  const name = machine ? machinePrimaryName(machine) : id;
   return `${name}: ${displayPath(path)}`;
 }
 
@@ -1611,7 +1630,7 @@ function renderFolderMachineOptions() {
     ? machineStatus.machines
     : normalizeMachines((cfg && cfg.machines) || []);
   el.folderMachine.innerHTML = machines.map((machine) => `
-    <option value="${escapeAttr(machine.id)}">${escapeHtml(machine.id === "local" ? "local" : displayMachineName(machine))}${machine.online === false ? " (offline)" : ""}</option>
+    <option value="${escapeAttr(machine.id)}">${escapeHtml(machine.id === "local" ? "local" : machinePrimaryName(machine))}${machine.online === false ? " (offline)" : ""}</option>
   `).join("");
   if (folderPicker) {
     el.folderMachine.value = folderPicker.machineId || "local";
@@ -1824,7 +1843,7 @@ async function autoSaveConfig() {
 }
 
 async function syncAllNow() {
-  await runBusy("Scanning for changes...", async () => {
+  await runBusy("Checking changes...", async () => {
     await saveConfig();
     statuses = await invoke("sync_now");
     setMessage("");
@@ -1870,7 +1889,7 @@ function setMessage(text) {
 
 function destinationSyncStatusMessage(source, mode) {
   if (mode !== "full") {
-    return "Scanning for changes...";
+    return "Checking changes...";
   }
   return "Scanning...";
 }

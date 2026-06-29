@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::core::config::{
-    AppConfig, MachineConfig, load_config, load_or_create_config, machine_matches_reference,
-    save_config,
+    AppConfig, MachineConfig, clean_config_for_save, load_config, load_or_create_config,
+    machine_matches_reference, save_config,
 };
 use crate::core::machines::{
     MachineHealth, MachineStatus, configure_tcp_connection_pool, discover_lan,
@@ -68,6 +68,7 @@ impl Backend {
 
     pub fn save_config(&self, cfg: &AppConfig) -> Result<AppConfig> {
         let cfg = preserve_current_machines(&self.config_path, cfg);
+        reject_locked_source_path_changes(&self.config_path, &cfg)?;
         let cfg = save_config(&self.config_path, &cfg)?;
         apply_runtime_config(&cfg);
         let state_db = DbState::open(&cfg.app.data_db)?;
@@ -284,6 +285,35 @@ fn preserve_current_machines(config_path: &Path, cfg: &AppConfig) -> AppConfig {
     cfg
 }
 
+fn reject_locked_source_path_changes(config_path: &Path, next: &AppConfig) -> Result<()> {
+    let Ok(current) = load_config(config_path) else {
+        return Ok(());
+    };
+    let current = clean_config_for_save(&current);
+    let next = clean_config_for_save(next);
+    for current_source in &current.source_groups {
+        if current_source.destinations.is_empty() {
+            continue;
+        }
+        let Some(next_source) = next
+            .source_groups
+            .iter()
+            .find(|source| source.id == current_source.id)
+        else {
+            continue;
+        };
+        if current_source.src != next_source.src
+            || current_source.machine_id != next_source.machine_id
+        {
+            anyhow::bail!(
+                "source path is locked after adding a destination: {}",
+                current_source.id
+            );
+        }
+    }
+    Ok(())
+}
+
 fn apply_runtime_config(cfg: &AppConfig) {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
     configure_progress_file(&cfg.app.data_db);
@@ -407,6 +437,41 @@ mod tests {
                 .iter()
                 .any(|machine| machine.id == "windows")
         );
+    }
+
+    #[test]
+    fn rejects_source_path_change_after_destination_exists() {
+        let temp = temp_dir("backend_locked_source_path");
+        let config_path = temp.join("auto_sync.toml");
+
+        let mut current = AppConfig::default();
+        current.app.data_db = temp.join("state").join("auto_sync.sqlite");
+        current.app.log_dir = temp.join("logs");
+        current
+            .source_groups
+            .push(crate::core::config::SourceGroupConfig {
+                id: "src_1".to_string(),
+                machine_id: "local".to_string(),
+                src: temp.join("src"),
+                excludes: Vec::new(),
+                enabled: true,
+                mode: crate::core::config::SyncMode::Mirror,
+                snapshot: crate::core::config::SnapshotConfig::default(),
+                destinations: vec![crate::core::config::DestinationConfig {
+                    id: "dst_1".to_string(),
+                    machine_id: "local".to_string(),
+                    path: temp.join("dst"),
+                    enabled: true,
+                    schedule: crate::core::config::ScheduleConfig::default(),
+                }],
+            });
+        crate::core::config::save_config(&config_path, &current).unwrap();
+
+        let mut next = current.clone();
+        next.source_groups[0].src = temp.join("other_src");
+
+        let err = reject_locked_source_path_changes(&config_path, &next).unwrap_err();
+        assert!(err.to_string().contains("source path is locked"));
     }
 
     fn temp_dir(name: &str) -> PathBuf {

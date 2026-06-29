@@ -29,7 +29,7 @@ use crate::core::machines::{
     remote_post_bytes, remote_post_json,
 };
 use crate::core::progress;
-use crate::core::state::{Cycle, SnapshotEntry, State};
+use crate::core::state::{Cycle, CycleEvent, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
 
 pub mod delta;
@@ -37,7 +37,7 @@ pub mod delta;
 const INTERNAL_TMP: &str = ".auto_sync_tmp";
 const INTERNAL_TRASH: &str = ".auto_sync_trash";
 const INTERNAL_PROBE: &str = ".auto_sync_probe";
-const TRANSFER_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const TRANSFER_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 /// Files at least this large that already exist on the destination are sent as
 /// an rsync-style delta (only changed regions) instead of being re-sent whole.
 const DELTA_MIN_SIZE: u64 = 256 * 1024;
@@ -169,6 +169,17 @@ pub enum TransferSnapshotMode {
 pub struct TransferSnapshotRequest {
     pub root: PathBuf,
     pub mode: TransferSnapshotMode,
+    #[serde(default)]
+    pub excludes: Vec<PathBuf>,
+    #[serde(default)]
+    pub checksum: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferSnapshotPathsRequest {
+    pub root: PathBuf,
+    pub mode: TransferSnapshotMode,
+    pub rel_paths: Vec<String>,
     #[serde(default)]
     pub excludes: Vec<PathBuf>,
     #[serde(default)]
@@ -365,6 +376,31 @@ pub fn transfer_snapshot(req: TransferSnapshotRequest) -> Result<Vec<SnapshotEnt
                 return Ok(Vec::new());
             }
             take_snapshot_with_excludes(&req.root, SnapshotMode::Destination, &[], req.checksum)
+        }
+    }
+}
+
+pub fn transfer_snapshot_paths(req: TransferSnapshotPathsRequest) -> Result<Vec<SnapshotEntry>> {
+    match req.mode {
+        TransferSnapshotMode::Source => take_snapshot_paths_with_excludes(
+            &req.root,
+            &req.rel_paths,
+            SnapshotMode::Source,
+            &req.excludes,
+            req.checksum,
+        ),
+        TransferSnapshotMode::Destination => {
+            reject_dangerous_destination(&req.root)?;
+            if !req.root.exists() {
+                return Ok(Vec::new());
+            }
+            take_snapshot_paths_with_excludes(
+                &req.root,
+                &req.rel_paths,
+                SnapshotMode::Destination,
+                &[],
+                req.checksum,
+            )
         }
     }
 }
@@ -1176,6 +1212,77 @@ pub fn sync_cycle_for_source(
         });
     }
 
+    let ready_indexes: Vec<usize> = ready_destinations
+        .iter()
+        .map(|(dst_index, _)| *dst_index)
+        .collect();
+    if let Some(plan) = realtime_incremental_plan(state, source, cycle, &ready_indexes)? {
+        match plan {
+            RealtimeIncrementalPlan::Unusable(reason) => {
+                for dst_index in ready_indexes {
+                    let dst = &source.destinations[dst_index];
+                    state.clear_destination_issues(&source.id, &dst.id)?;
+                    state.upsert_destination_status(&source.id, &dst.id, None, "yellow", reason)?;
+                }
+                state.mark_cycle_status(cycle.id, "failed")?;
+                return Ok(SyncCycleOutcome {
+                    progressed: false,
+                    blocked: false,
+                });
+            }
+            RealtimeIncrementalPlan::Apply(rel_paths) => {
+                state.mark_cycle_status(cycle.id, "syncing")?;
+                for (dst_index, dst_endpoint) in ready_destinations {
+                    let dst = &source.destinations[dst_index];
+                    match sync_endpoint_event_paths(
+                        &live_source_endpoint,
+                        &dst_endpoint,
+                        &dst.id,
+                        cycle.id,
+                        &rel_paths,
+                        &source.excludes,
+                        &cfg.app.sync,
+                    ) {
+                        Ok(()) => {
+                            progressed |= !rel_paths.is_empty();
+                            state.clear_destination_issues(&source.id, &dst.id)?;
+                            state.upsert_destination_status(
+                                &source.id,
+                                &dst.id,
+                                Some(cycle.id),
+                                "green",
+                                "verified",
+                            )?;
+                        }
+                        Err(err) => {
+                            all_verified = false;
+                            had_unblocked_failure = true;
+                            state.clear_destination_issues(&source.id, &dst.id)?;
+                            state.upsert_destination_status(
+                                &source.id,
+                                &dst.id,
+                                None,
+                                "red",
+                                &short_reason(&err),
+                            )?;
+                        }
+                    }
+                }
+                if targeted_count == 0 || all_verified {
+                    state.mark_cycle_status(cycle.id, "verified")?;
+                } else if blocked_count > 0 && !had_unblocked_failure {
+                    state.mark_cycle_status(cycle.id, "closed")?;
+                } else {
+                    state.mark_cycle_status(cycle.id, "failed")?;
+                }
+                return Ok(SyncCycleOutcome {
+                    progressed,
+                    blocked: blocked_count > 0,
+                });
+            }
+        }
+    }
+
     let source_view = SourceReadView::prepare(source, &live_source_endpoint, cycle.id)?;
     let source_endpoint = source_view.endpoint.clone();
 
@@ -1328,6 +1435,67 @@ fn sync_task_label(task: &SyncTaskRef) -> String {
     format!("{}:{}", task.source_id, task.destination_id)
 }
 
+enum RealtimeIncrementalPlan {
+    Apply(Vec<String>),
+    Unusable(&'static str),
+}
+
+fn realtime_incremental_plan(
+    state: &State,
+    source: &SourceGroupConfig,
+    cycle: &Cycle,
+    ready_destinations: &[usize],
+) -> Result<Option<RealtimeIncrementalPlan>> {
+    if ready_destinations.is_empty() {
+        return Ok(None);
+    }
+    for dst_index in ready_destinations {
+        let dst = &source.destinations[*dst_index];
+        if dst.schedule.mode != ScheduleMode::Realtime {
+            return Ok(None);
+        }
+        if state
+            .destination_last_verified(&source.id, &dst.id)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+    }
+
+    let events = state.cycle_events(&source.id, cycle.id)?;
+    let actionable: Vec<&CycleEvent> = events
+        .iter()
+        .filter(|event| event.rel_path.is_some() || event.rescan_required)
+        .collect();
+    if actionable.is_empty() {
+        return Ok(Some(RealtimeIncrementalPlan::Apply(Vec::new())));
+    }
+    if cycle.needs_full_rescan || actionable.iter().any(|event| event.rescan_required) {
+        return Ok(Some(RealtimeIncrementalPlan::Unusable(
+            "realtime_rescan_required",
+        )));
+    }
+
+    let mut paths = BTreeSet::new();
+    for event in actionable {
+        let Some(rel_path) = event.rel_path.as_deref() else {
+            return Ok(Some(RealtimeIncrementalPlan::Unusable(
+                "realtime_event_path_unavailable",
+            )));
+        };
+        let rel = normalize_rel_path(rel_path).with_context(|| {
+            format!(
+                "invalid realtime event path in cycle {}: {rel_path}",
+                cycle.id
+            )
+        })?;
+        paths.insert(rel_to_string(&rel)?);
+    }
+    Ok(Some(RealtimeIncrementalPlan::Apply(
+        paths.into_iter().collect(),
+    )))
+}
+
 fn cycle_has_remote_target(
     state: &State,
     source: &SourceGroupConfig,
@@ -1438,6 +1606,112 @@ fn sync_cycle_with_transfer(
             progressed: false,
             blocked: blocked_count > 0,
         });
+    }
+
+    if let Some(plan) = realtime_incremental_plan(state, source, cycle, &ready_destinations)? {
+        match plan {
+            RealtimeIncrementalPlan::Unusable(reason) => {
+                for dst_index in ready_destinations {
+                    let dst = &source.destinations[dst_index];
+                    state.clear_destination_issues(&source.id, &dst.id)?;
+                    state.upsert_destination_status(&source.id, &dst.id, None, "yellow", reason)?;
+                }
+                state.mark_cycle_status(cycle.id, "failed")?;
+                return Ok(SyncCycleOutcome {
+                    progressed: false,
+                    blocked: false,
+                });
+            }
+            RealtimeIncrementalPlan::Apply(rel_paths) if source_info.kind == "dir" => {
+                state.mark_cycle_status(cycle.id, "syncing")?;
+                for dst_index in ready_destinations {
+                    let dst = &source.destinations[dst_index];
+                    let dst_machine_id = machine_id_or_local(&dst.machine_id);
+                    let dst_machine = match find_machine(cfg, dst_machine_id) {
+                        Some(machine) => machine,
+                        None => {
+                            all_verified = false;
+                            had_unblocked_failure = true;
+                            state.upsert_destination_status(
+                                &source.id,
+                                &dst.id,
+                                None,
+                                "red",
+                                "unknown_destination_machine",
+                            )?;
+                            continue;
+                        }
+                    };
+                    let dst_root = join_machine_path(&dst.path, &source_info.name, &dst_machine);
+                    match sync_directory_event_paths_with_transfer(
+                        source_machine_id,
+                        &source_machine,
+                        &source_info.base,
+                        dst_machine_id,
+                        &dst_machine,
+                        &dst_root,
+                        &dst.id,
+                        cycle.id,
+                        &rel_paths,
+                        &source.excludes,
+                        &cfg.app.sync,
+                    ) {
+                        Ok(()) => {
+                            progressed |= !rel_paths.is_empty();
+                            state.clear_destination_issues(&source.id, &dst.id)?;
+                            state.upsert_destination_status(
+                                &source.id,
+                                &dst.id,
+                                Some(cycle.id),
+                                "green",
+                                "verified",
+                            )?;
+                        }
+                        Err(err) => {
+                            all_verified = false;
+                            had_unblocked_failure = true;
+                            state.clear_destination_issues(&source.id, &dst.id)?;
+                            state.upsert_destination_status(
+                                &source.id,
+                                &dst.id,
+                                None,
+                                "red",
+                                &short_reason(&err),
+                            )?;
+                        }
+                    }
+                }
+                if targeted_count == 0 || all_verified {
+                    state.mark_cycle_status(cycle.id, "verified")?;
+                } else if blocked_count > 0 && !had_unblocked_failure {
+                    state.mark_cycle_status(cycle.id, "closed")?;
+                } else {
+                    state.mark_cycle_status(cycle.id, "failed")?;
+                }
+                return Ok(SyncCycleOutcome {
+                    progressed,
+                    blocked: blocked_count > 0,
+                });
+            }
+            RealtimeIncrementalPlan::Apply(_) => {
+                for dst_index in ready_destinations {
+                    let dst = &source.destinations[dst_index];
+                    state.clear_destination_issues(&source.id, &dst.id)?;
+                    state.upsert_destination_status(
+                        &source.id,
+                        &dst.id,
+                        None,
+                        "yellow",
+                        "realtime_file_source_needs_event_sync",
+                    )?;
+                }
+                state.mark_cycle_status(cycle.id, "failed")?;
+                return Ok(SyncCycleOutcome {
+                    progressed: false,
+                    blocked: false,
+                });
+            }
+        }
     }
 
     state.mark_cycle_status(cycle.id, "planning")?;
@@ -1606,10 +1880,7 @@ fn sync_directory_with_transfer(
         .filter(|entry| entry.file_type == "file" || entry.file_type == "symlink")
         .filter_map(|entry| match dst_map.get(&entry.rel_path) {
             Some(existing) if entries_match(entry, existing, sync) => None,
-            Some(existing) => Some((
-                entry,
-                existing.file_type == "file" && entry.file_type == "file",
-            )),
+            Some(existing) => Some((entry, should_attempt_delta(entry, existing))),
             None => Some((entry, false)),
         })
         .collect();
@@ -1667,6 +1938,145 @@ fn sync_directory_with_transfer(
         timeout,
     )?;
     verify_snapshot_entries(source_snapshot, &actual, excludes, sync)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_directory_event_paths_with_transfer(
+    source_machine_id: &str,
+    source_machine: &crate::core::config::MachineConfig,
+    source_root: &Path,
+    dst_machine_id: &str,
+    dst_machine: &crate::core::config::MachineConfig,
+    dst_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    rel_paths: &[String],
+    excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
+) -> Result<()> {
+    if rel_paths.is_empty() {
+        return Ok(());
+    }
+    let timeout = transfer_timeout(sync);
+    prepare_dir_on_machine(dst_machine_id, dst_machine, dst_root, None, None, timeout)?;
+    let source_snapshot = snapshot_paths_on_machine(
+        source_machine_id,
+        source_machine,
+        source_root,
+        rel_paths,
+        TransferSnapshotMode::Source,
+        excludes,
+        sync.checksum,
+        timeout,
+    )?;
+    let dst_snapshot = snapshot_paths_on_machine(
+        dst_machine_id,
+        dst_machine,
+        dst_root,
+        rel_paths,
+        TransferSnapshotMode::Destination,
+        &[],
+        sync.checksum,
+        timeout,
+    )?;
+    let source_map = map_entries(&source_snapshot);
+    let dst_map = map_entries(&dst_snapshot);
+
+    let mut remove_paths: Vec<String> = source_snapshot
+        .iter()
+        .filter(|entry| {
+            dst_map
+                .get(&entry.rel_path)
+                .is_some_and(|existing| existing.file_type != entry.file_type)
+        })
+        .map(|entry| entry.rel_path.clone())
+        .collect();
+
+    if sync.mirror {
+        remove_paths.extend(
+            dst_map
+                .keys()
+                .filter(|rel| {
+                    !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
+                })
+                .cloned(),
+        );
+        for rel in rel_paths {
+            if !source_map.contains_key(rel) && !is_rel_excluded(Path::new(rel), excludes) {
+                remove_paths.push(rel.clone());
+            }
+        }
+    }
+    remove_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
+    remove_paths.dedup();
+    remove_paths_on_machine(
+        dst_machine_id,
+        dst_machine,
+        dst_root,
+        &remove_paths,
+        cycle_id,
+        timeout,
+    )
+    .context("failed to remove changed destination paths")?;
+
+    let mut dirs: Vec<TransferDirSpec> = source_snapshot
+        .iter()
+        .filter(|entry| entry.file_type == "dir")
+        .map(|entry| TransferDirSpec {
+            rel_path: entry.rel_path.clone(),
+            mode: entry.mode,
+        })
+        .collect();
+    dirs.sort_by(|a, b| {
+        path_depth(&a.rel_path)
+            .cmp(&path_depth(&b.rel_path))
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+    prepare_dirs_on_machine(dst_machine_id, dst_machine, dst_root, &dirs, timeout)
+        .context("failed to create changed destination directories")?;
+
+    let pending: Vec<(&SnapshotEntry, bool)> = source_snapshot
+        .iter()
+        .filter(|entry| entry.file_type == "file" || entry.file_type == "symlink")
+        .filter_map(|entry| match dst_map.get(&entry.rel_path) {
+            Some(existing) if entries_match(entry, existing, sync) => None,
+            Some(existing) => Some((entry, should_attempt_delta(entry, existing))),
+            None => Some((entry, false)),
+        })
+        .collect();
+    let transferred = push_entries_parallel(
+        source_machine_id,
+        source_machine,
+        source_root,
+        dst_machine,
+        dst_root,
+        destination_id,
+        cycle_id,
+        &pending,
+        sync,
+    )?;
+    info!(
+        destination = destination_id,
+        cycle_id,
+        changed_paths = rel_paths.len(),
+        dirs = dirs.len(),
+        files = transferred,
+        "destination realtime event transfer phase complete"
+    );
+
+    cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, timeout).ok();
+    let actual = snapshot_paths_on_machine(
+        dst_machine_id,
+        dst_machine,
+        dst_root,
+        rel_paths,
+        TransferSnapshotMode::Destination,
+        &[],
+        sync.checksum,
+        timeout,
+    )?;
+    verify_snapshot_entries(&source_snapshot, &actual, excludes, sync)?;
     Ok(())
 }
 
@@ -1812,7 +2222,7 @@ fn sync_file_with_transfer(
             None => true,
         };
         if needs_copy {
-            let mut use_delta = entry.file_type == "file";
+            let mut use_delta = false;
             if let Some(existing) = dst_map.get(&entry.rel_path) {
                 if existing.file_type != entry.file_type {
                     remove_path_on_machine(
@@ -1823,7 +2233,8 @@ fn sync_file_with_transfer(
                         cycle_id,
                         timeout,
                     )?;
-                    use_delta = false;
+                } else {
+                    use_delta = should_attempt_delta(entry, existing);
                 }
             } else {
                 use_delta = false;
@@ -1896,6 +2307,30 @@ fn snapshot_on_machine(
         transfer_snapshot(req)
     } else {
         remote_snapshot_with_progress(machine, root, &req, timeout)
+    }
+}
+
+fn snapshot_paths_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    rel_paths: &[String],
+    mode: TransferSnapshotMode,
+    excludes: &[PathBuf],
+    checksum: bool,
+    timeout: Duration,
+) -> Result<Vec<SnapshotEntry>> {
+    let req = TransferSnapshotPathsRequest {
+        root: root.to_path_buf(),
+        mode,
+        rel_paths: rel_paths.to_vec(),
+        excludes: excludes.to_vec(),
+        checksum,
+    };
+    if machine_id == "local" {
+        transfer_snapshot_paths(req)
+    } else {
+        remote_post_json(machine, "/api/transfer/snapshot-paths", &req, timeout)
     }
 }
 
@@ -2789,6 +3224,204 @@ fn sync_destination(
     result
 }
 
+fn sync_endpoint_event_paths(
+    source: &SourceEndpoint,
+    dst: &DestinationEndpoint,
+    destination_id: &str,
+    cycle_id: i64,
+    rel_paths: &[String],
+    excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
+) -> Result<()> {
+    match (source, dst) {
+        (SourceEndpoint::Dir { root: src_root }, DestinationEndpoint::Dir { root: dst_root }) => {
+            sync_destination_event_paths(
+                src_root,
+                dst_root,
+                destination_id,
+                cycle_id,
+                rel_paths,
+                excludes,
+                sync,
+            )
+        }
+        (SourceEndpoint::Dir { .. }, DestinationEndpoint::File { .. }) => {
+            bail!("directory source cannot sync to a destination file")
+        }
+        (SourceEndpoint::File { path }, DestinationEndpoint::Dir { root }) => {
+            let rel_path = file_name_string(path)?;
+            if rel_paths.is_empty() || is_rel_excluded(Path::new(&rel_path), excludes) {
+                return Ok(());
+            }
+            sync_file_to_path(
+                path,
+                root,
+                &root.join(rel_path),
+                destination_id,
+                cycle_id,
+                sync,
+            )
+        }
+        (SourceEndpoint::File { path }, DestinationEndpoint::File { path: dst_path }) => {
+            let rel_path = file_name_string(path)?;
+            if rel_paths.is_empty() || is_rel_excluded(Path::new(&rel_path), excludes) {
+                return Ok(());
+            }
+            let parent = dst_path
+                .parent()
+                .ok_or_else(|| anyhow!("destination file path has no parent"))?;
+            sync_file_to_path(path, parent, dst_path, destination_id, cycle_id, sync)
+        }
+    }
+}
+
+fn sync_destination_event_paths(
+    src_root: &Path,
+    dst_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    rel_paths: &[String],
+    excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
+) -> Result<()> {
+    if rel_paths.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(dst_root).with_context(|| {
+        format!(
+            "failed to create destination directory: {}",
+            dst_root.display()
+        )
+    })?;
+    let result = (|| {
+        let source_snapshot = take_snapshot_paths_with_excludes(
+            src_root,
+            rel_paths,
+            SnapshotMode::Source,
+            excludes,
+            sync.checksum,
+        )?;
+        let dst_snapshot = take_snapshot_paths_with_excludes(
+            dst_root,
+            rel_paths,
+            SnapshotMode::Destination,
+            &[],
+            sync.checksum,
+        )?;
+        let mut changing_paths = BTreeSet::new();
+        sync_changed_entries_local(
+            src_root,
+            dst_root,
+            destination_id,
+            cycle_id,
+            rel_paths,
+            &source_snapshot,
+            &dst_snapshot,
+            excludes,
+            sync,
+            &mut changing_paths,
+        )?;
+
+        let actual = take_snapshot_paths_with_excludes(
+            dst_root,
+            rel_paths,
+            SnapshotMode::Destination,
+            &[],
+            sync.checksum,
+        )?;
+        verify_snapshot_entries(&source_snapshot, &actual, excludes, sync)?;
+        if !changing_paths.is_empty() {
+            return Err(source_changing_error(&changing_paths));
+        }
+        Ok(())
+    })();
+    cleanup_tmp_cycle(dst_root, cycle_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_changed_entries_local(
+    src_root: &Path,
+    dst_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    rel_paths: &[String],
+    source_snapshot: &[SnapshotEntry],
+    dst_snapshot: &[SnapshotEntry],
+    excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
+    changing_paths: &mut BTreeSet<String>,
+) -> Result<()> {
+    let source_map = map_entries(source_snapshot);
+    let dst_map = map_entries(dst_snapshot);
+
+    let mut type_mismatch: Vec<String> = source_snapshot
+        .iter()
+        .filter(|entry| {
+            dst_map
+                .get(&entry.rel_path)
+                .is_some_and(|existing| existing.file_type != entry.file_type)
+        })
+        .map(|entry| entry.rel_path.clone())
+        .collect();
+    type_mismatch.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
+    for rel in type_mismatch {
+        move_to_trash(dst_root, &rel, cycle_id)
+            .with_context(|| format!("failed to replace destination path {rel}"))?;
+    }
+
+    for entry in source_snapshot.iter().filter(|e| e.file_type == "dir") {
+        let target = dst_root.join(&entry.rel_path);
+        fs::create_dir_all(&target)
+            .with_context(|| format!("failed to create directory {}", target.display()))?;
+        set_mode(&target, entry.mode).ok();
+    }
+
+    for entry in source_snapshot
+        .iter()
+        .filter(|e| e.file_type == "file" || e.file_type == "symlink")
+    {
+        let needs_copy = match dst_map.get(&entry.rel_path) {
+            Some(existing) => !entries_match(entry, existing, sync),
+            None => true,
+        };
+        if !needs_copy {
+            continue;
+        }
+        if let Err(err) = copy_entry(src_root, dst_root, destination_id, cycle_id, entry)
+            .with_context(|| format!("failed to copy {}", entry.rel_path))
+        {
+            let paths = source_changed_paths(&err);
+            if paths.is_empty() {
+                return Err(err);
+            }
+            changing_paths.extend(paths);
+        }
+    }
+
+    if sync.mirror {
+        let mut extra_paths: Vec<String> = dst_map
+            .keys()
+            .filter(|rel| {
+                !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
+            })
+            .cloned()
+            .collect();
+        for rel in rel_paths {
+            if !source_map.contains_key(rel) && !is_rel_excluded(Path::new(rel), excludes) {
+                extra_paths.push(rel.clone());
+            }
+        }
+        extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
+        extra_paths.dedup();
+        for rel in extra_paths {
+            move_to_trash(dst_root, &rel, cycle_id)
+                .with_context(|| format!("failed to remove changed destination path {rel}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn sync_file_to_path(
     src_path: &Path,
     dst_root: &Path,
@@ -2911,6 +3544,76 @@ fn take_snapshot_with_excludes(
         }
     }
     Ok(entries)
+}
+
+fn take_snapshot_paths_with_excludes(
+    root: &Path,
+    rel_paths: &[String],
+    mode: SnapshotMode,
+    excludes: &[PathBuf],
+    checksum: bool,
+) -> Result<Vec<SnapshotEntry>> {
+    let mut entries = BTreeMap::new();
+    for rel_path in rel_paths {
+        let rel = normalize_rel_path(rel_path)?;
+        if matches!(mode, SnapshotMode::Source) && is_rel_excluded(&rel, excludes) {
+            continue;
+        }
+        let path = root.join(&rel);
+        collect_snapshot_path(root, &path, mode, excludes, checksum, &mut entries)
+            .with_context(|| format!("failed to snapshot changed path {rel_path}"))?;
+    }
+    Ok(entries.into_values().collect())
+}
+
+fn collect_snapshot_path(
+    root: &Path,
+    path: &Path,
+    mode: SnapshotMode,
+    excludes: &[PathBuf],
+    checksum: bool,
+    entries: &mut BTreeMap<String, SnapshotEntry>,
+) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read metadata {}", path.display()));
+        }
+    };
+
+    if metadata.is_dir() {
+        let scan_progress = progress::start_scan(path);
+        let mut entries_seen = 0_u64;
+        for item in WalkDir::new(path)
+            .follow_links(false)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(|entry| should_visit(root, entry, mode, excludes))
+        {
+            let item = item?;
+            let item_path = item.path();
+            entries_seen += 1;
+            scan_progress.update(item_path, entries_seen);
+            let rel = item_path
+                .strip_prefix(root)
+                .with_context(|| format!("failed to strip root from {}", item_path.display()))?;
+            let rel_path = rel_to_string(rel)?;
+            if let Some(entry) = snapshot_entry_if_supported(item_path, rel_path, checksum)? {
+                entries.insert(entry.rel_path.clone(), entry);
+            }
+        }
+        return Ok(());
+    }
+
+    let rel = path
+        .strip_prefix(root)
+        .with_context(|| format!("failed to strip root from {}", path.display()))?;
+    let rel_path = rel_to_string(rel)?;
+    if let Some(entry) = snapshot_entry_if_supported(path, rel_path, checksum)? {
+        entries.insert(entry.rel_path.clone(), entry);
+    }
+    Ok(())
 }
 
 fn snapshot_entry(path: &Path, rel_path: String, checksum: bool) -> Result<SnapshotEntry> {
@@ -3179,6 +3882,23 @@ fn entries_match(left: &SnapshotEntry, right: &SnapshotEntry, sync: &NativeSyncC
         "symlink" => left.hash == right.hash,
         _ => false,
     }
+}
+
+fn should_attempt_delta(source: &SnapshotEntry, existing: &SnapshotEntry) -> bool {
+    if source.file_type != "file" || existing.file_type != "file" || source.hash.is_some() {
+        return false;
+    }
+    let source_size = source.size.max(0) as u64;
+    let existing_size = existing.size.max(0) as u64;
+    if !(DELTA_MIN_SIZE..=DELTA_MAX_SIZE).contains(&source_size) || existing_size == 0 {
+        return false;
+    }
+    if source_size == existing_size {
+        return false;
+    }
+    let smaller = source_size.min(existing_size);
+    let larger = source_size.max(existing_size);
+    smaller.saturating_mul(10) >= larger.saturating_mul(7)
 }
 
 fn mtimes_match(left_ns: i64, right_ns: i64, sync: &NativeSyncConfig) -> bool {
@@ -3508,6 +4228,24 @@ mod tests {
         assert!(path.contains("root=C%3A%5Csync%20root"));
         assert!(path.contains("rel_path=dir%2Fhello%20world.txt"));
         assert!(path.contains("offset=7"));
+    }
+
+    #[test]
+    fn performance_strategy_streams_large_same_size_rewrites() {
+        assert!(TRANSFER_CHUNK_SIZE >= 16 * 1024 * 1024);
+
+        let source = test_file_entry("video.mp4", 512 * 1024 * 1024);
+        let existing = test_file_entry("video.mp4", 512 * 1024 * 1024);
+
+        assert!(!should_attempt_delta(&source, &existing));
+    }
+
+    #[test]
+    fn performance_strategy_keeps_delta_for_append_like_files() {
+        let source = test_file_entry("archive.log", 512 * 1024 * 1024);
+        let existing = test_file_entry("archive.log", 480 * 1024 * 1024);
+
+        assert!(should_attempt_delta(&source, &existing));
     }
 
     #[test]
@@ -3955,6 +4693,70 @@ mod tests {
     }
 
     #[test]
+    fn realtime_event_incremental_syncs_only_event_paths() {
+        let temp = temp_dir("realtime_event_paths_only");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("hello.txt"), b"hello").unwrap();
+        fs::write(src.join("untouched.txt"), b"untouched").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+            }],
+        });
+
+        let mut state = State::open(&db).unwrap();
+        sync_all_now(&cfg, &mut state).unwrap();
+        let effective_dst = dst.join("src");
+        fs::write(effective_dst.join("destination-only.txt"), b"extra").unwrap();
+        fs::write(src.join("hello.txt"), b"hello again").unwrap();
+
+        state
+            .record_event("src_1", 0, "modify", Some("hello.txt"), false)
+            .unwrap();
+        assert_eq!(
+            state.advance_due_destination_targets(&cfg).unwrap().len(),
+            1
+        );
+        sync_all_pending(&cfg, &mut state).unwrap();
+
+        assert_eq!(
+            fs::read(effective_dst.join("hello.txt")).unwrap(),
+            b"hello again"
+        );
+        assert_eq!(
+            fs::read(effective_dst.join("untouched.txt")).unwrap(),
+            b"untouched"
+        );
+        assert_eq!(
+            fs::read(effective_dst.join("destination-only.txt")).unwrap(),
+            b"extra"
+        );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
     fn excludes_source_paths_without_deleting_existing_destination_paths() {
         let temp = temp_dir("exclude_paths");
         let src = temp.join("src");
@@ -4129,5 +4931,16 @@ mod tests {
             std::env::temp_dir().join(format!("auto_sync_{name}_{}_{}", std::process::id(), nanos));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn test_file_entry(rel_path: &str, size: i64) -> SnapshotEntry {
+        SnapshotEntry {
+            rel_path: rel_path.to_string(),
+            file_type: "file".to_string(),
+            size,
+            mtime_ns: 123,
+            mode: 0o644,
+            hash: None,
+        }
     }
 }

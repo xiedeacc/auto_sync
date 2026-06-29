@@ -495,6 +495,13 @@ th {
   background: #fbfdff;
 }
 
+.path-picker-locked,
+.path-picker-locked:disabled {
+  cursor: not-allowed;
+  color: var(--muted);
+  background: #eef2f6;
+}
+
 .config-view {
   min-height: 260px;
   max-height: min(640px, 76vh);
@@ -661,6 +668,18 @@ th {
 
 .machine-field {
   min-width: 0;
+}
+
+.machine-form-head {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .machine-form-actions {
@@ -1045,6 +1064,10 @@ th {
   .machine-form,
   .machine-row {
     grid-template-columns: 1fr;
+  }
+
+  .machine-form-head {
+    display: none;
   }
 
   .machine-row {

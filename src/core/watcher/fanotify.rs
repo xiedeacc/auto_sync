@@ -269,7 +269,7 @@ fn parse_events(state: &State, sources: &[SourceRoot], mut bytes: &[u8]) -> Resu
         if meta.mask & FAN_Q_OVERFLOW != 0 {
             warn!("fanotify queue overflow; recording realtime source events");
             for source in sources {
-                state.record_event(&source.id, meta.mask, "queue_overflow", None, false)?;
+                state.record_event(&source.id, meta.mask, "queue_overflow", None, true)?;
             }
         } else {
             persist_event(state, sources, &meta)?;

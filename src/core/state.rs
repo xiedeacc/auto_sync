@@ -19,6 +19,14 @@ pub struct Cycle {
     pub needs_full_rescan: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleEvent {
+    pub event_id: i64,
+    pub event_kind: String,
+    pub rel_path: Option<String>,
+    pub rescan_required: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotEntry {
     pub rel_path: String,
@@ -326,7 +334,7 @@ impl State {
             let Some(cycle) = self.current_open_cycle(&source.id)? else {
                 continue;
             };
-            let open_has_events = self.cycle_has_events(cycle.id)?;
+            let open_has_events = self.cycle_has_actionable_events(cycle.id)?;
             let mut due_destinations = Vec::new();
 
             for dst in source.destinations.iter().filter(|d| d.enabled) {
@@ -343,8 +351,6 @@ impl State {
                     true
                 } else if dst.schedule.mode == ScheduleMode::Realtime {
                     open_has_events
-                        || now.signed_duration_since(cycle.starts_at).num_seconds()
-                            >= source.snapshot.reconcile_interval_secs as i64
                 } else {
                     scheduler::cycle_is_due(cycle.starts_at, now, &dst.schedule)
                 };
@@ -360,11 +366,13 @@ impl State {
             let Some(closed_cycle) = self.close_current_cycle_for_source(&source.id)? else {
                 continue;
             };
-            if due_destinations.iter().all(|destination_id| {
-                source.destinations.iter().any(|dst| {
-                    dst.id == *destination_id && dst.schedule.mode == ScheduleMode::Realtime
+            if !closed_cycle.needs_full_rescan
+                && due_destinations.iter().all(|destination_id| {
+                    source.destinations.iter().any(|dst| {
+                        dst.id == *destination_id && dst.schedule.mode == ScheduleMode::Realtime
+                    })
                 })
-            }) {
+            {
                 self.clear_cycle_needs_rescan(closed_cycle.id)?;
             }
             for destination_id in &due_destinations {
@@ -498,6 +506,40 @@ impl State {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    pub fn cycle_has_actionable_events(&self, cycle_id: i64) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM event_log
+            WHERE cycle_id=?1 AND (rel_path IS NOT NULL OR rescan_required <> 0)
+            "#,
+            params![cycle_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn cycle_events(&self, source_id: &str, cycle_id: i64) -> Result<Vec<CycleEvent>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT event_id, event_kind, rel_path, rescan_required
+            FROM event_log
+            WHERE source_id=?1 AND cycle_id=?2
+            ORDER BY event_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![source_id, cycle_id], |row| {
+            Ok(CycleEvent {
+                event_id: row.get(0)?,
+                event_kind: row.get(1)?,
+                rel_path: row.get(2)?,
+                rescan_required: row.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn source_has_target_cycle(&self, source_id: &str, cycle_id: i64) -> Result<bool> {
@@ -999,4 +1041,95 @@ pub fn require_existing_config_db(path: &Path) -> Result<State> {
         return Err(anyhow!("state db does not exist: {}", path.display()));
     }
     State::open(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::config::{
+        AppConfig, DestinationConfig, ScheduleConfig, SnapshotConfig, SourceGroupConfig, SyncMode,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn realtime_does_not_advance_only_because_reconcile_interval_elapsed() {
+        let temp = temp_dir("state_realtime_no_reconcile");
+        let db = temp.join("state.sqlite");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups = vec![SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src,
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                reconcile_interval_secs: 1,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst,
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+            }],
+        }];
+
+        let state = State::open(&db).unwrap();
+        state.ensure_config(&cfg).unwrap();
+        state
+            .ensure_open_cycle(
+                "src_1",
+                Utc::now() - chrono::Duration::try_seconds(10).unwrap(),
+            )
+            .unwrap();
+        state
+            .upsert_destination_status("src_1", "dst_1", Some(1), "green", "verified")
+            .unwrap();
+
+        assert!(
+            state
+                .advance_due_destination_targets(&cfg)
+                .unwrap()
+                .is_empty()
+        );
+
+        state
+            .record_event("src_1", 0, "usn_cursor_reconcile", None, false)
+            .unwrap();
+        assert!(
+            state
+                .advance_due_destination_targets(&cfg)
+                .unwrap()
+                .is_empty()
+        );
+
+        state
+            .record_event("src_1", 0, "modify", Some("file.txt"), false)
+            .unwrap();
+        assert_eq!(
+            state.advance_due_destination_targets(&cfg).unwrap().len(),
+            1
+        );
+
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("auto_sync_{name}_{}_{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 }
