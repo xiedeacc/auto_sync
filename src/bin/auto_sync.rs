@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     let _log_guard = init_logging(&cfg.app.log_dir, "auto_sync")?;
     info!(config = %args.config.display(), "auto_sync starting");
     #[cfg(windows)]
-    if maybe_relaunch_elevated_for_usn(&args, &cfg)? {
+    if maybe_relaunch_elevated_on_windows(&args)? {
         return Ok(());
     }
 
@@ -117,19 +117,11 @@ fn main() -> Result<()> {
 }
 
 #[cfg(windows)]
-fn maybe_relaunch_elevated_for_usn(args: &Args, cfg: &AppConfig) -> Result<bool> {
+fn maybe_relaunch_elevated_on_windows(args: &Args) -> Result<bool> {
     if args.elevation_attempted || unsafe { IsUserAnAdmin() } != 0 {
         return Ok(false);
     }
-    let Some(reason) =
-        auto_sync::core::watcher::windows_usn::first_local_realtime_usn_access_denied(cfg)
-    else {
-        return Ok(false);
-    };
-    warn!(
-        reason,
-        "USN Journal access requires elevation; relaunching with UAC"
-    );
+    warn!("auto_sync is not elevated on Windows; relaunching with UAC");
 
     let exe = std::env::current_exe().context("failed to locate current executable")?;
     let working_dir = std::env::current_dir().context("failed to locate current directory")?;
@@ -163,7 +155,7 @@ fn maybe_relaunch_elevated_for_usn(args: &Args, cfg: &AppConfig) -> Result<bool>
     if result <= 32 {
         warn!(
             shell_execute_result = result,
-            "failed to relaunch auto_sync elevated; continuing without USN"
+            "failed to relaunch auto_sync elevated; continuing without elevation"
         );
         return Ok(false);
     }
