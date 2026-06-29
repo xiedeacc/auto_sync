@@ -1462,6 +1462,67 @@ pub fn sync_cycle_for_source(
         ) = (&source_endpoint, &dst_endpoint)
         {
             if !cycle.manual_changed_since_rescan {
+                // ZFS diff incremental: when this is a ZFS source and the
+                // destination still has its retained base snapshot, sync only
+                // the paths `zfs diff` reports instead of re-scanning the tree.
+                // Falls back to a full reconcile on any failure.
+                if !is_event_loss_reconcile {
+                    if let Some(zfs) = source_view.zfs_snapshot.as_ref() {
+                        if let Some(base) =
+                            state.destination_verified_snapshot(&source.id, &dst.id)?
+                        {
+                            if let Some(rel_paths) = zfs_diff_changed_paths(
+                                &base,
+                                &zfs.full_name,
+                                &zfs.source_live_root,
+                            ) {
+                                info!(
+                                    source = source.id,
+                                    destination = dst.id,
+                                    cycle_id = cycle.id,
+                                    base = base,
+                                    changed = rel_paths.len(),
+                                    "zfs diff incremental sync"
+                                );
+                                match sync_endpoint_event_paths(
+                                    &source_endpoint,
+                                    &dst_endpoint,
+                                    &dst.id,
+                                    cycle.id,
+                                    &rel_paths,
+                                    &source.excludes,
+                                    &sync,
+                                ) {
+                                    Ok(()) => {
+                                        progressed |= !rel_paths.is_empty();
+                                        state.clear_destination_issues(&source.id, &dst.id)?;
+                                        state.upsert_destination_status(
+                                            &source.id,
+                                            &dst.id,
+                                            Some(cycle.id),
+                                            "green",
+                                            "verified",
+                                        )?;
+                                        state.set_destination_verified_snapshot(
+                                            &source.id,
+                                            &dst.id,
+                                            Some(&zfs.full_name),
+                                        )?;
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            source = source.id,
+                                            destination = dst.id,
+                                            error = %err,
+                                            "zfs diff incremental failed; falling back to full reconcile"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let sync_result = sync_destination_fast_missing_dirs(
                     src_root,
                     dst_root,
@@ -1481,6 +1542,13 @@ pub fn sync_cycle_for_source(
                             Some(cycle.id),
                             "green",
                             "verified",
+                        )?;
+                        // Record the base snapshot for the next zfs diff (or
+                        // clear it for non-ZFS sources so no stale base lingers).
+                        state.set_destination_verified_snapshot(
+                            &source.id,
+                            &dst.id,
+                            source_view.zfs_snapshot.as_ref().map(|z| z.full_name.as_str()),
                         )?;
                         info!(
                             source = source.id,
@@ -1636,7 +1704,8 @@ pub fn sync_cycle_for_source(
 
     if targeted_count == 0 || all_verified {
         state.mark_cycle_status(cycle.id, "verified")?;
-        source_view.cleanup(source);
+        let referenced = state.source_referenced_snapshots(&source.id)?;
+        source_view.cleanup(source, &referenced);
     } else if blocked_count > 0 && !had_unblocked_failure {
         state.mark_cycle_status(cycle.id, "closed")?;
     } else {
@@ -3277,9 +3346,9 @@ impl SourceReadView {
         }
     }
 
-    fn cleanup(&self, source: &SourceGroupConfig) {
+    fn cleanup(&self, source: &SourceGroupConfig, referenced: &[String]) {
         if let Some(snapshot) = &self.zfs_snapshot {
-            if let Err(err) = cleanup_zfs_snapshots(source, snapshot) {
+            if let Err(err) = cleanup_zfs_snapshots(source, snapshot, referenced) {
                 warn!(source = source.id, error = %err, "zfs snapshot cleanup failed");
             }
         }
@@ -3291,6 +3360,10 @@ struct ZfsSnapshot {
     dataset: String,
     full_name: String,
     source_path: PathBuf,
+    /// Live filesystem root of the source within the dataset
+    /// (`mountpoint`/`path_in_dataset`). `zfs diff` reports paths relative to
+    /// this, so it is used to map diff output back to source-relative paths.
+    source_live_root: PathBuf,
 }
 
 impl ZfsSnapshot {
@@ -3316,12 +3389,106 @@ impl ZfsSnapshot {
                 source_path.display()
             );
         }
+        let source_live_root = if dataset.path_in_dataset.as_os_str().is_empty() {
+            dataset.mountpoint.clone()
+        } else {
+            dataset.mountpoint.join(&dataset.path_in_dataset)
+        };
         Ok(Self {
             dataset: dataset.name,
             full_name,
             source_path,
+            source_live_root,
         })
     }
+}
+
+/// Relative paths (under the source root) that changed between two snapshots,
+/// computed with `zfs diff`. Returns `None` when a reliable diff cannot be
+/// produced (base snapshot missing, command failed) so the caller falls back to
+/// a full reconcile. `zfs diff` is authoritative, so a successful diff is a
+/// complete list of changed/added/removed/renamed paths.
+fn zfs_diff_changed_paths(
+    base_full_name: &str,
+    new_full_name: &str,
+    source_live_root: &Path,
+) -> Option<Vec<String>> {
+    if base_full_name == new_full_name {
+        return Some(Vec::new());
+    }
+    let base_exists = Command::new("zfs")
+        .args(["list", "-H", "-t", "snapshot", base_full_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !base_exists {
+        return None;
+    }
+    let output = Command::new("zfs")
+        .args(["diff", "-H", base_full_name, new_full_name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(parse_zfs_diff(&text, source_live_root))
+}
+
+/// Parse `zfs diff -H` output into source-relative paths. Each line is
+/// `<change>\t<path>` (or `R\t<old>\t<new>` for renames); paths are absolute
+/// under the dataset mountpoint and octal-escaped.
+fn parse_zfs_diff(output: &str, source_live_root: &Path) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for line in output.lines() {
+        let mut fields = line.split('\t');
+        let Some(change) = fields.next() else {
+            continue;
+        };
+        if !matches!(change, "-" | "+" | "M" | "R") {
+            continue;
+        }
+        for raw in fields {
+            let abs = unescape_zfs_path(raw);
+            if let Ok(rel) = Path::new(&abs).strip_prefix(source_live_root) {
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                if let Ok(rel_str) = rel_to_string(rel) {
+                    paths.insert(rel_str);
+                }
+            }
+        }
+    }
+    paths.into_iter().collect()
+}
+
+/// `zfs diff` escapes bytes outside the printable ASCII range as `\NNN` (three
+/// octal digits, per OpenZFS `stream_bytes`). Decode them back to raw bytes.
+fn unescape_zfs_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && (b'0'..=b'7').contains(&bytes[i + 1])
+            && (b'0'..=b'7').contains(&bytes[i + 2])
+            && (b'0'..=b'7').contains(&bytes[i + 3])
+        {
+            let value = (bytes[i + 1] - b'0') * 64
+                + (bytes[i + 2] - b'0') * 8
+                + (bytes[i + 3] - b'0');
+            out.push(value);
+            i += 4;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -3441,7 +3608,11 @@ fn ensure_zfs_snapshot(full_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_zfs_snapshots(source: &SourceGroupConfig, latest: &ZfsSnapshot) -> Result<()> {
+fn cleanup_zfs_snapshots(
+    source: &SourceGroupConfig,
+    latest: &ZfsSnapshot,
+    referenced: &[String],
+) -> Result<()> {
     let prefix = format!(
         "{}@{}_{}",
         latest.dataset,
@@ -3465,11 +3636,19 @@ fn cleanup_zfs_snapshots(source: &SourceGroupConfig, latest: &ZfsSnapshot) -> Re
         .filter(|name| name.starts_with(&prefix))
         .map(str::to_string)
         .collect();
+    // Always keep the most recent `keep_extra_cycles + 1` snapshots plus the
+    // latest, and never delete a snapshot still referenced as a diff base by a
+    // lagging/offline destination.
     let keep = source.snapshot.keep_extra_cycles.saturating_add(1);
-    if snapshots.len() <= keep {
-        return Ok(());
-    }
-    for snapshot in &snapshots[..snapshots.len() - keep] {
+    let retain_recent = snapshots.len().saturating_sub(keep);
+    let referenced: BTreeSet<&str> = referenced.iter().map(String::as_str).collect();
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        if index >= retain_recent {
+            break;
+        }
+        if snapshot == &latest.full_name || referenced.contains(snapshot.as_str()) {
+            continue;
+        }
         let status = Command::new("zfs")
             .args(["destroy", snapshot])
             .status()
@@ -6047,6 +6226,41 @@ mod tests {
         );
 
         fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn parses_zfs_diff_into_source_relative_paths() {
+        let root = Path::new("/tank/photos");
+        let output = "M\t/tank/photos/\n\
+                      M\t/tank/photos/a.jpg\n\
+                      +\t/tank/photos/sub/new.jpg\n\
+                      -\t/tank/photos/old.jpg\n\
+                      R\t/tank/photos/from.jpg\t/tank/photos/to.jpg\n\
+                      M\t/tank/photos/with\\040space.jpg\n\
+                      M\t/other/outside.jpg\n";
+        let paths = parse_zfs_diff(output, root);
+        assert_eq!(
+            paths,
+            vec![
+                "a.jpg".to_string(),
+                "from.jpg".to_string(),
+                "old.jpg".to_string(),
+                "sub/new.jpg".to_string(),
+                "to.jpg".to_string(),
+                "with space.jpg".to_string(),
+            ]
+        );
+        // The dataset root itself and paths outside the source root are skipped.
+        assert!(!paths.iter().any(|p| p.contains("outside")));
+    }
+
+    #[test]
+    fn unescapes_zfs_octal_paths() {
+        assert_eq!(unescape_zfs_path("a\\040b"), "a b");
+        assert_eq!(unescape_zfs_path("tab\\011x"), "tab\tx");
+        assert_eq!(unescape_zfs_path("plain"), "plain");
+        // A backslash not followed by three octal digits is left as-is.
+        assert_eq!(unescape_zfs_path("back\\slash"), "back\\slash");
     }
 
     #[test]

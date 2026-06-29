@@ -196,6 +196,7 @@ impl State {
             "manual_changed_since_rescan",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        self.ensure_column("destination_offset", "last_verified_snapshot_name", "TEXT")?;
         Ok(())
     }
 
@@ -774,6 +775,50 @@ impl State {
         Ok(())
     }
 
+    /// The ZFS snapshot a destination was last verified against, used as the
+    /// base for the next `zfs diff` incremental. `None` when the destination has
+    /// never completed a snapshot-backed sync.
+    pub fn destination_verified_snapshot(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT last_verified_snapshot_name FROM destination_offset WHERE source_id=?1 AND destination_id=?2",
+                params![source_id, destination_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+            .map_err(Into::into)
+    }
+
+    pub fn set_destination_verified_snapshot(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        snapshot_name: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE destination_offset SET last_verified_snapshot_name=?3, updated_at=?4 WHERE source_id=?1 AND destination_id=?2",
+            params![source_id, destination_id, snapshot_name, now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Snapshot names still referenced as a diff base by any destination of this
+    /// source. The snapshot cleaner must retain these.
+    pub fn source_referenced_snapshots(&self, source_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT last_verified_snapshot_name FROM destination_offset \
+             WHERE source_id=?1 AND last_verified_snapshot_name IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![source_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn replace_destination_issues(
         &self,
         source_id: &str,
@@ -862,6 +907,7 @@ impl State {
                 target_cycle_id=NULL,
                 last_completed_cycle_id=NULL,
                 last_verified_cycle_id=NULL,
+                last_verified_snapshot_name=NULL,
                 status='red',
                 status_reason=excluded.status_reason,
                 updated_at=excluded.updated_at
