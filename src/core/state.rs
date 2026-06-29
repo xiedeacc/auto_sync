@@ -360,6 +360,13 @@ impl State {
             let Some(closed_cycle) = self.close_current_cycle_for_source(&source.id)? else {
                 continue;
             };
+            if due_destinations.iter().all(|destination_id| {
+                source.destinations.iter().any(|dst| {
+                    dst.id == *destination_id && dst.schedule.mode == ScheduleMode::Realtime
+                })
+            }) {
+                self.clear_cycle_needs_rescan(closed_cycle.id)?;
+            }
             for destination_id in &due_destinations {
                 self.set_destination_target(&source.id, destination_id, closed_cycle.id)?;
             }
@@ -530,6 +537,14 @@ impl State {
     pub fn mark_cycle_needs_rescan(&self, cycle_id: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE sync_cycle SET needs_full_rescan=1, updated_at=?1 WHERE id=?2",
+            params![now_string(), cycle_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_cycle_needs_rescan(&self, cycle_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sync_cycle SET needs_full_rescan=0, updated_at=?1 WHERE id=?2",
             params![now_string(), cycle_id],
         )?;
         Ok(())

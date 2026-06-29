@@ -182,7 +182,11 @@ fn run_with_desktop(backend: Backend, addr: SocketAddr) {
 // Scheduler + watcher loop (always runs)
 // ---------------------------------------------------------------------------
 
-fn run_scheduler(config_path: PathBuf, initial_cfg: AppConfig, shutdown: Arc<AtomicBool>) -> Result<()> {
+fn run_scheduler(
+    config_path: PathBuf,
+    initial_cfg: AppConfig,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
     let mut cfg = initial_cfg;
     let mut state = State::open(&cfg.app.data_db)?;
     state.ensure_config(&cfg)?;
@@ -190,7 +194,8 @@ fn run_scheduler(config_path: PathBuf, initial_cfg: AppConfig, shutdown: Arc<Ato
 
     let mut watcher_state = start_watcher(&cfg);
     let mut watcher_signature = config_signature(&cfg);
-    let mut last_status_log = Instant::now() - Duration::from_secs(cfg.app.status_log_interval_secs);
+    let mut last_status_log =
+        Instant::now() - Duration::from_secs(cfg.app.status_log_interval_secs);
 
     while !shutdown.load(Ordering::SeqCst) {
         match load_config(&config_path) {
@@ -213,7 +218,11 @@ fn run_scheduler(config_path: PathBuf, initial_cfg: AppConfig, shutdown: Arc<Ato
         match state.advance_due_destination_targets(&cfg) {
             Ok(closed) => {
                 for cycle in closed {
-                    info!(source = cycle.source_id, cycle_id = cycle.id, "cycle target advanced");
+                    info!(
+                        source = cycle.source_id,
+                        cycle_id = cycle.id,
+                        "cycle target advanced"
+                    );
                 }
             }
             Err(err) => error!(error = %err, "failed to advance due destination targets"),

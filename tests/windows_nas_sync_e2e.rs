@@ -199,6 +199,7 @@ impl TestEnv {
 
         let nas = MachineConfig {
             id: "nas".to_string(),
+            alias_name: "nas".to_string(),
             name: "nas".to_string(),
             host: self.nas_host.clone(),
             web_port: self.nas_web_port,

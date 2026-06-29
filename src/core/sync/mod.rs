@@ -21,7 +21,8 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::core::config::{
     AppConfig, DEFAULT_MAX_PARALLEL_TRANSFERS, DEFAULT_TRANSFER_TIMEOUT_SECS, DestinationConfig,
-    NativeSyncConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef, machine_id_or_local,
+    NativeSyncConfig, ScheduleMode, SnapshotBackend, SourceGroupConfig, SyncTaskRef,
+    machine_id_or_local,
 };
 use crate::core::machines::{
     configure_tcp_connection_pool, encode_query_component, find_machine, remote_get_json,
@@ -112,12 +113,30 @@ pub fn sync_destination_now_with_mode(
     destination_id: &str,
     mode: SyncRequestMode,
 ) -> Result<()> {
+    let mode = if destination_is_realtime(cfg, source_id, destination_id) {
+        SyncRequestMode::Incremental
+    } else {
+        mode
+    };
     if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
         if mode == SyncRequestMode::Full {
             state.mark_cycle_needs_rescan(cycle.id)?;
         }
     }
     sync_all_pending(cfg, state)
+}
+
+fn destination_is_realtime(cfg: &AppConfig, source_id: &str, destination_id: &str) -> bool {
+    cfg.source_groups
+        .iter()
+        .find(|source| source.id == source_id)
+        .and_then(|source| {
+            source
+                .destinations
+                .iter()
+                .find(|dst| dst.id == destination_id)
+        })
+        .is_some_and(|dst| dst.schedule.mode == ScheduleMode::Realtime)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -551,7 +570,8 @@ pub fn transfer_put_file(query: TransferPutFileQuery, bytes: &[u8]) -> Result<Tr
     if let Some(parent) = tmp.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&tmp, bytes).with_context(|| format!("failed to write temp file {}", tmp.display()))?;
+    fs::write(&tmp, bytes)
+        .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
     finish_received_file(&root, query.cycle_id, &entry, &tmp, &final_path)?;
     Ok(transfer_ack())
 }
@@ -578,7 +598,10 @@ pub fn transfer_block_sums(req: TransferBlockSumsRequest) -> Result<delta::Block
     })
 }
 
-pub fn transfer_apply_delta(query: TransferApplyDeltaQuery, delta_bytes: &[u8]) -> Result<TransferAck> {
+pub fn transfer_apply_delta(
+    query: TransferApplyDeltaQuery,
+    delta_bytes: &[u8],
+) -> Result<TransferAck> {
     let root = PathBuf::from(&query.root);
     reject_dangerous_destination(&root)?;
     let final_path = safe_join_rel(&root, &query.rel_path)?;
@@ -1583,7 +1606,10 @@ fn sync_directory_with_transfer(
         .filter(|entry| entry.file_type == "file" || entry.file_type == "symlink")
         .filter_map(|entry| match dst_map.get(&entry.rel_path) {
             Some(existing) if entries_match(entry, existing, sync) => None,
-            Some(existing) => Some((entry, existing.file_type == "file" && entry.file_type == "file")),
+            Some(existing) => Some((
+                entry,
+                existing.file_type == "file" && entry.file_type == "file",
+            )),
             None => Some((entry, false)),
         })
         .collect();
@@ -2154,7 +2180,10 @@ fn push_entries_parallel(
         }
     });
 
-    if let Some(err) = first_error.into_inner().unwrap_or_else(|err| err.into_inner()) {
+    if let Some(err) = first_error
+        .into_inner()
+        .unwrap_or_else(|err| err.into_inner())
+    {
         return Err(err);
     }
     Ok(done.load(Ordering::Relaxed) as usize)
@@ -3750,7 +3779,10 @@ mod tests {
                     machine_id: "local".to_string(),
                     path: dst_2.clone(),
                     enabled: true,
-                    schedule: ScheduleConfig::default(),
+                    schedule: ScheduleConfig {
+                        mode: ScheduleMode::Daily,
+                        ..ScheduleConfig::default()
+                    },
                 },
             ],
         });
@@ -3819,7 +3851,10 @@ mod tests {
                     machine_id: "local".to_string(),
                     path: dst_2.clone(),
                     enabled: true,
-                    schedule: ScheduleConfig::default(),
+                    schedule: ScheduleConfig {
+                        mode: ScheduleMode::Daily,
+                        ..ScheduleConfig::default()
+                    },
                 },
             ],
         });
@@ -3858,6 +3893,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(needs_full_rescan, 1);
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn realtime_destination_full_request_stays_incremental() {
+        let temp = temp_dir("realtime_full_stays_incremental");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("hello.txt"), b"hello").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+            }],
+        });
+
+        let mut state = State::open(&db).unwrap();
+        sync_destination_now_with_mode(&cfg, &mut state, "src_1", "dst_1", SyncRequestMode::Full)
+            .unwrap();
+
+        let view = state
+            .destination_views(&cfg)
+            .unwrap()
+            .into_iter()
+            .find(|view| view.destination_id == "dst_1")
+            .unwrap();
+        assert_eq!(view.status, "green");
+        let cycle_id = view.target_cycle_id.unwrap();
+        let needs_full_rescan: i64 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT needs_full_rescan FROM sync_cycle WHERE id=?1",
+                rusqlite::params![cycle_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(needs_full_rescan, 0);
 
         fs::remove_dir_all(temp).ok();
     }

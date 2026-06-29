@@ -67,6 +67,7 @@ const el = {
   machineAdd: document.getElementById("machine-add"),
   machineId: document.getElementById("machine-id"),
   machineName: document.getElementById("machine-name"),
+  machineAlias: document.getElementById("machine-alias"),
   machineHost: document.getElementById("machine-host"),
   machineWebPort: document.getElementById("machine-web-port"),
   machineSshUser: document.getElementById("machine-ssh-user"),
@@ -250,7 +251,7 @@ function updateStatusUi() {
 function updateStatusBar() {
   const transfer = runtimeStatus && runtimeStatus.transfer;
   if (transfer) {
-    const destination = transfer.destination_id || transfer.destination_path || "-";
+    const destination = transferDestinationLabel(transfer);
     const file = transfer.rel_path || "-";
     const fileLabel = compactStatusPath(file, 56);
     const speed = formatBytesPerSecond(transfer.bytes_per_sec || 0);
@@ -342,8 +343,8 @@ function renderMachineModal() {
         <div class="machine-row ${machine.id === selectedId ? "machine-row-selected" : ""}" data-id="${escapeAttr(machine.id)}" title="Edit machine">
           <span class="machine-dot ${machine.online ? "online" : ""}" title="${machine.online ? "Online" : "Offline"}"></span>
           <div class="machine-name-cell">
-            <div class="machine-name">${escapeHtml(machine.name || machine.id)}</div>
-            <div class="machine-meta">${escapeHtml(machine.id)}${machine.discovered ? " · discovered" : ""}</div>
+            <div class="machine-name">${escapeHtml(displayMachineName(machine))}</div>
+            <div class="machine-meta">${escapeHtml(machineMeta(machine))}${machine.discovered ? " · discovered" : ""}</div>
           </div>
           <div class="machine-cell" title="${escapeAttr(machine.host)}">${escapeHtml(machine.host)}</div>
           <div class="machine-cell">${escapeHtml(String(machine.web_port || "-"))}</div>
@@ -375,6 +376,7 @@ function renderMachineModal() {
 function selectMachineForEdit(machine) {
   el.machineId.value = machine.id || "";
   el.machineName.value = machine.name || machine.id || "";
+  el.machineAlias.value = machine.alias_name || "";
   el.machineHost.value = machine.host || "";
   el.machineWebPort.value = machine.web_port || 18765;
   el.machineSshUser.value = machine.ssh_user || "";
@@ -387,6 +389,7 @@ function selectMachineForEdit(machine) {
 function clearMachineForm() {
   el.machineId.value = "";
   el.machineName.value = "";
+  el.machineAlias.value = "";
   el.machineHost.value = "";
   el.machineWebPort.value = 18765;
   el.machineSshUser.value = "root";
@@ -443,6 +446,7 @@ async function addMachine() {
   const id = cleanMachineId(el.machineId.value) || machineIdFromEndpoint(host, webPort);
   const machine = {
     id,
+    alias_name: cleanMachineId(el.machineAlias.value),
     name: trimPathValue(el.machineName.value) || id,
     host,
     web_port: webPort,
@@ -544,7 +548,7 @@ function renderSourcePanel() {
           <label>ID</label>
           <label>Source Path</label>
           <input value="${escapeAttr(source.id)}" data-field="source-id">
-          <input class="path-picker" value="${escapeAttr(displayPath(source.src))}" data-field="source-src" readonly title="${escapeAttr(machineLabel(source.machine_id))}">
+          <input class="path-picker" value="${escapeAttr(machinePathLabel(source.machine_id, source.src))}" data-field="source-src" readonly title="${escapeAttr(machineLabel(source.machine_id))}">
         </div>
         <div class="row-right source-right">
           <label>Latest Cycle</label>
@@ -754,7 +758,7 @@ function renderSyncRows(source, group) {
           <button class="dot ${dotClass}" data-action="show-issues" title="${escapeAttr(dotTitle)}" aria-label="${escapeAttr(dotTitle)}"></button>
           <input class="dst-id" value="${escapeAttr(dst.id)}" data-field="dst-id" readonly>
         </div>
-        <input class="path-picker dst-path" value="${escapeAttr(dst.path)}" data-field="dst-path" readonly title="${escapeAttr(machineLabel(dst.machine_id))}">
+        <input class="path-picker dst-path" value="${escapeAttr(machinePathLabel(dst.machine_id, dst.path))}" data-field="dst-path" readonly title="${escapeAttr(machineLabel(dst.machine_id))}">
       </div>
       <div class="row-right destination-right">
         <label>Schedule</label>
@@ -765,7 +769,7 @@ function renderSyncRows(source, group) {
         <select class="destination-sync-select" data-action="sync-dst" title="Sync destination">
           <option value="">Sync...</option>
           <option value="incremental">Incremental</option>
-          <option value="full">Full</option>
+          ${isRealtimeSchedule(dst.schedule) ? "" : '<option value="full">Full</option>'}
         </select>
         <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
       </div>
@@ -875,8 +879,9 @@ function destinationPathError(source, path, ignoreDst = null, machineId = "local
 
 function hasDestinationPath(source, path, ignoreDst = null, machineId = "local") {
   const normalized = normalizeAbsolutePath(path);
+  const machineKey = machineReferenceKey(machineId);
   return (source.destinations || []).some((dst) =>
-    dst !== ignoreDst && machineIdOrLocal(dst.machine_id) === machineIdOrLocal(machineId) && normalizeAbsolutePath(dst.path) === normalized
+    dst !== ignoreDst && machineReferenceKey(dst.machine_id) === machineKey && normalizeAbsolutePath(dst.path) === normalized
   );
 }
 
@@ -961,6 +966,7 @@ function normalizeMachines(values) {
   const machines = [
     {
       id: "local",
+      alias_name: "",
       name: "This machine",
       host: "127.0.0.1",
       web_port: 18765,
@@ -981,6 +987,7 @@ function normalizeMachines(values) {
     seen.add(id);
     cleaned.push({
       id,
+      alias_name: cleanMachineId(machine.alias_name || ""),
       name: trimPathValue(machine.name) || id,
       host: trimPathValue(machine.host) || "127.0.0.1",
       web_port: Number(machine.web_port || 18765),
@@ -1008,11 +1015,92 @@ function machineIdOrLocal(value) {
   return String(value || "").trim() || "local";
 }
 
+function machineReferenceKey(value = "local") {
+  const id = machineIdOrLocal(value);
+  const machine = findMachineByReference(id);
+  if (machine) {
+    return String(machine.id || id).toLowerCase();
+  }
+  return id.toLowerCase();
+}
+
 function machineLabel(machineId = "local") {
   const id = machineIdOrLocal(machineId);
   const machines = (machineStatus && machineStatus.machines) || (cfg && cfg.machines) || [];
-  const machine = machines.find((item) => item.id === id);
-  return machine ? `Machine: ${machine.name || machine.id}` : `Machine: ${id}`;
+  const machine = findMachineByReference(id);
+  return machine ? `Machine: ${displayMachineName(machine)}` : `Machine: ${id}`;
+}
+
+function displayMachineName(machine) {
+  if (!machine) {
+    return "";
+  }
+  const alias = trimPathValue(machine.alias_name);
+  if (alias) {
+    return alias;
+  }
+  const host = trimPathValue(machine.host);
+  if (host) {
+    return host;
+  }
+  return trimPathValue(machine.name) || machine.id || "";
+}
+
+function machineMeta(machine) {
+  const parts = [machine.id];
+  const name = trimPathValue(machine.name);
+  if (name && name !== displayMachineName(machine)) {
+    parts.push(name);
+  }
+  return parts.filter(Boolean).join(" · ");
+}
+
+function findMachineByReference(value = "local") {
+  const id = machineIdOrLocal(value);
+  const machines = (machineStatus && machineStatus.machines && machineStatus.machines.length)
+    ? machineStatus.machines
+    : ((cfg && cfg.machines) || []);
+  if (id === "local") {
+    return machines.find((item) => item.id === "local");
+  }
+  return machines.find((item) => trimPathValue(item.alias_name).toLowerCase() === id.toLowerCase())
+    || machines.find((item) => String(item.id || "").toLowerCase() === id.toLowerCase())
+    || machines.find((item) => trimPathValue(item.host).toLowerCase() === id.toLowerCase());
+}
+
+function machinePathLabel(machineId, path) {
+  const id = machineIdOrLocal(machineId);
+  if (id === "local") {
+    return `local: ${displayPath(path)}`;
+  }
+  const machine = findMachineByReference(id);
+  const name = machine ? displayMachineName(machine) : id;
+  return `${name}: ${displayPath(path)}`;
+}
+
+function transferDestinationLabel(transfer) {
+  if (!transfer) {
+    return "-";
+  }
+  const endpoint = findDestinationEndpoint(transfer.destination_id);
+  if (endpoint) {
+    return machinePathLabel(endpoint.machine_id, transfer.destination_path || endpoint.path || transfer.destination_id);
+  }
+  if (transfer.destination_path) {
+    return displayPath(transfer.destination_path);
+  }
+  return transfer.destination_id || "-";
+}
+
+function findDestinationEndpoint(destinationId) {
+  for (const source of (cfg && cfg.source_groups) || []) {
+    for (const dst of source.destinations || []) {
+      if (dst.id === destinationId) {
+        return dst;
+      }
+    }
+  }
+  return null;
 }
 
 function syncTaskOptions() {
@@ -1523,7 +1611,7 @@ function renderFolderMachineOptions() {
     ? machineStatus.machines
     : normalizeMachines((cfg && cfg.machines) || []);
   el.folderMachine.innerHTML = machines.map((machine) => `
-    <option value="${escapeAttr(machine.id)}">${escapeHtml(machine.name || machine.id)}${machine.online === false ? " (offline)" : ""}</option>
+    <option value="${escapeAttr(machine.id)}">${escapeHtml(machine.id === "local" ? "local" : displayMachineName(machine))}${machine.online === false ? " (offline)" : ""}</option>
   `).join("");
   if (folderPicker) {
     el.folderMachine.value = folderPicker.machineId || "local";
@@ -1531,8 +1619,7 @@ function renderFolderMachineOptions() {
 }
 
 function defaultPathForMachine(machineId = "local") {
-  const machine = ((machineStatus && machineStatus.machines) || (cfg && cfg.machines) || [])
-    .find((item) => item.id === machineIdOrLocal(machineId));
+  const machine = findMachineByReference(machineId);
   return String((machine && machine.os) || "").toLowerCase() === "windows" ? "C:\\" : "/";
 }
 
@@ -1786,6 +1873,10 @@ function destinationSyncStatusMessage(source, mode) {
     return "Scanning for changes...";
   }
   return "Scanning...";
+}
+
+function isRealtimeSchedule(schedule) {
+  return String((schedule && schedule.mode) || "realtime").toLowerCase() === "realtime";
 }
 
 function displayPath(value) {

@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, warn};
 
 use crate::core::config::{
-    AppConfig, DEFAULT_TCP_CONNECTION_POOL_SIZE, MachineConfig, load_config, normalized_machines,
-    preferred_local_host,
+    AppConfig, DEFAULT_TCP_CONNECTION_POOL_SIZE, MachineConfig, load_config,
+    machine_matches_reference, normalized_machines, preferred_local_host,
 };
 
 pub const DISCOVERY_PORT: u16 = 18766;
@@ -41,6 +41,8 @@ struct TcpConnectionPool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineHealth {
     pub id: String,
+    #[serde(default)]
+    pub alias_name: String,
     pub name: String,
     pub host: String,
     pub web_port: u16,
@@ -55,6 +57,7 @@ pub struct MachineHealth {
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineView {
     pub id: String,
+    pub alias_name: String,
     pub name: String,
     pub host: String,
     pub web_port: u16,
@@ -86,6 +89,7 @@ pub fn local_health(cfg: &AppConfig, web_port: u16) -> MachineHealth {
     let host = local.host;
     MachineHealth {
         id: discovery_machine_id(&host, web_port),
+        alias_name: local.alias_name.trim().to_string(),
         name: local_machine_name(&local.name),
         host,
         web_port,
@@ -119,6 +123,7 @@ pub fn machine_status(cfg: &AppConfig) -> MachineStatus {
         };
         machines.push(MachineView {
             id: machine.id.clone(),
+            alias_name: machine.alias_name.clone(),
             name: machine.name.clone(),
             host: machine.host.clone(),
             web_port: machine.web_port,
@@ -393,7 +398,7 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
         if let Some(existing) = status
             .machines
             .iter_mut()
-            .find(|machine| machine.host == health.host && machine.web_port == health.web_port)
+            .find(|machine| machine_view_matches_health(machine, &health))
         {
             existing.online = true;
             merge_name_from_health(existing, &health);
@@ -404,7 +409,10 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
             continue;
         }
 
-        let mut id = clean_machine_id(&health.id);
+        let mut id = clean_machine_id(&health.alias_name);
+        if id.is_empty() {
+            id = clean_machine_id(&health.id);
+        }
         if id.is_empty() || id == "local" || known_ids.contains(&id) {
             id = discovery_machine_id(&health.host, health.web_port);
         }
@@ -415,6 +423,7 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
 
         status.machines.push(MachineView {
             id,
+            alias_name: clean_machine_id(&health.alias_name),
             name,
             host: health.host,
             web_port: health.web_port,
@@ -443,6 +452,10 @@ fn merge_name_from_health(view: &mut MachineView, health: &MachineHealth) {
 }
 
 fn discovered_machine_name(health: &MachineHealth) -> String {
+    let alias = health.alias_name.trim();
+    if !alias.is_empty() {
+        return alias.to_string();
+    }
     let name = health.name.trim();
     if name.is_empty() || name == "local" || name == "This machine" {
         health.host.clone()
@@ -590,8 +603,12 @@ pub fn machines_share_lan(left: &MachineConfig, right: &MachineConfig, timeout: 
 }
 
 fn health_matches(machine: &MachineConfig, health: &MachineHealth) -> bool {
-    endpoint_key(&health.host, health.web_port) == machine_endpoint_key(machine)
-        || (!machine.id.trim().is_empty() && machine.id == health.id)
+    let alias = health.alias_name.trim();
+    (!alias.is_empty() && machine_matches_reference(machine, alias))
+        || (health.id.trim() != "local"
+            && !health.id.trim().is_empty()
+            && machine_matches_reference(machine, &health.id))
+        || endpoint_key(&health.host, health.web_port) == machine_endpoint_key(machine)
 }
 
 fn same_private_ipv4_lan(left: &str, right: &str) -> bool {
@@ -697,9 +714,46 @@ pub fn configure_tcp_connection_pool(max_idle: usize) {
 }
 
 pub fn find_machine(cfg: &AppConfig, machine_id: &str) -> Option<MachineConfig> {
-    normalized_machines(cfg)
-        .into_iter()
-        .find(|machine| machine.id == machine_id)
+    let machines = normalized_machines(cfg);
+    resolve_machine(&machines, machine_id)
+}
+
+fn resolve_machine(machines: &[MachineConfig], machine_id: &str) -> Option<MachineConfig> {
+    let machine_id = machine_id_from_path(Some(machine_id));
+    if machine_id == "local" {
+        return machines
+            .iter()
+            .find(|machine| machine.id == "local")
+            .cloned();
+    }
+    machines
+        .iter()
+        .find(|machine| {
+            let alias = machine.alias_name.trim();
+            !alias.is_empty() && alias.eq_ignore_ascii_case(machine_id)
+        })
+        .or_else(|| {
+            machines
+                .iter()
+                .find(|machine| machine.id.eq_ignore_ascii_case(machine_id))
+        })
+        .or_else(|| {
+            machines
+                .iter()
+                .find(|machine| machine.host.trim().eq_ignore_ascii_case(machine_id))
+        })
+        .cloned()
+}
+
+fn machine_view_matches_health(machine: &MachineView, health: &MachineHealth) -> bool {
+    let alias = health.alias_name.trim();
+    (!alias.is_empty()
+        && !machine.alias_name.trim().is_empty()
+        && machine.alias_name.eq_ignore_ascii_case(alias))
+        || (health.id.trim() != "local"
+            && !health.id.trim().is_empty()
+            && machine.id.eq_ignore_ascii_case(&health.id))
+        || (machine.host == health.host && machine.web_port == health.web_port)
 }
 
 pub fn machine_id_from_path(machine_id: Option<&str>) -> &str {
@@ -1019,6 +1073,7 @@ mod tests {
             vec![
                 MachineHealth {
                     id: "local".to_string(),
+                    alias_name: String::new(),
                     name: "This machine".to_string(),
                     host: "203.0.113.10".to_string(),
                     web_port: 18765,
@@ -1029,6 +1084,7 @@ mod tests {
                 },
                 MachineHealth {
                     id: "local".to_string(),
+                    alias_name: String::new(),
                     name: "This machine".to_string(),
                     host: "203.0.113.11".to_string(),
                     web_port: 18765,
@@ -1064,6 +1120,7 @@ mod tests {
         cfg.machines[0].host = "192.168.2.166".to_string();
         cfg.machines.push(MachineConfig {
             id: "windows".to_string(),
+            alias_name: String::new(),
             name: "windows".to_string(),
             host: "192.168.2.166".to_string(),
             web_port: 18765,
@@ -1170,6 +1227,7 @@ mod tests {
         let local_host = MachineConfig::local().host;
         cfg.machines.push(MachineConfig {
             id: "nas".to_string(),
+            alias_name: String::new(),
             name: "nas".to_string(),
             host: local_host.clone(),
             web_port: 18765,
@@ -1199,6 +1257,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         let mut nas = MachineConfig::local();
         nas.id = "nas".to_string();
+        nas.alias_name = "nas".to_string();
         nas.name = "nas".to_string();
         nas.host = "203.0.113.10".to_string();
         nas.web_port = 18765;
@@ -1210,8 +1269,9 @@ mod tests {
             &cfg,
             vec![MachineHealth {
                 id: "local".to_string(),
+                alias_name: "nas".to_string(),
                 name: "This machine".to_string(),
-                host: "203.0.113.10".to_string(),
+                host: "203.0.113.99".to_string(),
                 web_port: 18765,
                 ssh_user: "root".to_string(),
                 ssh_port: 10022,
@@ -1223,10 +1283,11 @@ mod tests {
         let matches: Vec<_> = status
             .machines
             .iter()
-            .filter(|machine| machine.host == "203.0.113.10")
+            .filter(|machine| machine.alias_name == "nas")
             .collect();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "nas");
+        assert_eq!(matches[0].host, "203.0.113.10");
         assert!(matches[0].online);
         assert_eq!(matches[0].ssh_user, "root");
         assert_eq!(matches[0].ssh_port, 10022);
@@ -1234,10 +1295,40 @@ mod tests {
     }
 
     #[test]
+    fn find_machine_prefers_alias_then_id_then_host() {
+        let mut cfg = AppConfig::default();
+        cfg.machines.push(MachineConfig {
+            id: "lan_203_0_113_10_18765_abcd1234".to_string(),
+            alias_name: "nas".to_string(),
+            name: "Reported Host".to_string(),
+            host: "203.0.113.10".to_string(),
+            web_port: 18765,
+            ssh_user: "root".to_string(),
+            ssh_port: 10022,
+            os: "linux".to_string(),
+            enabled: true,
+            manual: true,
+        });
+
+        assert_eq!(find_machine(&cfg, "nas").unwrap().host, "203.0.113.10");
+        assert_eq!(
+            find_machine(&cfg, "lan_203_0_113_10_18765_abcd1234")
+                .unwrap()
+                .alias_name,
+            "nas"
+        );
+        assert_eq!(
+            find_machine(&cfg, "203.0.113.10").unwrap().alias_name,
+            "nas"
+        );
+    }
+
+    #[test]
     fn merge_discovered_preserves_manual_machine_edits() {
         let mut cfg = AppConfig::default();
         cfg.machines.push(MachineConfig {
             id: "manual_peer".to_string(),
+            alias_name: String::new(),
             name: "Manual Name".to_string(),
             host: "203.0.113.30".to_string(),
             web_port: 18765,
@@ -1252,6 +1343,7 @@ mod tests {
             &cfg,
             vec![MachineHealth {
                 id: "lan_peer".to_string(),
+                alias_name: String::new(),
                 name: "Auto Name".to_string(),
                 host: "203.0.113.30".to_string(),
                 web_port: 18765,

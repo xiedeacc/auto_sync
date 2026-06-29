@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::core::config::{
-    AppConfig, MachineConfig, load_config, load_or_create_config, save_config,
+    AppConfig, MachineConfig, load_config, load_or_create_config, machine_matches_reference,
+    save_config,
 };
 use crate::core::machines::{
     MachineHealth, MachineStatus, configure_tcp_connection_pool, discover_lan,
@@ -94,7 +95,11 @@ impl Backend {
 
     pub fn add_machine(&self, machine: MachineConfig) -> Result<AppConfig> {
         let mut cfg = load_or_create_config(&self.config_path)?;
-        if let Some(existing) = cfg.machines.iter_mut().find(|item| item.id == machine.id) {
+        if let Some(existing) = cfg.machines.iter_mut().find(|item| {
+            non_empty_machine_match(item, &machine.alias_name)
+                || non_empty_machine_match(item, &machine.id)
+                || non_empty_machine_match(item, &machine.host)
+        }) {
             *existing = machine;
         } else {
             cfg.machines.push(machine);
@@ -267,6 +272,10 @@ impl BuildInfo {
     }
 }
 
+fn non_empty_machine_match(machine: &MachineConfig, value: &str) -> bool {
+    !value.trim().is_empty() && machine_matches_reference(machine, value)
+}
+
 fn preserve_current_machines(config_path: &Path, cfg: &AppConfig) -> AppConfig {
     let mut cfg = cfg.clone();
     if let Ok(current) = load_config(config_path) {
@@ -376,6 +385,7 @@ mod tests {
         stale.app.log_dir = temp.join("logs");
         stale.machines.push(MachineConfig {
             id: "windows".to_string(),
+            alias_name: String::new(),
             name: "windows".to_string(),
             host: "192.168.3.7".to_string(),
             web_port: 18765,

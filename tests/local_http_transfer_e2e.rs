@@ -52,8 +52,14 @@ fn full_sync_over_http_transfer_protocol() -> Result<()> {
 
     let mut state = State::open(&state_db)?;
     let started = Instant::now();
-    sync_destination_now_with_mode(&cfg, &mut state, SOURCE_ID, DESTINATION_ID, SyncRequestMode::Full)
-        .context("full sync over HTTP transfer failed")?;
+    sync_destination_now_with_mode(
+        &cfg,
+        &mut state,
+        SOURCE_ID,
+        DESTINATION_ID,
+        SyncRequestMode::Full,
+    )
+    .context("full sync over HTTP transfer failed")?;
     eprintln!("sync completed in {} ms", started.elapsed().as_millis());
 
     // Destination must verify green.
@@ -110,13 +116,21 @@ fn changed_large_file_resyncs_via_delta() -> Result<()> {
     fs::create_dir_all(&dest_parent)?;
 
     // 2 MiB file -> first sync transfers it whole, establishing a delta basis.
-    let v1: Vec<u8> = (0..2_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let v1: Vec<u8> = (0..2_000_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
     write_bytes(source_root.join("db/data.bin"), &v1)?;
 
     let server = start_receiver(&base)?;
     let cfg = build_config(&state_db, &source_root, &dest_parent, server.port);
     let mut state = State::open(&state_db)?;
-    sync_destination_now_with_mode(&cfg, &mut state, SOURCE_ID, DESTINATION_ID, SyncRequestMode::Full)?;
+    sync_destination_now_with_mode(
+        &cfg,
+        &mut state,
+        SOURCE_ID,
+        DESTINATION_ID,
+        SyncRequestMode::Full,
+    )?;
 
     let dest_root = dest_parent.join(SOURCE_DIR_NAME);
     assert_file(&dest_root.join("db/data.bin"), &v1)?;
@@ -130,7 +144,13 @@ fn changed_large_file_resyncs_via_delta() -> Result<()> {
     v2.extend(std::iter::repeat(b'Z').take(300_000));
     write_bytes(source_root.join("db/data.bin"), &v2)?;
 
-    sync_destination_now_with_mode(&cfg, &mut state, SOURCE_ID, DESTINATION_ID, SyncRequestMode::Full)?;
+    sync_destination_now_with_mode(
+        &cfg,
+        &mut state,
+        SOURCE_ID,
+        DESTINATION_ID,
+        SyncRequestMode::Full,
+    )?;
     assert_file(&dest_root.join("db/data.bin"), &v2)?;
 
     let view = state
@@ -188,6 +208,7 @@ fn build_config(state_db: &Path, source_root: &Path, dest_parent: &Path, port: u
 
     let receiver = MachineConfig {
         id: "localweb".to_string(),
+        alias_name: String::new(),
         name: "localweb".to_string(),
         host: "127.0.0.1".to_string(),
         web_port: port,
@@ -257,7 +278,10 @@ fn assert_size(path: &Path, expected: u64) -> Result<()> {
         .with_context(|| format!("missing {}", path.display()))?
         .len();
     if actual != expected {
-        bail!("size mismatch at {}: {actual} vs {expected}", path.display());
+        bail!(
+            "size mismatch at {}: {actual} vs {expected}",
+            path.display()
+        );
     }
     Ok(())
 }

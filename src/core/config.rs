@@ -131,6 +131,7 @@ pub struct DestinationConfig {
 #[serde(default)]
 pub struct MachineConfig {
     pub id: String,
+    pub alias_name: String,
     pub name: String,
     pub host: String,
     pub web_port: u16,
@@ -293,6 +294,7 @@ impl MachineConfig {
     pub fn local() -> Self {
         Self {
             id: "local".to_string(),
+            alias_name: String::new(),
             name: "This machine".to_string(),
             host: preferred_local_host(),
             web_port: 18765,
@@ -409,6 +411,7 @@ fn clean_machines(machines: &[MachineConfig]) -> Vec<MachineConfig> {
             continue;
         }
         machine.name = machine.name.trim().to_string();
+        machine.alias_name = clean_id(&machine.alias_name);
         machine.host = machine.host.trim().to_string();
         machine.ssh_user = machine.ssh_user.trim().to_string();
         machine.os = machine.os.trim().to_string();
@@ -441,6 +444,7 @@ fn local_machine_from_config(machines: &[MachineConfig]) -> MachineConfig {
     if !configured.name.trim().is_empty() {
         local.name = configured.name.trim().to_string();
     }
+    local.alias_name = clean_id(&configured.alias_name);
     if is_advertisable_host(&configured.host) {
         local.host = configured.host.trim().to_string();
     }
@@ -518,10 +522,8 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         let mut source_ids = HashSet::new();
         let mut task_ids = HashSet::new();
-        let machine_ids: HashSet<String> = clean_machines(&self.machines)
-            .into_iter()
-            .map(|machine| machine.id)
-            .collect();
+        let machines = clean_machines(&self.machines);
+        let machine_ids = machine_reference_set(&machines);
         for source in &self.source_groups {
             if source.id.trim().is_empty() {
                 bail!("source group id cannot be empty");
@@ -533,7 +535,7 @@ impl AppConfig {
                 bail!("source {} has empty src path", source.id);
             }
             let source_machine = machine_id_or_local(&source.machine_id);
-            if !machine_ids.contains(source_machine) {
+            if !machine_ids.contains(&source_machine.to_ascii_lowercase()) {
                 bail!(
                     "source {} references unknown machine {}",
                     source.id,
@@ -566,7 +568,7 @@ impl AppConfig {
                     bail!("destination {} has empty path", dst.id);
                 }
                 let dst_machine = machine_id_or_local(&dst.machine_id);
-                if !machine_ids.contains(dst_machine) {
+                if !machine_ids.contains(&dst_machine.to_ascii_lowercase()) {
                     bail!(
                         "destination {} references unknown machine {}",
                         dst.id,
@@ -605,6 +607,56 @@ pub fn machine_id_or_local(value: &str) -> &str {
     } else {
         value.trim()
     }
+}
+
+fn machine_reference_set(machines: &[MachineConfig]) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    for machine in machines {
+        insert_machine_reference(&mut refs, &machine.id);
+        insert_machine_reference(&mut refs, &machine.alias_name);
+        insert_machine_reference(&mut refs, &machine.host);
+    }
+    refs
+}
+
+fn insert_machine_reference(refs: &mut HashSet<String>, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    refs.insert(value.to_ascii_lowercase());
+}
+
+pub fn machine_matches_reference(machine: &MachineConfig, value: &str) -> bool {
+    let value = machine_id_or_local(value);
+    let value_lower = value.to_ascii_lowercase();
+    if value_lower == "local" {
+        return machine.id == "local";
+    }
+    let alias = machine.alias_name.trim();
+    if !alias.is_empty() && alias.eq_ignore_ascii_case(value) {
+        return true;
+    }
+    if machine.id.eq_ignore_ascii_case(value) {
+        return true;
+    }
+    machine.host.trim().eq_ignore_ascii_case(value)
+}
+
+pub fn machine_display_name(machine: &MachineConfig) -> String {
+    let alias = machine.alias_name.trim();
+    if !alias.is_empty() {
+        return alias.to_string();
+    }
+    let host = machine.host.trim();
+    if !host.is_empty() {
+        return host.to_string();
+    }
+    let name = machine.name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    machine.id.clone()
 }
 
 pub fn normalized_machines(cfg: &AppConfig) -> Vec<MachineConfig> {

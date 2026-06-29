@@ -27,6 +27,7 @@ manual = true
 
 [[machines]]
 id = "nas"
+alias_name = "nas"
 name = "nas"
 host = "192.168.2.247"
 web_port = 18765

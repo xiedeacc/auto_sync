@@ -179,9 +179,9 @@ fn run_source_watcher_session(
                         source = watch.id,
                         volume = watch.volume,
                         kind,
-                        "Windows USN watcher detected an unreadable journal range; marking full rescan"
+                        "Windows USN watcher detected an unreadable journal range; recording realtime source event"
                     );
-                    state.record_event(&watch.id, 0, kind, None, true)?;
+                    state.record_event(&watch.id, 0, kind, None, false)?;
                     journal = query_usn_journal(volume.raw())?;
                     next_usn = journal.NextUsn;
                     watch.journal_id = journal.UsnJournalID;
@@ -218,7 +218,7 @@ fn initial_next_usn(
     watch.journal_id = journal.UsnJournalID;
     let cursor = state.windows_usn_cursor(&watch.id, &watch.volume)?;
     let Some(cursor) = cursor else {
-        state.record_event(&watch.id, 0, "usn_initial_reconcile", None, true)?;
+        state.record_event(&watch.id, 0, "usn_initial_reconcile", None, false)?;
         state.set_windows_usn_cursor(
             &watch.id,
             &watch.volume,
@@ -229,7 +229,7 @@ fn initial_next_usn(
     };
 
     if cursor.journal_id != journal.UsnJournalID || cursor.next_usn < journal.LowestValidUsn {
-        state.record_event(&watch.id, 0, "usn_cursor_reconcile", None, true)?;
+        state.record_event(&watch.id, 0, "usn_cursor_reconcile", None, false)?;
         state.set_windows_usn_cursor(
             &watch.id,
             &watch.volume,
@@ -244,7 +244,7 @@ fn initial_next_usn(
 
 fn record_rescan_event(db_path: &Path, source_id: &str, kind: &str) -> Result<()> {
     let state = State::open(db_path)?;
-    state.record_event(source_id, 0, kind, None, true)?;
+    state.record_event(source_id, 0, kind, None, false)?;
     Ok(())
 }
 
@@ -313,7 +313,7 @@ impl SourceWatch {
                 .root
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string());
-            let rescan = record_requires_rescan(record);
+            let rescan = false;
             state.record_event(
                 &self.id,
                 record.reason as u64,
@@ -341,7 +341,7 @@ impl SourceWatch {
 
         let rel = parent_rel.join(&record.file_name);
         let rel_text = path_to_event_string(&rel);
-        let rescan = record_requires_rescan(record);
+        let rescan = false;
         state.record_event(
             &self.id,
             record.reason as u64,
@@ -653,13 +653,6 @@ fn reason_to_kind(reason: u32) -> &'static str {
     }
 }
 
-fn record_requires_rescan(record: &UsnRecord) -> bool {
-    record.reason & (USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME) != 0
-        || (record.is_dir
-            && record.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0)
-        || record.reason & USN_REASON_HARD_LINK_CHANGE != 0
-}
-
 fn path_to_event_string(path: &Path) -> Option<String> {
     if path.as_os_str().is_empty() {
         None
@@ -707,24 +700,5 @@ mod tests {
         assert_eq!(reason_to_kind(USN_REASON_RENAME_OLD_NAME), "rename_old");
         assert_eq!(reason_to_kind(USN_REASON_RENAME_NEW_NAME), "rename_new");
         assert_eq!(reason_to_kind(USN_REASON_DATA_EXTEND), "modify");
-    }
-
-    #[test]
-    fn destructive_records_require_rescan() {
-        let delete = UsnRecord {
-            file_reference_number: 1,
-            parent_file_reference_number: 2,
-            reason: USN_REASON_FILE_DELETE,
-            is_dir: false,
-            file_name: "old.txt".to_string(),
-        };
-        assert!(record_requires_rescan(&delete));
-
-        let create_file = UsnRecord {
-            reason: USN_REASON_FILE_CREATE,
-            is_dir: false,
-            ..delete
-        };
-        assert!(!record_requires_rescan(&create_file));
     }
 }

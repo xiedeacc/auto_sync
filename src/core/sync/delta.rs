@@ -189,7 +189,9 @@ fn emit_copy(out: &mut Vec<u8>, offset: u64, len: u32) {
 pub fn apply_delta<R: Read + Seek, W: Write>(old: &mut R, delta: &[u8], out: &mut W) -> Result<()> {
     let mut pos = 0usize;
     loop {
-        let tag = *delta.get(pos).ok_or_else(|| anyhow::anyhow!("delta truncated"))?;
+        let tag = *delta
+            .get(pos)
+            .ok_or_else(|| anyhow::anyhow!("delta truncated"))?;
         pos += 1;
         match tag {
             OP_LITERAL => {

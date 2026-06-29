@@ -267,9 +267,9 @@ fn parse_events(state: &State, sources: &[SourceRoot], mut bytes: &[u8]) -> Resu
         }
 
         if meta.mask & FAN_Q_OVERFLOW != 0 {
-            warn!("fanotify queue overflow; marking all sources for full rescan");
+            warn!("fanotify queue overflow; recording realtime source events");
             for source in sources {
-                state.record_event(&source.id, meta.mask, "queue_overflow", None, true)?;
+                state.record_event(&source.id, meta.mask, "queue_overflow", None, false)?;
             }
         } else {
             persist_event(state, sources, &meta)?;
@@ -294,13 +294,12 @@ fn persist_event(
 
     for source in sources {
         if let Some(rel) = source_relative_event_path(source, &path) {
-            let rescan_required = meta.mask & (FAN_DELETE | FAN_MOVED_FROM | FAN_DELETE_SELF) != 0;
             state.record_event(
                 &source.id,
                 meta.mask,
                 mask_to_kind(meta.mask),
                 Some(rel.as_str()),
-                rescan_required,
+                false,
             )?;
         }
     }
