@@ -2245,6 +2245,7 @@ fn sync_directory_with_transfer(
         destination_id,
         cycle_id,
         &pending,
+        dirs.len(),
         sync,
     )?;
     info!(
@@ -2409,6 +2410,7 @@ fn sync_directory_event_paths_with_transfer(
         destination_id,
         cycle_id,
         &pending,
+        dirs.len(),
         sync,
     )?;
     info!(
@@ -2608,8 +2610,13 @@ fn sync_file_with_transfer(
             } else {
                 use_delta = false;
             }
-            let _transfer =
-                progress::begin_transfer(destination_id, dst_root, entry.size.max(0) as u64);
+            let _transfer = progress::begin_transfer_with_totals(
+                destination_id,
+                dst_root,
+                entry.size.max(0) as u64,
+                1,
+                0,
+            );
             push_entry_between_machines(
                 source_machine_id,
                 source_machine,
@@ -2952,6 +2959,7 @@ fn push_entries_parallel(
     destination_id: &str,
     cycle_id: i64,
     entries: &[(&SnapshotEntry, bool)],
+    total_dirs: usize,
     sync: &NativeSyncConfig,
 ) -> Result<usize> {
     if entries.is_empty() {
@@ -2962,7 +2970,17 @@ fn push_entries_parallel(
         .filter(|(entry, _)| entry.file_type == "file")
         .map(|(entry, _)| entry.size.max(0) as u64)
         .sum();
-    let _transfer = progress::begin_transfer(destination_id, dst_root, total_bytes);
+    let total_files = entries
+        .iter()
+        .filter(|(entry, _)| entry.file_type == "file" || entry.file_type == "symlink")
+        .count();
+    let _transfer = progress::begin_transfer_with_totals(
+        destination_id,
+        dst_root,
+        total_bytes,
+        total_files as u64,
+        total_dirs as u64,
+    );
     let workers = resolve_parallelism(sync.max_parallel_transfers, entries.len());
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
@@ -2999,6 +3017,7 @@ fn push_entries_parallel(
                     .with_context(|| format!("failed to transfer {}", entry.rel_path))
                     {
                         Ok(()) => {
+                            progress::record_entry_finished(&entry.rel_path, &entry.file_type);
                             done.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(err) => {

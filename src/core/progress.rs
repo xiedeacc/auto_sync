@@ -21,6 +21,14 @@ pub struct TransferProgressView {
     pub rel_path: String,
     pub transferred_bytes: u64,
     pub total_bytes: u64,
+    #[serde(default)]
+    pub completed_files: u64,
+    #[serde(default)]
+    pub total_files: u64,
+    #[serde(default)]
+    pub completed_dirs: u64,
+    #[serde(default)]
+    pub total_dirs: u64,
     pub bytes_per_sec: u64,
     pub updated_at_ms: u128,
 }
@@ -41,6 +49,10 @@ struct TransferProgressState {
     rel_path: String,
     transferred_bytes: u64,
     total_bytes: u64,
+    completed_files: u64,
+    total_files: u64,
+    completed_dirs: u64,
+    total_dirs: u64,
     bytes_per_sec: u64,
     last_bytes: u64,
     started_at: Instant,
@@ -182,6 +194,10 @@ pub fn start_transfer(
         rel_path: rel_path.to_string(),
         transferred_bytes: transferred_bytes.min(total_bytes),
         total_bytes,
+        completed_files: 0,
+        total_files: 1,
+        completed_dirs: 0,
+        total_dirs: 0,
         bytes_per_sec: 0,
         last_bytes: transferred_bytes.min(total_bytes),
         started_at: now,
@@ -224,6 +240,16 @@ pub fn begin_transfer(
     destination_path: &Path,
     total_bytes: u64,
 ) -> TransferProgressGuard {
+    begin_transfer_with_totals(destination_id, destination_path, total_bytes, 0, 0)
+}
+
+pub fn begin_transfer_with_totals(
+    destination_id: &str,
+    destination_path: &Path,
+    total_bytes: u64,
+    total_files: u64,
+    total_dirs: u64,
+) -> TransferProgressGuard {
     let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     let now = Instant::now();
     let mut progress = progress_lock()
@@ -236,6 +262,10 @@ pub fn begin_transfer(
         rel_path: String::new(),
         transferred_bytes: 0,
         total_bytes,
+        completed_files: 0,
+        total_files,
+        completed_dirs: total_dirs,
+        total_dirs,
         bytes_per_sec: 0,
         last_bytes: 0,
         started_at: now,
@@ -277,6 +307,27 @@ pub fn record_transfer(rel_path: &str, added: u64) {
         state.last_sample_at = now;
         write_progress_file(&state.view());
     }
+}
+
+pub fn record_entry_finished(rel_path: &str, file_type: &str) {
+    let mut progress = progress_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let Some(state) = progress.as_mut() else {
+        return;
+    };
+    if !rel_path.is_empty() {
+        state.rel_path = rel_path.to_string();
+    }
+    match file_type {
+        "dir" => state.completed_dirs = state.completed_dirs.saturating_add(1),
+        "file" | "symlink" => state.completed_files = state.completed_files.saturating_add(1),
+        _ => {}
+    }
+    let now = Instant::now();
+    state.updated_at = now;
+    state.updated_at_ms = now_ms();
+    write_progress_file(&state.view());
 }
 
 pub fn current_transfer_progress() -> Option<TransferProgressView> {
@@ -339,6 +390,10 @@ impl TransferProgressState {
             rel_path: self.rel_path.clone(),
             transferred_bytes: self.transferred_bytes,
             total_bytes: self.total_bytes,
+            completed_files: self.completed_files,
+            total_files: self.total_files,
+            completed_dirs: self.completed_dirs,
+            total_dirs: self.total_dirs,
             bytes_per_sec,
             updated_at_ms: self.updated_at_ms,
         }
