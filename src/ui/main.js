@@ -295,8 +295,10 @@ function updateStatusUi() {
     const logButton = row.querySelector('[data-action="show-dst-log"]');
     if (logButton) {
       const activity = activityForSourceId(sourceId);
-      logButton.classList.toggle("is-syncing", activityIsSyncing(activity));
-      logButton.title = activityIsSyncing(activity) ? activitySyncingLabel(activity) : "Destination log";
+      const iconState = destinationLogIconState(status, activity);
+      logButton.className = `destination-log-button icon destination-log-${iconState.kind}`;
+      logButton.title = iconState.title;
+      logButton.setAttribute("aria-label", iconState.title);
     }
   }
 }
@@ -815,6 +817,7 @@ function renderSyncRows(source, group) {
     const dotTitle = dotClass === "yellow"
       ? `${issueCount} changing file${issueCount === 1 ? "" : "s"}`
       : ((status && status.status) || "red");
+    const logIconState = destinationLogIconState(status, activityForSource(source));
     row.innerHTML = `
       <div class="row-left">
         <label>ID</label>
@@ -831,7 +834,7 @@ function renderSyncRows(source, group) {
         <label>Cycle</label>
         <span aria-hidden="true"></span>
         <label class="actions-label">Sync</label>
-        <button class="destination-log-button" data-action="show-dst-log" title="Destination log">Log</button>
+        <button class="destination-log-button icon destination-log-${escapeAttr(logIconState.kind)}" data-action="show-dst-log" title="${escapeAttr(logIconState.title)}" aria-label="${escapeAttr(logIconState.title)}"><span class="destination-log-icon" aria-hidden="true">i</span></button>
         <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
         <input class="destination-readonly destination-cycle" value="${escapeAttr(cycleDisplay(status))}" readonly>
         <button class="sync-config-button icon" data-action="edit-dst-sync" title="${escapeAttr(destinationSyncTitle(dst))}">&#9881;</button>
@@ -1507,6 +1510,29 @@ function statusClass(status) {
   return "red";
 }
 
+function destinationLogIconState(status, activity) {
+  if (isPathUnavailable(status)) {
+    return { kind: "gray", title: pathUnavailableLabel(status) };
+  }
+  if (activityIsSyncing(activity)) {
+    if (destinationHasError(status) || (activity && activity.error)) {
+      return { kind: "red", title: destinationStatusText(status) || "Sync error" };
+    }
+    return { kind: "yellow", title: activitySyncingLabel(activity) };
+  }
+  if (status && status.status === "green") {
+    return { kind: "green", title: "Destination synced" };
+  }
+  if (status && status.status === "yellow") {
+    const issueCount = status && status.issues ? status.issues.length : 0;
+    return {
+      kind: "yellow",
+      title: `${issueCount} changing file${issueCount === 1 ? "" : "s"}`,
+    };
+  }
+  return { kind: "red", title: destinationStatusText(status) || "Destination needs attention" };
+}
+
 function openScheduleModal(schedule, onApply) {
   const draft = cloneSchedule(schedule);
   scheduleEditor = { draft, onApply };
@@ -1945,11 +1971,19 @@ function blockedByLabel(status) {
 }
 
 function isDestinationUnavailable(status) {
+  return isPathUnavailable(status);
+}
+
+function isPathUnavailable(status) {
   if (!status || status.status !== "red") {
     return false;
   }
   const reason = String(status.status_reason || "").toLowerCase();
   return [
+    "source path does not exist",
+    "source path is not a directory",
+    "source offline",
+    "source unavailable",
     "destination path does not exist",
     "destination path is not a directory",
     "destination file path is a directory",
@@ -1966,9 +2000,25 @@ function isDestinationUnavailable(status) {
   ].some((text) => reason.includes(text));
 }
 
+function destinationHasError(status) {
+  if (!status) {
+    return false;
+  }
+  if (status.status === "red") {
+    return !isPathUnavailable(status);
+  }
+  const reason = String(status.status_reason || "").toLowerCase();
+  return reason.includes("failed") || reason.includes("error");
+}
+
 function unavailableLabel(status) {
   const reason = String((status && status.status_reason) || "").trim();
   return reason ? `Destination unavailable: ${reason}` : "Destination unavailable";
+}
+
+function pathUnavailableLabel(status) {
+  const reason = String((status && status.status_reason) || "").trim();
+  return reason ? `Path unavailable: ${reason}` : "Path unavailable";
 }
 
 function renderFolderMachineOptions() {

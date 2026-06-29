@@ -312,7 +312,7 @@ th {
 }
 
 .destination-right {
-  grid-template-columns: 52px 100px 100px 34px 104px 34px;
+  grid-template-columns: 34px 100px 100px 34px 104px 34px;
 }
 
 .actions-label {
@@ -366,10 +366,43 @@ th {
 }
 
 .destination-log-button {
-  width: 52px;
-  min-width: 52px;
-  font-weight: 700;
-  color: var(--accent);
+  width: 34px;
+  min-width: 34px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+}
+
+.destination-log-icon {
+  width: 18px;
+  height: 18px;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.destination-log-green {
+  color: var(--green);
+}
+
+.destination-log-yellow {
+  color: #d99a00;
+}
+
+.destination-log-red {
+  color: var(--red);
+}
+
+.destination-log-gray {
+  color: #8a94a6;
 }
 
 .destination-row.destination-unavailable .destination-sync-select {
