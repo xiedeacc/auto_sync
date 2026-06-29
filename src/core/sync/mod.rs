@@ -1367,15 +1367,96 @@ pub fn sync_cycle_for_source(
     let source_endpoint = source_view.endpoint.clone();
 
     state.mark_cycle_status(cycle.id, "planning")?;
-    let source_snapshot = source_endpoint
-        .snapshot(&source.excludes, source_checksum)
-        .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
-    state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
-
     state.mark_cycle_status(cycle.id, "syncing")?;
+    let mut shared_source_snapshot: Option<Vec<SnapshotEntry>> = None;
     for (dst_index, dst_endpoint) in ready_destinations {
         let dst = &source.destinations[dst_index];
         let sync = effective_sync_config(cfg, dst);
+        if let (
+            SourceEndpoint::Dir { root: src_root, .. },
+            DestinationEndpoint::Dir { root: dst_root },
+        ) = (&source_endpoint, &dst_endpoint)
+        {
+            if !cycle.manual_changed_since_rescan {
+                let sync_result = sync_destination_fast_missing_dirs(
+                    src_root,
+                    dst_root,
+                    &dst.id,
+                    cycle.id,
+                    &source.excludes,
+                    &sync,
+                );
+                match sync_result {
+                    Ok(source_snapshot) => {
+                        state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
+                        progressed = true;
+                        state.clear_destination_issues(&source.id, &dst.id)?;
+                        state.upsert_destination_status(
+                            &source.id,
+                            &dst.id,
+                            Some(cycle.id),
+                            "green",
+                            "verified",
+                        )?;
+                        info!(
+                            source = source.id,
+                            destination = dst.id,
+                            cycle_id = cycle.id,
+                            "destination verified"
+                        );
+                    }
+                    Err(err) => {
+                        all_verified = false;
+                        had_unblocked_failure = true;
+                        error!(
+                            source = source.id,
+                            destination = dst.id,
+                            cycle_id = cycle.id,
+                            error = %err,
+                            "destination sync failed"
+                        );
+                        let changing_paths = source_changed_paths(&err);
+                        if changing_paths.is_empty() {
+                            state.clear_destination_issues(&source.id, &dst.id)?;
+                            state.upsert_destination_status(
+                                &source.id,
+                                &dst.id,
+                                None,
+                                "red",
+                                &short_reason(&err),
+                            )?;
+                        } else {
+                            state.replace_destination_issues(
+                                &source.id,
+                                &dst.id,
+                                cycle.id,
+                                "source_changing",
+                                &changing_paths,
+                                "source file changed while copying",
+                            )?;
+                            state.upsert_destination_status(
+                                &source.id,
+                                &dst.id,
+                                None,
+                                "yellow",
+                                "source_changed_while_copying",
+                            )?;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        let source_snapshot = if let Some(snapshot) = shared_source_snapshot.as_ref() {
+            snapshot
+        } else {
+            let snapshot = source_endpoint
+                .snapshot(&source.excludes, source_checksum)
+                .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
+            state.replace_snapshot(cycle.id, &source.id, &snapshot)?;
+            shared_source_snapshot = Some(snapshot);
+            shared_source_snapshot.as_ref().unwrap()
+        };
         let changed_since_paths = if cycle.manual_changed_since_rescan {
             changed_since_scan_paths(
                 state,
@@ -3508,6 +3589,264 @@ fn sync_destination(
     result
 }
 
+fn sync_destination_fast_missing_dirs(
+    src_root: &Path,
+    dst_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
+) -> Result<Vec<SnapshotEntry>> {
+    fs::create_dir_all(dst_root).with_context(|| {
+        format!(
+            "failed to create destination directory: {}",
+            dst_root.display()
+        )
+    })?;
+    let result = (|| {
+        let mut changing_paths = BTreeSet::new();
+        let mut copied_paths = BTreeSet::new();
+        let dst_snapshot =
+            take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
+        let dst_map = map_entries(&dst_snapshot);
+        let mut source_snapshot = Vec::new();
+        collect_source_snapshot_copying_missing_dirs(
+            src_root,
+            dst_root,
+            destination_id,
+            cycle_id,
+            excludes,
+            sync,
+            &dst_map,
+            &mut source_snapshot,
+            &mut copied_paths,
+            &mut changing_paths,
+        )?;
+        let source_map = map_entries(&source_snapshot);
+
+        for entry in source_snapshot.iter().filter(|e| e.file_type == "dir") {
+            if copied_paths.contains(&entry.rel_path) {
+                continue;
+            }
+            let target = dst_root.join(&entry.rel_path);
+            if target.exists() && !target.is_dir() {
+                move_to_trash(dst_root, &entry.rel_path, cycle_id)?;
+            }
+            fs::create_dir_all(&target)
+                .with_context(|| format!("failed to create directory {}", target.display()))?;
+            set_mode(&target, entry.mode).ok();
+        }
+
+        for entry in source_snapshot
+            .iter()
+            .filter(|e| e.file_type == "file" || e.file_type == "symlink")
+        {
+            if copied_paths.contains(&entry.rel_path) {
+                continue;
+            }
+            let needs_copy = match dst_map.get(&entry.rel_path) {
+                Some(existing) => !entries_match(entry, existing, sync),
+                None => true,
+            };
+            if !needs_copy {
+                continue;
+            }
+            if let Err(err) = copy_entry(src_root, dst_root, destination_id, cycle_id, entry)
+                .with_context(|| format!("failed to copy {}", entry.rel_path))
+            {
+                let paths = source_changed_paths(&err);
+                if paths.is_empty() {
+                    return Err(err);
+                }
+                changing_paths.extend(paths);
+            }
+        }
+
+        if sync.mirror {
+            let mut extra_paths: Vec<String> = dst_map
+                .keys()
+                .filter(|rel| {
+                    !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
+                })
+                .cloned()
+                .collect();
+            extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
+            for rel in extra_paths {
+                move_to_trash(dst_root, &rel, cycle_id)
+                    .with_context(|| format!("failed to remove extra destination path {rel}"))?;
+            }
+        }
+
+        set_snapshot_dir_mtimes(dst_root, &source_snapshot)?;
+        verify_destination(dst_root, &source_snapshot, &changing_paths, excludes, sync)?;
+        if !changing_paths.is_empty() {
+            return Err(source_changing_error(&changing_paths));
+        }
+        Ok(source_snapshot)
+    })();
+    cleanup_tmp_cycle(dst_root, cycle_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_source_snapshot_copying_missing_dirs(
+    src_root: &Path,
+    dst_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
+    dst_map: &BTreeMap<String, SnapshotEntry>,
+    source_snapshot: &mut Vec<SnapshotEntry>,
+    copied_paths: &mut BTreeSet<String>,
+    changing_paths: &mut BTreeSet<String>,
+) -> Result<()> {
+    let scan_progress = progress::start_scan(src_root);
+    let mut entries_seen = 0_u64;
+    let mut queue = VecDeque::from([src_root.to_path_buf()]);
+    while let Some(dir) = queue.pop_front() {
+        let mut children = sorted_read_dir(&dir)?;
+        for child in children.drain(..) {
+            if entry_is_excluded(src_root, &child, excludes) {
+                continue;
+            }
+            let rel = child
+                .strip_prefix(src_root)
+                .with_context(|| format!("failed to strip root from {}", child.display()))?;
+            let rel_path = rel_to_string(rel)?;
+            entries_seen += 1;
+            let metadata = fs::symlink_metadata(&child)
+                .with_context(|| format!("failed to read metadata {}", child.display()))?;
+            let scan_path = if metadata.is_dir() {
+                child.as_path()
+            } else {
+                child.parent().unwrap_or(src_root)
+            };
+            scan_progress.update(scan_path, entries_seen);
+            let Some(entry) = snapshot_entry_if_supported(&child, rel_path.clone(), sync.checksum)?
+            else {
+                continue;
+            };
+            if entry.file_type == "dir"
+                && destination_subtree_missing_or_wrong_type(dst_map, &entry)
+            {
+                copy_missing_directory_tree(
+                    src_root,
+                    dst_root,
+                    destination_id,
+                    cycle_id,
+                    &child,
+                    &entry.rel_path,
+                    excludes,
+                    sync,
+                    source_snapshot,
+                    copied_paths,
+                    changing_paths,
+                )?;
+                continue;
+            }
+            let is_dir = entry.file_type == "dir";
+            source_snapshot.push(entry);
+            if is_dir {
+                queue.push_back(child);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn destination_subtree_missing_or_wrong_type(
+    dst_map: &BTreeMap<String, SnapshotEntry>,
+    entry: &SnapshotEntry,
+) -> bool {
+    entry.file_type == "dir"
+        && !dst_map
+            .get(&entry.rel_path)
+            .is_some_and(|dst_entry| dst_entry.file_type == "dir")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_missing_directory_tree(
+    src_root: &Path,
+    dst_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    subtree_root: &Path,
+    subtree_rel: &str,
+    excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
+    source_snapshot: &mut Vec<SnapshotEntry>,
+    copied_paths: &mut BTreeSet<String>,
+    changing_paths: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut dir_specs = Vec::new();
+    let mut queue = VecDeque::from([subtree_root.to_path_buf()]);
+    while let Some(dir) = queue.pop_front() {
+        let rel = dir
+            .strip_prefix(src_root)
+            .with_context(|| format!("failed to strip root from {}", dir.display()))?;
+        let rel_path = rel_to_string(rel)?;
+        if is_rel_excluded(Path::new(&rel_path), excludes) {
+            continue;
+        }
+        let Some(entry) = snapshot_entry_if_supported(&dir, rel_path.clone(), sync.checksum)?
+        else {
+            continue;
+        };
+        if entry.file_type != "dir" {
+            continue;
+        }
+        let target = dst_root.join(&entry.rel_path);
+        if target.exists() && !target.is_dir() {
+            move_to_trash(dst_root, &entry.rel_path, cycle_id)?;
+        }
+        fs::create_dir_all(&target)
+            .with_context(|| format!("failed to create directory {}", target.display()))?;
+        set_mode(&target, entry.mode).ok();
+        copied_paths.insert(entry.rel_path.clone());
+        dir_specs.push(TransferDirSpec {
+            rel_path: entry.rel_path.clone(),
+            mode: entry.mode,
+            mtime_ns: entry.mtime_ns,
+        });
+        source_snapshot.push(entry);
+
+        let mut children = sorted_read_dir(&dir)?;
+        for child in children.drain(..) {
+            if entry_is_excluded(src_root, &child, excludes) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&child)
+                .with_context(|| format!("failed to read metadata {}", child.display()))?;
+            if metadata.is_dir() {
+                queue.push_back(child);
+                continue;
+            }
+            let rel = child
+                .strip_prefix(src_root)
+                .with_context(|| format!("failed to strip root from {}", child.display()))?;
+            let rel_path = rel_to_string(rel)?;
+            let Some(entry) = snapshot_entry_if_supported(&child, rel_path, sync.checksum)? else {
+                continue;
+            };
+            if let Err(err) = copy_entry(src_root, dst_root, destination_id, cycle_id, &entry)
+                .with_context(|| format!("failed to copy {}", entry.rel_path))
+            {
+                let paths = source_changed_paths(&err);
+                if paths.is_empty() {
+                    return Err(err);
+                }
+                changing_paths.extend(paths);
+            }
+            copied_paths.insert(entry.rel_path.clone());
+            source_snapshot.push(entry);
+        }
+    }
+    set_dir_mtimes(dst_root, &dir_specs)
+        .with_context(|| format!("failed to set directory mtimes for {subtree_rel}"))?;
+    Ok(())
+}
+
 fn sync_endpoint_event_paths(
     source: &SourceEndpoint,
     dst: &DestinationEndpoint,
@@ -4841,6 +5180,36 @@ mod tests {
         let paths: Vec<String> = snapshot.into_iter().map(|entry| entry.rel_path).collect();
 
         assert_eq!(paths, vec!["a", "b.txt", "a/deep.txt"]);
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn missing_destination_directory_copies_whole_subtree() {
+        let temp = temp_dir("missing_dst_dir_fast_path");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        fs::create_dir_all(src.join("top").join("nested")).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("top").join("nested").join("file.txt"), b"hello").unwrap();
+
+        let snapshot = sync_destination_fast_missing_dirs(
+            &src,
+            &dst,
+            "dst_1",
+            7,
+            &[],
+            &NativeSyncConfig::default(),
+        )
+        .unwrap();
+        let paths: BTreeSet<String> = snapshot.into_iter().map(|entry| entry.rel_path).collect();
+
+        assert!(paths.contains("top"));
+        assert!(paths.contains("top/nested"));
+        assert!(paths.contains("top/nested/file.txt"));
+        assert_eq!(
+            fs::read(dst.join("top").join("nested").join("file.txt")).unwrap(),
+            b"hello"
+        );
         fs::remove_dir_all(temp).ok();
     }
 
