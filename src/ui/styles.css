@@ -71,8 +71,8 @@ h3 {
 }
 
 main {
-  padding: 14px;
-  max-width: var(--app-width);
+  padding: 14px 80px;
+  max-width: none;
   margin: 0 auto;
 }
 
@@ -1036,6 +1036,10 @@ th {
 @media (max-width: 940px) {
   body {
     min-width: 0;
+  }
+
+  main {
+    padding: 14px;
   }
 
   .schedule-row,

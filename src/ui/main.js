@@ -549,7 +549,7 @@ function renderSourcePanel() {
         <div class="row-left">
           <label>ID</label>
           <label>Source Path</label>
-          <input value="${escapeAttr(source.id)}" data-field="source-id">
+          <input value="${escapeAttr(source.id)}" data-field="source-id" readonly>
           <input class="path-picker ${sourcePathIsLocked ? "path-picker-locked" : ""}" value="${escapeAttr(sourcePathDisplay)}" data-field="source-src" readonly title="${escapeAttr(sourcePathDisplay)}">
         </div>
         <div class="row-right source-right">
@@ -688,14 +688,7 @@ async function saveSyncOrderDraft() {
 }
 
 function bindSourceControls(source, sourceIndex, group) {
-  const idInput = group.querySelector('[data-field="source-id"]');
   const srcInput = group.querySelector('[data-field="source-src"]');
-  idInput.oninput = () => {
-    source.id = idInput.value;
-  };
-  idInput.onchange = () => {
-    autoSaveConfig().catch((error) => setMessage(String(error)));
-  };
   srcInput.onclick = async () => {
     if (sourcePathLocked(source)) {
       setMessage(machinePathLabel(source.machine_id, source.src));
