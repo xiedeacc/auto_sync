@@ -15,4 +15,5 @@
      - NAS directly on NAS: `ssh -p 10022 root@192.168.2.247 "cd /opt/auto_sync && git pull --ff-only && scripts/deploy_local.sh --install-dir /opt/auto_sync"`.
      If parallel execution is not available, run the same two commands sequentially.
 - Do not deploy to tiger and do not use Windows-to-Linux cross-compilation for the normal NAS deployment path; build Linux x64 binaries on NAS.
+- Always build and deploy through the existing project scripts, never with ad-hoc commands. On Windows use `scripts/deploy_windows.ps1`; on NAS use `scripts/deploy_local.sh`. Do not run ad-hoc `cargo build`/`cargo check` against other targets (e.g. `--target *-linux-*`) on Windows to "validate" Linux-only code — cross-target builds pull in unbuildable native deps (libdbus, etc.). Validate Linux/`cfg`-gated code by building it on the NAS via `scripts/deploy_local.sh`.
 - For normal NAS deployment, do not delete `/opt/auto_sync`, do not run `git reset --hard`, and do not clean `/opt/auto_sync/target`; preserving Cargo build cache is required. If tracked files in `/opt/auto_sync` are dirty, stop and resolve why instead of masking it with reset.

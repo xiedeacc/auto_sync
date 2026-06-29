@@ -3023,6 +3023,76 @@ fn push_entries_parallel(
     Ok(done.load(Ordering::Relaxed) as usize)
 }
 
+/// Copy local file/symlink entries to the destination using a bounded worker
+/// pool. Returns the set of paths whose source changed mid-copy (so the caller
+/// can record a `source_changing` issue); any other error stops the pool and is
+/// propagated. An aggregate transfer meter must already be active.
+fn copy_entries_parallel(
+    src_root: &Path,
+    dst_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    entries: &[&SnapshotEntry],
+    sync: &NativeSyncConfig,
+) -> Result<BTreeSet<String>> {
+    if entries.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let workers = resolve_parallelism(sync.max_parallel_transfers, entries.len());
+    let next = AtomicUsize::new(0);
+    let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let changing: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    if first_error
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .is_some()
+                    {
+                        break;
+                    }
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= entries.len() {
+                        break;
+                    }
+                    let entry = entries[idx];
+                    match copy_entry(src_root, dst_root, destination_id, cycle_id, entry)
+                        .with_context(|| format!("failed to copy {}", entry.rel_path))
+                    {
+                        Ok(()) => {}
+                        Err(err) => {
+                            let paths = source_changed_paths(&err);
+                            if paths.is_empty() {
+                                let mut slot =
+                                    first_error.lock().unwrap_or_else(|e| e.into_inner());
+                                if slot.is_none() {
+                                    *slot = Some(err);
+                                }
+                                break;
+                            }
+                            changing
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .extend(paths);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(err) = first_error
+        .into_inner()
+        .unwrap_or_else(|err| err.into_inner())
+    {
+        return Err(err);
+    }
+    Ok(changing.into_inner().unwrap_or_else(|err| err.into_inner()))
+}
+
 fn verify_snapshot_entries(
     expected: &[SnapshotEntry],
     actual: &[SnapshotEntry],
@@ -3600,27 +3670,29 @@ fn sync_destination(
             set_mode(&target, entry.mode).ok();
         }
 
-        for entry in source_snapshot
+        let to_copy: Vec<&SnapshotEntry> = source_snapshot
             .iter()
             .filter(|e| e.file_type == "file" || e.file_type == "symlink")
-        {
-            let needs_copy = match dst_map.get(&entry.rel_path) {
-                Some(existing) => !entries_match(entry, existing, sync),
+            .filter(|e| match dst_map.get(&e.rel_path) {
+                Some(existing) => !entries_match(e, existing, sync),
                 None => true,
-            };
-            if !needs_copy {
-                continue;
-            }
-            if let Err(err) = copy_entry(src_root, dst_root, destination_id, cycle_id, entry)
-                .with_context(|| format!("failed to copy {}", entry.rel_path))
-            {
-                let paths = source_changed_paths(&err);
-                if paths.is_empty() {
-                    return Err(err);
-                }
-                changing_paths.extend(paths);
-            }
-        }
+            })
+            .collect();
+        let total_bytes: u64 = to_copy
+            .iter()
+            .filter(|e| e.file_type == "file")
+            .map(|e| e.size.max(0) as u64)
+            .sum();
+        let transfer_guard = progress::begin_transfer(destination_id, dst_root, total_bytes);
+        changing_paths.extend(copy_entries_parallel(
+            src_root,
+            dst_root,
+            destination_id,
+            cycle_id,
+            &to_copy,
+            sync,
+        )?);
+        drop(transfer_guard);
 
         if sync.mirror {
             let mut extra_paths: Vec<String> = dst_map
@@ -3669,6 +3741,9 @@ fn sync_destination_fast_missing_dirs(
             take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
         let dst_map = map_entries(&dst_snapshot);
         let mut source_snapshot = Vec::new();
+        // Total is unknown up front (scan and copy interleave); the meter still
+        // tracks throughput so the UI shows a live, non-zero transfer speed.
+        let transfer_guard = progress::begin_transfer(destination_id, dst_root, 0);
         collect_source_snapshot_copying_missing_dirs(
             src_root,
             dst_root,
@@ -3696,30 +3771,24 @@ fn sync_destination_fast_missing_dirs(
             set_mode(&target, entry.mode).ok();
         }
 
-        for entry in source_snapshot
+        let to_copy: Vec<&SnapshotEntry> = source_snapshot
             .iter()
             .filter(|e| e.file_type == "file" || e.file_type == "symlink")
-        {
-            if copied_paths.contains(&entry.rel_path) {
-                continue;
-            }
-            let needs_copy = match dst_map.get(&entry.rel_path) {
-                Some(existing) => !entries_match(entry, existing, sync),
+            .filter(|e| !copied_paths.contains(&e.rel_path))
+            .filter(|e| match dst_map.get(&e.rel_path) {
+                Some(existing) => !entries_match(e, existing, sync),
                 None => true,
-            };
-            if !needs_copy {
-                continue;
-            }
-            if let Err(err) = copy_entry(src_root, dst_root, destination_id, cycle_id, entry)
-                .with_context(|| format!("failed to copy {}", entry.rel_path))
-            {
-                let paths = source_changed_paths(&err);
-                if paths.is_empty() {
-                    return Err(err);
-                }
-                changing_paths.extend(paths);
-            }
-        }
+            })
+            .collect();
+        changing_paths.extend(copy_entries_parallel(
+            src_root,
+            dst_root,
+            destination_id,
+            cycle_id,
+            &to_copy,
+            sync,
+        )?);
+        drop(transfer_guard);
 
         if sync.mirror {
             let mut extra_paths: Vec<String> = dst_map
@@ -4138,6 +4207,12 @@ fn sync_file_to_path(
             .unwrap_or(true);
 
         if needs_copy {
+            let total_bytes = if entry.file_type == "file" {
+                entry.size.max(0) as u64
+            } else {
+                0
+            };
+            let transfer_guard = progress::begin_transfer(destination_id, dst_root, total_bytes);
             copy_single_entry(
                 src_path,
                 dst_root,
@@ -4146,6 +4221,7 @@ fn sync_file_to_path(
                 &entry,
                 final_path,
             )?;
+            drop(transfer_guard);
         }
         verify_file_target(final_path, &entry, sync)?;
         Ok(())
@@ -4509,31 +4585,126 @@ fn copy_file(
     Ok(())
 }
 
+/// Buffer for the streaming copy fallback. Kept modest (vs `TRANSFER_CHUNK_SIZE`)
+/// so a pool of parallel local copies does not balloon resident memory.
+const LOCAL_COPY_BUF: usize = 1024 * 1024;
+
 fn copy_file_with_progress(
     src: &Path,
-    dst_root: &Path,
-    destination_id: &str,
+    _dst_root: &Path,
+    _destination_id: &str,
     entry: &SnapshotEntry,
     tmp: &Path,
 ) -> Result<()> {
-    let total_size = entry.size.max(0) as u64;
-    let progress =
-        progress::start_transfer(destination_id, dst_root, &entry.rel_path, total_size, 0);
+    copy_file_data(src, tmp, &entry.rel_path)
+        .with_context(|| format!("failed to copy data {} -> {}", src.display(), tmp.display()))?;
+    Ok(())
+}
+
+/// Copy file contents from `src` to a fresh `dst` at near system-`cp` speed.
+/// Linux uses reflink (instant on ZFS 2.2+/btrfs) then `copy_file_range`
+/// (kernel-space copy) before falling back to a streaming loop; Windows uses
+/// `std::fs::copy` (`CopyFileExW`). Bytes moved are reported to the active
+/// aggregate transfer meter via [`progress::record_transfer`].
+fn copy_file_data(src: &Path, dst: &Path, rel_path: &str) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if linux_fast_copy(src, dst, rel_path)? {
+            return Ok(());
+        }
+    }
+    #[cfg(windows)]
+    {
+        // CopyFileExW: cache-optimized, server-side copy over SMB.
+        let copied = fs::copy(src, dst)?;
+        progress::record_transfer(rel_path, copied);
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    stream_copy(src, dst, rel_path)
+}
+
+/// Streaming read/write fallback with a bounded buffer.
+fn stream_copy(src: &Path, dst: &Path, rel_path: &str) -> io::Result<()> {
     let mut reader = File::open(src)?;
-    let mut writer = File::create(tmp)?;
-    let mut copied = 0_u64;
-    let mut buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
+    let mut writer = File::create(dst)?;
+    let mut buf = vec![0_u8; LOCAL_COPY_BUF];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
         writer.write_all(&buf[..n])?;
-        copied += n as u64;
-        progress.update(copied);
+        progress::record_transfer(rel_path, n as u64);
     }
-    writer.flush().ok();
+    writer.flush()?;
     Ok(())
+}
+
+/// Returns `Ok(true)` when the copy completed via reflink/`copy_file_range`,
+/// `Ok(false)` when the kernel does not support those on this pair (caller
+/// should stream), or `Err` on a genuine I/O error.
+#[cfg(target_os = "linux")]
+fn linux_fast_copy(src: &Path, dst: &Path, rel_path: &str) -> io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    // FICLONE = _IOW(0x94, 9, int) on the asm-generic ioctl layout (x86_64/aarch64).
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+
+    let src_file = File::open(src)?;
+    let dst_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)?;
+    let src_fd = src_file.as_raw_fd();
+    let dst_fd = dst_file.as_raw_fd();
+    let total = src_file.metadata()?.len();
+
+    // 1) reflink — block-level clone, no data movement.
+    if unsafe { libc::ioctl(dst_fd, FICLONE, src_fd) } == 0 {
+        progress::record_transfer(rel_path, total);
+        return Ok(true);
+    }
+
+    // 2) copy_file_range — kernel-space copy, no userspace bounce buffer.
+    let mut remaining = total;
+    let mut any = false;
+    while remaining > 0 {
+        let n = unsafe {
+            libc::copy_file_range(
+                src_fd,
+                std::ptr::null_mut(),
+                dst_fd,
+                std::ptr::null_mut(),
+                remaining as usize,
+                0,
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            let raw = err.raw_os_error().unwrap_or(0);
+            // Unsupported for this fs pair: only fall back if we have not yet
+            // copied anything (otherwise dst is half-written and we error out).
+            if !any
+                && matches!(
+                    raw,
+                    libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL | libc::EBADF
+                )
+            {
+                drop(dst_file);
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            break;
+        }
+        any = true;
+        remaining -= n as u64;
+        progress::record_transfer(rel_path, n as u64);
+    }
+    Ok(true)
 }
 
 fn copy_symlink(
