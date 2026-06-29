@@ -419,6 +419,26 @@ Realtime + ZFS：
 - 手动同步会为全部 source 或选定 source 关闭当前 open cycle，创建新的 target cycle，并让 enabled dst 追赶该 cycle。
 - 若目标离线或校验失败，不推进 `last_verified_cycle_id`，下一轮会继续重试该 target cycle。
 
+当前实现的 Full sync：
+
+- Full sync 只由用户在单个 destination 的 `Sync... -> Full` 手动触发。`Sync All`、source 级 `Sync`、destination 级 `Incremental`、以及 realtime watcher 自动触发都按 incremental 处理。
+- 手动 Full 会先保存配置，然后调用 `sync_destination_now_with_mode(..., Full)`：关闭该 source 当前 open cycle，只把当前 destination 的 `target_cycle_id` 指向这个新 cycle，并把 cycle 标记为 `needs_full_rescan = 1`、`manual_full_rescan = 1`。
+- realtime destination 也允许手动 Full。`manual_full_rescan` 是 realtime 的显式例外：同步执行时会跳过 event-path realtime incremental 分支，进入完整 reconcile。fanotify overflow、USN gap 等自动产生的 `needs_full_rescan` 事件不会偷偷执行 Full；它们会让该 realtime cycle 标记为需要人工/完整处理，而不是自动全量扫描。
+- Full sync 不是“删除目标后全部重传”。它会对 source 做完整 snapshot/manifest 扫描，并对目标 destination root 做完整 snapshot/manifest 扫描，然后按相对路径比较两边状态。
+- 对目录 source，完整 reconcile 的执行顺序是：
+  1. 读取 source path 信息，确认 source 是目录或文件。
+  2. 对目录 source，生成完整 `source_snapshot`，并写入 `path_snapshot`。
+  3. 对当前 destination 生成完整 `dst_snapshot`。
+  4. 如果同一路径 source/dst 类型不同，先删除或替换目标端旧路径。
+  5. 批量创建 source 中存在的目录。
+  6. 对 source 中的文件和 symlink，只复制目标端缺失或 metadata/content 不匹配的条目；已匹配文件不会重传。
+  7. mirror 模式下，删除目标端存在但 source_snapshot 中不存在、且不在 exclude 规则内的额外路径。
+  8. 清理本 cycle 的临时传输目录。
+  9. 再次对目标端做 snapshot，并用 `verify_snapshot_entries` 校验目标端与 source_snapshot 一致。
+- 对文件 source，Full sync 只围绕该单个文件生成 source snapshot，并同步到目标文件或目标目录下的同名文件；不支持 `src dir -> dst file`。
+- 跨机器 Full sync 使用同一语义，但 source/destination snapshot、批量 mkdir、批量 remove 和文件推送通过 peer HTTP transfer API 执行。大文件传输仍会按差异策略决定是 delta 还是流式全量传输；这不改变 Full sync 的“完整扫描 + 只修复差异”语义。
+- Full sync 成功后，目标 destination 的 `last_verified_cycle_id` 推进到该 cycle，并显示绿色。任何复制、删除或最终校验失败都不会推进 verified offset，目标保持红/黄状态并在下一轮继续处理。
+
 ## 9. 同步一致性设计
 
 目标语义：每个 `dst` 完成 cycle N 后，应与 source group 在 cycle N 对应 snapshot 中的源状态一致。
