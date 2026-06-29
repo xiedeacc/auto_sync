@@ -185,6 +185,7 @@ mod tests {
                     mode: ScheduleMode::Realtime,
                     ..ScheduleConfig::default()
                 },
+                sync: None,
             }],
         });
 

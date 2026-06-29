@@ -503,6 +503,7 @@ mod tests {
                     path: temp.join("dst"),
                     enabled: true,
                     schedule: crate::core::config::ScheduleConfig::default(),
+                    sync: None,
                 }],
             });
         crate::core::config::save_config(&config_path, &current).unwrap();
@@ -536,6 +537,7 @@ mod tests {
                     path: temp.join("dst_a"),
                     enabled: true,
                     schedule: crate::core::config::ScheduleConfig::default(),
+                    sync: None,
                 }],
             });
 

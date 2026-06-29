@@ -151,6 +151,34 @@
     </div>
   </div>
 
+  <div id="dst-sync-modal" class="modal" hidden>
+    <div class="modal-panel settings-modal-panel">
+      <div class="modal-head">
+        <h2>Destination Sync</h2>
+        <button id="dst-sync-close" class="icon" title="Close">x</button>
+      </div>
+      <div class="settings-grid">
+        <div class="settings-section">
+          <h3>Sync</h3>
+          <label class="check-row"><input id="dst-sync-mirror" type="checkbox"> Mirror</label>
+          <label class="check-row"><input id="dst-sync-checksum" type="checkbox"> Checksum</label>
+          <label class="check-row"><input id="dst-sync-debug" type="checkbox"> Debug logs</label>
+        </div>
+        <div class="settings-section">
+          <h3>Limits</h3>
+          <label for="dst-sync-timeout">Transfer timeout seconds</label>
+          <input id="dst-sync-timeout" type="number" min="1" step="1">
+          <label for="dst-sync-bwlimit">Bandwidth KB/s</label>
+          <input id="dst-sync-bwlimit" type="number" min="0" step="1">
+        </div>
+      </div>
+      <div class="folder-actions">
+        <button id="dst-sync-reset">Use Global</button>
+        <button id="dst-sync-save" class="primary">Save</button>
+      </div>
+    </div>
+  </div>
+
   <div id="machine-modal" class="modal" hidden>
     <div class="modal-panel machine-modal-panel">
       <div class="modal-head">

@@ -359,6 +359,32 @@ fn transfer_timeout(sync: &NativeSyncConfig) -> Duration {
     Duration::from_secs(sync.transfer_timeout_secs.max(1))
 }
 
+fn effective_sync_config(cfg: &AppConfig, dst: &DestinationConfig) -> NativeSyncConfig {
+    dst.sync.clone().unwrap_or_else(|| cfg.app.sync.clone())
+}
+
+fn any_ready_destination_needs_checksum(
+    cfg: &AppConfig,
+    source: &SourceGroupConfig,
+    ready_destinations: &[usize],
+) -> bool {
+    ready_destinations
+        .iter()
+        .any(|index| effective_sync_config(cfg, &source.destinations[*index]).checksum)
+}
+
+fn ready_destination_timeout(
+    cfg: &AppConfig,
+    source: &SourceGroupConfig,
+    ready_destinations: &[usize],
+) -> Duration {
+    ready_destinations
+        .iter()
+        .map(|index| transfer_timeout(&effective_sync_config(cfg, &source.destinations[*index])))
+        .max()
+        .unwrap_or_else(|| transfer_timeout(&cfg.app.sync))
+}
+
 pub fn transfer_snapshot(req: TransferSnapshotRequest) -> Result<Vec<SnapshotEntry>> {
     match req.mode {
         TransferSnapshotMode::Source => take_snapshot_with_excludes(
@@ -1219,6 +1245,7 @@ pub fn sync_cycle_for_source(
         .iter()
         .map(|(dst_index, _)| *dst_index)
         .collect();
+    let source_checksum = any_ready_destination_needs_checksum(cfg, source, &ready_indexes);
     if let Some(plan) = realtime_incremental_plan(state, source, cycle, &ready_indexes)? {
         match plan {
             RealtimeIncrementalPlan::Unusable(reason) => {
@@ -1237,6 +1264,7 @@ pub fn sync_cycle_for_source(
                 state.mark_cycle_status(cycle.id, "syncing")?;
                 for (dst_index, dst_endpoint) in ready_destinations {
                     let dst = &source.destinations[dst_index];
+                    let sync = effective_sync_config(cfg, dst);
                     match sync_endpoint_event_paths(
                         &live_source_endpoint,
                         &dst_endpoint,
@@ -1244,7 +1272,7 @@ pub fn sync_cycle_for_source(
                         cycle.id,
                         &rel_paths,
                         &source.excludes,
-                        &cfg.app.sync,
+                        &sync,
                     ) {
                         Ok(()) => {
                             progressed |= !rel_paths.is_empty();
@@ -1291,13 +1319,14 @@ pub fn sync_cycle_for_source(
 
     state.mark_cycle_status(cycle.id, "planning")?;
     let source_snapshot = source_endpoint
-        .snapshot(&source.excludes, cfg.app.sync.checksum)
+        .snapshot(&source.excludes, source_checksum)
         .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
     state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
 
     state.mark_cycle_status(cycle.id, "syncing")?;
     for (dst_index, dst_endpoint) in ready_destinations {
         let dst = &source.destinations[dst_index];
+        let sync = effective_sync_config(cfg, dst);
         let changed_since_paths = if cycle.manual_changed_since_rescan {
             changed_since_scan_paths(
                 state,
@@ -1317,7 +1346,7 @@ pub fn sync_cycle_for_source(
                 cycle.id,
                 rel_paths,
                 &source.excludes,
-                &cfg.app.sync,
+                &sync,
             )
         } else {
             sync_endpoint(
@@ -1327,7 +1356,7 @@ pub fn sync_cycle_for_source(
                 cycle.id,
                 &source_snapshot,
                 &source.excludes,
-                &cfg.app.sync,
+                &sync,
             )
         };
         match sync_result {
@@ -1723,6 +1752,7 @@ fn sync_cycle_with_transfer(
                 state.mark_cycle_status(cycle.id, "syncing")?;
                 for dst_index in ready_destinations {
                     let dst = &source.destinations[dst_index];
+                    let sync = effective_sync_config(cfg, dst);
                     let dst_machine_id = machine_id_or_local(&dst.machine_id);
                     let dst_machine = match find_machine(cfg, dst_machine_id) {
                         Some(machine) => machine,
@@ -1751,7 +1781,7 @@ fn sync_cycle_with_transfer(
                         cycle.id,
                         &rel_paths,
                         &source.excludes,
-                        &cfg.app.sync,
+                        &sync,
                     ) {
                         Ok(()) => {
                             progressed |= !rel_paths.is_empty();
@@ -1811,6 +1841,8 @@ fn sync_cycle_with_transfer(
         }
     }
 
+    let source_checksum = any_ready_destination_needs_checksum(cfg, source, &ready_destinations);
+    let source_timeout = ready_destination_timeout(cfg, source, &ready_destinations);
     state.mark_cycle_status(cycle.id, "planning")?;
     let source_snapshot = snapshot_on_machine(
         source_machine_id,
@@ -1818,8 +1850,8 @@ fn sync_cycle_with_transfer(
         &source_info.base,
         TransferSnapshotMode::Source,
         &source.excludes,
-        cfg.app.sync.checksum,
-        transfer_timeout(&cfg.app.sync),
+        source_checksum,
+        source_timeout,
     )
     .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
     state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
@@ -1827,6 +1859,7 @@ fn sync_cycle_with_transfer(
     state.mark_cycle_status(cycle.id, "syncing")?;
     for dst_index in ready_destinations {
         let dst = &source.destinations[dst_index];
+        let sync = effective_sync_config(cfg, dst);
         let dst_machine_id = machine_id_or_local(&dst.machine_id);
         let dst_machine = match find_machine(cfg, dst_machine_id) {
             Some(machine) => machine,
@@ -1873,7 +1906,7 @@ fn sync_cycle_with_transfer(
                 cycle.id,
                 rel_paths,
                 &source.excludes,
-                &cfg.app.sync,
+                &sync,
             )
         } else {
             sync_directory_with_transfer(
@@ -1887,7 +1920,7 @@ fn sync_cycle_with_transfer(
                 cycle.id,
                 &source_snapshot,
                 &source.excludes,
-                &cfg.app.sync,
+                &sync,
             )
         };
         match sync_result {
@@ -2225,14 +2258,25 @@ fn sync_cycle_file_with_transfer(
     let source_machine_id = machine_id_or_local(&source.machine_id);
     let source_machine = find_machine(cfg, source_machine_id)
         .ok_or_else(|| anyhow!("unknown source machine: {source_machine_id}"))?;
+    let mut targeted_indexes = Vec::new();
+    for (dst_index, dst) in source
+        .destinations
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.enabled)
+    {
+        if state.destination_target_cycle(&source.id, &dst.id)? == Some(cycle.id) {
+            targeted_indexes.push(dst_index);
+        }
+    }
     let mut source_snapshot = snapshot_on_machine(
         source_machine_id,
         &source_machine,
         &source_info.base,
         TransferSnapshotMode::Source,
         &source.excludes,
-        cfg.app.sync.checksum,
-        transfer_timeout(&cfg.app.sync),
+        any_ready_destination_needs_checksum(cfg, source, &targeted_indexes),
+        ready_destination_timeout(cfg, source, &targeted_indexes),
     )?;
     source_snapshot.retain(|entry| entry.rel_path == source_info.name);
     state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
@@ -2285,7 +2329,7 @@ fn sync_cycle_file_with_transfer(
             &dst.id,
             cycle.id,
             &source_snapshot,
-            &cfg.app.sync,
+            &effective_sync_config(cfg, dst),
         );
         match result {
             Ok(()) => {
@@ -4650,6 +4694,7 @@ mod tests {
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             },
         );
 
@@ -4669,6 +4714,7 @@ mod tests {
                 path: PathBuf::from("/dev"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             },
         );
 
@@ -4690,6 +4736,7 @@ mod tests {
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             },
         )
         .unwrap();
@@ -4727,6 +4774,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
 
@@ -4778,6 +4826,7 @@ mod tests {
                     path: dst_1.clone(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    sync: None,
                 },
                 DestinationConfig {
                     id: "dst_2".to_string(),
@@ -4788,6 +4837,7 @@ mod tests {
                         mode: ScheduleMode::Daily,
                         ..ScheduleConfig::default()
                     },
+                    sync: None,
                 },
             ],
         });
@@ -4850,6 +4900,7 @@ mod tests {
                     path: dst_1.clone(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    sync: None,
                 },
                 DestinationConfig {
                     id: "dst_2".to_string(),
@@ -4860,6 +4911,7 @@ mod tests {
                         mode: ScheduleMode::Daily,
                         ..ScheduleConfig::default()
                     },
+                    sync: None,
                 },
             ],
         });
@@ -4932,6 +4984,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
 
@@ -4997,6 +5050,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
 
@@ -5084,6 +5138,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
 
@@ -5113,6 +5168,70 @@ mod tests {
         assert_eq!(
             fs::read(effective_dst.join("destination-only.txt")).unwrap(),
             b"extra"
+        );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn destination_sync_config_overrides_global_mirror() {
+        let temp = temp_dir("dst_sync_override");
+        let src = temp.join("src");
+        let dst_a = temp.join("dst_a");
+        let dst_b = temp.join("dst_b");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(dst_a.join("src")).unwrap();
+        fs::create_dir_all(dst_b.join("src")).unwrap();
+        fs::write(src.join("keep.txt"), b"keep").unwrap();
+        fs::write(dst_a.join("src").join("extra.txt"), b"extra").unwrap();
+        fs::write(dst_b.join("src").join("extra.txt"), b"extra").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.app.sync.mirror = true;
+        let mut dst_b_sync = cfg.app.sync.clone();
+        dst_b_sync.mirror = false;
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            excludes: vec![],
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
+            destinations: vec![
+                DestinationConfig {
+                    id: "dst_a".to_string(),
+                    machine_id: "local".to_string(),
+                    path: dst_a.clone(),
+                    enabled: true,
+                    schedule: ScheduleConfig::default(),
+                    sync: None,
+                },
+                DestinationConfig {
+                    id: "dst_b".to_string(),
+                    machine_id: "local".to_string(),
+                    path: dst_b.clone(),
+                    enabled: true,
+                    schedule: ScheduleConfig::default(),
+                    sync: Some(dst_b_sync),
+                },
+            ],
+        });
+
+        let mut state = State::open(&db).unwrap();
+        sync_all_now(&cfg, &mut state).unwrap();
+
+        assert!(!dst_a.join("src").join("extra.txt").exists());
+        assert!(dst_b.join("src").join("extra.txt").exists());
+        assert_eq!(
+            fs::read(dst_a.join("src").join("keep.txt")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(
+            fs::read(dst_b.join("src").join("keep.txt")).unwrap(),
+            b"keep"
         );
 
         fs::remove_dir_all(temp).ok();
@@ -5156,6 +5275,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
 
@@ -5208,6 +5328,7 @@ mod tests {
                 path: after_dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
         cfg.source_groups.push(SourceGroupConfig {
@@ -5227,6 +5348,7 @@ mod tests {
                 path: before_dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
         cfg.sync_order.push(SyncOrderRule {

@@ -1241,6 +1241,7 @@ mod tests {
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         }];
 

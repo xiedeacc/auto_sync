@@ -17,6 +17,7 @@ let runtimeStatusPolling = false;
 let folderPicker = null;
 let scheduleEditor = null;
 let excludeEditor = null;
+let dstSyncEditor = null;
 let latestDestinationSchedule = defaultDestinationSchedule();
 let activeSourceTab = "sources";
 let machineHostLocked = false;
@@ -60,6 +61,15 @@ const el = {
   settingsSyncTimeout: document.getElementById("settings-sync-timeout"),
   settingsSyncBwlimit: document.getElementById("settings-sync-bwlimit"),
   settingsTcpPool: document.getElementById("settings-tcp-pool"),
+  dstSyncModal: document.getElementById("dst-sync-modal"),
+  dstSyncClose: document.getElementById("dst-sync-close"),
+  dstSyncSave: document.getElementById("dst-sync-save"),
+  dstSyncReset: document.getElementById("dst-sync-reset"),
+  dstSyncMirror: document.getElementById("dst-sync-mirror"),
+  dstSyncChecksum: document.getElementById("dst-sync-checksum"),
+  dstSyncDebug: document.getElementById("dst-sync-debug"),
+  dstSyncTimeout: document.getElementById("dst-sync-timeout"),
+  dstSyncBwlimit: document.getElementById("dst-sync-bwlimit"),
   machineModal: document.getElementById("machine-modal"),
   machineClose: document.getElementById("machine-close"),
   machineList: document.getElementById("machine-list"),
@@ -762,9 +772,11 @@ function renderSyncRows(source, group) {
       <div class="row-right destination-right">
         <label>Schedule</label>
         <label>Cycle</label>
+        <label>Options</label>
         <label class="actions-label">Actions</label>
         <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
         <input class="destination-readonly destination-cycle" value="${escapeAttr(cycleDisplay(status))}" readonly>
+        <button class="sync-config-button icon" data-action="edit-dst-sync" title="${escapeAttr(destinationSyncTitle(dst))}">&#9881;</button>
         <select class="destination-sync-select" data-action="sync-dst" title="Sync destination">
           <option value="">Sync...</option>
           <option value="incremental">Incremental</option>
@@ -795,6 +807,12 @@ function renderSyncRows(source, group) {
       openScheduleModal(dst.schedule, (schedule) => {
         dst.schedule = cloneSchedule(schedule);
         latestDestinationSchedule = cloneSchedule(schedule);
+        renderSourcePanel();
+        autoSaveConfig().catch((error) => setMessage(String(error)));
+      });
+    };
+    row.querySelector('[data-action="edit-dst-sync"]').onclick = () => {
+      openDestinationSyncModal(dst, () => {
         renderSourcePanel();
         autoSaveConfig().catch((error) => setMessage(String(error)));
       });
@@ -938,6 +956,7 @@ function normalizeConfig(nextCfg) {
     for (const dst of source.destinations || []) {
       dst.machine_id = machineIdOrLocal(dst.machine_id);
       dst.schedule = normalizeSchedule(dst.schedule);
+      dst.sync = normalizeOptionalNativeSyncConfig(dst.sync);
       latestDestinationSchedule = cloneSchedule(dst.schedule);
     }
   }
@@ -962,7 +981,17 @@ function normalizeNativeSyncConfig(sync) {
     debug_logs: sync.debug_logs === true,
     transfer_timeout_secs: Number(sync.transfer_timeout_secs || 120),
     bwlimit_kbps: Number(sync.bwlimit_kbps || 0),
+    max_parallel_transfers: Number(sync.max_parallel_transfers ?? 16),
+    modify_window_secs: Number(sync.modify_window_secs ?? 1),
+    fsync: sync.fsync === true,
   };
+}
+
+function normalizeOptionalNativeSyncConfig(sync) {
+  if (!sync || typeof sync !== "object") {
+    return undefined;
+  }
+  return normalizeNativeSyncConfig(sync);
 }
 
 function normalizeMachines(values) {
@@ -1335,6 +1364,17 @@ function scheduleLabel(schedule) {
   return "Realtime";
 }
 
+function destinationSyncTitle(dst) {
+  if (!dst.sync) {
+    return "Sync options: global";
+  }
+  const sync = normalizeNativeSyncConfig(dst.sync);
+  const mode = sync.mirror ? "Mirror" : "No mirror";
+  const checksum = sync.checksum ? "checksum" : "mtime/size";
+  const limit = sync.bwlimit_kbps > 0 ? `${sync.bwlimit_kbps} KB/s` : "unlimited";
+  return `Sync options: ${mode}, ${checksum}, ${limit}`;
+}
+
 function normalizeScheduleTime(value) {
   const text = String(value || "02:00");
   const match = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(text);
@@ -1456,7 +1496,9 @@ async function saveSettings() {
   updateCfgFromForm();
   cfg.app = normalizeAppConfig(cfg.app || {});
   cfg.app.tcp_connection_pool_size = clampInteger(el.settingsTcpPool.value, 0, 10000);
+  const baseSync = normalizeNativeSyncConfig(cfg.app.sync || {});
   cfg.app.sync = normalizeNativeSyncConfig({
+    ...baseSync,
     mirror: el.settingsSyncMirror.checked,
     checksum: el.settingsSyncChecksum.checked,
     debug_logs: el.settingsSyncDebug.checked,
@@ -1465,6 +1507,64 @@ async function saveSettings() {
   });
   await autoSaveConfig();
   closeSettingsModal();
+}
+
+function openDestinationSyncModal(dst, onApply) {
+  updateCfgFromForm();
+  cfg.app = normalizeAppConfig(cfg.app || {});
+  const inherited = !dst.sync;
+  const sync = normalizeNativeSyncConfig(dst.sync || cfg.app.sync || {});
+  dstSyncEditor = { dst, onApply, baseSync: sync };
+  el.dstSyncMirror.checked = sync.mirror;
+  el.dstSyncChecksum.checked = sync.checksum;
+  el.dstSyncDebug.checked = sync.debug_logs;
+  el.dstSyncTimeout.value = String(sync.transfer_timeout_secs || 120);
+  el.dstSyncBwlimit.value = String(sync.bwlimit_kbps || 0);
+  el.dstSyncReset.disabled = inherited;
+  el.dstSyncModal.hidden = false;
+}
+
+function closeDestinationSyncModal() {
+  el.dstSyncModal.hidden = true;
+  dstSyncEditor = null;
+}
+
+async function saveDestinationSync() {
+  if (!dstSyncEditor || !dstSyncEditor.dst) {
+    closeDestinationSyncModal();
+    return;
+  }
+  const baseSync = normalizeNativeSyncConfig(dstSyncEditor.baseSync || {});
+  dstSyncEditor.dst.sync = normalizeNativeSyncConfig({
+    ...baseSync,
+    mirror: el.dstSyncMirror.checked,
+    checksum: el.dstSyncChecksum.checked,
+    debug_logs: el.dstSyncDebug.checked,
+    transfer_timeout_secs: clampInteger(el.dstSyncTimeout.value, 1, 86400),
+    bwlimit_kbps: clampInteger(el.dstSyncBwlimit.value, 0, 10_000_000),
+  });
+  const onApply = dstSyncEditor.onApply;
+  closeDestinationSyncModal();
+  if (onApply) {
+    onApply();
+  } else {
+    await autoSaveConfig();
+  }
+}
+
+async function resetDestinationSync() {
+  if (!dstSyncEditor || !dstSyncEditor.dst) {
+    closeDestinationSyncModal();
+    return;
+  }
+  delete dstSyncEditor.dst.sync;
+  const onApply = dstSyncEditor.onApply;
+  closeDestinationSyncModal();
+  if (onApply) {
+    onApply();
+  } else {
+    await autoSaveConfig();
+  }
 }
 
 function openIssueModal(status) {
@@ -1742,6 +1842,7 @@ function updateCfgFromForm() {
       dst.path = trimPathValue(dst.path);
       dst.enabled = true;
       dst.schedule = normalizeSchedule(dst.schedule);
+      dst.sync = normalizeOptionalNativeSyncConfig(dst.sync);
       return dst;
     }).filter((dst) => dst.path);
     source.destinations = dedupeDestinationsByPath(source.destinations);
@@ -2075,6 +2176,9 @@ el.readmeClose.onclick = closeReadmeModal;
 el.configClose.onclick = closeConfigModal;
 el.settingsClose.onclick = closeSettingsModal;
 el.settingsSave.onclick = () => saveSettings().catch((error) => setMessage(String(error)));
+el.dstSyncClose.onclick = closeDestinationSyncModal;
+el.dstSyncSave.onclick = () => saveDestinationSync().catch((error) => setMessage(String(error)));
+el.dstSyncReset.onclick = () => resetDestinationSync().catch((error) => setMessage(String(error)));
 el.machineClose.onclick = closeMachineModal;
 el.machineDiscover.onclick = () => discoverMachines().catch((error) => setMessage(String(error)));
 el.machineAdd.onclick = () => addMachine().catch((error) => setMessage(String(error)));

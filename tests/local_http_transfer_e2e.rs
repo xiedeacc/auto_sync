@@ -239,6 +239,7 @@ fn build_config(state_db: &Path, source_root: &Path, dest_parent: &Path, port: u
             path: dest_parent.to_path_buf(),
             enabled: true,
             schedule: ScheduleConfig::default(),
+            sync: None,
         }],
     }];
     cfg

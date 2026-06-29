@@ -129,6 +129,8 @@ pub struct DestinationConfig {
     pub path: PathBuf,
     pub enabled: bool,
     pub schedule: ScheduleConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<NativeSyncConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -290,6 +292,7 @@ impl Default for DestinationConfig {
             path: PathBuf::new(),
             enabled: true,
             schedule: ScheduleConfig::default(),
+            sync: None,
         }
     }
 }
@@ -364,9 +367,7 @@ pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<AppConfig> {
 pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
     let mut cfg = cfg.clone();
     cfg.app.web_bind = cfg.app.web_bind.trim().to_string();
-    if cfg.app.sync.transfer_timeout_secs == 0 {
-        cfg.app.sync.transfer_timeout_secs = DEFAULT_TRANSFER_TIMEOUT_SECS;
-    }
+    clean_native_sync_config(&mut cfg.app.sync);
     cfg.machines = clean_machines(&cfg.machines);
     for source in &mut cfg.source_groups {
         if source.machine_id.trim().is_empty() {
@@ -380,6 +381,9 @@ pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
                 dst.machine_id = "local".to_string();
             }
             dst.path = clean_path(&dst.path);
+            if let Some(sync) = dst.sync.as_mut() {
+                clean_native_sync_config(sync);
+            }
             if dst.path.as_os_str().is_empty() {
                 return false;
             }
@@ -399,6 +403,12 @@ pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
             && order_edges.insert((before, after))
     });
     cfg
+}
+
+fn clean_native_sync_config(sync: &mut NativeSyncConfig) {
+    if sync.transfer_timeout_secs == 0 {
+        sync.transfer_timeout_secs = DEFAULT_TRANSFER_TIMEOUT_SECS;
+    }
 }
 
 fn clean_machines(machines: &[MachineConfig]) -> Vec<MachineConfig> {
@@ -930,6 +940,7 @@ mod tests {
                 path: PathBuf::from("/data/src/backup"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
         assert!(cfg.validate().is_err());
@@ -958,6 +969,7 @@ mod tests {
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
         assert!(cfg.validate().is_err());
@@ -987,6 +999,7 @@ mod tests {
                     path: PathBuf::from(" /data/dst "),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    sync: None,
                 },
                 DestinationConfig {
                     id: "dst_2".to_string(),
@@ -994,6 +1007,7 @@ mod tests {
                     path: PathBuf::new(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    sync: None,
                 },
                 DestinationConfig {
                     id: "dst_3".to_string(),
@@ -1001,6 +1015,7 @@ mod tests {
                     path: PathBuf::from("/data/dst"),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    sync: None,
                 },
             ],
         });
@@ -1018,6 +1033,7 @@ mod tests {
                 path: PathBuf::from("/unused"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
 
@@ -1194,6 +1210,7 @@ mod tests {
                 path: PathBuf::from("/data/dst_1"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
         cfg.source_groups.push(SourceGroupConfig {
@@ -1210,6 +1227,7 @@ mod tests {
                 path: PathBuf::from("/data/dst_2"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         });
         cfg

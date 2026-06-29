@@ -230,6 +230,7 @@ impl TestEnv {
                 path: PathBuf::from(&self.remote_base),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                sync: None,
             }],
         }];
         cfg
