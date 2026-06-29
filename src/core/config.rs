@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 pub const DEFAULT_TCP_CONNECTION_POOL_SIZE: usize = 100;
 pub const DEFAULT_TRANSFER_TIMEOUT_SECS: u64 = 120;
@@ -24,6 +24,7 @@ pub struct AppConfig {
     pub source_groups: Vec<SourceGroupConfig>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sync_order: Vec<SyncOrderRule>,
+    #[serde(default, skip_serializing)]
     pub deploy: DeployConfig,
 }
 
@@ -33,7 +34,12 @@ pub struct AppSection {
     pub data_db: PathBuf,
     pub log_dir: PathBuf,
     pub status_log_interval_secs: u64,
-    pub web_bind: String,
+    #[serde(
+        default = "default_app_port",
+        alias = "web_bind",
+        deserialize_with = "deserialize_port"
+    )]
+    pub port: u16,
     pub tcp_connection_pool_size: usize,
     pub sync: NativeSyncConfig,
 }
@@ -140,10 +146,16 @@ pub struct MachineConfig {
     pub alias_name: String,
     pub name: String,
     pub host: String,
-    pub web_port: u16,
+    #[serde(
+        default = "default_machine_port",
+        alias = "web_port",
+        deserialize_with = "deserialize_port"
+    )]
+    pub port: u16,
     pub ssh_user: String,
     pub ssh_port: u16,
     pub os: String,
+    pub install_dir: PathBuf,
     pub enabled: bool,
     pub manual: bool,
 }
@@ -185,15 +197,7 @@ impl Default for AppConfig {
             machines: vec![MachineConfig::local()],
             source_groups: Vec::new(),
             sync_order: Vec::new(),
-            deploy: DeployConfig {
-                targets: vec![DeployTarget {
-                    id: "nas".to_string(),
-                    host: "192.168.2.247".to_string(),
-                    port: 10022,
-                    user: "root".to_string(),
-                    install_dir: PathBuf::from("/usr/local/auto_sync"),
-                }],
-            },
+            deploy: DeployConfig::default(),
         }
     }
 }
@@ -204,7 +208,7 @@ impl Default for AppSection {
             data_db: PathBuf::from("conf/state/auto_sync.sqlite"),
             log_dir: PathBuf::from("logs"),
             status_log_interval_secs: 300,
-            web_bind: "0.0.0.0:18765".to_string(),
+            port: default_app_port(),
             tcp_connection_pool_size: DEFAULT_TCP_CONNECTION_POOL_SIZE,
             sync: NativeSyncConfig::default(),
         }
@@ -304,10 +308,11 @@ impl MachineConfig {
             alias_name: String::new(),
             name: local_hostname(),
             host: preferred_local_host(),
-            web_port: 18765,
+            port: default_machine_port(),
             ssh_user: String::new(),
             ssh_port: 22,
             os: std::env::consts::OS.to_string(),
+            install_dir: default_install_dir_for_os(std::env::consts::OS),
             enabled: true,
             manual: true,
         }
@@ -366,8 +371,11 @@ pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<AppConfig> {
 
 pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
     let mut cfg = cfg.clone();
-    cfg.app.web_bind = cfg.app.web_bind.trim().to_string();
+    if cfg.app.port == 0 {
+        cfg.app.port = default_app_port();
+    }
     clean_native_sync_config(&mut cfg.app.sync);
+    merge_deploy_targets_into_machines(&mut cfg);
     cfg.machines = clean_machines(&cfg.machines);
     for source in &mut cfg.source_groups {
         if source.machine_id.trim().is_empty() {
@@ -405,6 +413,47 @@ pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
     cfg
 }
 
+fn merge_deploy_targets_into_machines(cfg: &mut AppConfig) {
+    for target in &cfg.deploy.targets {
+        let id = clean_id(&target.id);
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(machine) = cfg
+            .machines
+            .iter_mut()
+            .find(|machine| clean_id(&machine.id) == id)
+        {
+            if machine.host.trim().is_empty() {
+                machine.host = target.host.trim().to_string();
+            }
+            if machine.ssh_user.trim().is_empty() {
+                machine.ssh_user = target.user.trim().to_string();
+            }
+            if machine.ssh_port == 0 || machine.ssh_port == 22 {
+                machine.ssh_port = target.port;
+            }
+            if machine.install_dir.as_os_str().is_empty() {
+                machine.install_dir = target.install_dir.clone();
+            }
+            continue;
+        }
+        cfg.machines.push(MachineConfig {
+            id: id.clone(),
+            alias_name: String::new(),
+            name: id,
+            host: target.host.trim().to_string(),
+            port: default_machine_port(),
+            ssh_user: target.user.trim().to_string(),
+            ssh_port: if target.port == 0 { 22 } else { target.port },
+            os: String::new(),
+            install_dir: target.install_dir.clone(),
+            enabled: true,
+            manual: true,
+        });
+    }
+}
+
 fn clean_native_sync_config(sync: &mut NativeSyncConfig) {
     if sync.transfer_timeout_secs == 0 {
         sync.transfer_timeout_secs = DEFAULT_TRANSFER_TIMEOUT_SECS;
@@ -436,11 +485,14 @@ fn clean_machines(machines: &[MachineConfig]) -> Vec<MachineConfig> {
         if machine.host.is_empty() {
             machine.host = preferred_local_host();
         }
-        if machine.web_port == 0 {
-            machine.web_port = 18765;
+        if machine.port == 0 {
+            machine.port = default_machine_port();
         }
         if machine.ssh_port == 0 {
             machine.ssh_port = 22;
+        }
+        if machine.install_dir.as_os_str().is_empty() {
+            machine.install_dir = default_install_dir_for_os(&machine.os);
         }
         cleaned.push(machine);
     }
@@ -464,8 +516,8 @@ fn local_machine_from_config(machines: &[MachineConfig]) -> MachineConfig {
     if is_advertisable_host(&configured.host) {
         local.host = configured.host.trim().to_string();
     }
-    if configured.web_port != 0 {
-        local.web_port = configured.web_port;
+    if configured.port != 0 {
+        local.port = configured.port;
     }
     if configured.ssh_port != 0 {
         local.ssh_port = configured.ssh_port;
@@ -476,7 +528,58 @@ fn local_machine_from_config(machines: &[MachineConfig]) -> MachineConfig {
     if !configured.os.trim().is_empty() {
         local.os = configured.os.trim().to_string();
     }
+    if !configured.install_dir.as_os_str().is_empty() {
+        local.install_dir = configured.install_dir.clone();
+    }
     local
+}
+
+fn default_app_port() -> u16 {
+    18765
+}
+
+pub fn default_machine_port() -> u16 {
+    18765
+}
+
+fn default_install_dir_for_os(os: &str) -> PathBuf {
+    if os.eq_ignore_ascii_case("windows") {
+        PathBuf::from("C:/auto_sync")
+    } else {
+        PathBuf::from("/usr/local/auto_sync")
+    }
+}
+
+fn deserialize_port<'de, D>(deserializer: D) -> std::result::Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PortValue {
+        Number(u16),
+        Text(String),
+    }
+
+    match PortValue::deserialize(deserializer)? {
+        PortValue::Number(port) => Ok(port),
+        PortValue::Text(value) => parse_port_text(&value).map_err(de::Error::custom),
+    }
+}
+
+fn parse_port_text(value: &str) -> Result<u16, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(default_app_port());
+    }
+    let port = trimmed
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .unwrap_or(trimmed)
+        .trim()
+        .parse::<u16>()
+        .map_err(|err| format!("invalid port {trimmed}: {err}"))?;
+    Ok(port)
 }
 
 fn is_placeholder_local_name(name: &str) -> bool {
@@ -1065,6 +1168,52 @@ mod tests {
     }
 
     #[test]
+    fn legacy_web_bind_and_web_port_deserialize_to_port() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[app]
+web_bind = "0.0.0.0:18766"
+
+[[machines]]
+id = "nas"
+name = "tiger"
+host = "192.0.2.10"
+web_port = 18767
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.app.port, 18766);
+        assert_eq!(cfg.machines[0].port, 18767);
+    }
+
+    #[test]
+    fn clean_config_for_save_merges_legacy_deploy_targets_into_machines() {
+        let mut cfg = AppConfig::default();
+        cfg.machines.clear();
+        cfg.deploy.targets.push(DeployTarget {
+            id: "nas".to_string(),
+            host: "192.0.2.10".to_string(),
+            port: 10022,
+            user: "root".to_string(),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
+        });
+
+        let cleaned = clean_config_for_save(&cfg);
+
+        let nas = cleaned
+            .machines
+            .iter()
+            .find(|machine| machine.id == "nas")
+            .unwrap();
+        assert_eq!(nas.host, "192.0.2.10");
+        assert_eq!(nas.port, 18765);
+        assert_eq!(nas.ssh_user, "root");
+        assert_eq!(nas.ssh_port, 10022);
+        assert_eq!(nas.install_dir, PathBuf::from("/usr/local/auto_sync"));
+    }
+
+    #[test]
     fn rejects_duplicate_machine_ids() {
         let mut cfg = AppConfig::default();
         cfg.machines.push(MachineConfig {
@@ -1072,10 +1221,11 @@ mod tests {
             alias_name: "nas_a".to_string(),
             name: "nas-a".to_string(),
             host: "192.0.2.10".to_string(),
-            web_port: 18765,
+            port: 18765,
             ssh_user: "root".to_string(),
             ssh_port: 22,
             os: "linux".to_string(),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1084,10 +1234,11 @@ mod tests {
             alias_name: "nas_b".to_string(),
             name: "nas-b".to_string(),
             host: "192.0.2.11".to_string(),
-            web_port: 18765,
+            port: 18765,
             ssh_user: "root".to_string(),
             ssh_port: 22,
             os: "linux".to_string(),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1106,10 +1257,11 @@ mod tests {
             alias_name: String::new(),
             name: "another local".to_string(),
             host: "192.0.2.20".to_string(),
-            web_port: 18765,
+            port: 18765,
             ssh_user: String::new(),
             ssh_port: 22,
             os: "linux".to_string(),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });

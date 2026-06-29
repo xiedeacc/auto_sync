@@ -211,10 +211,11 @@ fn build_config(state_db: &Path, source_root: &Path, dest_parent: &Path, port: u
         alias_name: String::new(),
         name: "localweb".to_string(),
         host: "127.0.0.1".to_string(),
-        web_port: port,
+        port: port,
         ssh_user: String::new(),
         ssh_port: 22,
         os,
+        install_dir: std::path::PathBuf::from("/usr/local/auto_sync"),
         enabled: true,
         manual: true,
     };

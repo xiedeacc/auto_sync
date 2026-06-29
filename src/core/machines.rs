@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, warn};
 
 use crate::core::config::{
-    AppConfig, DEFAULT_TCP_CONNECTION_POOL_SIZE, MachineConfig, load_config, local_hostname,
-    machine_matches_reference, normalized_machines, preferred_local_host,
+    AppConfig, DEFAULT_TCP_CONNECTION_POOL_SIZE, MachineConfig, default_machine_port, load_config,
+    local_hostname, machine_matches_reference, normalized_machines, preferred_local_host,
 };
 
 pub const DISCOVERY_PORT: u16 = 18766;
@@ -40,7 +40,8 @@ pub struct MachineHealth {
     pub alias_name: String,
     pub name: String,
     pub host: String,
-    pub web_port: u16,
+    #[serde(default = "default_machine_port", alias = "web_port")]
+    pub port: u16,
     #[serde(default)]
     pub ssh_user: String,
     #[serde(default = "default_ssh_port")]
@@ -55,10 +56,11 @@ pub struct MachineView {
     pub alias_name: String,
     pub name: String,
     pub host: String,
-    pub web_port: u16,
+    pub port: u16,
     pub ssh_user: String,
     pub ssh_port: u16,
     pub os: String,
+    pub install_dir: PathBuf,
     pub enabled: bool,
     pub manual: bool,
     pub online: bool,
@@ -72,7 +74,7 @@ pub struct MachineStatus {
     pub machines: Vec<MachineView>,
 }
 
-pub fn local_health(cfg: &AppConfig, web_port: u16) -> MachineHealth {
+pub fn local_health(cfg: &AppConfig, port: u16) -> MachineHealth {
     let machines = normalized_machines(cfg);
     let local = machines
         .iter()
@@ -80,14 +82,14 @@ pub fn local_health(cfg: &AppConfig, web_port: u16) -> MachineHealth {
         .find(|machine| machine.id == "local")
         .cloned()
         .unwrap_or_else(MachineConfig::local);
-    let (ssh_user, ssh_port) = advertised_ssh_config(cfg, &machines, &local, web_port);
+    let (ssh_user, ssh_port) = advertised_ssh_config(cfg, &machines, &local, port);
     let host = local.host;
     MachineHealth {
-        id: discovery_machine_id(&host, web_port),
+        id: discovery_machine_id(&host, port),
         alias_name: local.alias_name.trim().to_string(),
         name: local_machine_name(&local.name),
         host,
-        web_port,
+        port,
         ssh_user,
         ssh_port,
         os: std::env::consts::OS.to_string(),
@@ -109,7 +111,7 @@ pub fn machine_status(cfg: &AppConfig) -> MachineStatus {
         }
         let online = machine.id == "local" || ping_machine(machine);
         let (ssh_user, ssh_port) = if machine.id == "local" {
-            advertised_ssh_config(cfg, &normalized, machine, machine.web_port)
+            advertised_ssh_config(cfg, &normalized, machine, machine.port)
         } else {
             (
                 machine.ssh_user.trim().to_string(),
@@ -121,10 +123,11 @@ pub fn machine_status(cfg: &AppConfig) -> MachineStatus {
             alias_name: machine.alias_name.clone(),
             name: machine.name.clone(),
             host: machine.host.clone(),
-            web_port: machine.web_port,
+            port: machine.port,
             ssh_user,
             ssh_port,
             os: machine.os.clone(),
+            install_dir: machine.install_dir.clone(),
             enabled: machine.enabled,
             manual: machine.manual,
             online,
@@ -140,15 +143,15 @@ pub fn machine_status(cfg: &AppConfig) -> MachineStatus {
 }
 
 fn machine_endpoint_key(machine: &MachineConfig) -> (String, u16) {
-    endpoint_key(&machine.host, machine.web_port)
+    endpoint_key(&machine.host, machine.port)
 }
 
 fn machine_view_endpoint_key(machine: &MachineView) -> (String, u16) {
-    endpoint_key(&machine.host, machine.web_port)
+    endpoint_key(&machine.host, machine.port)
 }
 
-fn endpoint_key(host: &str, web_port: u16) -> (String, u16) {
-    (host.trim().to_ascii_lowercase(), web_port)
+fn endpoint_key(host: &str, port: u16) -> (String, u16) {
+    (host.trim().to_ascii_lowercase(), port)
 }
 
 fn default_ssh_port() -> u16 {
@@ -185,13 +188,13 @@ fn advertised_ssh_config(
     cfg: &AppConfig,
     machines: &[MachineConfig],
     local: &MachineConfig,
-    web_port: u16,
+    port: u16,
 ) -> (String, u16) {
     let local_host = local.host.trim();
     if let Some(machine) = machines.iter().find(|machine| {
         machine.id != "local"
             && machine.host.trim().eq_ignore_ascii_case(local_host)
-            && machine.web_port == web_port
+            && machine.port == port
             && has_advertised_ssh(machine)
     }) {
         return (
@@ -226,7 +229,7 @@ fn local_ssh_probe_hosts(local: &MachineConfig) -> Vec<String> {
 }
 
 fn local_ssh_probe_ports(
-    cfg: &AppConfig,
+    _cfg: &AppConfig,
     machines: &[MachineConfig],
     local: &MachineConfig,
 ) -> Vec<u16> {
@@ -234,11 +237,6 @@ fn local_ssh_probe_ports(
     let local_port = normalized_ssh_port(local.ssh_port);
     if local_port != 22 {
         push_unique_port(&mut ports, local_port);
-    }
-    for target in &cfg.deploy.targets {
-        if is_localish_host(&target.host, &local.host) {
-            push_unique_port(&mut ports, target.port);
-        }
     }
     for machine in machines {
         let port = normalized_ssh_port(machine.ssh_port);
@@ -255,20 +253,23 @@ fn advertised_ssh_user(cfg: &AppConfig, local: &MachineConfig, ssh_port: u16) ->
     if !local.ssh_user.trim().is_empty() {
         return local.ssh_user.trim().to_string();
     }
-    cfg.deploy
-        .targets
+    let machines = normalized_machines(cfg);
+    machines
         .iter()
-        .find(|target| {
-            is_localish_host(&target.host, &local.host)
-                && (target.port == ssh_port || target.port == 0)
-                && !target.user.trim().is_empty()
+        .find(|machine| {
+            machine.id != "local"
+                && is_localish_host(&machine.host, &local.host)
+                && (normalized_ssh_port(machine.ssh_port) == ssh_port || machine.ssh_port == 0)
+                && !machine.ssh_user.trim().is_empty()
         })
         .or_else(|| {
-            cfg.deploy.targets.iter().find(|target| {
-                is_localish_host(&target.host, &local.host) && !target.user.trim().is_empty()
+            machines.iter().find(|machine| {
+                machine.id != "local"
+                    && is_localish_host(&machine.host, &local.host)
+                    && !machine.ssh_user.trim().is_empty()
             })
         })
-        .map(|target| target.user.trim().to_string())
+        .map(|machine| machine.ssh_user.trim().to_string())
         .unwrap_or_default()
 }
 
@@ -377,7 +378,7 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
             id = clean_machine_id(&health.id);
         }
         if id.is_empty() || id == "local" || known_ids.contains(&id) {
-            id = discovery_machine_id(&health.host, health.web_port);
+            id = discovery_machine_id(&health.host, health.port);
         }
         id = unique_machine_id(id, &known_ids);
         known_ids.insert(id.clone());
@@ -389,10 +390,11 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
             alias_name: clean_machine_id(&health.alias_name),
             name,
             host: health.host,
-            web_port: health.web_port,
+            port: health.port,
             ssh_user: health.ssh_user.trim().to_string(),
             ssh_port: normalized_ssh_port(health.ssh_port),
             os: health.os,
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: false,
             online: true,
@@ -427,13 +429,13 @@ fn discovered_machine_name(health: &MachineHealth) -> String {
     }
 }
 
-fn discovery_machine_id(host: &str, web_port: u16) -> String {
+fn discovery_machine_id(host: &str, port: u16) -> String {
     let host = clean_machine_id(host);
     let path_hash = current_exe_path_hash();
     if host.is_empty() {
-        format!("lan_{web_port}_{path_hash}")
+        format!("lan_{port}_{path_hash}")
     } else {
-        format!("lan_{host}_{web_port}_{path_hash}")
+        format!("lan_{host}_{port}_{path_hash}")
     }
 }
 
@@ -480,7 +482,7 @@ fn unique_machine_id(base: String, known_ids: &HashSet<String>) -> String {
     unreachable!()
 }
 
-pub fn spawn_discovery_responder(config_path: Arc<PathBuf>, web_port: u16) -> JoinHandle<()> {
+pub fn spawn_discovery_responder(config_path: Arc<PathBuf>, port: u16) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let socket = match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) {
             Ok(socket) => socket,
@@ -500,7 +502,7 @@ pub fn spawn_discovery_responder(config_path: Arc<PathBuf>, web_port: u16) -> Jo
             let Ok(cfg) = load_config(&config_path) else {
                 continue;
             };
-            let health = local_health(&cfg, web_port);
+            let health = local_health(&cfg, port);
             let Ok(raw) = serde_json::to_vec(&health) else {
                 continue;
             };
@@ -529,7 +531,7 @@ pub fn discover_lan(timeout: Duration) -> Result<Vec<MachineHealth>> {
                 if let Ok(health) = serde_json::from_slice::<MachineHealth>(&buf[..len]) {
                     if !out
                         .iter()
-                        .any(|item| item.host == health.host && item.web_port == health.web_port)
+                        .any(|item| item.host == health.host && item.port == health.port)
                     {
                         out.push(health);
                     }
@@ -571,7 +573,7 @@ fn health_matches(machine: &MachineConfig, health: &MachineHealth) -> bool {
         || (health.id.trim() != "local"
             && !health.id.trim().is_empty()
             && machine_matches_reference(machine, &health.id))
-        || endpoint_key(&health.host, health.web_port) == machine_endpoint_key(machine)
+        || endpoint_key(&health.host, health.port) == machine_endpoint_key(machine)
 }
 
 fn same_private_ipv4_lan(left: &str, right: &str) -> bool {
@@ -618,15 +620,7 @@ pub fn remote_get_json<T: DeserializeOwned>(
     path: &str,
     timeout: Duration,
 ) -> Result<T> {
-    let raw = http_request(
-        &machine.host,
-        machine.web_port,
-        "GET",
-        path,
-        None,
-        &[],
-        timeout,
-    )?;
+    let raw = http_request(&machine.host, machine.port, "GET", path, None, &[], timeout)?;
     serde_json::from_slice(&raw).context("failed to parse peer response")
 }
 
@@ -639,7 +633,7 @@ pub fn remote_post_json<B: Serialize, T: DeserializeOwned>(
     let body = serde_json::to_vec(body).context("failed to serialize peer request")?;
     let raw = http_request(
         &machine.host,
-        machine.web_port,
+        machine.port,
         "POST",
         path,
         Some("application/json"),
@@ -657,7 +651,7 @@ pub fn remote_post_bytes<T: DeserializeOwned>(
 ) -> Result<T> {
     let raw = http_request(
         &machine.host,
-        machine.web_port,
+        machine.port,
         "POST",
         path,
         Some("application/octet-stream"),
@@ -716,7 +710,7 @@ fn machine_view_matches_health(machine: &MachineView, health: &MachineHealth) ->
         || (health.id.trim() != "local"
             && !health.id.trim().is_empty()
             && machine.id.eq_ignore_ascii_case(&health.id))
-        || (machine.host == health.host && machine.web_port == health.web_port)
+        || (machine.host == health.host && machine.port == health.port)
 }
 
 pub fn machine_id_from_path(machine_id: Option<&str>) -> &str {
@@ -1039,7 +1033,7 @@ mod tests {
                     alias_name: String::new(),
                     name: "This machine".to_string(),
                     host: "203.0.113.10".to_string(),
-                    web_port: 18765,
+                    port: 18765,
                     ssh_user: "root".to_string(),
                     ssh_port: 10022,
                     os: "linux".to_string(),
@@ -1050,7 +1044,7 @@ mod tests {
                     alias_name: String::new(),
                     name: "This machine".to_string(),
                     host: "203.0.113.11".to_string(),
-                    web_port: 18765,
+                    port: 18765,
                     ssh_user: "Administrator".to_string(),
                     ssh_port: 2222,
                     os: "linux".to_string(),
@@ -1086,10 +1080,11 @@ mod tests {
             alias_name: String::new(),
             name: "windows".to_string(),
             host: "192.168.2.166".to_string(),
-            web_port: 18765,
+            port: 18765,
             ssh_user: "Administrator".to_string(),
             ssh_port: 2222,
             os: "windows".to_string(),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1124,6 +1119,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(health.port, 18765);
         assert_eq!(health.ssh_user, "");
         assert_eq!(health.ssh_port, 22);
     }
@@ -1147,7 +1143,7 @@ mod tests {
         });
         let mut machine = MachineConfig::local();
         machine.host = "127.0.0.1".to_string();
-        machine.web_port = port;
+        machine.port = port;
 
         let first: serde_json::Value =
             remote_get_json(&machine, "/first", Duration::from_secs(2)).unwrap();
@@ -1193,10 +1189,11 @@ mod tests {
             alias_name: String::new(),
             name: "nas".to_string(),
             host: local_host.clone(),
-            web_port: 18765,
+            port: 18765,
             ssh_user: "root".to_string(),
             ssh_port: 10022,
             os: "linux".to_string(),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1205,7 +1202,7 @@ mod tests {
         let matches: Vec<_> = status
             .machines
             .iter()
-            .filter(|machine| machine.host == local_host && machine.web_port == 18765)
+            .filter(|machine| machine.host == local_host && machine.port == 18765)
             .collect();
 
         assert_eq!(matches.len(), 1);
@@ -1223,7 +1220,7 @@ mod tests {
         nas.alias_name = "nas".to_string();
         nas.name = "nas".to_string();
         nas.host = "203.0.113.10".to_string();
-        nas.web_port = 18765;
+        nas.port = 18765;
         nas.os = "linux".to_string();
         nas.manual = false;
         cfg.machines.push(nas);
@@ -1235,7 +1232,7 @@ mod tests {
                 alias_name: "nas".to_string(),
                 name: "This machine".to_string(),
                 host: "203.0.113.99".to_string(),
-                web_port: 18765,
+                port: 18765,
                 ssh_user: "root".to_string(),
                 ssh_port: 10022,
                 os: "linux".to_string(),
@@ -1265,10 +1262,11 @@ mod tests {
             alias_name: "nas".to_string(),
             name: "Reported Host".to_string(),
             host: "203.0.113.10".to_string(),
-            web_port: 18765,
+            port: 18765,
             ssh_user: "root".to_string(),
             ssh_port: 10022,
             os: "linux".to_string(),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1294,10 +1292,11 @@ mod tests {
             alias_name: String::new(),
             name: "Manual Name".to_string(),
             host: "203.0.113.30".to_string(),
-            web_port: 18765,
+            port: 18765,
             ssh_user: "manual".to_string(),
             ssh_port: 2222,
             os: "linux".to_string(),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1309,7 +1308,7 @@ mod tests {
                 alias_name: String::new(),
                 name: "Auto Name".to_string(),
                 host: "203.0.113.30".to_string(),
-                web_port: 18765,
+                port: 18765,
                 ssh_user: "root".to_string(),
                 ssh_port: 10022,
                 os: "linux".to_string(),

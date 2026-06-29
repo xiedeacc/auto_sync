@@ -18,7 +18,7 @@ const DESTINATION_ID: &str = "nas_dst";
 static E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[test]
-#[ignore = "requires Windows controller, SSH to NAS, and NAS auto_sync web service"]
+#[ignore = "requires Windows controller, SSH to NAS, and NAS auto_sync service"]
 fn full_sync_windows_to_nas_mirrors_tree() -> Result<()> {
     let _guard = e2e_lock().lock().unwrap();
     let env = TestEnv::reset("full_sync_windows_to_nas_mirrors_tree")?;
@@ -53,7 +53,7 @@ fn full_sync_windows_to_nas_mirrors_tree() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires Windows controller, SSH to NAS, and NAS auto_sync web service"]
+#[ignore = "requires Windows controller, SSH to NAS, and NAS auto_sync service"]
 fn incremental_sync_windows_to_nas_handles_common_changes() -> Result<()> {
     let _guard = e2e_lock().lock().unwrap();
     let env = TestEnv::reset("incremental_sync_windows_to_nas_handles_common_changes")?;
@@ -96,7 +96,7 @@ fn incremental_sync_windows_to_nas_handles_common_changes() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires Windows controller, SSH to NAS, and NAS auto_sync web service"]
+#[ignore = "requires Windows controller, SSH to NAS, and NAS auto_sync service"]
 fn incremental_sync_windows_to_nas_replaces_file_and_directory_shapes() -> Result<()> {
     let _guard = e2e_lock().lock().unwrap();
     let env = TestEnv::reset("incremental_sync_windows_to_nas_replaces_file_and_directory_shapes")?;
@@ -131,7 +131,7 @@ struct TestEnv {
     nas_host: String,
     nas_port: u16,
     nas_user: String,
-    nas_web_port: u16,
+    nas_api_port: u16,
     remote_base: String,
     remote_dest_root: String,
 }
@@ -149,7 +149,7 @@ impl TestEnv {
         let nas_port = parse_env_u16("AUTO_SYNC_E2E_NAS_PORT", 10022)?;
         let nas_user =
             std::env::var("AUTO_SYNC_E2E_NAS_USER").unwrap_or_else(|_| "root".to_string());
-        let nas_web_port = parse_env_u16("AUTO_SYNC_E2E_NAS_WEB_PORT", 18765)?;
+        let nas_api_port = parse_env_u16("AUTO_SYNC_E2E_NAS_API_PORT", 18765)?;
         let remote_base = trim_remote_path(
             &std::env::var("AUTO_SYNC_E2E_NAS_ROOT").unwrap_or_else(|_| "/zfs/tmp".to_string()),
         );
@@ -172,7 +172,7 @@ impl TestEnv {
             nas_host,
             nas_port,
             nas_user,
-            nas_web_port,
+            nas_api_port,
             remote_base,
             remote_dest_root,
         };
@@ -202,10 +202,11 @@ impl TestEnv {
             alias_name: "nas".to_string(),
             name: "nas".to_string(),
             host: self.nas_host.clone(),
-            web_port: self.nas_web_port,
+            port: self.nas_api_port,
             ssh_user: self.nas_user.clone(),
             ssh_port: self.nas_port,
             os: "linux".to_string(),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         };
@@ -238,10 +239,10 @@ impl TestEnv {
 
     fn preflight(&self) -> Result<()> {
         self.remote_sh("command -v ssh >/dev/null")?;
-        let addr = format!("{}:{}", self.nas_host, self.nas_web_port);
+        let addr = format!("{}:{}", self.nas_host, self.nas_api_port);
         let socket = addr.parse()?;
         std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(3))
-            .with_context(|| format!("failed to connect to NAS auto_sync web service at {addr}"))?;
+            .with_context(|| format!("failed to connect to NAS auto_sync service at {addr}"))?;
         Ok(())
     }
 

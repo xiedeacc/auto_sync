@@ -2,7 +2,7 @@
 data_db = "conf/state/auto_sync.sqlite"
 log_dir = "logs"
 status_log_interval_secs = 300
-web_bind = "0.0.0.0:18765"
+port = 18765
 tcp_connection_pool_size = 100
 
 [app.sync]
@@ -19,10 +19,11 @@ id = "local"
 name = "DESKTOP-576IPE3"
 alias_name = "Windows"
 host = "192.168.2.166"
-web_port = 18765
+port = 18765
 ssh_user = ""
 ssh_port = 22
 os = "windows"
+install_dir = "C:/auto_sync"
 enabled = true
 manual = true
 
@@ -31,10 +32,11 @@ id = "nas"
 alias_name = "nas"
 name = "tiger"
 host = "192.168.2.247"
-web_port = 18765
+port = 18765
 ssh_user = "root"
 ssh_port = 10022
 os = "linux"
+install_dir = "/usr/local/auto_sync"
 enabled = true
 manual = true
 
@@ -42,10 +44,11 @@ manual = true
 id = "openwrt"
 name = "openwrt"
 host = "192.168.2.1"
-web_port = 18765
+port = 18765
 ssh_user = "root"
 ssh_port = 10022
 os = "linux"
+install_dir = "/usr/local/auto_sync"
 enabled = true
 manual = true
 
@@ -73,31 +76,3 @@ time = "02:00"
 timezone = "local"
 weekday = "monday"
 sync_current_cycle_manually = false
-
-[[deploy.targets]]
-id = "tiger"
-host = "localhost"
-port = 22
-user = "root"
-install_dir = "/usr/local/auto_sync"
-
-[[deploy.targets]]
-id = "nas"
-host = "192.168.2.247"
-port = 10022
-user = "root"
-install_dir = "/usr/local/auto_sync"
-
-[[deploy.targets]]
-id = "windows"
-host = "192.168.3.7"
-port = 22
-user = "Administrator"
-install_dir = "C:/auto_sync"
-
-[[deploy.targets]]
-id = "openwrt"
-host = "192.168.2.1"
-port = 10022
-user = "root"
-install_dir = "/usr/local/auto_sync"

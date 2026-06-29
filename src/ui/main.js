@@ -79,10 +79,11 @@ const el = {
   machineName: document.getElementById("machine-name"),
   machineAlias: document.getElementById("machine-alias"),
   machineHost: document.getElementById("machine-host"),
-  machineWebPort: document.getElementById("machine-web-port"),
+  machinePort: document.getElementById("machine-port"),
   machineSshUser: document.getElementById("machine-ssh-user"),
   machineSshPort: document.getElementById("machine-ssh-port"),
   machineOs: document.getElementById("machine-os"),
+  machineInstallDir: document.getElementById("machine-install-dir"),
   issueModal: document.getElementById("issue-modal"),
   issueClose: document.getElementById("issue-close"),
   issueSummary: document.getElementById("issue-summary"),
@@ -344,7 +345,7 @@ function renderMachineModal() {
         <span></span>
         <span>Name</span>
         <span>Host</span>
-        <span>Web</span>
+        <span>Port</span>
         <span>SSH</span>
         <span>OS</span>
         <span></span>
@@ -357,7 +358,7 @@ function renderMachineModal() {
             <div class="machine-meta">${escapeHtml(machineSecondaryName(machine))}</div>
           </div>
           <div class="machine-cell" title="${escapeAttr(machine.host)}">${escapeHtml(machine.host)}</div>
-          <div class="machine-cell">${escapeHtml(String(machine.web_port || "-"))}</div>
+          <div class="machine-cell">${escapeHtml(String(machine.port || "-"))}</div>
           <div class="machine-cell">${escapeHtml(machineSshLabel(machine))}</div>
           <div class="machine-cell">${escapeHtml(machine.os || "-")}</div>
           <button class="danger icon" data-action="remove-machine" data-id="${escapeAttr(machine.id)}" title="Delete machine" ${machine.id === "local" ? "disabled" : ""}>x</button>
@@ -388,10 +389,11 @@ function selectMachineForEdit(machine) {
   el.machineName.value = machine.name || machine.id || "";
   el.machineAlias.value = machine.alias_name || "";
   el.machineHost.value = machine.host || "";
-  el.machineWebPort.value = machine.web_port || 18765;
+  el.machinePort.value = machine.port || 18765;
   el.machineSshUser.value = machine.ssh_user || "";
   el.machineSshPort.value = machine.ssh_port || 22;
   el.machineOs.value = machine.os || "linux";
+  el.machineInstallDir.value = machine.install_dir || defaultInstallDirForOs(machine.os);
   setMachineHostLocked(machineHostShouldLock(machine));
   renderMachineModal();
 }
@@ -401,10 +403,11 @@ function clearMachineForm() {
   el.machineName.value = "";
   el.machineAlias.value = "";
   el.machineHost.value = "";
-  el.machineWebPort.value = 18765;
+  el.machinePort.value = 18765;
   el.machineSshUser.value = "root";
   el.machineSshPort.value = 22;
   el.machineOs.value = "linux";
+  el.machineInstallDir.value = defaultInstallDirForOs("linux");
   setMachineHostLocked(false);
 }
 
@@ -452,17 +455,18 @@ async function addMachine() {
     setMessage("Machine host is required");
     return;
   }
-  const webPort = Number(el.machineWebPort.value || 18765);
-  const id = cleanMachineId(el.machineId.value) || machineIdFromEndpoint(host, webPort);
+  const port = Number(el.machinePort.value || 18765);
+  const id = cleanMachineId(el.machineId.value) || machineIdFromEndpoint(host, port);
   const machine = {
     id,
     alias_name: cleanMachineId(el.machineAlias.value),
     name: trimPathValue(el.machineName.value) || id,
     host,
-    web_port: webPort,
+    port,
     ssh_user: trimPathValue(el.machineSshUser.value),
     ssh_port: Number(el.machineSshPort.value || 22),
     os: el.machineOs.value || "linux",
+    install_dir: trimPathValue(el.machineInstallDir.value) || defaultInstallDirForOs(el.machineOs.value),
     enabled: true,
     manual: true,
   };
@@ -968,10 +972,19 @@ function normalizeAppConfig(app) {
     data_db: app.data_db || "conf/state/auto_sync.sqlite",
     log_dir: app.log_dir || "logs",
     status_log_interval_secs: Number(app.status_log_interval_secs || 300),
-    web_bind: trimPathValue(app.web_bind) || "0.0.0.0:18765",
+    port: Number(app.port || appPortFromLegacyBind(app.web_bind) || 18765),
     tcp_connection_pool_size: Number(app.tcp_connection_pool_size ?? 100),
     sync: normalizeNativeSyncConfig(app.sync || {}),
   };
+}
+
+function appPortFromLegacyBind(value) {
+  const text = trimPathValue(value);
+  if (!text) {
+    return 0;
+  }
+  const parts = text.split(":");
+  return Number(parts[parts.length - 1] || 0);
 }
 
 function normalizeNativeSyncConfig(sync) {
@@ -1002,10 +1015,11 @@ function normalizeMachines(values) {
       alias_name: "",
       name: "This machine",
       host: "127.0.0.1",
-      web_port: 18765,
+      port: 18765,
       ssh_user: "",
       ssh_port: 22,
       os: "linux",
+      install_dir: defaultInstallDirForOs("linux"),
       enabled: true,
       manual: true,
     },
@@ -1023,10 +1037,11 @@ function normalizeMachines(values) {
       alias_name: cleanMachineId(machine.alias_name || ""),
       name: trimPathValue(machine.name) || id,
       host: trimPathValue(machine.host) || "127.0.0.1",
-      web_port: Number(machine.web_port || 18765),
+      port: Number(machine.port || machine.web_port || 18765),
       ssh_user: trimPathValue(machine.ssh_user),
       ssh_port: Number(machine.ssh_port || 22),
       os: trimPathValue(machine.os) || "linux",
+      install_dir: trimPathValue(machine.install_dir) || defaultInstallDirForOs(machine.os),
       enabled: machine.enabled !== false,
       manual: machine.manual !== false,
     });
@@ -1038,10 +1053,14 @@ function cleanMachineId(value) {
   return String(value || "").trim().replace(/[^A-Za-z0-9_-]/g, "_");
 }
 
-function machineIdFromEndpoint(host, webPort) {
+function machineIdFromEndpoint(host, machinePort) {
   const hostId = cleanMachineId(host).replace(/^_+|_+$/g, "");
-  const port = Number(webPort || 18765);
+  const port = Number(machinePort || 18765);
   return hostId ? `machine_${hostId}_${port}` : `machine_${port}`;
+}
+
+function defaultInstallDirForOs(os) {
+  return String(os || "").toLowerCase() === "windows" ? "C:/auto_sync" : "/usr/local/auto_sync";
 }
 
 function machineIdOrLocal(value) {

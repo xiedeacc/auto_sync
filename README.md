@@ -9,8 +9,8 @@ Headless deployments can use the Web UI.
 ## LAN machines
 
 The Web UI exposes a machine selector in path picking. Peers are discovered on
-UDP `18766`; the Web API listens on the configured `web_bind` port, commonly
-`18765`. Manual machines can also be added with host, web port, SSH user, SSH
+UDP `18766`; the Web API listens on the configured `port`, commonly
+`18765`. Manual machines can also be added with host, port, SSH user, SSH
 port, and OS.
 
 Cross-machine sync uses the auto_sync Web API and a keep-alive TCP connection

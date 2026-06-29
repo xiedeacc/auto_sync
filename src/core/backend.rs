@@ -31,7 +31,7 @@ const MANUAL_DISCOVERY_MIN_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct Backend {
     config_path: Arc<PathBuf>,
-    web_port: u16,
+    port: u16,
     machine_cache: Arc<Mutex<MachineCache>>,
 }
 
@@ -42,10 +42,10 @@ struct MachineCache {
 }
 
 impl Backend {
-    pub fn new(config_path: PathBuf, web_port: u16) -> Self {
+    pub fn new(config_path: PathBuf, port: u16) -> Self {
         let backend = Self {
             config_path: Arc::new(config_path),
-            web_port,
+            port,
             machine_cache: Arc::new(Mutex::new(MachineCache::default())),
         };
         backend.spawn_machine_discovery_worker();
@@ -56,8 +56,8 @@ impl Backend {
         self.config_path.clone()
     }
 
-    pub fn web_port(&self) -> u16 {
-        self.web_port
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     pub fn get_config(&self) -> Result<AppConfig> {
@@ -87,7 +87,7 @@ impl Backend {
     pub fn health(&self) -> Result<MachineHealth> {
         let cfg = load_or_create_config(&self.config_path)?;
         apply_runtime_config(&cfg);
-        Ok(local_health(&cfg, self.web_port))
+        Ok(local_health(&cfg, self.port))
     }
 
     pub fn machines(&self) -> Result<MachineStatus> {
@@ -458,10 +458,11 @@ mod tests {
             alias_name: String::new(),
             name: "windows".to_string(),
             host: "192.168.3.7".to_string(),
-            web_port: 18765,
+            port: 18765,
             ssh_user: "Administrator".to_string(),
             ssh_port: 22,
             os: "windows".to_string(),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });

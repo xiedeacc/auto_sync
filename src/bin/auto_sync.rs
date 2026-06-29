@@ -6,7 +6,7 @@
 //! in a single process removes the old daemon/GUI contention over the shared
 //! SQLite database and the destination machines.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use auto_sync::core::backend::Backend;
-use auto_sync::core::config::{AppConfig, load_config, load_or_create_config};
+use auto_sync::core::config::{
+    AppConfig, load_config, load_or_create_config, preferred_local_host,
+};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::state::State;
 use auto_sync::core::sync::sync_all_pending;
@@ -77,11 +79,7 @@ fn main() -> Result<()> {
         .config
         .canonicalize()
         .unwrap_or_else(|_| args.config.clone());
-    let addr: SocketAddr = cfg
-        .app
-        .web_bind
-        .parse()
-        .with_context(|| format!("invalid bind address {}", cfg.app.web_bind))?;
+    let addr = bind_addr_for_port(cfg.app.port);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -114,6 +112,13 @@ fn main() -> Result<()> {
     let _ = scheduler.join();
     info!("auto_sync stopped");
     Ok(())
+}
+
+fn bind_addr_for_port(port: u16) -> SocketAddr {
+    match preferred_local_host().parse::<IpAddr>() {
+        Ok(ip) => SocketAddr::new(ip, port),
+        Err(_) => SocketAddr::from(([0, 0, 0, 0], port)),
+    }
 }
 
 #[cfg(windows)]

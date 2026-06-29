@@ -106,8 +106,8 @@ GUI 与 daemon 通信：
 - 当前 GUI/Web 直接读写本机配置和 SQLite 状态库。
 - 后续如需要常驻 daemon 控制面，可增加 Unix domain socket。
 - 远程 NAS 使用 SSH 执行 `auto_syncctl status`、上传配置、启动/停止服务。
-- `auto_sync_web` 默认开放 `0.0.0.0:18765`，适合 NAS/headless；生产环境必须启用访问控制或通过防火墙/反向代理限制访问。
-- Web UI 是配置写入口。生产环境至少需要一种保护：只监听 `127.0.0.1` 后接反向代理认证、HTTP token/basic auth、或防火墙限制到可信 LAN/IP。
+- Web/API 控制面配置只保存 `port`，运行时用自动探测到的本机地址加该端口监听，适合 NAS/headless 内网部署。
+- Web UI 是配置写入口。生产环境至少需要一种保护：防火墙限制到可信 LAN/IP、反向代理认证、HTTP token/basic auth，或仅在本机地址监听。
 
 当前实现与目标设计：
 
@@ -180,11 +180,14 @@ enabled = true
 before = { source_id = "photos", destination_id = "usb_backup" }
 after = { source_id = "docs", destination_id = "docs_backup" }
 
-[[deploy.targets]]
+[[machines]]
 id = "nas"
+name = "nas"
 host = "192.168.3.178"
-port = 10022
-user = "root"
+port = 18765
+ssh_user = "root"
+ssh_port = 10022
+os = "linux"
 install_dir = "/usr/local/auto_sync"
 ```
 

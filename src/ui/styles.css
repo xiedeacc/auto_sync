@@ -669,7 +669,7 @@ th {
 
 .machine-form {
   display: grid;
-  grid-template-columns: 92px 92px minmax(140px, 1fr) 72px 86px 68px 82px;
+  grid-template-columns: 92px 92px minmax(140px, 1fr) 72px 86px 68px 82px minmax(150px, 1fr);
   gap: 6px;
   align-items: end;
   margin-top: 12px;

@@ -191,10 +191,11 @@
         <div class="machine-form-head">Name</div>
         <div class="machine-form-head">Alias</div>
         <div class="machine-form-head">Host</div>
-        <div class="machine-form-head">Web</div>
+        <div class="machine-form-head">Port</div>
         <div class="machine-form-head">SSH User</div>
         <div class="machine-form-head">SSH Port</div>
         <div class="machine-form-head">OS</div>
+        <div class="machine-form-head">Install Dir</div>
         <div class="machine-field machine-field-name">
           <input id="machine-name" placeholder="name">
         </div>
@@ -204,8 +205,8 @@
         <div class="machine-field machine-field-host">
           <input id="machine-host" placeholder="host">
         </div>
-        <div class="machine-field machine-field-web-port">
-          <input id="machine-web-port" type="number" min="1" max="65535" value="18765">
+        <div class="machine-field machine-field-port">
+          <input id="machine-port" type="number" min="1" max="65535" value="18765">
         </div>
         <div class="machine-field machine-field-ssh-user">
           <input id="machine-ssh-user" placeholder="root">
@@ -218,6 +219,9 @@
             <option value="linux">Linux</option>
             <option value="windows">Windows</option>
           </select>
+        </div>
+        <div class="machine-field machine-field-install-dir">
+          <input id="machine-install-dir" placeholder="/usr/local/auto_sync">
         </div>
         <div class="machine-form-actions">
           <button id="machine-add" class="primary" type="button">Save</button>
@@ -303,7 +307,7 @@
             <span></span>
             <span>Name</span>
             <span>Host</span>
-            <span>Web</span>
+            <span>Port</span>
             <span>SSH</span>
             <span>OS</span>
             <span></span>
@@ -316,7 +320,7 @@
                 <div class="machine-meta">${escapeHtml(machine.id)}${machine.discovered ? " · discovered" : ""}</div>
               </div>
               <div class="machine-cell">${escapeHtml(machine.host)}</div>
-              <div class="machine-cell">${escapeHtml(String(machine.web_port || "-"))}</div>
+              <div class="machine-cell">${escapeHtml(String(machine.port || "-"))}</div>
               <div class="machine-cell">${escapeHtml(machineSshLabel(machine))}</div>
               <div class="machine-cell">${escapeHtml(machine.os || "-")}</div>
               <span></span>

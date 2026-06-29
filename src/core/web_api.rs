@@ -89,7 +89,7 @@ pub fn router(backend: Backend) -> Router {
 
 pub async fn serve(backend: Backend, addr: SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let _discovery = spawn_discovery_responder(backend.config_path(), backend.web_port());
+    let _discovery = spawn_discovery_responder(backend.config_path(), backend.port());
     let app = router(backend);
     info!(url = %format!("http://{addr}/"), "auto_sync web listening");
     println!("auto_sync Web UI: http://{addr}/");
