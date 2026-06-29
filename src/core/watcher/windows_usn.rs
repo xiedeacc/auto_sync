@@ -266,7 +266,10 @@ fn initial_next_usn(
     watch.journal_id = journal.UsnJournalID;
     let cursor = state.windows_usn_cursor(&watch.id, &watch.volume)?;
     let Some(cursor) = cursor else {
-        state.record_event(&watch.id, 0, "usn_initial_reconcile", None, false)?;
+        // No persisted cursor: we cannot prove what changed while we were not
+        // watching, so flag a rescan (rescan_required=true) rather than silently
+        // jumping to the journal tip and reporting green.
+        state.record_event(&watch.id, 0, "usn_initial_reconcile", None, true)?;
         state.set_windows_usn_cursor(
             &watch.id,
             &watch.volume,
@@ -277,7 +280,10 @@ fn initial_next_usn(
     };
 
     if cursor.journal_id != journal.UsnJournalID || cursor.next_usn < journal.LowestValidUsn {
-        state.record_event(&watch.id, 0, "usn_cursor_reconcile", None, false)?;
+        // The journal wrapped past our cursor (or was recreated): events were
+        // provably lost. Flag a rescan instead of advancing to the tip silently
+        // — this matches the in-session gap path (run loop `usn_gap`).
+        state.record_event(&watch.id, 0, "usn_cursor_reconcile", None, true)?;
         state.set_windows_usn_cursor(
             &watch.id,
             &watch.volume,

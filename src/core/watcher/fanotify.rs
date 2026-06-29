@@ -117,8 +117,22 @@ pub fn spawn_fanotify_thread(
             let db_path = db_path.clone();
             let shutdown = shutdown.clone();
             handles.push(thread::spawn(move || {
-                if let Err(err) = run_fanotify_loop(source_cfg, db_path, shutdown) {
-                    error!(error = %err, "fanotify source watcher stopped");
+                // Supervise: a watcher that errors out (read error, mark/setup
+                // failure) is restarted after a short backoff instead of dying
+                // silently for the lifetime of the process.
+                while !shutdown.load(Ordering::SeqCst) {
+                    match run_fanotify_loop(source_cfg.clone(), db_path.clone(), shutdown.clone()) {
+                        Ok(()) => break,
+                        Err(err) => {
+                            error!(error = %err, "fanotify source watcher stopped; restarting after backoff");
+                            for _ in 0..50 {
+                                if shutdown.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(100));
+                            }
+                        }
+                    }
                 }
             }));
         }
@@ -374,25 +388,43 @@ fn parse_events(
     while bytes.len() >= min_len {
         let meta = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<FanotifyEventMetadata>()) };
         if meta.vers != FANOTIFY_METADATA_VERSION {
-            bail!("unsupported fanotify metadata version {}", meta.vers);
+            // Cannot trust event_len to resync mid-buffer; drop the rest of this
+            // read. The next read() returns fresh, aligned events.
+            warn!(
+                version = meta.vers,
+                "unsupported fanotify metadata version; dropping rest of buffer"
+            );
+            break;
         }
         if meta.event_len == 0 || meta.event_len as usize > bytes.len() {
-            bail!("invalid fanotify event length {}", meta.event_len);
+            warn!(
+                event_len = meta.event_len,
+                "invalid fanotify event length; dropping rest of buffer"
+            );
+            break;
         }
 
-        if meta.mask & FAN_Q_OVERFLOW != 0 {
+        // Persist failures (e.g. a transient SQLite lock) must not kill the
+        // watcher thread; log and continue so realtime watching survives.
+        let result = if meta.mask & FAN_Q_OVERFLOW != 0 {
             warn!("fanotify queue overflow; recording realtime source events");
-            for source in &mut *sources {
-                state.record_event(&source.id, meta.mask, "queue_overflow", None, true)?;
-            }
+            (|| -> Result<()> {
+                for source in &mut *sources {
+                    state.record_event(&source.id, meta.mask, "queue_overflow", None, true)?;
+                }
+                Ok(())
+            })()
         } else {
             let event = &bytes[..meta.event_len as usize];
             match mode {
                 FanotifyMode::FidName => {
-                    persist_fid_name_event(state, sources, fanotify_fd, mark_mask, &meta, event)?
+                    persist_fid_name_event(state, sources, fanotify_fd, mark_mask, &meta, event)
                 }
-                FanotifyMode::FdPath => persist_fd_path_event(state, sources, &meta)?,
+                FanotifyMode::FdPath => persist_fd_path_event(state, sources, &meta),
             }
+        };
+        if let Err(err) = result {
+            warn!(error = %err, "failed to persist fanotify event; skipping");
         }
 
         bytes = &bytes[meta.event_len as usize..];
