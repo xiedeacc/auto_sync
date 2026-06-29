@@ -539,9 +539,7 @@ function renderSourcePanel() {
   const stack = body.querySelector("#sources-stack");
   cfg.source_groups.forEach((source, sourceIndex) => {
     const sourcePathIsLocked = sourcePathLocked(source);
-    const sourcePathTitle = sourcePathIsLocked
-      ? "Source path is locked after adding a destination"
-      : machineLabel(source.machine_id);
+    const sourcePathDisplay = machinePathLabel(source.machine_id, source.src);
     const group = document.createElement("div");
     group.className = "source-group";
     group.dataset.sourceId = source.id;
@@ -552,7 +550,7 @@ function renderSourcePanel() {
           <label>ID</label>
           <label>Source Path</label>
           <input value="${escapeAttr(source.id)}" data-field="source-id">
-          <input class="path-picker ${sourcePathIsLocked ? "path-picker-locked" : ""}" value="${escapeAttr(machinePathLabel(source.machine_id, source.src))}" data-field="source-src" readonly ${sourcePathIsLocked ? "disabled" : ""} title="${escapeAttr(sourcePathTitle)}">
+          <input class="path-picker ${sourcePathIsLocked ? "path-picker-locked" : ""}" value="${escapeAttr(sourcePathDisplay)}" data-field="source-src" readonly title="${escapeAttr(sourcePathDisplay)}">
         </div>
         <div class="row-right source-right">
           <label>Latest Cycle</label>

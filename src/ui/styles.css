@@ -495,11 +495,8 @@ th {
   background: #fbfdff;
 }
 
-.path-picker-locked,
-.path-picker-locked:disabled {
+.path-picker-locked {
   cursor: not-allowed;
-  color: var(--muted);
-  background: #eef2f6;
 }
 
 .config-view {
