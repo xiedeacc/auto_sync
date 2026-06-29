@@ -778,7 +778,7 @@ function renderSyncRows(source, group) {
         <input class="destination-readonly destination-cycle" value="${escapeAttr(cycleDisplay(status))}" readonly>
         <button class="sync-config-button icon" data-action="edit-dst-sync" title="${escapeAttr(destinationSyncTitle(dst))}">&#9881;</button>
         <select class="destination-sync-select" data-action="sync-dst" title="Sync">
-          <option value="">Sync...</option>
+          <option value="">Sync</option>
           <option value="incremental">Incremental</option>
           <option value="changed_since">Changed Since</option>
           <option value="full">Full</option>

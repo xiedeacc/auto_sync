@@ -312,7 +312,7 @@ th {
 }
 
 .destination-right {
-  grid-template-columns: 100px 100px 34px 96px 34px;
+  grid-template-columns: 100px 100px 34px 104px 34px;
 }
 
 .actions-label {
@@ -356,7 +356,7 @@ th {
 }
 
 .destination-sync-select {
-  min-width: 96px;
+  min-width: 104px;
   font-weight: 650;
 }
 
