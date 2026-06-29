@@ -16,7 +16,7 @@ modify_window_secs = 1
 
 [[machines]]
 id = "local"
-name = "This machine"
+name = "DESKTOP-576IPE3"
 host = "192.168.2.166"
 web_port = 18765
 ssh_user = ""
@@ -28,7 +28,7 @@ manual = true
 [[machines]]
 id = "nas"
 alias_name = "nas"
-name = "nas"
+name = "tiger"
 host = "192.168.2.247"
 web_port = 18765
 ssh_user = "root"
