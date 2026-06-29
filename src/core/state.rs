@@ -797,6 +797,32 @@ impl State {
         Ok(())
     }
 
+    pub fn reset_destination_offset(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.clear_destination_issues(source_id, destination_id)?;
+        self.conn.execute(
+            r#"
+            INSERT INTO destination_offset
+                (source_id, destination_id, target_cycle_id, last_completed_cycle_id,
+                 last_verified_cycle_id, status, status_reason, updated_at)
+            VALUES (?1, ?2, NULL, NULL, NULL, 'red', ?3, ?4)
+            ON CONFLICT(source_id, destination_id) DO UPDATE SET
+                target_cycle_id=NULL,
+                last_completed_cycle_id=NULL,
+                last_verified_cycle_id=NULL,
+                status='red',
+                status_reason=excluded.status_reason,
+                updated_at=excluded.updated_at
+            "#,
+            params![source_id, destination_id, reason, now_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn destination_target_cycle(
         &self,
         source_id: &str,

@@ -495,8 +495,17 @@ th {
   background: #fbfdff;
 }
 
+.readonly-id,
+.path-picker-locked {
+  background: #eef2f6;
+}
+
 .path-picker-locked {
   cursor: not-allowed;
+}
+
+.dst-path {
+  background: #fff;
 }
 
 .config-view {

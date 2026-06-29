@@ -67,12 +67,19 @@ impl Backend {
     }
 
     pub fn save_config(&self, cfg: &AppConfig) -> Result<AppConfig> {
+        let current = load_config(&self.config_path)
+            .ok()
+            .map(|cfg| clean_config_for_save(&cfg));
         let cfg = preserve_current_machines(&self.config_path, cfg);
         reject_locked_source_path_changes(&self.config_path, &cfg)?;
+        let next = clean_config_for_save(&cfg);
         let cfg = save_config(&self.config_path, &cfg)?;
         apply_runtime_config(&cfg);
         let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
+        if let Some(current) = current.as_ref() {
+            reset_changed_destination_offsets(&state_db, current, &next)?;
+        }
         self.clear_machine_cache();
         Ok(cfg)
     }
@@ -314,6 +321,39 @@ fn reject_locked_source_path_changes(config_path: &Path, next: &AppConfig) -> Re
     Ok(())
 }
 
+fn reset_changed_destination_offsets(
+    state: &DbState,
+    current: &AppConfig,
+    next: &AppConfig,
+) -> Result<()> {
+    for current_source in &current.source_groups {
+        let Some(next_source) = next
+            .source_groups
+            .iter()
+            .find(|source| source.id == current_source.id)
+        else {
+            continue;
+        };
+        for current_dst in &current_source.destinations {
+            let Some(next_dst) = next_source
+                .destinations
+                .iter()
+                .find(|dst| dst.id == current_dst.id)
+            else {
+                continue;
+            };
+            if current_dst.path != next_dst.path || current_dst.machine_id != next_dst.machine_id {
+                state.reset_destination_offset(
+                    &current_source.id,
+                    &current_dst.id,
+                    "destination_path_changed",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_runtime_config(cfg: &AppConfig) {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
     configure_progress_file(&cfg.app.data_db);
@@ -472,6 +512,55 @@ mod tests {
 
         let err = reject_locked_source_path_changes(&config_path, &next).unwrap_err();
         assert!(err.to_string().contains("source path is locked"));
+    }
+
+    #[test]
+    fn resets_destination_offset_when_destination_path_changes() {
+        let temp = temp_dir("backend_reset_destination_offset");
+        let mut current = AppConfig::default();
+        current.app.data_db = temp.join("state").join("auto_sync.sqlite");
+        current.app.log_dir = temp.join("logs");
+        current
+            .source_groups
+            .push(crate::core::config::SourceGroupConfig {
+                id: "src_1".to_string(),
+                machine_id: "local".to_string(),
+                src: temp.join("src"),
+                excludes: Vec::new(),
+                enabled: true,
+                mode: crate::core::config::SyncMode::Mirror,
+                snapshot: crate::core::config::SnapshotConfig::default(),
+                destinations: vec![crate::core::config::DestinationConfig {
+                    id: "dst_1".to_string(),
+                    machine_id: "local".to_string(),
+                    path: temp.join("dst_a"),
+                    enabled: true,
+                    schedule: crate::core::config::ScheduleConfig::default(),
+                }],
+            });
+
+        let state = DbState::open(&current.app.data_db).unwrap();
+        state.ensure_config(&current).unwrap();
+        state.set_destination_target("src_1", "dst_1", 7).unwrap();
+        state
+            .upsert_destination_status("src_1", "dst_1", Some(7), "green", "verified")
+            .unwrap();
+
+        let mut next = current.clone();
+        next.source_groups[0].destinations[0].path = temp.join("dst_b");
+        reset_changed_destination_offsets(
+            &state,
+            &clean_config_for_save(&current),
+            &clean_config_for_save(&next),
+        )
+        .unwrap();
+
+        let offset = state.destination_offset("src_1", "dst_1").unwrap();
+        assert_eq!(offset.target_cycle_id, None);
+        assert_eq!(offset.last_completed_cycle_id, None);
+        assert_eq!(offset.last_verified_cycle_id, None);
+        assert_eq!(offset.status, "red");
+        assert_eq!(offset.status_reason, "destination_path_changed");
     }
 
     fn temp_dir(name: &str) -> PathBuf {

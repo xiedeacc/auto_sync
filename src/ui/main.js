@@ -549,7 +549,7 @@ function renderSourcePanel() {
         <div class="row-left">
           <label>ID</label>
           <label>Source Path</label>
-          <input value="${escapeAttr(source.id)}" data-field="source-id" readonly>
+          <input class="readonly-id" value="${escapeAttr(source.id)}" data-field="source-id" readonly>
           <input class="path-picker ${sourcePathIsLocked ? "path-picker-locked" : ""}" value="${escapeAttr(sourcePathDisplay)}" data-field="source-src" readonly title="${escapeAttr(sourcePathDisplay)}">
         </div>
         <div class="row-right source-right">
@@ -755,7 +755,7 @@ function renderSyncRows(source, group) {
         <label>Destination Path</label>
         <div class="destination-id-cell">
           <button class="dot ${dotClass}" data-action="show-issues" title="${escapeAttr(dotTitle)}" aria-label="${escapeAttr(dotTitle)}"></button>
-          <input class="dst-id" value="${escapeAttr(dst.id)}" data-field="dst-id" readonly>
+          <input class="dst-id readonly-id" value="${escapeAttr(dst.id)}" data-field="dst-id" readonly>
         </div>
         <input class="path-picker dst-path" value="${escapeAttr(machinePathLabel(dst.machine_id, dst.path))}" data-field="dst-path" readonly title="${escapeAttr(machineLabel(dst.machine_id))}">
       </div>

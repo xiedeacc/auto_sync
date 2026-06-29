@@ -51,7 +51,7 @@ manual = true
 
 [[source_groups]]
 id = "src_1"
-src = '\\?\C:\Users\tiger\Documents\xwechat_files'
+src = '\\?\C:\Users\tiger\Documents\xwechat_files\Backup'
 enabled = true
 mode = "mirror"
 
