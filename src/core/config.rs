@@ -341,6 +341,7 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
 }
 
 pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<AppConfig> {
+    validate_unique_machine_ids(&cfg.machines)?;
     let cfg = clean_config_for_save(cfg);
     cfg.validate()?;
     if let Some(parent) = path.parent() {
@@ -529,6 +530,7 @@ fn clean_excludes(excludes: &[PathBuf]) -> Vec<PathBuf> {
 
 impl AppConfig {
     pub fn validate(&self) -> Result<()> {
+        validate_unique_machine_ids(&self.machines)?;
         let mut source_ids = HashSet::new();
         let mut task_ids = HashSet::new();
         let machines = clean_machines(&self.machines);
@@ -608,6 +610,20 @@ impl AppConfig {
         validate_sync_order(&self.sync_order, &task_ids)?;
         Ok(())
     }
+}
+
+fn validate_unique_machine_ids(machines: &[MachineConfig]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for machine in machines {
+        let id = clean_id(&machine.id);
+        if id.is_empty() {
+            continue;
+        }
+        if !seen.insert(id.clone()) {
+            bail!("duplicate machine id: {id}");
+        }
+    }
+    Ok(())
 }
 
 pub fn machine_id_or_local(value: &str) -> &str {
@@ -1030,6 +1046,61 @@ mod tests {
 
             assert_eq!(cleaned.machines[0].name, local_hostname());
         }
+    }
+
+    #[test]
+    fn rejects_duplicate_machine_ids() {
+        let mut cfg = AppConfig::default();
+        cfg.machines.push(MachineConfig {
+            id: "nas".to_string(),
+            alias_name: "nas_a".to_string(),
+            name: "nas-a".to_string(),
+            host: "192.0.2.10".to_string(),
+            web_port: 18765,
+            ssh_user: "root".to_string(),
+            ssh_port: 22,
+            os: "linux".to_string(),
+            enabled: true,
+            manual: true,
+        });
+        cfg.machines.push(MachineConfig {
+            id: " nas ".to_string(),
+            alias_name: "nas_b".to_string(),
+            name: "nas-b".to_string(),
+            host: "192.0.2.11".to_string(),
+            web_port: 18765,
+            ssh_user: "root".to_string(),
+            ssh_port: 22,
+            os: "linux".to_string(),
+            enabled: true,
+            manual: true,
+        });
+
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate machine id: nas"));
+    }
+
+    #[test]
+    fn save_config_rejects_duplicate_machine_ids_before_cleaning() {
+        let temp = temp_dir("duplicate_machine_save");
+        let path = temp.join("auto_sync.toml");
+        let mut cfg = AppConfig::default();
+        cfg.machines.push(MachineConfig {
+            id: "local".to_string(),
+            alias_name: String::new(),
+            name: "another local".to_string(),
+            host: "192.0.2.20".to_string(),
+            web_port: 18765,
+            ssh_user: String::new(),
+            ssh_port: 22,
+            os: "linux".to_string(),
+            enabled: true,
+            manual: true,
+        });
+
+        let err = save_config(&path, &cfg).unwrap_err();
+        assert!(err.to_string().contains("duplicate machine id: local"));
+        fs::remove_dir_all(temp).ok();
     }
 
     #[test]
