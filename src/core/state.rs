@@ -558,6 +558,43 @@ impl State {
             .map_err(Into::into)
     }
 
+    pub fn latest_event_observed_at(&self, source_id: &str) -> Result<Option<DateTime<Utc>>> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                r#"
+                SELECT observed_at
+                FROM event_log
+                WHERE source_id=?1
+                ORDER BY observed_at DESC, event_id DESC
+                LIMIT 1
+                "#,
+                params![source_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value.as_deref().map(parse_db_time).transpose()
+    }
+
+    pub fn event_paths_observed_since(
+        &self,
+        source_id: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT DISTINCT rel_path
+            FROM event_log
+            WHERE source_id=?1 AND observed_at>=?2 AND rel_path IS NOT NULL
+            "#,
+        )?;
+        let rows = stmt.query_map(params![source_id, observed_at.to_rfc3339()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn source_has_target_cycle(&self, source_id: &str, cycle_id: i64) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             r#"

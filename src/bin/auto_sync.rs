@@ -19,7 +19,7 @@ use auto_sync::core::config::{AppConfig, load_config, load_or_create_config};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::state::State;
 use auto_sync::core::sync::sync_all_pending;
-use auto_sync::core::watcher::spawn_source_watcher_thread;
+use auto_sync::core::watcher::{record_startup_mtime_events, spawn_source_watcher_thread};
 use auto_sync::core::web_api;
 use clap::Parser;
 use tracing::{error, info, warn};
@@ -312,6 +312,7 @@ fn run_scheduler(
     let mut state = State::open(&cfg.app.data_db)?;
     state.ensure_config(&cfg)?;
     state.ensure_open_cycles(&cfg)?;
+    record_startup_changes(&cfg, &state);
 
     let mut watcher_state = start_watcher(&cfg);
     let mut watcher_signature = config_signature(&cfg);
@@ -325,6 +326,7 @@ fn run_scheduler(
                 if signature != watcher_signature {
                     info!("config changed; restarting source watcher");
                     stop_watcher(&mut watcher_state);
+                    record_startup_changes(&new_cfg, &state);
                     watcher_state = start_watcher(&new_cfg);
                     watcher_signature = signature;
                 }
@@ -363,6 +365,16 @@ fn run_scheduler(
 
     stop_watcher(&mut watcher_state);
     Ok(())
+}
+
+fn record_startup_changes(cfg: &AppConfig, state: &State) {
+    match record_startup_mtime_events(cfg, state) {
+        Ok(recorded) if recorded > 0 => {
+            info!(recorded, "startup mtime scan recorded realtime events");
+        }
+        Ok(_) => {}
+        Err(err) => warn!(error = %err, "startup mtime scan failed"),
+    }
 }
 
 fn log_destination_status(state: &State, cfg: &AppConfig) {
