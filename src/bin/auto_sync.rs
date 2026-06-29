@@ -35,9 +35,8 @@ use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-use auto_sync::core::backend::SyncActivityStatus;
 #[cfg(feature = "gui")]
-use auto_sync::core::backend::{BrowseResponse, RuntimeStatus};
+use auto_sync::core::backend::{BrowseResponse, RuntimeStatus, SyncActivityStatus};
 #[cfg(feature = "gui")]
 use auto_sync::core::config::MachineConfig;
 #[cfg(feature = "gui")]
