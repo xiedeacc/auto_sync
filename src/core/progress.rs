@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 const STALE_AFTER: Duration = Duration::from_secs(8);
+const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const EWMA_NEW_SAMPLE_PERCENT: u64 = 35;
 
 static TRANSFER_PROGRESS: OnceLock<Mutex<Option<TransferProgressState>>> = OnceLock::new();
@@ -80,17 +81,9 @@ impl TransferProgressGuard {
         if state.token != self.token {
             return;
         }
-        let now = Instant::now();
-        let elapsed = now.duration_since(state.last_sample_at);
-        if elapsed >= Duration::from_millis(250) || transferred_bytes >= state.total_bytes {
-            let byte_delta = transferred_bytes.saturating_sub(state.last_bytes);
-            let millis = elapsed.as_millis().max(1);
-            let sample = ((byte_delta as u128) * 1000 / millis) as u64;
-            state.bytes_per_sec = ewma_speed(state.bytes_per_sec, sample);
-            state.last_bytes = transferred_bytes;
-            state.last_sample_at = now;
-        }
         state.transferred_bytes = transferred_bytes.min(state.total_bytes);
+        let now = Instant::now();
+        state.sample_speed(now, transferred_bytes >= state.total_bytes);
         state.updated_at = now;
         state.updated_at_ms = now_ms();
         write_progress_file(&state.view());
@@ -270,14 +263,7 @@ pub fn record_transfer(rel_path: &str, added: u64) {
     let now = Instant::now();
     state.updated_at = now;
     state.updated_at_ms = now_ms();
-    let elapsed = now.duration_since(state.last_sample_at);
-    if elapsed >= Duration::from_millis(250) {
-        let byte_delta = state.transferred_bytes.saturating_sub(state.last_bytes);
-        let millis = elapsed.as_millis().max(1);
-        let sample = ((byte_delta as u128) * 1000 / millis) as u64;
-        state.bytes_per_sec = ewma_speed(state.bytes_per_sec, sample);
-        state.last_bytes = state.transferred_bytes;
-        state.last_sample_at = now;
+    if state.sample_speed(now, false) {
         write_progress_file(&state.view());
     }
 }
@@ -286,11 +272,17 @@ pub fn current_transfer_progress() -> Option<TransferProgressView> {
     let mut progress = progress_lock()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    if let Some(state) = progress.as_ref() {
+    if let Some(state) = progress.as_mut() {
         if state.updated_at.elapsed() > STALE_AFTER {
             *progress = None;
             clear_progress_file();
         } else {
+            let now = Instant::now();
+            if state.sample_speed(now, false) {
+                state.updated_at = now;
+                state.updated_at_ms = now_ms();
+                write_progress_file(&state.view());
+            }
             return Some(state.view());
         }
     }
@@ -329,6 +321,23 @@ fn scan_progress_file_lock() -> &'static Mutex<Option<PathBuf>> {
 }
 
 impl TransferProgressState {
+    fn sample_speed(&mut self, now: Instant, force: bool) -> bool {
+        let elapsed = now.duration_since(self.last_sample_at);
+        if !force && elapsed < SPEED_SAMPLE_INTERVAL {
+            return false;
+        }
+        let byte_delta = self.transferred_bytes.saturating_sub(self.last_bytes);
+        if byte_delta == 0 {
+            return false;
+        }
+        let millis = elapsed.as_millis().max(1);
+        let sample = ((byte_delta as u128) * 1000 / millis) as u64;
+        self.bytes_per_sec = ewma_speed(self.bytes_per_sec, sample);
+        self.last_bytes = self.transferred_bytes;
+        self.last_sample_at = now;
+        true
+    }
+
     fn view(&self) -> TransferProgressView {
         let elapsed = self.started_at.elapsed().as_secs().max(1);
         let bytes_per_sec = if self.bytes_per_sec == 0 && self.transferred_bytes > 0 {
@@ -461,7 +470,9 @@ fn ewma_speed(previous: u64, sample: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::ewma_speed;
+    use std::time::{Duration, Instant};
+
+    use super::{TransferProgressState, ewma_speed};
 
     #[test]
     fn transfer_speed_ewma_uses_first_sample_directly() {
@@ -472,5 +483,28 @@ mod tests {
     fn transfer_speed_ewma_smooths_new_samples() {
         assert_eq!(ewma_speed(1_000, 2_000), 1_350);
         assert_eq!(ewma_speed(2_000, 1_000), 1_650);
+    }
+
+    #[test]
+    fn transfer_speed_can_be_sampled_when_status_is_read_later() {
+        let now = Instant::now();
+        let mut state = TransferProgressState {
+            token: 1,
+            destination_id: "dst".to_string(),
+            destination_path: "/dst".to_string(),
+            rel_path: "file.bin".to_string(),
+            transferred_bytes: 10_000,
+            total_bytes: 20_000,
+            bytes_per_sec: 0,
+            last_bytes: 0,
+            started_at: now - Duration::from_secs(5),
+            last_sample_at: now - Duration::from_secs(5),
+            updated_at: now,
+            updated_at_ms: 0,
+        };
+
+        assert!(state.sample_speed(now, false));
+        assert_eq!(state.bytes_per_sec, 2_000);
+        assert_eq!(state.last_bytes, 10_000);
     }
 }
