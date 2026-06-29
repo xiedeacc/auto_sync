@@ -268,23 +268,24 @@ fn run_directory_changes_session(
     let state = State::open(db_path)?;
     state.ensure_open_cycle(&source.id, Utc::now())?;
 
-    let watch = SourceWatch::new(source)?;
-    let (watch_root, file_filter) = if watch.is_file {
-        let parent = watch
-            .root
+    let root = source
+        .src
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize source {}", source.src.display()))?;
+    let info = file_information(&root)
+        .with_context(|| format!("failed to read file id for {}", root.display()))?;
+    let (watch_root, file_filter) = if !info.is_dir {
+        let parent = root
             .parent()
-            .ok_or_else(|| anyhow::anyhow!("file source has no parent: {}", watch.root.display()))?
+            .ok_or_else(|| anyhow::anyhow!("file source has no parent: {}", root.display()))?
             .to_path_buf();
-        let file_name = watch
-            .root
+        let file_name = root
             .file_name()
-            .ok_or_else(|| {
-                anyhow::anyhow!("file source has no file name: {}", watch.root.display())
-            })?
+            .ok_or_else(|| anyhow::anyhow!("file source has no file name: {}", root.display()))?
             .to_os_string();
         (parent, Some(file_name))
     } else {
-        (watch.root.clone(), None)
+        (root, None)
     };
     let handle = DirectoryWatchHandle::open(&watch_root)
         .with_context(|| format!("failed to watch directory {}", watch_root.display()))?;
