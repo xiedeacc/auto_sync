@@ -9,6 +9,7 @@ let lastRuntimeScan = null;
 let machineStatus = { online: 1, total: 1, machines: [] };
 let busy = false;
 let statusBusyMessage = "";
+let statusMessage = "";
 let statusPolling = false;
 let statusPollTimer = null;
 let runtimeStatusPollTimer = null;
@@ -23,7 +24,6 @@ let machineHostLocked = false;
 const el = {
   configPath: document.getElementById("config-path"),
   sourcePanel: document.getElementById("source-panel"),
-  message: document.getElementById("message"),
   readme: document.getElementById("readme"),
   readmeModal: document.getElementById("readme-modal"),
   readmeClose: document.getElementById("readme-close"),
@@ -278,7 +278,7 @@ function updateStatusBar() {
     if (!busy) {
       lastRuntimeScan = null;
     }
-    const message = statusBusyMessage || el.message.textContent || "Ready";
+    const message = statusBusyMessage || statusMessage || "Ready";
     el.statusText.textContent = message;
     el.statusText.title = message;
   }
@@ -698,7 +698,7 @@ function bindSourceControls(source, sourceIndex, group) {
   };
   srcInput.onclick = async () => {
     if (sourcePathLocked(source)) {
-      setMessage("Source path is locked after adding a destination");
+      setMessage(machinePathLabel(source.machine_id, source.src));
       return;
     }
     const selected = await pickPath(source.src || defaultPathForMachine(source.machine_id), {
@@ -1881,8 +1881,7 @@ function setBusy(nextBusy) {
 }
 
 function setMessage(text) {
-  const value = text || "";
-  el.message.textContent = value;
+  statusMessage = text || "";
   updateStatusBar();
 }
 

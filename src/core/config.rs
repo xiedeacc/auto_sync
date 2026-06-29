@@ -1,7 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -295,7 +299,7 @@ impl MachineConfig {
         Self {
             id: "local".to_string(),
             alias_name: String::new(),
-            name: "This machine".to_string(),
+            name: local_hostname(),
             host: preferred_local_host(),
             web_port: 18765,
             ssh_user: String::new(),
@@ -441,8 +445,9 @@ fn local_machine_from_config(machines: &[MachineConfig]) -> MachineConfig {
         return local;
     };
 
-    if !configured.name.trim().is_empty() {
-        local.name = configured.name.trim().to_string();
+    let configured_name = configured.name.trim();
+    if !is_placeholder_local_name(configured_name) {
+        local.name = configured_name.to_string();
     }
     local.alias_name = clean_id(&configured.alias_name);
     if is_advertisable_host(&configured.host) {
@@ -461,6 +466,10 @@ fn local_machine_from_config(machines: &[MachineConfig]) -> MachineConfig {
         local.os = configured.os.trim().to_string();
     }
     local
+}
+
+fn is_placeholder_local_name(name: &str) -> bool {
+    name.is_empty() || name == "This machine" || name.eq_ignore_ascii_case("local")
 }
 
 fn is_advertisable_host(host: &str) -> bool {
@@ -673,6 +682,46 @@ pub fn preferred_local_host() -> String {
         return ip.to_string();
     }
     "127.0.0.1".to_string()
+}
+
+pub fn local_hostname() -> String {
+    static LOCAL_HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
+    LOCAL_HOSTNAME
+        .get_or_init(detect_local_hostname)
+        .clone()
+        .unwrap_or_else(|| "This machine".to_string())
+}
+
+fn detect_local_hostname() -> Option<String> {
+    for value in [
+        std::env::var("COMPUTERNAME").ok(),
+        std::env::var("HOSTNAME").ok(),
+        std::fs::read_to_string("/etc/hostname").ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    hostname_command_name()
+}
+
+fn hostname_command_name() -> Option<String> {
+    let mut command = Command::new("hostname");
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    command.output().ok().and_then(|output| {
+        let value = String::from_utf8(output.stdout).ok()?;
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
 }
 
 fn detect_local_ip_for(peer: Ipv4Addr) -> Option<Ipv4Addr> {
@@ -969,6 +1018,18 @@ mod tests {
             cleaned.source_groups[0].destinations[0].path,
             PathBuf::from("/data/dst")
         );
+    }
+
+    #[test]
+    fn clean_config_for_save_replaces_local_name_placeholders() {
+        for placeholder in ["This machine", "local"] {
+            let mut cfg = AppConfig::default();
+            cfg.machines[0].name = placeholder.to_string();
+
+            let cleaned = clean_config_for_save(&cfg);
+
+            assert_eq!(cleaned.machines[0].name, local_hostname());
+        }
     }
 
     #[test]
