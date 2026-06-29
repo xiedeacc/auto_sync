@@ -17,6 +17,7 @@ pub struct Cycle {
     pub ends_at: Option<DateTime<Utc>>,
     pub status: String,
     pub needs_full_rescan: bool,
+    pub manual_full_rescan: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +115,7 @@ impl State {
                 ends_at TEXT,
                 status TEXT NOT NULL,
                 needs_full_rescan INTEGER NOT NULL DEFAULT 0,
+                manual_full_rescan INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -182,6 +184,11 @@ impl State {
         )?;
         self.ensure_column("destination_offset", "target_cycle_id", "INTEGER")?;
         self.ensure_column("destination_offset", "last_completed_cycle_id", "INTEGER")?;
+        self.ensure_column(
+            "sync_cycle",
+            "manual_full_rescan",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
@@ -472,7 +479,8 @@ impl State {
         self.conn
             .query_row(
                 r#"
-                SELECT id, source_id, starts_at, ends_at, status, needs_full_rescan
+                SELECT id, source_id, starts_at, ends_at, status, needs_full_rescan,
+                       manual_full_rescan
                 FROM sync_cycle
                 WHERE source_id=?1 AND status='open'
                 ORDER BY id DESC
@@ -488,7 +496,8 @@ impl State {
     pub fn closed_cycles_for_source(&self, source_id: &str) -> Result<Vec<Cycle>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, source_id, starts_at, ends_at, status, needs_full_rescan
+            SELECT id, source_id, starts_at, ends_at, status, needs_full_rescan,
+                   manual_full_rescan
             FROM sync_cycle
             WHERE source_id=?1 AND status IN ('closed', 'planning', 'syncing', 'failed')
             ORDER BY id ASC
@@ -584,9 +593,25 @@ impl State {
         Ok(())
     }
 
+    pub fn mark_cycle_manual_full_rescan(&self, cycle_id: i64) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE sync_cycle
+            SET needs_full_rescan=1, manual_full_rescan=1, updated_at=?1
+            WHERE id=?2
+            "#,
+            params![now_string(), cycle_id],
+        )?;
+        Ok(())
+    }
+
     pub fn clear_cycle_needs_rescan(&self, cycle_id: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE sync_cycle SET needs_full_rescan=0, updated_at=?1 WHERE id=?2",
+            r#"
+            UPDATE sync_cycle
+            SET needs_full_rescan=0, manual_full_rescan=0, updated_at=?1
+            WHERE id=?2
+            "#,
             params![now_string(), cycle_id],
         )?;
         Ok(())
@@ -1011,6 +1036,7 @@ fn cycle_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cycle> {
             .map_err(to_sql_err)?,
         status: row.get(4)?,
         needs_full_rescan: row.get::<_, i64>(5)? != 0,
+        manual_full_rescan: row.get::<_, i64>(6)? != 0,
     })
 }
 

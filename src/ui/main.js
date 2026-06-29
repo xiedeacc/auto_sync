@@ -777,7 +777,7 @@ function renderSyncRows(source, group) {
         <select class="destination-sync-select" data-action="sync-dst" title="Sync destination">
           <option value="">Sync...</option>
           <option value="incremental">Incremental</option>
-          ${isRealtimeSchedule(dst.schedule) ? "" : '<option value="full">Full</option>'}
+          <option value="full">Full</option>
         </select>
         <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
       </div>
@@ -1892,10 +1892,6 @@ function destinationSyncStatusMessage(source, mode) {
     return "Checking changes...";
   }
   return "Scanning...";
-}
-
-function isRealtimeSchedule(schedule) {
-  return String((schedule && schedule.mode) || "realtime").toLowerCase() === "realtime";
 }
 
 function displayPath(value) {

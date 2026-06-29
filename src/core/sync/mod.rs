@@ -113,30 +113,12 @@ pub fn sync_destination_now_with_mode(
     destination_id: &str,
     mode: SyncRequestMode,
 ) -> Result<()> {
-    let mode = if destination_is_realtime(cfg, source_id, destination_id) {
-        SyncRequestMode::Incremental
-    } else {
-        mode
-    };
     if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
         if mode == SyncRequestMode::Full {
-            state.mark_cycle_needs_rescan(cycle.id)?;
+            state.mark_cycle_manual_full_rescan(cycle.id)?;
         }
     }
     sync_all_pending(cfg, state)
-}
-
-fn destination_is_realtime(cfg: &AppConfig, source_id: &str, destination_id: &str) -> bool {
-    cfg.source_groups
-        .iter()
-        .find(|source| source.id == source_id)
-        .and_then(|source| {
-            source
-                .destinations
-                .iter()
-                .find(|dst| dst.id == destination_id)
-        })
-        .is_some_and(|dst| dst.schedule.mode == ScheduleMode::Realtime)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1467,6 +1449,9 @@ fn realtime_incremental_plan(
         .iter()
         .filter(|event| event.rel_path.is_some() || event.rescan_required)
         .collect();
+    if cycle.manual_full_rescan {
+        return Ok(None);
+    }
     if actionable.is_empty() {
         return Ok(Some(RealtimeIncrementalPlan::Apply(Vec::new())));
     }
@@ -4636,14 +4621,15 @@ mod tests {
     }
 
     #[test]
-    fn realtime_destination_full_request_stays_incremental() {
-        let temp = temp_dir("realtime_full_stays_incremental");
+    fn realtime_destination_manual_full_request_runs_full_sync() {
+        let temp = temp_dir("realtime_manual_full_runs_full");
         let src = temp.join("src");
         let dst = temp.join("dst");
         let db = temp.join("state.sqlite");
         fs::create_dir_all(&src).unwrap();
-        fs::create_dir_all(&dst).unwrap();
+        fs::create_dir_all(dst.join("src")).unwrap();
         fs::write(src.join("hello.txt"), b"hello").unwrap();
+        fs::write(dst.join("src").join("extra.txt"), b"extra").unwrap();
 
         let mut cfg = AppConfig::default();
         cfg.app.data_db = db.clone();
@@ -4678,16 +4664,22 @@ mod tests {
             .find(|view| view.destination_id == "dst_1")
             .unwrap();
         assert_eq!(view.status, "green");
+        assert_eq!(
+            fs::read(dst.join("src").join("hello.txt")).unwrap(),
+            b"hello"
+        );
+        assert!(!dst.join("src").join("extra.txt").exists());
         let cycle_id = view.target_cycle_id.unwrap();
-        let needs_full_rescan: i64 = rusqlite::Connection::open(&db)
+        let (needs_full_rescan, manual_full_rescan): (i64, i64) = rusqlite::Connection::open(&db)
             .unwrap()
             .query_row(
-                "SELECT needs_full_rescan FROM sync_cycle WHERE id=?1",
+                "SELECT needs_full_rescan, manual_full_rescan FROM sync_cycle WHERE id=?1",
                 rusqlite::params![cycle_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(needs_full_rescan, 0);
+        assert_eq!(needs_full_rescan, 1);
+        assert_eq!(manual_full_rescan, 1);
 
         fs::remove_dir_all(temp).ok();
     }
