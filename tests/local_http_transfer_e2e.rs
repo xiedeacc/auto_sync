@@ -228,6 +228,7 @@ fn build_config(state_db: &Path, source_root: &Path, dest_parent: &Path, port: u
         machine_id: "local".to_string(),
         src: source_root.to_path_buf(),
         add_directory: true,
+        managed_by: String::new(),
         excludes: Vec::new(),
         enabled: true,
         mode: SyncMode::Mirror,

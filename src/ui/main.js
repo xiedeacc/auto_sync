@@ -1747,10 +1747,14 @@ function renderFolderMachineOptions() {
   const machines = machineStatus && machineStatus.machines && machineStatus.machines.length
     ? machineStatus.machines
     : normalizeMachines((cfg && cfg.machines) || []);
-  el.folderMachine.innerHTML = machines.map((machine) => `
+  const selectable = machines.filter((machine) => machine.online !== false);
+  el.folderMachine.innerHTML = selectable.map((machine) => `
     <option value="${escapeAttr(machine.id)}">${escapeHtml(machine.id === "local" ? "local" : machinePrimaryName(machine))}${machine.online === false ? " (offline)" : ""}</option>
   `).join("");
   if (folderPicker) {
+    if (!selectable.some((machine) => machineReferenceKey(machine.id) === machineReferenceKey(folderPicker.machineId))) {
+      folderPicker.machineId = selectable[0] ? selectable[0].id : "local";
+    }
     el.folderMachine.value = folderPicker.machineId || "local";
   }
 }

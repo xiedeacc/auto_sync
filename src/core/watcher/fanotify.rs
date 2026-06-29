@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
 
-use crate::core::config::{AppConfig, ScheduleMode, SourceGroupConfig};
+use crate::core::config::{AppConfig, ScheduleMode, SourceGroupConfig, machine_id_or_local};
 use crate::core::state::State;
 
 const FAN_CLOEXEC: u32 = 0x0000_0001;
@@ -144,6 +144,7 @@ pub fn spawn_source_watcher_thread(
 
 fn source_needs_fanotify(source: &SourceGroupConfig) -> bool {
     source.enabled
+        && machine_id_or_local(&source.machine_id) == "local"
         && source
             .destinations
             .iter()

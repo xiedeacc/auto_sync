@@ -62,7 +62,11 @@ pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     loop {
         let mut progressed = false;
         let mut blocked = false;
-        for source in cfg.source_groups.iter().filter(|s| s.enabled) {
+        for source in cfg
+            .source_groups
+            .iter()
+            .filter(|s| s.enabled && machine_id_or_local(&s.machine_id) == "local")
+        {
             let cycles = state.closed_cycles_for_source(&source.id)?;
             for cycle in cycles {
                 if state.source_has_target_cycle(&source.id, cycle.id)? {
@@ -4470,6 +4474,7 @@ mod tests {
         };
         let mut source = SourceGroupConfig {
             add_directory: false,
+            managed_by: String::new(),
             ..SourceGroupConfig::default()
         };
 
@@ -4821,6 +4826,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -4873,6 +4879,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -4948,6 +4955,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5033,6 +5041,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: false,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5077,6 +5086,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5144,6 +5154,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5233,6 +5244,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5305,6 +5317,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: vec![],
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5372,6 +5385,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: vec![PathBuf::from("skip.txt"), PathBuf::from("skip_dir")],
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5426,6 +5440,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: after_src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,
@@ -5447,6 +5462,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: before_src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,

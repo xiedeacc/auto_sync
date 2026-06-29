@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::core::config::{
-    AppConfig, MachineConfig, clean_config_for_save, load_config, load_or_create_config,
-    machine_matches_reference, save_config,
+    AppConfig, MachineConfig, SourceGroupConfig, clean_config_for_save, load_config,
+    load_or_create_config, machine_id_or_local, machine_matches_reference, save_config,
 };
 use crate::core::machines::{
     MachineHealth, MachineStatus, configure_tcp_connection_pool, discover_lan,
     encode_query_component, find_machine, local_health, machine_id_from_path, merge_discovered,
-    remote_get_json,
+    remote_get_json, remote_post_json,
 };
 use crate::core::progress::{
     ScanProgressView, TransferProgressView, configure_progress_file, current_scan_progress,
@@ -80,6 +80,27 @@ impl Backend {
         if let Some(current) = current.as_ref() {
             reset_changed_destination_offsets(&state_db, current, &next)?;
         }
+        self.propagate_remote_source_groups(current.as_ref(), &cfg)?;
+        self.clear_machine_cache();
+        Ok(cfg)
+    }
+
+    pub fn apply_delegated_source_groups(
+        &self,
+        req: DelegatedSourceGroupsRequest,
+    ) -> Result<AppConfig> {
+        let mut cfg = load_or_create_config(&self.config_path)?;
+        cfg.source_groups
+            .retain(|source| source.managed_by != req.controller_id);
+        for mut source in req.source_groups {
+            source.managed_by = req.controller_id.clone();
+            cfg.source_groups.push(source);
+        }
+        merge_delegated_machines(&mut cfg, &req.machines);
+        let cfg = save_config(&self.config_path, &cfg)?;
+        apply_runtime_config(&cfg);
+        let state_db = DbState::open(&cfg.app.data_db)?;
+        state_db.ensure_config(&cfg)?;
         self.clear_machine_cache();
         Ok(cfg)
     }
@@ -135,7 +156,8 @@ impl Backend {
         apply_runtime_config(&cfg);
         let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
-        state_db.destination_views(&cfg)
+        let local = state_db.destination_views(&cfg)?;
+        self.merge_remote_source_statuses(&cfg, local)
     }
 
     pub fn runtime_status(&self) -> RuntimeStatus {
@@ -149,19 +171,38 @@ impl Backend {
     pub fn sync_now(&self) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
+        for machine in remote_source_machines(&cfg) {
+            let _: Vec<DestinationView> = remote_post_json(
+                &machine,
+                "/api/sync-now",
+                &EmptyRequest {},
+                Duration::from_secs(30),
+            )?;
+        }
         let mut state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         sync_all_now(&cfg, &mut state_db)?;
-        state_db.destination_views(&cfg)
+        self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
     pub fn sync_source_now(&self, source_id: &str) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
+        if let Some(machine) = source_execution_machine(&cfg, source_id)? {
+            let _: Vec<DestinationView> = remote_post_json(
+                &machine,
+                "/api/sync-source-now",
+                &SyncSourceRequest {
+                    source_id: source_id.to_string(),
+                },
+                Duration::from_secs(30),
+            )?;
+            return self.status();
+        }
         let mut state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         sync_source_now(&cfg, &mut state_db, source_id)?;
-        state_db.destination_views(&cfg)
+        self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
     pub fn sync_destination_now(
@@ -172,10 +213,23 @@ impl Backend {
     ) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
+        if let Some(machine) = source_execution_machine(&cfg, source_id)? {
+            let _: Vec<DestinationView> = remote_post_json(
+                &machine,
+                "/api/sync-destination-now",
+                &SyncDestinationRequest {
+                    source_id: source_id.to_string(),
+                    destination_id: destination_id.to_string(),
+                    mode: Some(sync_request_mode_wire_value(mode).to_string()),
+                },
+                Duration::from_secs(30),
+            )?;
+            return self.status();
+        }
         let mut state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         sync_destination_now_with_mode(&cfg, &mut state_db, source_id, destination_id, mode)?;
-        state_db.destination_views(&cfg)
+        self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
     pub fn browse_paths(
@@ -251,6 +305,236 @@ impl Backend {
             .unwrap_or_else(|err| err.into_inner());
         cache.status = None;
         cache.refreshed_at = None;
+    }
+
+    fn propagate_remote_source_groups(
+        &self,
+        previous: Option<&AppConfig>,
+        cfg: &AppConfig,
+    ) -> Result<()> {
+        let controller_id = local_health(cfg, self.port).id;
+        let mut source_machines = Vec::<String>::new();
+        for source in previous
+            .into_iter()
+            .flat_map(|cfg| cfg.source_groups.iter())
+            .chain(cfg.source_groups.iter())
+        {
+            let machine_id = machine_id_or_local(&source.machine_id);
+            if machine_id != "local" && !source_machines.iter().any(|id| id == machine_id) {
+                source_machines.push(machine_id.to_string());
+            }
+        }
+
+        for source_machine_id in source_machines {
+            let machine = find_machine(cfg, &source_machine_id)
+                .or_else(|| {
+                    previous.and_then(|previous| find_machine(previous, &source_machine_id))
+                })
+                .ok_or_else(|| anyhow::anyhow!("unknown source machine: {source_machine_id}"))?;
+            let groups = delegated_groups_for_machine(cfg, &source_machine_id, &controller_id)?;
+            let req = DelegatedSourceGroupsRequest {
+                controller_id: controller_id.clone(),
+                machines: cfg.machines.clone(),
+                source_groups: groups,
+            };
+            let _: AppConfig = remote_post_json(
+                &machine,
+                "/api/config/delegated-source-groups",
+                &req,
+                Duration::from_secs(5),
+            )
+            .with_context(|| format!("failed to push source groups to {source_machine_id}"))?;
+        }
+        Ok(())
+    }
+
+    fn merge_remote_source_statuses(
+        &self,
+        cfg: &AppConfig,
+        local: Vec<DestinationView>,
+    ) -> Result<Vec<DestinationView>> {
+        let remote_source_ids: Vec<String> = cfg
+            .source_groups
+            .iter()
+            .filter(|source| machine_id_or_local(&source.machine_id) != "local")
+            .map(|source| source.id.clone())
+            .collect();
+        if remote_source_ids.is_empty() {
+            return Ok(local);
+        }
+
+        let mut views: Vec<DestinationView> = local
+            .into_iter()
+            .filter(|view| !remote_source_ids.iter().any(|id| id == &view.source_id))
+            .collect();
+        for source in cfg
+            .source_groups
+            .iter()
+            .filter(|source| machine_id_or_local(&source.machine_id) != "local")
+        {
+            let machine_id = machine_id_or_local(&source.machine_id);
+            let Some(machine) = find_machine(cfg, machine_id) else {
+                views.extend(offline_views_for_source(source, "unknown_source_machine"));
+                continue;
+            };
+            match remote_get_json::<Vec<DestinationView>>(
+                &machine,
+                "/api/status",
+                Duration::from_secs(3),
+            ) {
+                Ok(remote_views) => {
+                    let wanted: Vec<DestinationView> = remote_views
+                        .into_iter()
+                        .filter(|view| view.source_id == source.id)
+                        .collect();
+                    if wanted.is_empty() {
+                        views.extend(offline_views_for_source(source, "remote_status_missing"));
+                    } else {
+                        views.extend(wanted);
+                    }
+                }
+                Err(err) => {
+                    warn!(source = source.id, machine = machine_id, error = %err, "failed to fetch remote source status");
+                    views.extend(offline_views_for_source(source, "source_machine_offline"));
+                }
+            }
+        }
+        Ok(views)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegatedSourceGroupsRequest {
+    pub controller_id: String,
+    pub machines: Vec<MachineConfig>,
+    pub source_groups: Vec<crate::core::config::SourceGroupConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncSourceRequest {
+    source_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncDestinationRequest {
+    source_id: String,
+    destination_id: String,
+    mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EmptyRequest {}
+
+fn delegated_groups_for_machine(
+    cfg: &AppConfig,
+    source_machine_id: &str,
+    controller_id: &str,
+) -> Result<Vec<SourceGroupConfig>> {
+    let source_machine = find_machine(cfg, source_machine_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown source machine: {source_machine_id}"))?;
+    let mut groups = Vec::new();
+    for source in cfg
+        .source_groups
+        .iter()
+        .filter(|source| machine_id_or_local(&source.machine_id) == source_machine_id)
+    {
+        let mut delegated = source.clone();
+        delegated.machine_id = "local".to_string();
+        delegated.managed_by = controller_id.to_string();
+        for dst in &mut delegated.destinations {
+            let dst_machine_id = machine_id_or_local(&dst.machine_id);
+            if dst_machine_id == source_machine_id
+                || machine_matches_reference(&source_machine, &dst.machine_id)
+            {
+                dst.machine_id = "local".to_string();
+            }
+        }
+        groups.push(delegated);
+    }
+    Ok(groups)
+}
+
+fn source_execution_machine(cfg: &AppConfig, source_id: &str) -> Result<Option<MachineConfig>> {
+    let Some(source) = cfg
+        .source_groups
+        .iter()
+        .find(|source| source.id == source_id)
+    else {
+        return Ok(None);
+    };
+    let machine_id = machine_id_or_local(&source.machine_id);
+    if machine_id == "local" {
+        return Ok(None);
+    }
+    Ok(Some(find_machine(cfg, machine_id).ok_or_else(|| {
+        anyhow::anyhow!("unknown source machine: {machine_id}")
+    })?))
+}
+
+fn remote_source_machines(cfg: &AppConfig) -> Vec<MachineConfig> {
+    let mut machines = Vec::new();
+    for source in cfg
+        .source_groups
+        .iter()
+        .filter(|source| machine_id_or_local(&source.machine_id) != "local")
+    {
+        let machine_id = machine_id_or_local(&source.machine_id);
+        if machines
+            .iter()
+            .any(|machine: &MachineConfig| machine_matches_reference(machine, machine_id))
+        {
+            continue;
+        }
+        if let Some(machine) = find_machine(cfg, machine_id) {
+            machines.push(machine);
+        }
+    }
+    machines
+}
+
+fn offline_views_for_source(source: &SourceGroupConfig, reason: &str) -> Vec<DestinationView> {
+    source
+        .destinations
+        .iter()
+        .filter(|dst| dst.enabled)
+        .map(|dst| DestinationView {
+            source_id: source.id.clone(),
+            destination_id: dst.id.clone(),
+            path: dst.path.to_string_lossy().to_string(),
+            enabled: dst.enabled,
+            latest_closed_cycle_id: None,
+            target_cycle_id: None,
+            last_verified_cycle_id: None,
+            last_completed_cycle_id: None,
+            status: "red".to_string(),
+            status_reason: reason.to_string(),
+            updated_at: None,
+            issues: Vec::new(),
+        })
+        .collect()
+}
+
+fn merge_delegated_machines(cfg: &mut AppConfig, incoming: &[MachineConfig]) {
+    for machine in incoming.iter().filter(|machine| machine.id != "local") {
+        if let Some(existing) = cfg.machines.iter_mut().find(|existing| {
+            non_empty_machine_match(existing, &machine.id)
+                || non_empty_machine_match(existing, &machine.alias_name)
+                || non_empty_machine_match(existing, &machine.host)
+        }) {
+            if existing.id != "local" {
+                *existing = machine.clone();
+            }
+        } else {
+            cfg.machines.push(machine.clone());
+        }
+    }
+}
+
+fn sync_request_mode_wire_value(mode: SyncRequestMode) -> &'static str {
+    match mode {
+        SyncRequestMode::Incremental => "incremental",
+        SyncRequestMode::Full => "full",
+        SyncRequestMode::ChangedSince => "changed_since",
     }
 }
 
@@ -481,6 +765,51 @@ mod tests {
     }
 
     #[test]
+    fn delegated_groups_execute_on_source_machine_as_local() {
+        let mut cfg = AppConfig::default();
+        cfg.machines.push(MachineConfig {
+            id: "nas".to_string(),
+            alias_name: "nas".to_string(),
+            name: "nas".to_string(),
+            host: "192.0.2.20".to_string(),
+            port: 18765,
+            ssh_user: "root".to_string(),
+            ssh_port: 10022,
+            os: "linux".to_string(),
+            install_dir: PathBuf::from("/opt/auto_sync"),
+            enabled: true,
+            manual: true,
+        });
+        cfg.source_groups
+            .push(crate::core::config::SourceGroupConfig {
+                id: "src_nas".to_string(),
+                machine_id: "nas".to_string(),
+                src: PathBuf::from("/zfs"),
+                add_directory: false,
+                managed_by: String::new(),
+                excludes: Vec::new(),
+                enabled: true,
+                mode: crate::core::config::SyncMode::Mirror,
+                snapshot: crate::core::config::SnapshotConfig::default(),
+                destinations: vec![crate::core::config::DestinationConfig {
+                    id: "dst_nas".to_string(),
+                    machine_id: "nas".to_string(),
+                    path: PathBuf::from("/zfs_pool"),
+                    enabled: true,
+                    schedule: crate::core::config::ScheduleConfig::default(),
+                    sync: None,
+                }],
+            });
+
+        let groups = delegated_groups_for_machine(&cfg, "nas", "controller-1").unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].machine_id, "local");
+        assert_eq!(groups[0].managed_by, "controller-1");
+        assert_eq!(groups[0].destinations[0].machine_id, "local");
+    }
+
+    #[test]
     fn rejects_source_path_change_after_destination_exists() {
         let temp = temp_dir("backend_locked_source_path");
         let config_path = temp.join("auto_sync.toml");
@@ -495,6 +824,7 @@ mod tests {
                 machine_id: "local".to_string(),
                 src: temp.join("src"),
                 add_directory: true,
+                managed_by: String::new(),
                 excludes: Vec::new(),
                 enabled: true,
                 mode: crate::core::config::SyncMode::Mirror,
@@ -530,6 +860,7 @@ mod tests {
                 machine_id: "local".to_string(),
                 src: temp.join("src"),
                 add_directory: true,
+                managed_by: String::new(),
                 excludes: Vec::new(),
                 enabled: true,
                 mode: crate::core::config::SyncMode::Mirror,

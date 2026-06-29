@@ -199,6 +199,7 @@ install_dir = "/opt/auto_sync"
 - 每个 `source_groups.id` 和 `destinations.id` 必须稳定，作为 offset 和状态表的外键。
 - `dst` 可以离线；离线不删除状态，只标记红点并在下一次在线时从落后周期补齐。
 - 每个 `dst` 独立配置 `schedule`。`schedule.mode = "realtime"` 表示 fanotify 触发近实时同步，同时由 source snapshot backend 定期 reconcile。
+- 如果 source 选择的是远程机器，控制机保存配置后会把该 source group 下发到 source 所在机器，并由 source 机器的 daemon 真正执行。下发后的 group 会把该 source 机器自身重写为 `local`，同机 destination 也重写为 `local`；控制机只保留完整配置用于 UI，并通过网络读取执行机器的最新状态。
 - `schedule` 是用户可见的触发策略；`cycle` 是后端生成的 source 版本点，两者不能混用命名。
 - ZFS snapshot 是 dataset 级别，不是任意目录级别。若 `src` 是 dataset 的子目录，配置需要记录 `dataset` 和 `path_in_dataset`。
 - 路径类型规则：`src` 可以是文件或目录；`dst` 可以是目录，且当 `src` 是文件并且 `dst` 路径已经存在为文件时，允许 `src file -> dst file`。如果 `src` 是文件而 `dst` 路径不存在，则按 `src file -> dst dir` 处理；不支持 `src dir -> dst file`。

@@ -173,6 +173,7 @@ mod tests {
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: true,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,

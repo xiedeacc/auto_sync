@@ -39,7 +39,7 @@ pub struct SnapshotEntry {
     pub hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DestinationView {
     pub source_id: String,
     pub destination_id: String,
@@ -55,7 +55,7 @@ pub struct DestinationView {
     pub issues: Vec<DestinationIssueView>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DestinationIssueView {
     pub cycle_id: Option<i64>,
     pub rel_path: String,
@@ -1229,6 +1229,7 @@ mod tests {
             machine_id: "local".to_string(),
             src,
             add_directory: true,
+            managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
             mode: SyncMode::Mirror,

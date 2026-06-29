@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use tracing::info;
 
-use crate::core::backend::{Backend, BrowseResponse, RuntimeStatus};
+use crate::core::backend::{Backend, BrowseResponse, DelegatedSourceGroupsRequest, RuntimeStatus};
 use crate::core::config::{AppConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
 use crate::core::state::{DestinationView, SnapshotEntry};
@@ -37,6 +37,10 @@ pub fn router(backend: Backend) -> Router {
         .route("/main.js", get(main_js))
         .route("/styles.css", get(styles_css))
         .route("/api/config", get(api_get_config).post(api_save_config))
+        .route(
+            "/api/config/delegated-source-groups",
+            post(api_delegated_source_groups),
+        )
         .route("/api/health", get(api_health))
         .route("/api/machines", get(api_machines).post(api_add_machine))
         .route("/api/machines/:machine_id", delete(api_remove_machine))
@@ -132,6 +136,13 @@ async fn api_save_config(
     Json(cfg): Json<AppConfig>,
 ) -> Result<Json<AppConfig>, ApiError> {
     Ok(Json(backend.save_config(&cfg)?))
+}
+
+async fn api_delegated_source_groups(
+    AxumState(backend): AxumState<Backend>,
+    Json(req): Json<DelegatedSourceGroupsRequest>,
+) -> Result<Json<AppConfig>, ApiError> {
+    Ok(Json(backend.apply_delegated_source_groups(req)?))
 }
 
 async fn api_health(
