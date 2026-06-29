@@ -172,11 +172,14 @@ function Initialize-Config {
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TargetConfig) | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path (Split-Path -Parent $TargetConfig) "state") | Out-Null
+    if (Test-Path -LiteralPath $TargetConfig) {
+        return "preserved-existing"
+    }
     if (-not (Test-Path -LiteralPath $SourceConfig)) {
-        throw "Missing config template: $SourceConfig"
+        throw "Missing config template for initial install: $SourceConfig"
     }
     Copy-Item -LiteralPath $SourceConfig -Destination $TargetConfig -Force
-    "copied-from-source"
+    "initialized-from-template"
 }
 
 function Install-WindowsRuntime {

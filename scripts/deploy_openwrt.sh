@@ -145,10 +145,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ! -f "$CONFIG" ]]; then
-  echo "Config file not found: $CONFIG" >&2
-  exit 1
-fi
 if [[ ! -f "$PROCD_INIT" ]]; then
   echo "procd init template not found: $PROCD_INIT" >&2
   exit 1
@@ -188,8 +184,16 @@ for binary in auto_sync auto_syncctl; do
   scp -O -P "$PORT" "$BINARY_DIR/$binary" "${target}:${INSTALL_DIR}/bin/${binary}"
 done
 
-scp -O -P "$PORT" "$CONFIG" "${target}:${INSTALL_DIR}/conf/auto_sync.toml"
-echo "Installed OpenWrt config $INSTALL_DIR/conf/auto_sync.toml from $CONFIG"
+if ssh -p "$PORT" "$target" "test -f '${INSTALL_DIR}/conf/auto_sync.toml'"; then
+  echo "Preserved existing OpenWrt config $INSTALL_DIR/conf/auto_sync.toml"
+else
+  if [[ ! -f "$CONFIG" ]]; then
+    echo "Config file not found for initial install: $CONFIG" >&2
+    exit 1
+  fi
+  scp -O -P "$PORT" "$CONFIG" "${target}:${INSTALL_DIR}/conf/auto_sync.toml"
+  echo "Initialized OpenWrt config $INSTALL_DIR/conf/auto_sync.toml from $CONFIG"
+fi
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT

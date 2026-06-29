@@ -53,8 +53,54 @@ pub fn sync_gate() -> &'static Mutex<()> {
     SYNC_GATE.get_or_init(|| Mutex::new(()))
 }
 
+pub fn sync_is_running() -> bool {
+    sync_gate().try_lock().is_err()
+}
+
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     let _serialized = sync_gate().lock().unwrap_or_else(|err| err.into_inner());
+    sync_all_pending_inner(cfg, state)
+}
+
+pub fn try_sync_all_now(cfg: &AppConfig, state: &mut State) -> Result<()> {
+    let _serialized = sync_gate()
+        .try_lock()
+        .map_err(|_| anyhow!("sync already in progress"))?;
+    state.force_target_all_destinations(cfg)?;
+    sync_all_pending_inner(cfg, state)
+}
+
+pub fn try_sync_source_now(cfg: &AppConfig, state: &mut State, source_id: &str) -> Result<()> {
+    let _serialized = sync_gate()
+        .try_lock()
+        .map_err(|_| anyhow!("sync already in progress"))?;
+    state.force_target_source(cfg, source_id)?;
+    sync_all_pending_inner(cfg, state)
+}
+
+pub fn try_sync_destination_now_with_mode(
+    cfg: &AppConfig,
+    state: &mut State,
+    source_id: &str,
+    destination_id: &str,
+    mode: SyncRequestMode,
+) -> Result<()> {
+    let _serialized = sync_gate()
+        .try_lock()
+        .map_err(|_| anyhow!("sync already in progress"))?;
+    if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
+        match mode {
+            SyncRequestMode::Incremental => {}
+            SyncRequestMode::Full => state.mark_cycle_manual_full_rescan(cycle.id)?,
+            SyncRequestMode::ChangedSince => {
+                state.mark_cycle_manual_changed_since_rescan(cycle.id)?
+            }
+        }
+    }
+    sync_all_pending_inner(cfg, state)
+}
+
+fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
     configure_fsync(cfg.app.sync.fsync);
     progress::configure_progress_file(&cfg.app.data_db);

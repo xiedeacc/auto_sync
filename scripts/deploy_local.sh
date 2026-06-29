@@ -32,11 +32,6 @@ if [[ -z "$CONFIG" ]]; then
   CONFIG="conf/auto_sync.linux.toml"
 fi
 
-if [[ ! -f "$CONFIG" ]]; then
-  echo "Config file not found: $CONFIG" >&2
-  exit 1
-fi
-
 if ! command -v systemctl >/dev/null 2>&1; then
   echo "systemctl is required for Linux local deployment" >&2
   exit 1
@@ -154,8 +149,16 @@ install -m 0755 target/release/auto_syncctl bin/auto_syncctl
 install_if_different 0755 bin/auto_sync "$INSTALL_DIR/bin/auto_sync"
 install_if_different 0755 bin/auto_syncctl "$INSTALL_DIR/bin/auto_syncctl"
 
-"${SUDO[@]}" install -m 0644 "$CONFIG" "$INSTALL_DIR/conf/auto_sync.toml"
-echo "Installed local config $INSTALL_DIR/conf/auto_sync.toml from $CONFIG"
+if "${SUDO[@]}" test -f "$INSTALL_DIR/conf/auto_sync.toml"; then
+  echo "Preserved existing local config $INSTALL_DIR/conf/auto_sync.toml"
+else
+  if [[ ! -f "$CONFIG" ]]; then
+    echo "Config file not found for initial install: $CONFIG" >&2
+    exit 1
+  fi
+  "${SUDO[@]}" install -m 0644 "$CONFIG" "$INSTALL_DIR/conf/auto_sync.toml"
+  echo "Initialized local config $INSTALL_DIR/conf/auto_sync.toml from $CONFIG"
+fi
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT

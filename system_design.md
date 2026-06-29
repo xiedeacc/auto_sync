@@ -199,7 +199,7 @@ install_dir = "/opt/auto_sync"
 - 每个 `source_groups.id` 和 `destinations.id` 必须稳定，作为 offset 和状态表的外键。
 - `dst` 可以离线；离线不删除状态，只标记红点并在下一次在线时从落后周期补齐。
 - 每个 `dst` 独立配置 `schedule`。`schedule.mode = "realtime"` 表示 fanotify 触发近实时同步，同时由 source snapshot backend 定期 reconcile。
-- 如果 source 选择的是远程机器，控制机保存配置后会把该 source group 下发到 source 所在机器，并由 source 机器的 daemon 真正执行。下发后的 group 会把该 source 机器自身重写为 `local`，同机 destination 也重写为 `local`；控制机只保留完整配置用于 UI，并通过网络读取执行机器的最新状态。
+- 如果 source 选择的是远程机器，控制机保存配置后会把该 source group 下发到 source 所在机器，并由 source 机器的 daemon 真正执行。下发后的 group 会把该 source 机器自身重写为 `local`，同机 destination 也重写为 `local`；远端会把该 delegated group 持久化到自己的 `conf/auto_sync.toml`，并用 `managed_by` 标记控制机；控制机只保留完整配置用于 UI，并通过网络读取执行机器的最新状态。手动触发远程 sync 前，控制机会先查询远端 `/api/runtime-status`，若远端已有 sync 占用则拒绝新请求，行为与本机 sync gate 一致。
 - `schedule` 是用户可见的触发策略；`cycle` 是后端生成的 source 版本点，两者不能混用命名。
 - ZFS snapshot 是 dataset 级别，不是任意目录级别。若 `src` 是 dataset 的子目录，配置需要记录 `dataset` 和 `path_in_dataset`。
 - 路径类型规则：`src` 可以是文件或目录；`dst` 可以是目录，且当 `src` 是文件并且 `dst` 路径已经存在为文件时，允许 `src file -> dst file`。如果 `src` 是文件而 `dst` 路径不存在，则按 `src file -> dst dir` 处理；不支持 `src dir -> dst file`。
@@ -563,7 +563,7 @@ source=photos dst=nas_backup online=false target_cycle=40 verified_cycle=39 stat
 
 - 构建 Rust/Tauri 产物。
 - 复制二进制到 `bin/`。
-- 初始化 `conf/auto_sync.toml` 和 `conf/state/`。
+- 初始化或保留 `conf/auto_sync.toml`，并初始化 `conf/state/`。
 - 初始化 `logs/`。
 - Ubuntu/NAS 后台模式安装 systemd unit；OpenWrt 安装 procd init。
 - Linux 机器（tiger Linux、NAS、OpenWrt）共用 `conf/auto_sync.linux.toml` 作为部署配置模板。
@@ -589,16 +589,16 @@ ssh -p 10022 root@192.168.3.178
 
 1. 通过 SSH 执行 `uname -m`、`uname -s`，检测架构和 init 系统（systemd 或 OpenWrt procd）。
 2. 根据架构选择、交叉编译，或在目标 Linux 机器本机编译二进制。
-3. 上传 `bin/auto_sync`、`bin/auto_syncctl`、`conf/auto_sync.linux.toml`，并按 init 系统安装 systemd unit 或 `conf/auto_sync.procd`。
+3. 上传 `bin/auto_sync`、`bin/auto_syncctl`，并按 init 系统安装 systemd unit 或 `conf/auto_sync.procd`；仅在目标 `conf/auto_sync.toml` 不存在时用 `conf/auto_sync.linux.toml` 初始化。
 4. 执行权限设置：`chmod +x /opt/auto_sync/bin/*`。
 5. 如果支持 systemd，安装并启动 `auto_sync.service`；如果是 OpenWrt，安装并启动 `/etc/init.d/auto_sync`。
 6. 通过 `auto_syncctl status` 验证状态。
 
 配置部署原则：
 
-- Linux 部署把 `conf/auto_sync.linux.toml` 安装为 `/opt/auto_sync/conf/auto_sync.toml`。
+- Linux/OpenWrt 部署必须保留已有 `conf/auto_sync.toml`；只有目标配置不存在时，才用 `conf/auto_sync.linux.toml` 初始化。
 - OpenWrt 部署把 `conf/auto_sync.procd` 渲染为 `/etc/init.d/auto_sync`。
-- 覆盖配置必须使用显式参数，例如 `--overwrite-config`，并先保存时间戳备份。
+- 部署脚本不提供默认覆盖配置行为；如果未来要支持覆盖配置，必须使用显式参数，例如 `--overwrite-config`，并先保存时间戳备份。
 
 systemd unit 初稿：
 

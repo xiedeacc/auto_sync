@@ -22,7 +22,8 @@ use crate::core::progress::{
 };
 use crate::core::state::{DestinationView, State as DbState};
 use crate::core::sync::{
-    SyncRequestMode, sync_all_now, sync_destination_now_with_mode, sync_source_now,
+    SyncRequestMode, sync_is_running, try_sync_all_now, try_sync_destination_now_with_mode,
+    try_sync_source_now,
 };
 
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -162,6 +163,7 @@ impl Backend {
 
     pub fn runtime_status(&self) -> RuntimeStatus {
         RuntimeStatus {
+            syncing: sync_is_running(),
             transfer: current_transfer_progress(),
             scan: current_scan_progress(),
             build: BuildInfo::current(),
@@ -171,7 +173,12 @@ impl Backend {
     pub fn sync_now(&self) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
-        for machine in remote_source_machines(&cfg) {
+        ensure_local_not_syncing()?;
+        let remote_machines = remote_source_machines(&cfg);
+        for machine in &remote_machines {
+            ensure_remote_machine_not_syncing(&machine)?;
+        }
+        for machine in remote_machines {
             let _: Vec<DestinationView> = remote_post_json(
                 &machine,
                 "/api/sync-now",
@@ -181,7 +188,7 @@ impl Backend {
         }
         let mut state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
-        sync_all_now(&cfg, &mut state_db)?;
+        try_sync_all_now(&cfg, &mut state_db)?;
         self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
@@ -189,6 +196,7 @@ impl Backend {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
         if let Some(machine) = source_execution_machine(&cfg, source_id)? {
+            ensure_remote_machine_not_syncing(&machine)?;
             let _: Vec<DestinationView> = remote_post_json(
                 &machine,
                 "/api/sync-source-now",
@@ -201,7 +209,7 @@ impl Backend {
         }
         let mut state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
-        sync_source_now(&cfg, &mut state_db, source_id)?;
+        try_sync_source_now(&cfg, &mut state_db, source_id)?;
         self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
@@ -214,6 +222,7 @@ impl Backend {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
         if let Some(machine) = source_execution_machine(&cfg, source_id)? {
+            ensure_remote_machine_not_syncing(&machine)?;
             let _: Vec<DestinationView> = remote_post_json(
                 &machine,
                 "/api/sync-destination-now",
@@ -228,7 +237,7 @@ impl Backend {
         }
         let mut state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
-        sync_destination_now_with_mode(&cfg, &mut state_db, source_id, destination_id, mode)?;
+        try_sync_destination_now_with_mode(&cfg, &mut state_db, source_id, destination_id, mode)?;
         self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
@@ -538,14 +547,52 @@ fn sync_request_mode_wire_value(mode: SyncRequestMode) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+fn ensure_remote_machine_not_syncing(machine: &MachineConfig) -> Result<()> {
+    let status: RuntimeStatus =
+        remote_get_json(machine, "/api/runtime-status", Duration::from_secs(3)).with_context(
+            || {
+                format!(
+                    "failed to query sync status from {}",
+                    machine_label(machine)
+                )
+            },
+        )?;
+    if status.syncing {
+        anyhow::bail!("sync already in progress on {}", machine_label(machine));
+    }
+    Ok(())
+}
+
+fn ensure_local_not_syncing() -> Result<()> {
+    if sync_is_running() {
+        anyhow::bail!("sync already in progress");
+    }
+    Ok(())
+}
+
+fn machine_label(machine: &MachineConfig) -> String {
+    if !machine.alias_name.trim().is_empty() {
+        return machine.alias_name.trim().to_string();
+    }
+    if !machine.name.trim().is_empty() {
+        return machine.name.trim().to_string();
+    }
+    if !machine.host.trim().is_empty() {
+        return machine.host.trim().to_string();
+    }
+    machine.id.clone()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatus {
+    #[serde(default)]
+    pub syncing: bool,
     pub transfer: Option<TransferProgressView>,
     pub scan: Option<ScanProgressView>,
     pub build: BuildInfo,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildInfo {
     pub commit: String,
     pub commit_time_beijing: String,
@@ -807,6 +854,55 @@ mod tests {
         assert_eq!(groups[0].machine_id, "local");
         assert_eq!(groups[0].managed_by, "controller-1");
         assert_eq!(groups[0].destinations[0].machine_id, "local");
+    }
+
+    #[test]
+    fn delegated_groups_are_saved_to_remote_config() {
+        let temp = temp_dir("backend_delegated_persist");
+        let config_path = temp.join("auto_sync.toml");
+        let mut initial = AppConfig::default();
+        initial.app.data_db = temp.join("state").join("auto_sync.sqlite");
+        initial.app.log_dir = temp.join("logs");
+        crate::core::config::save_config(&config_path, &initial).unwrap();
+
+        let backend = Backend::new(config_path.clone(), 18765);
+        let delegated = crate::core::config::SourceGroupConfig {
+            id: "src_from_controller".to_string(),
+            machine_id: "local".to_string(),
+            src: PathBuf::from("/zfs"),
+            add_directory: false,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: crate::core::config::SyncMode::Mirror,
+            snapshot: crate::core::config::SnapshotConfig::default(),
+            destinations: vec![crate::core::config::DestinationConfig {
+                id: "dst_local".to_string(),
+                machine_id: "local".to_string(),
+                path: PathBuf::from("/zfs_pool"),
+                enabled: true,
+                schedule: crate::core::config::ScheduleConfig::default(),
+                sync: None,
+            }],
+        };
+
+        backend
+            .apply_delegated_source_groups(DelegatedSourceGroupsRequest {
+                controller_id: "controller-1".to_string(),
+                machines: Vec::new(),
+                source_groups: vec![delegated],
+            })
+            .unwrap();
+
+        let saved = crate::core::config::load_config(&config_path).unwrap();
+        let source = saved
+            .source_groups
+            .iter()
+            .find(|source| source.id == "src_from_controller")
+            .unwrap();
+        assert_eq!(source.managed_by, "controller-1");
+        assert_eq!(source.machine_id, "local");
+        assert_eq!(source.src, PathBuf::from("/zfs"));
     }
 
     #[test]
