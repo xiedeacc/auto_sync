@@ -10,6 +10,11 @@ INSTALL_DIR="${INSTALL_DIR:-/usr/local/auto_sync}"
 
 detect_deploy_profile() {
   local name lower ips
+  ips="$(hostname -I 2>/dev/null || true)"
+  if [[ " $ips " == *" 192.168.2.247 "* ]]; then
+    printf '%s\n' "nas"
+    return
+  fi
   name="$(hostname 2>/dev/null || true)"
   lower="${name,,}"
   if [[ "$lower" == *tiger* ]]; then
@@ -17,11 +22,6 @@ detect_deploy_profile() {
     return
   fi
   if [[ "$lower" == *nas* ]]; then
-    printf '%s\n' "nas"
-    return
-  fi
-  ips="$(hostname -I 2>/dev/null || true)"
-  if [[ " $ips " == *" 192.168.2.247 "* ]]; then
     printf '%s\n' "nas"
     return
   fi
