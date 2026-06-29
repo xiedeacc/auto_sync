@@ -1715,10 +1715,6 @@ function renderDestinationLogModal() {
     rows.push(["File", transfer.rel_path || "-"]);
     rows.push(["Speed", formatBytesPerSecond(transfer.bytes_per_sec || 0)]);
     rows.push(["Progress", formatTransferProgress(transfer) || "-"]);
-    rows.push(["Synced Size", formatTransferSyncedBytes(transfer)]);
-    rows.push(["Files", formatTransferCount(transfer.completed_files, transfer.total_files)]);
-    rows.push(["Folders", formatTransferCount(transfer.completed_dirs, transfer.total_dirs)]);
-    rows.push(["Total Size", formatBytes(transfer.total_bytes || 0)]);
   } else if (scan) {
     rows.push(["Scanning", scan.current_path || scan.root_path || "-"]);
     rows.push(["Entries", String(Number(scan.entries_seen || 0))]);
@@ -2300,14 +2296,6 @@ function formatTransferProgress(transfer) {
   const transferred = Number(transfer.transferred_bytes || 0);
   const percent = Math.min(100, Math.max(0, (transferred / total) * 100));
   return `${formatBytes(transferred)} / ${formatBytes(total)} (${percent.toFixed(0)}%)`;
-}
-
-function formatTransferSyncedBytes(transfer) {
-  return `${formatBytes(transfer.transferred_bytes || 0)} / ${formatBytes(transfer.total_bytes || 0)}`;
-}
-
-function formatTransferCount(completed, total) {
-  return `${Number(completed || 0)} / ${Number(total || 0)}`;
 }
 
 function formatBytesPerSecond(value) {
