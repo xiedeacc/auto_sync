@@ -16,8 +16,8 @@ use chrono::Utc;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED,
-    ERROR_JOURNAL_NOT_ACTIVE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_JOURNAL_DELETE_IN_PROGRESS,
+    ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
@@ -47,6 +47,25 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const USN_BUFFER_SIZE: usize = 1024 * 1024;
 const DIRECTORY_CHANGE_BUFFER_SIZE: usize = 256 * 1024;
 const FILE_NOTIFY_INFORMATION_HEADER_SIZE: usize = 12;
+
+pub fn first_local_realtime_usn_access_denied(cfg: &AppConfig) -> Option<String> {
+    for source in cfg
+        .source_groups
+        .iter()
+        .filter(|source| source_needs_usn(source))
+    {
+        if let Err(err) = check_source_usn_access(source) {
+            if error_has_raw_os_error(&err, ERROR_ACCESS_DENIED as i32) {
+                return Some(format!(
+                    "source {} requires elevated access to query the USN Journal: {}",
+                    source.id,
+                    format_error_chain(&err)
+                ));
+            }
+        }
+    }
+    None
+}
 
 pub fn spawn_source_watcher_thread(
     cfg: AppConfig,
@@ -95,6 +114,17 @@ fn source_needs_usn(source: &SourceGroupConfig) -> bool {
             .destinations
             .iter()
             .any(|dst| dst.enabled && dst.schedule.mode == ScheduleMode::Realtime)
+}
+
+fn check_source_usn_access(source: &SourceGroupConfig) -> Result<()> {
+    let root = source
+        .src
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize source {}", source.src.display()))?;
+    let volume = volume_from_path(&root)?;
+    let volume = VolumeHandle::open(&volume)?;
+    query_usn_journal(volume.raw())?;
+    Ok(())
 }
 
 fn run_resilient_source_watcher(
@@ -593,14 +623,7 @@ impl VolumeHandle {
         let path = format!(r"\\.\{volume}");
         let volume_path = OsStr::new(&path);
         let handle = create_file(volume_path, FILE_GENERIC_READ, 0)
-            .or_else(|generic_err| {
-                create_file(volume_path, FILE_READ_ATTRIBUTES, 0).with_context(|| {
-                    format!(
-                        "failed to open volume {path}; FILE_GENERIC_READ failed first: {generic_err:#}"
-                    )
-                })
-            })
-            .with_context(|| format!("failed to open volume {path}"))?;
+            .with_context(|| format!("failed to open volume {path} for USN Journal access"))?;
         Ok(Self(handle))
     }
 
@@ -877,6 +900,15 @@ fn format_error_chain(err: &anyhow::Error) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ")
+}
+
+fn error_has_raw_os_error(err: &anyhow::Error, code: i32) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+            == Some(code)
+    })
 }
 
 #[cfg(test)]

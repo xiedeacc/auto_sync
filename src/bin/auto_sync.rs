@@ -24,6 +24,15 @@ use auto_sync::core::web_api;
 use clap::Parser;
 use tracing::{error, info, warn};
 
+#[cfg(windows)]
+use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
 #[cfg(feature = "gui")]
 use auto_sync::core::backend::{BrowseResponse, RuntimeStatus};
 #[cfg(feature = "gui")]
@@ -44,6 +53,10 @@ struct Args {
     /// Run web-only, never opening the desktop window even on a GUI build.
     #[arg(long)]
     no_gui: bool,
+    /// Internal guard to avoid repeated UAC relaunch attempts.
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    elevation_attempted: bool,
 }
 
 fn main() -> Result<()> {
@@ -51,6 +64,10 @@ fn main() -> Result<()> {
     let cfg = load_or_create_config(&args.config)?;
     let _log_guard = init_logging(&cfg.app.log_dir, "auto_sync")?;
     info!(config = %args.config.display(), "auto_sync starting");
+    #[cfg(windows)]
+    if maybe_relaunch_elevated_for_usn(&args, &cfg)? {
+        return Ok(());
+    }
 
     // Apply receiver-side policy up front so the web server (the destination of
     // pushes) honours it even though it never runs the scheduler loop.
@@ -97,6 +114,118 @@ fn main() -> Result<()> {
     let _ = scheduler.join();
     info!("auto_sync stopped");
     Ok(())
+}
+
+#[cfg(windows)]
+fn maybe_relaunch_elevated_for_usn(args: &Args, cfg: &AppConfig) -> Result<bool> {
+    if args.elevation_attempted || unsafe { IsUserAnAdmin() } != 0 {
+        return Ok(false);
+    }
+    let Some(reason) =
+        auto_sync::core::watcher::windows_usn::first_local_realtime_usn_access_denied(cfg)
+    else {
+        return Ok(false);
+    };
+    warn!(
+        reason,
+        "USN Journal access requires elevation; relaunching with UAC"
+    );
+
+    let exe = std::env::current_exe().context("failed to locate current executable")?;
+    let working_dir = std::env::current_dir().context("failed to locate current directory")?;
+    let config = args
+        .config
+        .canonicalize()
+        .unwrap_or_else(|_| args.config.clone());
+    let mut relaunch_args = vec![
+        OsString::from("--config"),
+        config.into_os_string(),
+        OsString::from("--elevation-attempted"),
+    ];
+    if args.no_gui {
+        relaunch_args.push(OsString::from("--no-gui"));
+    }
+    let parameters = join_windows_command_line(&relaunch_args);
+    let operation = wide_null(OsStr::new("runas"));
+    let file = wide_null(exe.as_os_str());
+    let params = wide_null(OsStr::new(&parameters));
+    let dir = wide_null(working_dir.as_os_str());
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            dir.as_ptr(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result <= 32 {
+        warn!(
+            shell_execute_result = result,
+            "failed to relaunch auto_sync elevated; continuing without USN"
+        );
+        return Ok(false);
+    }
+    info!("elevated auto_sync relaunch requested; exiting non-elevated process");
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn join_windows_command_line(args: &[OsString]) -> String {
+    args.iter()
+        .map(|arg| quote_windows_arg(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0_usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+#[cfg(windows)]
+fn wide_null(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn quotes_windows_relaunch_arguments() {
+        assert_eq!(
+            quote_windows_arg(r#"C:\sync root\conf.toml"#),
+            r#""C:\sync root\conf.toml""#
+        );
+        assert_eq!(
+            quote_windows_arg(r#"C:\path\"quote".toml"#),
+            r#""C:\path\\\"quote\".toml""#
+        );
+    }
 }
 
 /// Run the web server, and the desktop window when one is available.

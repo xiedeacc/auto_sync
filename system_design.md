@@ -482,6 +482,7 @@ Realtime 快速同步语义：
 
 - fanotify 触发的 realtime 快速同步可以直接更新正式 dst，以提供接近实时的体验。
 - Windows realtime 优先使用 USN Journal；如果当前进程权限或环境无法查询 USN Journal，则降级到 `ReadDirectoryChangesW` 递归目录 watcher，仍然按相对路径写入 `event_log` 触发增量同步。
+- Windows 启动时会先探测本机 realtime source 的 USN Journal 权限。如果 volume 需要 `FILE_GENERIC_READ` 但当前进程返回 `Access denied`，`auto_sync` 会用 `runas` 重新拉起同一配置的 elevated 进程，并退出当前非 elevated 进程；用户需要在 UAC 中确认。若 elevated 启动失败，继续使用 `ReadDirectoryChangesW` fallback。
 - realtime 快速同步完成只能说明“事件提示队列已处理”，不能证明 dst 与最新 snapshot 完全一致。
 - 只有 snapshot/diff reconcile 完成并校验通过后，才能推进 `last_verified_cycle_id` 并显示绿点。
 - 如果 realtime 写入与后续 snapshot diff 结果冲突，以 snapshot diff/reconcile 为准修正 dst。
