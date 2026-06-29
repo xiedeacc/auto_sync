@@ -33,6 +33,7 @@ const FAN_DELETE: u64 = 0x0000_0200;
 const FAN_DELETE_SELF: u64 = 0x0000_0400;
 const FAN_MOVE_SELF: u64 = 0x0000_0800;
 const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
+const FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
 const FAN_NOFD: i32 = -1;
 const FANOTIFY_METADATA_VERSION: u8 = 3;
 
@@ -131,14 +132,11 @@ fn run_fanotify_loop(cfg: AppConfig, db_path: PathBuf, shutdown: Arc<AtomicBool>
 
     let fd = fanotify_init()?;
     let _guard = FdGuard(fd);
-    let mask = FAN_MODIFY
-        | FAN_CLOSE_WRITE
-        | FAN_CREATE
-        | FAN_DELETE
-        | FAN_MOVED_FROM
-        | FAN_MOVED_TO
-        | FAN_DELETE_SELF
-        | FAN_MOVE_SELF;
+    // Traditional fd-based fanotify reliably reports write/close events with a
+    // path. Directory entry events such as create/delete/move require newer
+    // FID/name reporting modes on some kernels/filesystems; requesting them in
+    // this mode can make fanotify_mark fail with EINVAL.
+    let mask = FAN_MODIFY | FAN_CLOSE_WRITE;
 
     for source in &sources {
         mark_source(fd, source, mask)
@@ -218,7 +216,7 @@ fn mark_source(fd: RawFd, source: &SourceRoot, mask: u64) -> Result<()> {
         error = %mount_err,
         "fanotify mount mark failed; trying recursive directory marks"
     );
-    mark_directory_tree(fd, root, mask)
+    mark_directory_tree(fd, root, mask | FAN_EVENT_ON_CHILD)
 }
 
 fn try_mark(fd: RawFd, root: &Path, flags: u32, mask: u64) -> Result<()> {
