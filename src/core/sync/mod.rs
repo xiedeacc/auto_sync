@@ -1422,6 +1422,31 @@ pub fn sync_cycle_for_source(
         }
     }
 
+    // A reconcile reached here because of a possible-event-loss signal (overflow,
+    // USN/journal gap, startup gap) rather than a user action. Mark the affected
+    // destinations red and identify the reason while the reconcile runs; each one
+    // returns to green only after its full re-scan verifies.
+    let is_event_loss_reconcile = cycle.needs_full_rescan
+        && !cycle.manual_full_rescan
+        && !cycle.manual_changed_since_rescan;
+    if is_event_loss_reconcile {
+        warn!(
+            source = source.id,
+            cycle_id = cycle.id,
+            "possible event loss detected; running reconcile to repair destinations"
+        );
+        for &dst_index in &ready_indexes {
+            let dst = &source.destinations[dst_index];
+            state.upsert_destination_status(
+                &source.id,
+                &dst.id,
+                None,
+                "red",
+                "event_loss_reconcile",
+            )?;
+        }
+    }
+
     let source_view = SourceReadView::prepare(source, &live_source_endpoint, cycle.id)?;
     let source_endpoint = source_view.endpoint.clone();
 
@@ -1724,9 +1749,11 @@ fn realtime_incremental_plan(
         return Ok(Some(RealtimeIncrementalPlan::Apply(Vec::new())));
     }
     if cycle.needs_full_rescan || actionable.iter().any(|event| event.rescan_required) {
-        return Ok(Some(RealtimeIncrementalPlan::Unusable(
-            "realtime_rescan_required",
-        )));
+        // A possible-event-loss signal (queue overflow, USN gap, startup gap).
+        // Fall through to a full reconcile that re-scans source+dst and repairs
+        // every difference (incl. deletes the event stream may have missed),
+        // instead of stalling on a yellow "needs manual Full".
+        return Ok(None);
     }
 
     let mut paths = BTreeSet::new();
@@ -2028,6 +2055,30 @@ fn sync_cycle_with_transfer(
                     blocked: false,
                 });
             }
+        }
+    }
+
+    // Possible-event-loss reconcile (overflow / journal gap / startup gap):
+    // mark destinations red and identify the reason while the cross-machine
+    // re-scan runs; each returns to green only after it verifies.
+    let is_event_loss_reconcile = cycle.needs_full_rescan
+        && !cycle.manual_full_rescan
+        && !cycle.manual_changed_since_rescan;
+    if is_event_loss_reconcile {
+        warn!(
+            source = source.id,
+            cycle_id = cycle.id,
+            "possible event loss detected; running reconcile to repair destinations"
+        );
+        for &dst_index in &ready_destinations {
+            let dst = &source.destinations[dst_index];
+            state.upsert_destination_status(
+                &source.id,
+                &dst.id,
+                None,
+                "red",
+                "event_loss_reconcile",
+            )?;
         }
     }
 
@@ -5994,6 +6045,79 @@ mod tests {
             fs::read(effective_dst.join("destination-only.txt")).unwrap(),
             b"extra"
         );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn realtime_rescan_event_triggers_full_reconcile() {
+        // A possible-event-loss signal (here a rescan_required event, as recorded
+        // on queue overflow / USN gap) must trigger a full reconcile that repairs
+        // every difference — including a destination-only file the event stream
+        // never mentioned — instead of the event-path incremental sync.
+        let temp = temp_dir("realtime_rescan_full_reconcile");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("hello.txt"), b"hello").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            add_directory: true,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+                sync: None,
+            }],
+        });
+
+        let mut state = State::open(&db).unwrap();
+        sync_all_now(&cfg, &mut state).unwrap();
+        let effective_dst = dst.join("src");
+
+        // A change the watcher missed (no event), plus a destination-only extra.
+        fs::write(effective_dst.join("destination-only.txt"), b"extra").unwrap();
+        fs::write(src.join("late.txt"), b"late").unwrap();
+
+        // Only a possible-loss marker is recorded — no path-level events.
+        state
+            .record_event("src_1", 0, "queue_overflow", None, true)
+            .unwrap();
+        assert_eq!(
+            state.advance_due_destination_targets(&cfg).unwrap().len(),
+            1
+        );
+        sync_all_pending(&cfg, &mut state).unwrap();
+
+        // Full reconcile: the unmentioned new file is copied and the
+        // destination-only extra is mirror-deleted.
+        assert_eq!(fs::read(effective_dst.join("late.txt")).unwrap(), b"late");
+        assert!(!effective_dst.join("destination-only.txt").exists());
+
+        let views = state.destination_views(&cfg).unwrap();
+        let view = views
+            .iter()
+            .find(|v| v.destination_id == "dst_1")
+            .unwrap();
+        assert_eq!(view.status, "green");
+        assert_eq!(view.target_cycle_id, view.last_verified_cycle_id);
 
         fs::remove_dir_all(temp).ok();
     }
