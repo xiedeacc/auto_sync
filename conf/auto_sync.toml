@@ -11,11 +11,13 @@ checksum = false
 debug_logs = false
 transfer_timeout_secs = 120
 bwlimit_kbps = 0
-max_parallel_transfers = 32
+max_parallel_transfers = 16
 modify_window_secs = 1
+fsync = false
 
 [[machines]]
 id = "local"
+alias_name = ""
 name = "This machine"
 host = "192.168.2.166"
 web_port = 18765
@@ -39,6 +41,7 @@ manual = true
 
 [[machines]]
 id = "openwrt"
+alias_name = ""
 name = "openwrt"
 host = "192.168.2.1"
 web_port = 18765
