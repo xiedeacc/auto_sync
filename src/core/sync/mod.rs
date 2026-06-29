@@ -1465,8 +1465,10 @@ pub fn sync_cycle_for_source(
                 // ZFS diff incremental: when this is a ZFS source and the
                 // destination still has its retained base snapshot, sync only
                 // the paths `zfs diff` reports instead of re-scanning the tree.
-                // Falls back to a full reconcile on any failure.
-                if !is_event_loss_reconcile {
+                // Skipped for event-loss and manual Full reconciles, which must
+                // re-verify the whole destination (incl. dst-side drift). Falls
+                // back to a full reconcile on any failure.
+                if !is_event_loss_reconcile && !cycle.manual_full_rescan {
                     if let Some(zfs) = source_view.zfs_snapshot.as_ref() {
                         if let Some(base) =
                             state.destination_verified_snapshot(&source.id, &dst.id)?
