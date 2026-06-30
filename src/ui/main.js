@@ -2086,9 +2086,22 @@ function activityIsSyncing(activity) {
   return Boolean(activity && activity.runtime && activity.runtime.syncing);
 }
 
+function syncKindLabel(kind) {
+  switch (String(kind || "").trim()) {
+    case "incremental": return "incremental";
+    case "full": return "full";
+    case "changed_since": return "changed since";
+    case "automatic": return "automatic";
+    case "scan": return "compare";
+    default: return "";
+  }
+}
+
 function activitySyncingLabel(activity) {
   const label = (activity && activity.label) || "machine";
-  return `Sync already in progress on ${label}`;
+  const runtime = activity && activity.runtime;
+  const kind = syncKindLabel(runtime && runtime.sync_kind);
+  return `Sync already in progress on ${label}${kind ? ` (${kind})` : ""}`;
 }
 
 function matchingTransfer(runtime, dst) {
