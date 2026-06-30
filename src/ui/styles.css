@@ -998,6 +998,55 @@ th {
   font-size: 12px;
 }
 
+.dst-log-section-title {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-weight: 600;
+}
+
+.scan-diff-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  max-height: 320px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.scan-diff-row {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+}
+
+.scan-diff-kind {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.scan-diff-path {
+  overflow-wrap: anywhere;
+}
+
+.scan-diff-add .scan-diff-kind { color: #2e9e5b; }
+.scan-diff-update .scan-diff-kind { color: #c98a00; }
+.scan-diff-delete .scan-diff-kind { color: #c0392b; }
+.scan-diff-type_mismatch .scan-diff-kind { color: #8e44ad; }
+
+.scan-diff-empty {
+  margin-top: 8px;
+  color: #2e9e5b;
+}
+
+.scan-diff-more {
+  margin-top: 6px;
+  color: var(--muted);
+}
+
 .folder-machine-row {
   display: grid;
   grid-template-columns: 86px 1fr;

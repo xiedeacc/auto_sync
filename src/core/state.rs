@@ -72,6 +72,33 @@ pub struct DestinationIssueView {
     pub updated_at: String,
 }
 
+/// One differing path found by a dry-run Scan. `kind` is add | update | delete
+/// | type_mismatch (relative to a mirror sync of source onto destination).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanDiffEntry {
+    pub rel_path: String,
+    pub kind: String,
+    pub file_type: String,
+}
+
+/// Result of a dry-run Scan: how source and destination differ, without making
+/// any change. `differences` is a capped sample; `truncated` flags more.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScanReport {
+    pub source_id: String,
+    pub destination_id: String,
+    pub scanned_at: String,
+    pub source_entries: u64,
+    pub dst_entries: u64,
+    pub in_sync: u64,
+    pub to_add: u64,
+    pub to_update: u64,
+    pub to_delete: u64,
+    pub type_mismatch: u64,
+    pub differences: Vec<ScanDiffEntry>,
+    pub truncated: bool,
+}
+
 pub struct State {
     conn: Connection,
 }
@@ -189,6 +216,14 @@ impl State {
                 journal_id TEXT NOT NULL,
                 next_usn INTEGER NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS scan_report (
+                source_id TEXT NOT NULL,
+                destination_id TEXT NOT NULL,
+                scanned_at TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                PRIMARY KEY (source_id, destination_id)
             );
             "#,
         )?;
@@ -873,6 +908,47 @@ impl State {
             params![source_id, destination_id],
         )?;
         Ok(())
+    }
+
+    pub fn put_scan_report(&self, report: &ScanReport) -> Result<()> {
+        let json = serde_json::to_string(report).context("failed to encode scan report")?;
+        self.conn.execute(
+            r#"
+            INSERT INTO scan_report (source_id, destination_id, scanned_at, report_json)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(source_id, destination_id) DO UPDATE SET
+                scanned_at=excluded.scanned_at,
+                report_json=excluded.report_json
+            "#,
+            params![
+                report.source_id,
+                report.destination_id,
+                report.scanned_at,
+                json
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_scan_report(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+    ) -> Result<Option<ScanReport>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT report_json FROM scan_report WHERE source_id=?1 AND destination_id=?2",
+                params![source_id, destination_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match json {
+            Some(json) => Ok(Some(
+                serde_json::from_str(&json).context("failed to decode scan report")?,
+            )),
+            None => Ok(None),
+        }
     }
 
     pub fn set_destination_target(

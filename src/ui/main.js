@@ -20,6 +20,11 @@ let scheduleEditor = null;
 let excludeEditor = null;
 let dstSyncEditor = null;
 let dstLogViewer = null;
+const scanReports = {};
+
+function scanReportKey(sourceId, destinationId) {
+  return `${sourceId}|${destinationId}`;
+}
 let latestDestinationSchedule = defaultDestinationSchedule();
 let activeSourceTab = "sources";
 let machineHostLocked = false;
@@ -843,6 +848,7 @@ function renderSyncRows(source, group) {
           <option value="incremental">Incremental</option>
           <option value="changed_since">Changed Since</option>
           <option value="full">Full</option>
+          <option value="scan">Scan (compare only)</option>
         </select>
         <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
       </div>
@@ -908,6 +914,19 @@ function renderSyncRows(source, group) {
       if (activityIsSyncing(activity)) {
         setMessage(activitySyncingLabel(activity));
         updateStatusUi();
+        return;
+      }
+      if (mode === "scan") {
+        runBusy(`Scanning ${source.id} -> ${dst.id}...`, async () => {
+          await saveConfig();
+          const report = await invoke("scan_destination_now", {
+            sourceId: source.id,
+            destinationId: dst.id,
+          });
+          scanReports[scanReportKey(source.id, dst.id)] = report;
+          setMessage("");
+          openDestinationLogModal(source, dst);
+        }, { showMainMessage: false });
         return;
       }
       runBusy(destinationSyncStatusMessage(source, mode), async () => {
@@ -1703,6 +1722,19 @@ function openDestinationLogModal(source, dst) {
   };
   renderDestinationLogModal();
   el.dstLogModal.hidden = false;
+  // Pull the last stored scan report (from this or a prior session) if we don't
+  // already have a fresh one cached from a Scan run just now.
+  const key = scanReportKey(source.id, dst.id);
+  if (!scanReports[key]) {
+    invoke("scan_report", { sourceId: source.id, destinationId: dst.id })
+      .then((report) => {
+        if (report) {
+          scanReports[key] = report;
+          renderDestinationLogModal();
+        }
+      })
+      .catch(() => {});
+  }
 }
 
 function closeDestinationLogModal() {
@@ -1757,7 +1789,62 @@ function renderDestinationLogModal() {
       <div class="dst-log-key">${escapeHtml(key)}</div>
       <div class="dst-log-value">${escapeHtml(value || "-")}</div>
     </div>
+  `).join("") + renderScanReportSection(source, dst);
+}
+
+function scanKindLabel(kind) {
+  switch (kind) {
+    case "add": return "+ add";
+    case "update": return "~ update";
+    case "delete": return "- delete";
+    case "type_mismatch": return "! type";
+    default: return kind;
+  }
+}
+
+function formatScanTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function renderScanReportSection(source, dst) {
+  const report = scanReports[scanReportKey(source.id, dst.id)];
+  if (!report) {
+    return "";
+  }
+  const total = (report.to_add || 0) + (report.to_update || 0) + (report.to_delete || 0) + (report.type_mismatch || 0);
+  const title = `<div class="dst-log-section-title">Last scan — ${escapeHtml(formatScanTime(report.scanned_at))} (${total} difference${total === 1 ? "" : "s"})</div>`;
+  const counts = [
+    ["Add (missing on dst)", report.to_add],
+    ["Update (content differs)", report.to_update],
+    ["Delete (extra on dst)", report.to_delete],
+    ["Type mismatch", report.type_mismatch],
+    ["In sync", report.in_sync],
+    ["Source / Dst entries", `${report.source_entries || 0} / ${report.dst_entries || 0}`],
+  ];
+  const summary = counts.map(([key, value]) => `
+    <div class="dst-log-row">
+      <div class="dst-log-key">${escapeHtml(key)}</div>
+      <div class="dst-log-value">${escapeHtml(String(value ?? 0))}</div>
+    </div>
   `).join("");
+  let body;
+  if (total === 0) {
+    body = `<div class="scan-diff-empty">Source and destination are in sync.</div>`;
+  } else {
+    const diffs = (report.differences || []).map((diff) => `
+      <div class="scan-diff-row scan-diff-${escapeAttr(diff.kind)}">
+        <span class="scan-diff-kind">${escapeHtml(scanKindLabel(diff.kind))}</span>
+        <span class="scan-diff-path" title="${escapeAttr(diff.rel_path)}">${escapeHtml(diff.rel_path)}</span>
+      </div>
+    `).join("");
+    const more = report.truncated
+      ? `<div class="scan-diff-more">… showing first ${(report.differences || []).length}; more differences exist.</div>`
+      : "";
+    body = `<div class="scan-diff-list">${diffs}${more}</div>`;
+  }
+  return title + summary + body;
 }
 
 function openExcludeModal(source) {
@@ -2515,6 +2602,8 @@ async function invokeWeb(command, payload = {}) {
     sync_now: ["POST", "/api/sync-now"],
     sync_source_now: ["POST", "/api/sync-source-now"],
     sync_destination_now: ["POST", "/api/sync-destination-now"],
+    scan_destination_now: ["POST", "/api/scan-destination-now"],
+    scan_report: ["GET", "/api/scan-report"],
     browse_paths: ["GET", "/api/browse-paths"],
   };
   const route = routes[command];
@@ -2528,6 +2617,10 @@ async function invokeWeb(command, payload = {}) {
   if (command === "browse_paths") {
     const machineId = payload.machineId || payload.machine_id || "local";
     url = `${path}?path=${encodeURIComponent(payload.path || "/")}&machine_id=${encodeURIComponent(machineId)}`;
+  } else if (command === "scan_report") {
+    const sourceId = payload.sourceId || payload.source_id;
+    const destinationId = payload.destinationId || payload.destination_id;
+    url = `${path}?source_id=${encodeURIComponent(sourceId)}&destination_id=${encodeURIComponent(destinationId)}`;
   } else if (command === "remove_machine") {
     const machineId = payload.machineId || payload.machine_id;
     url = `${path}/${encodeURIComponent(machineId || "")}`;
@@ -2542,6 +2635,11 @@ async function invokeWeb(command, payload = {}) {
         source_id: payload.sourceId || payload.source_id,
         destination_id: payload.destinationId || payload.destination_id,
         mode: payload.mode || payload.syncMode || payload.sync_mode || "incremental",
+      });
+    } else if (command === "scan_destination_now") {
+      options.body = JSON.stringify({
+        source_id: payload.sourceId || payload.source_id,
+        destination_id: payload.destinationId || payload.destination_id,
       });
     } else if (command === "add_machine") {
       options.body = JSON.stringify(payload.machine);

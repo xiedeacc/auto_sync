@@ -42,7 +42,7 @@ use auto_sync::core::config::MachineConfig;
 #[cfg(feature = "gui")]
 use auto_sync::core::machines::MachineStatus;
 #[cfg(feature = "gui")]
-use auto_sync::core::state::DestinationView;
+use auto_sync::core::state::{DestinationView, ScanReport};
 #[cfg(feature = "gui")]
 use auto_sync::core::sync::SyncRequestMode;
 
@@ -297,6 +297,8 @@ fn run_with_desktop(backend: Backend, addr: SocketAddr) {
             sync_now,
             sync_source_now,
             sync_destination_now,
+            scan_destination_now,
+            scan_report,
             browse_paths
         ])
         .run(tauri::generate_context!());
@@ -532,6 +534,30 @@ async fn sync_destination_now(
         .map_err(error_text)?;
     backend
         .sync_destination_now(&source_id, &destination_id, mode)
+        .map_err(error_text)
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn scan_destination_now(
+    backend: tauri::State<'_, Backend>,
+    source_id: String,
+    destination_id: String,
+) -> Result<ScanReport, String> {
+    backend
+        .scan_destination_now(&source_id, &destination_id)
+        .map_err(error_text)
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn scan_report(
+    backend: tauri::State<'_, Backend>,
+    source_id: String,
+    destination_id: String,
+) -> Result<Option<ScanReport>, String> {
+    backend
+        .scan_report(&source_id, &destination_id)
         .map_err(error_text)
 }
 

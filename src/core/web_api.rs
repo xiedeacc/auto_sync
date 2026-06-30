@@ -19,7 +19,7 @@ use crate::core::backend::{
 };
 use crate::core::config::{AppConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
-use crate::core::state::{DestinationView, SnapshotEntry};
+use crate::core::state::{DestinationView, ScanReport, SnapshotEntry};
 use crate::core::sync::{
     SyncRequestMode, TransferAck, TransferApplyDeltaQuery, TransferBlockSumsRequest,
     TransferCleanupTmpRequest, TransferPathInfo, TransferPathInfoRequest,
@@ -53,6 +53,8 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/sync-now", post(api_sync_now))
         .route("/api/sync-source-now", post(api_sync_source_now))
         .route("/api/sync-destination-now", post(api_sync_destination_now))
+        .route("/api/scan-destination-now", post(api_scan_destination_now))
+        .route("/api/scan-report", get(api_scan_report))
         .route("/api/transfer/snapshot", post(api_transfer_snapshot))
         .route(
             "/api/transfer/snapshot-paths",
@@ -237,6 +239,36 @@ async fn api_sync_destination_now(
         &req.destination_id,
         mode,
     )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanDestinationRequest {
+    source_id: String,
+    destination_id: String,
+}
+
+async fn api_scan_destination_now(
+    AxumState(backend): AxumState<Backend>,
+    Json(req): Json<ScanDestinationRequest>,
+) -> Result<Json<ScanReport>, ApiError> {
+    Ok(Json(
+        backend.scan_destination_now(&req.source_id, &req.destination_id)?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanReportQuery {
+    source_id: String,
+    destination_id: String,
+}
+
+async fn api_scan_report(
+    AxumState(backend): AxumState<Backend>,
+    Query(query): Query<ScanReportQuery>,
+) -> Result<Json<Option<ScanReport>>, ApiError> {
+    Ok(Json(
+        backend.scan_report(&query.source_id, &query.destination_id)?,
+    ))
 }
 
 async fn api_transfer_snapshot(

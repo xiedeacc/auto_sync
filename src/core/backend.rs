@@ -20,7 +20,7 @@ use crate::core::progress::{
     ScanProgressView, TransferProgressView, configure_progress_file, current_scan_progress,
     current_transfer_progress,
 };
-use crate::core::state::{DestinationView, State as DbState};
+use crate::core::state::{DestinationView, ScanReport, State as DbState};
 use crate::core::sync::{
     SyncRequestMode, current_sync_kind, sync_is_running, try_sync_all_now,
     try_sync_destination_now_with_mode, try_sync_source_now,
@@ -277,6 +277,54 @@ impl Backend {
         self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
+    /// Run a dry-run Scan (compare source vs destination, no changes) and return
+    /// the difference report. Delegated to the source's machine for a remote
+    /// source; the report is persisted there and on this machine.
+    pub fn scan_destination_now(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+    ) -> Result<ScanReport> {
+        let cfg = load_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
+        if let Some(machine) = source_execution_machine(&cfg, source_id)? {
+            ensure_remote_machine_not_syncing(&machine)?;
+            let timeout = Duration::from_secs(cfg.app.sync.transfer_timeout_secs.max(60).max(600));
+            return remote_post_json(
+                &machine,
+                "/api/scan-destination-now",
+                &ScanDestinationRequest {
+                    source_id: source_id.to_string(),
+                    destination_id: destination_id.to_string(),
+                },
+                timeout,
+            );
+        }
+        let state_db = DbState::open(&cfg.app.data_db)?;
+        state_db.ensure_config(&cfg)?;
+        crate::core::sync::scan_destination_now(&cfg, &state_db, source_id, destination_id)
+    }
+
+    /// The most recent stored Scan report for a destination, if any.
+    pub fn scan_report(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+    ) -> Result<Option<ScanReport>> {
+        let cfg = load_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
+        if let Some(machine) = source_execution_machine(&cfg, source_id)? {
+            let path = format!(
+                "/api/scan-report?source_id={}&destination_id={}",
+                encode_query_component(source_id),
+                encode_query_component(destination_id),
+            );
+            return remote_get_json::<Option<ScanReport>>(&machine, &path, Duration::from_secs(10));
+        }
+        let state_db = DbState::open(&cfg.app.data_db)?;
+        state_db.get_scan_report(source_id, destination_id)
+    }
+
     pub fn browse_paths(
         &self,
         path: Option<PathBuf>,
@@ -465,6 +513,12 @@ struct SyncDestinationRequest {
     source_id: String,
     destination_id: String,
     mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanDestinationRequest {
+    source_id: String,
+    destination_id: String,
 }
 
 #[derive(Debug, Serialize)]

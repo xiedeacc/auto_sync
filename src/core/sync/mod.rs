@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
 use filetime::{FileTime, set_file_mtime};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -28,7 +29,7 @@ use crate::core::machines::{
     remote_post_bytes, remote_post_json,
 };
 use crate::core::progress;
-use crate::core::state::{Cycle, CycleEvent, SnapshotEntry, State};
+use crate::core::state::{Cycle, CycleEvent, ScanDiffEntry, ScanReport, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
 
 pub mod delta;
@@ -226,6 +227,168 @@ pub fn sync_destination_now_with_mode(
         }
     }
     sync_all_pending(cfg, state)
+}
+
+const SCAN_DIFF_SAMPLE_CAP: usize = 5000;
+
+/// Dry-run compare of a destination against its source. Reads both trees and
+/// reports how they differ (add/update/delete/type-mismatch) WITHOUT changing
+/// anything. The result is persisted so the UI info panel can display it.
+pub fn scan_destination_now(
+    cfg: &AppConfig,
+    state: &State,
+    source_id: &str,
+    destination_id: &str,
+) -> Result<ScanReport> {
+    let _serialized = sync_gate()
+        .try_lock()
+        .map_err(|_| anyhow!("sync already in progress"))?;
+    let _kind = set_sync_kind("scan");
+    configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
+    progress::configure_progress_file(&cfg.app.data_db);
+
+    let source = cfg
+        .source_groups
+        .iter()
+        .find(|s| s.id == source_id && s.enabled)
+        .ok_or_else(|| anyhow!("source not found or disabled: {source_id}"))?;
+    let dst = source
+        .destinations
+        .iter()
+        .find(|d| d.id == destination_id && d.enabled)
+        .ok_or_else(|| anyhow!("destination not found or disabled: {destination_id}"))?;
+    let sync = effective_sync_config(cfg, dst);
+    let timeout = Duration::from_secs(sync.transfer_timeout_secs.max(1));
+
+    let source_machine_id = machine_id_or_local(&source.machine_id);
+    let source_machine = machine_or_local(cfg, source_machine_id)?;
+    let source_info = path_info_on_machine(source_machine_id, &source_machine, &source.src)?;
+
+    let dst_machine_id = machine_id_or_local(&dst.machine_id);
+    let dst_machine = machine_or_local(cfg, dst_machine_id)?;
+    let dst_root = destination_root_for_source(source, &source_info, &dst.path, &dst_machine);
+
+    let mut source_snapshot = snapshot_on_machine(
+        source_machine_id,
+        &source_machine,
+        &source_info.base,
+        TransferSnapshotMode::Source,
+        &source.excludes,
+        sync.checksum,
+        timeout,
+    )?;
+    if source_info.kind != "dir" {
+        source_snapshot.retain(|entry| entry.rel_path == source_info.name);
+    }
+    let dst_snapshot = snapshot_on_machine(
+        dst_machine_id,
+        &dst_machine,
+        &dst_root,
+        TransferSnapshotMode::Destination,
+        &[],
+        sync.checksum,
+        timeout,
+    )?;
+
+    let report = build_scan_report(
+        source_id,
+        destination_id,
+        &source_snapshot,
+        &dst_snapshot,
+        &source.excludes,
+        &sync,
+    );
+    state.put_scan_report(&report)?;
+    Ok(report)
+}
+
+fn machine_or_local(
+    cfg: &AppConfig,
+    machine_id: &str,
+) -> Result<crate::core::config::MachineConfig> {
+    if let Some(machine) = find_machine(cfg, machine_id) {
+        return Ok(machine);
+    }
+    if machine_id == "local" {
+        // snapshot/path-info ignore the machine handle for local roots.
+        return Ok(crate::core::config::MachineConfig {
+            id: "local".to_string(),
+            ..Default::default()
+        });
+    }
+    bail!("unknown machine: {machine_id}")
+}
+
+fn build_scan_report(
+    source_id: &str,
+    destination_id: &str,
+    source_snapshot: &[SnapshotEntry],
+    dst_snapshot: &[SnapshotEntry],
+    excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
+) -> ScanReport {
+    let source_map = map_entries(source_snapshot);
+    let dst_map = map_entries(dst_snapshot);
+    let mut report = ScanReport {
+        source_id: source_id.to_string(),
+        destination_id: destination_id.to_string(),
+        scanned_at: Utc::now().to_rfc3339(),
+        source_entries: source_snapshot.len() as u64,
+        dst_entries: dst_snapshot.len() as u64,
+        ..Default::default()
+    };
+    let mut diffs: Vec<ScanDiffEntry> = Vec::new();
+    let mut push = |rel: &str, kind: &str, file_type: &str| {
+        if diffs.len() < SCAN_DIFF_SAMPLE_CAP {
+            diffs.push(ScanDiffEntry {
+                rel_path: rel.to_string(),
+                kind: kind.to_string(),
+                file_type: file_type.to_string(),
+            });
+        }
+    };
+    for entry in source_snapshot {
+        if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
+            continue;
+        }
+        match dst_map.get(&entry.rel_path) {
+            None => {
+                report.to_add += 1;
+                push(&entry.rel_path, "add", &entry.file_type);
+            }
+            Some(existing) if existing.file_type != entry.file_type => {
+                report.type_mismatch += 1;
+                push(&entry.rel_path, "type_mismatch", &entry.file_type);
+            }
+            Some(existing) => {
+                // Directories only count as different on add/type-mismatch; an
+                // mtime-only touch is noise for a "what differs" report.
+                if entry.file_type == "dir" || entries_match(entry, existing, sync) {
+                    report.in_sync += 1;
+                } else {
+                    report.to_update += 1;
+                    push(&entry.rel_path, "update", &entry.file_type);
+                }
+            }
+        }
+    }
+    if sync.mirror {
+        for entry in dst_snapshot {
+            if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
+                continue;
+            }
+            if !source_map.contains_key(&entry.rel_path) {
+                report.to_delete += 1;
+                push(&entry.rel_path, "delete", &entry.file_type);
+            }
+        }
+    }
+    drop(push);
+    diffs.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let total = report.to_add + report.to_update + report.to_delete + report.type_mismatch;
+    report.truncated = total > diffs.len() as u64;
+    report.differences = diffs;
+    report
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -6713,5 +6876,34 @@ mod tests {
             mode: 0o644,
             hash: None,
         }
+    }
+
+    #[test]
+    fn scan_report_classifies_differences() {
+        let source = vec![
+            test_file_entry("same.txt", 10),
+            test_file_entry("changed.txt", 20),
+            test_file_entry("new.txt", 5),
+        ];
+        let dst = vec![
+            test_file_entry("same.txt", 10),
+            test_file_entry("changed.txt", 21),
+            test_file_entry("extra.txt", 7),
+        ];
+        let mut sync = NativeSyncConfig::default();
+        sync.mirror = true;
+        sync.checksum = false;
+        let report = build_scan_report("s", "d", &source, &dst, &[], &sync);
+        assert_eq!(report.to_add, 1, "new.txt");
+        assert_eq!(report.to_update, 1, "changed.txt");
+        assert_eq!(report.to_delete, 1, "extra.txt");
+        assert_eq!(report.in_sync, 1, "same.txt");
+        assert_eq!(report.differences.len(), 3);
+        assert!(!report.truncated);
+
+        // Mirror off: extra destination files are not flagged for deletion.
+        sync.mirror = false;
+        let report = build_scan_report("s", "d", &source, &dst, &[], &sync);
+        assert_eq!(report.to_delete, 0);
     }
 }
