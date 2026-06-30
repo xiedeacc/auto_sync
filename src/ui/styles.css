@@ -1023,9 +1023,23 @@ th {
   align-items: baseline;
 }
 
-.scan-diff-kind {
+.scan-diff-kind,
+.scan-diff-ftype {
   color: var(--muted);
   white-space: nowrap;
+}
+
+.scan-count-value {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.scan-diff-view {
+  padding: 1px 10px;
+  font-size: 11px;
+  line-height: 18px;
+  cursor: pointer;
 }
 
 .scan-diff-path {

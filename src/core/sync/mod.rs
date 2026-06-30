@@ -237,7 +237,9 @@ pub fn sync_destination_now_with_mode(
     sync_all_pending(cfg, state)
 }
 
-const SCAN_DIFF_SAMPLE_CAP: usize = 5000;
+/// Per-kind cap on sampled differing paths kept in the report (the UI shows up
+/// to 50 of each kind; the headroom covers the popup without bloating the JSON).
+const SCAN_DIFF_PER_KIND_CAP: usize = 200;
 
 /// Dry-run compare of a destination against its source. Reads both trees and
 /// reports how they differ (add/update/delete/type-mismatch) WITHOUT changing
@@ -348,8 +350,13 @@ fn build_scan_report(
         ..Default::default()
     };
     let mut diffs: Vec<ScanDiffEntry> = Vec::new();
-    let mut push = |rel: &str, kind: &str, file_type: &str| {
-        if diffs.len() < SCAN_DIFF_SAMPLE_CAP {
+    // Keep a bounded sample PER KIND so each kind's "view files" popup has data,
+    // regardless of how lopsided the totals are.
+    let mut kind_pushed: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut push = |rel: &str, kind: &'static str, file_type: &str| {
+        let count = kind_pushed.entry(kind).or_insert(0);
+        if *count < SCAN_DIFF_PER_KIND_CAP {
+            *count += 1;
             diffs.push(ScanDiffEntry {
                 rel_path: rel.to_string(),
                 kind: kind.to_string(),

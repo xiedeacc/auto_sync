@@ -249,11 +249,22 @@
   <div id="dst-log-modal" class="modal" hidden>
     <div class="modal-panel dst-log-modal-panel">
       <div class="modal-head">
-        <h2>Destination Log</h2>
+        <h2 id="dst-log-title">Destination Log</h2>
         <button id="dst-log-close" class="icon" title="Close">x</button>
       </div>
       <div id="dst-log-summary" class="issue-summary"></div>
       <div id="dst-log-list" class="dst-log-list"></div>
+    </div>
+  </div>
+
+  <div id="scan-diff-modal" class="modal" hidden>
+    <div class="modal-panel issue-modal-panel">
+      <div class="modal-head">
+        <h2 id="scan-diff-title">Differences</h2>
+        <button id="scan-diff-close" class="icon" title="Close">x</button>
+      </div>
+      <div id="scan-diff-summary" class="issue-summary"></div>
+      <div id="scan-diff-modal-list" class="scan-diff-list"></div>
     </div>
   </div>
 

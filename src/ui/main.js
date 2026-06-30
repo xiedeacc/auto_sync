@@ -129,9 +129,15 @@ const el = {
   issueSummary: document.getElementById("issue-summary"),
   issueList: document.getElementById("issue-list"),
   dstLogModal: document.getElementById("dst-log-modal"),
+  dstLogTitle: document.getElementById("dst-log-title"),
   dstLogClose: document.getElementById("dst-log-close"),
   dstLogSummary: document.getElementById("dst-log-summary"),
   dstLogList: document.getElementById("dst-log-list"),
+  scanDiffModal: document.getElementById("scan-diff-modal"),
+  scanDiffTitle: document.getElementById("scan-diff-title"),
+  scanDiffClose: document.getElementById("scan-diff-close"),
+  scanDiffSummary: document.getElementById("scan-diff-summary"),
+  scanDiffModalList: document.getElementById("scan-diff-modal-list"),
   excludeModal: document.getElementById("exclude-modal"),
   excludeClose: document.getElementById("exclude-close"),
   excludeAdd: document.getElementById("exclude-add"),
@@ -953,7 +959,7 @@ function renderSyncRows(source, group) {
         // tree and must not block the backup). Open the info panel so live
         // progress shows, kick it off, and poll for the report when it lands.
         const key = scanReportKey(source.id, dst.id);
-        openDestinationLogModal(source, dst);
+        openDestinationLogModal(source, dst, "scan");
         runBusy(`Starting scan ${source.id} -> ${dst.id}...`, async () => {
           await saveConfig();
           const previous = await invoke("scan_destination_now", {
@@ -1759,17 +1765,26 @@ function closeIssueModal() {
   el.issueModal.hidden = true;
 }
 
-function openDestinationLogModal(source, dst) {
+const SCAN_DIFF_KINDS = [
+  { kind: "add", label: "Add (missing on dst)", field: "to_add" },
+  { kind: "update", label: "Update (content differs)", field: "to_update" },
+  { kind: "delete", label: "Delete (extra on dst)", field: "to_delete" },
+  { kind: "type_mismatch", label: "Type mismatch", field: "type_mismatch" },
+];
+const SCAN_DIFF_MODAL_CAP = 50;
+
+function openDestinationLogModal(source, dst, mode = "log") {
   dstLogViewer = {
     sourceId: source.id,
     destinationId: dst.id,
+    mode,
   };
   renderDestinationLogModal();
   el.dstLogModal.hidden = false;
-  // Pull the last stored scan report (from this or a prior session) if we don't
-  // already have a fresh one cached from a Scan run just now.
+  // In scan mode, pull the last stored report (from this or a prior session) if
+  // we don't already have a fresh one cached from a Scan run just now.
   const key = scanReportKey(source.id, dst.id);
-  if (!scanReports[key]) {
+  if (mode === "scan" && !scanReports[key]) {
     invoke("scan_report", { sourceId: source.id, destinationId: dst.id })
       .then((report) => {
         if (report) {
@@ -1792,6 +1807,10 @@ function renderDestinationLogModal() {
   }
   const source = findSourceById(dstLogViewer.sourceId);
   const dst = source && (source.destinations || []).find((item) => item.id === dstLogViewer.destinationId);
+  const scanMode = dstLogViewer.mode === "scan";
+  if (el.dstLogTitle) {
+    el.dstLogTitle.textContent = scanMode ? "Scan" : "Destination Log";
+  }
   if (!source || !dst) {
     el.dstLogSummary.textContent = "Destination no longer exists";
     el.dstLogList.innerHTML = "";
@@ -1809,23 +1828,29 @@ function renderDestinationLogModal() {
     ["Status", destinationStatusText(status)],
     ["Cycle", cycleDisplay(status)],
   ];
-  if (activity && activity.error) {
-    rows.push(["Runtime", activity.error]);
-  } else if (runtime && runtime.syncing) {
-    rows.push(["Runtime", runtimeSyncLabel(runtime)]);
+  if (scanMode) {
+    // Scan view: only scan progress + report, never the sync runtime/transfer.
+    if (scan) {
+      rows.push(["Scanning", scan.current_path || scan.root_path || "-"]);
+      rows.push(["Entries", String(Number(scan.entries_seen || 0))]);
+    }
   } else {
-    rows.push(["Runtime", "idle"]);
-  }
-  if (transfer) {
-    rows.push(["File", transfer.rel_path || "-"]);
-    rows.push(["Speed", formatBytesPerSecond(transfer.bytes_per_sec || 0)]);
-    rows.push(["Progress", formatTransferProgress(transfer) || "-"]);
-  } else if (scan) {
-    rows.push(["Scanning", scan.current_path || scan.root_path || "-"]);
-    rows.push(["Entries", String(Number(scan.entries_seen || 0))]);
-  } else {
-    rows.push(["Current file", "-"]);
-    rows.push(["Speed", "-"]);
+    // Destination Log view: sync runtime/transfer, never the scan report.
+    if (activity && activity.error) {
+      rows.push(["Runtime", activity.error]);
+    } else if (runtime && runtime.syncing) {
+      rows.push(["Runtime", runtimeSyncLabel(runtime)]);
+    } else {
+      rows.push(["Runtime", "idle"]);
+    }
+    if (transfer) {
+      rows.push(["File", transfer.rel_path || "-"]);
+      rows.push(["Speed", formatBytesPerSecond(transfer.bytes_per_sec || 0)]);
+      rows.push(["Progress", formatTransferProgress(transfer) || "-"]);
+    } else {
+      rows.push(["Current file", "-"]);
+      rows.push(["Speed", "-"]);
+    }
   }
   el.dstLogSummary.textContent = "";
   el.dstLogList.innerHTML = rows.map(([key, value]) => `
@@ -1833,7 +1858,12 @@ function renderDestinationLogModal() {
       <div class="dst-log-key">${escapeHtml(key)}</div>
       <div class="dst-log-value">${escapeHtml(value || "-")}</div>
     </div>
-  `).join("") + renderScanReportSection(source, dst);
+  `).join("") + (scanMode ? renderScanReportSection(source, dst) : "");
+  if (scanMode) {
+    el.dstLogList.querySelectorAll("[data-scan-kind]").forEach((button) => {
+      button.onclick = () => openScanDiffModal(source, dst, button.getAttribute("data-scan-kind"));
+    });
+  }
 }
 
 function scanKindLabel(kind) {
@@ -1859,36 +1889,60 @@ function renderScanReportSection(source, dst) {
   }
   const total = (report.to_add || 0) + (report.to_update || 0) + (report.to_delete || 0) + (report.type_mismatch || 0);
   const title = `<div class="dst-log-section-title">Last scan — ${escapeHtml(formatScanTime(report.scanned_at))} (${total} difference${total === 1 ? "" : "s"})</div>`;
-  const counts = [
-    ["Add (missing on dst)", report.to_add],
-    ["Update (content differs)", report.to_update],
-    ["Delete (extra on dst)", report.to_delete],
-    ["Type mismatch", report.type_mismatch],
+  const diffRows = SCAN_DIFF_KINDS.map(({ kind, label, field }) => {
+    const count = report[field] || 0;
+    const button = count > 0
+      ? `<button class="scan-diff-view" data-scan-kind="${escapeAttr(kind)}">View</button>`
+      : "";
+    return `
+      <div class="dst-log-row">
+        <div class="dst-log-key">${escapeHtml(label)}</div>
+        <div class="dst-log-value scan-count-value">${escapeHtml(String(count))}${button}</div>
+      </div>
+    `;
+  }).join("");
+  const extraRows = [
     ["In sync", report.in_sync],
     ["Source / Dst entries", `${report.source_entries || 0} / ${report.dst_entries || 0}`],
-  ];
-  const summary = counts.map(([key, value]) => `
+  ].map(([key, value]) => `
     <div class="dst-log-row">
       <div class="dst-log-key">${escapeHtml(key)}</div>
       <div class="dst-log-value">${escapeHtml(String(value ?? 0))}</div>
     </div>
   `).join("");
-  let body;
-  if (total === 0) {
-    body = `<div class="scan-diff-empty">Source and destination are in sync.</div>`;
-  } else {
-    const diffs = (report.differences || []).map((diff) => `
-      <div class="scan-diff-row scan-diff-${escapeAttr(diff.kind)}">
-        <span class="scan-diff-kind">${escapeHtml(scanKindLabel(diff.kind))}</span>
-        <span class="scan-diff-path" title="${escapeAttr(diff.rel_path)}">${escapeHtml(diff.rel_path)}</span>
-      </div>
-    `).join("");
-    const more = report.truncated
-      ? `<div class="scan-diff-more">… showing first ${(report.differences || []).length}; more differences exist.</div>`
-      : "";
-    body = `<div class="scan-diff-list">${diffs}${more}</div>`;
+  const footer = total === 0
+    ? `<div class="scan-diff-empty">Source and destination are in sync.</div>`
+    : "";
+  return title + diffRows + extraRows + footer;
+}
+
+function openScanDiffModal(source, dst, kind) {
+  const report = scanReports[scanReportKey(source.id, dst.id)];
+  if (!report) {
+    return;
   }
-  return title + summary + body;
+  const meta = SCAN_DIFF_KINDS.find((item) => item.kind === kind);
+  const total = report[meta ? meta.field : ""] || 0;
+  const paths = (report.differences || []).filter((diff) => diff.kind === kind);
+  const shown = paths.slice(0, SCAN_DIFF_MODAL_CAP);
+  el.scanDiffTitle.textContent = meta ? meta.label : "Differences";
+  const moreNote = total > shown.length
+    ? ` (showing first ${shown.length} of ${total})`
+    : ` (${total})`;
+  el.scanDiffSummary.textContent = `${source.id} -> ${dst.id}${moreNote}`;
+  el.scanDiffModalList.innerHTML = shown.length
+    ? shown.map((diff) => `
+        <div class="scan-diff-row scan-diff-${escapeAttr(diff.kind)}">
+          <span class="scan-diff-ftype">${escapeHtml(diff.file_type || "")}</span>
+          <span class="scan-diff-path" title="${escapeAttr(diff.rel_path)}">${escapeHtml(diff.rel_path)}</span>
+        </div>
+      `).join("")
+    : `<div class="scan-diff-empty">No paths.</div>`;
+  el.scanDiffModal.hidden = false;
+}
+
+function closeScanDiffModal() {
+  el.scanDiffModal.hidden = true;
 }
 
 function openExcludeModal(source) {
@@ -2612,6 +2666,7 @@ el.machineDiscover.onclick = () => discoverMachines().catch((error) => setMessag
 el.machineAdd.onclick = () => addMachine().catch((error) => setMessage(String(error)));
 el.issueClose.onclick = closeIssueModal;
 el.dstLogClose.onclick = closeDestinationLogModal;
+el.scanDiffClose.onclick = closeScanDiffModal;
 el.excludeClose.onclick = closeExcludeModal;
 el.excludeAdd.onclick = () => addExcludePath().catch((error) => setMessage(String(error)));
 
