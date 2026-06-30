@@ -250,7 +250,7 @@ struct ScanDestinationRequest {
 async fn api_scan_destination_now(
     AxumState(backend): AxumState<Backend>,
     Json(req): Json<ScanDestinationRequest>,
-) -> Result<Json<ScanReport>, ApiError> {
+) -> Result<Json<Option<ScanReport>>, ApiError> {
     Ok(Json(
         backend.scan_destination_now(&req.source_id, &req.destination_id)?,
     ))

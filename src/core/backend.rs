@@ -277,19 +277,20 @@ impl Backend {
         self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
-    /// Run a dry-run Scan (compare source vs destination, no changes) and return
-    /// the difference report. Delegated to the source's machine for a remote
-    /// source; the report is persisted there and on this machine.
+    /// Start a dry-run Scan (compare source vs destination, no changes). The
+    /// scan runs in the background — a large tree can take many minutes and must
+    /// not hold the request open or block the backup — and persists its report;
+    /// callers poll [`Self::scan_report`] for the result. Returns the previously
+    /// stored report (if any) so the UI has something to show immediately.
+    /// Delegated to the source's machine for a remote source.
     pub fn scan_destination_now(
         &self,
         source_id: &str,
         destination_id: &str,
-    ) -> Result<ScanReport> {
+    ) -> Result<Option<ScanReport>> {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
         if let Some(machine) = source_execution_machine(&cfg, source_id)? {
-            ensure_remote_machine_not_syncing(&machine)?;
-            let timeout = Duration::from_secs(cfg.app.sync.transfer_timeout_secs.max(60).max(600));
             return remote_post_json(
                 &machine,
                 "/api/scan-destination-now",
@@ -297,12 +298,29 @@ impl Backend {
                     source_id: source_id.to_string(),
                     destination_id: destination_id.to_string(),
                 },
-                timeout,
+                Duration::from_secs(30),
             );
         }
         let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
-        crate::core::sync::scan_destination_now(&cfg, &state_db, source_id, destination_id)
+        let previous = state_db.get_scan_report(source_id, destination_id)?;
+        let cfg = cfg.clone();
+        let source_id = source_id.to_string();
+        let destination_id = destination_id.to_string();
+        std::thread::spawn(move || match DbState::open(&cfg.app.data_db) {
+            Ok(state) => {
+                if let Err(err) = crate::core::sync::scan_destination_now(
+                    &cfg,
+                    &state,
+                    &source_id,
+                    &destination_id,
+                ) {
+                    tracing::warn!(error = %err, source = source_id, destination = destination_id, "scan failed");
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "scan could not open state db"),
+        });
+        Ok(previous)
     }
 
     /// The most recent stored Scan report for a destination, if any.

@@ -543,7 +543,7 @@ async fn scan_destination_now(
     backend: tauri::State<'_, Backend>,
     source_id: String,
     destination_id: String,
-) -> Result<ScanReport, String> {
+) -> Result<Option<ScanReport>, String> {
     backend
         .scan_destination_now(&source_id, &destination_id)
         .map_err(error_text)

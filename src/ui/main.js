@@ -21,9 +21,40 @@ let excludeEditor = null;
 let dstSyncEditor = null;
 let dstLogViewer = null;
 const scanReports = {};
+const scanPending = {};
+let checkingScans = false;
 
 function scanReportKey(sourceId, destinationId) {
   return `${sourceId}|${destinationId}`;
+}
+
+// While a background scan is running, poll for its report (identified by a new
+// scanned_at) and surface it in the info panel when it completes.
+async function checkPendingScans() {
+  if (checkingScans) return;
+  const entries = Object.entries(scanPending);
+  if (!entries.length) return;
+  checkingScans = true;
+  try {
+    for (const [key, info] of entries) {
+      let report;
+      try {
+        report = await invoke("scan_report", {
+          sourceId: info.sourceId,
+          destinationId: info.destinationId,
+        });
+      } catch (_error) {
+        continue;
+      }
+      if (report && report.scanned_at && report.scanned_at !== info.prev) {
+        scanReports[key] = report;
+        delete scanPending[key];
+        renderDestinationLogModal();
+      }
+    }
+  } finally {
+    checkingScans = false;
+  }
 }
 let latestDestinationSchedule = defaultDestinationSchedule();
 let activeSourceTab = "sources";
@@ -162,6 +193,7 @@ async function loadRuntimeStatus() {
   runtimeStatus = await invoke("get_runtime_status");
   updateStatusBar();
   renderDestinationLogModal();
+  checkPendingScans();
 }
 
 async function loadSyncActivity() {
@@ -917,15 +949,27 @@ function renderSyncRows(source, group) {
         return;
       }
       if (mode === "scan") {
-        runBusy(`Scanning ${source.id} -> ${dst.id}...`, async () => {
+        // The scan runs in the background (it can take many minutes on a large
+        // tree and must not block the backup). Open the info panel so live
+        // progress shows, kick it off, and poll for the report when it lands.
+        const key = scanReportKey(source.id, dst.id);
+        openDestinationLogModal(source, dst);
+        runBusy(`Starting scan ${source.id} -> ${dst.id}...`, async () => {
           await saveConfig();
-          const report = await invoke("scan_destination_now", {
+          const previous = await invoke("scan_destination_now", {
             sourceId: source.id,
             destinationId: dst.id,
           });
-          scanReports[scanReportKey(source.id, dst.id)] = report;
-          setMessage("");
-          openDestinationLogModal(source, dst);
+          scanPending[key] = {
+            sourceId: source.id,
+            destinationId: dst.id,
+            prev: (previous && previous.scanned_at) || "",
+          };
+          if (previous) {
+            scanReports[key] = previous;
+          }
+          setMessage("Scan running — progress and result appear in the info panel.");
+          renderDestinationLogModal();
         }, { showMainMessage: false });
         return;
       }

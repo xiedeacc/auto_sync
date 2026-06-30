@@ -51,6 +51,7 @@ const DELTA_MAX_SIZE: u64 = 512 * 1024 * 1024;
 /// web server and (optional) desktop UI now sharing one process, the scheduled
 /// tick and a manually triggered sync must never drive the engine concurrently.
 static SYNC_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+static SCAN_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 static SYNC_KIND: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 struct SyncKindGuard {
@@ -68,6 +69,13 @@ impl Drop for SyncKindGuard {
 
 pub fn sync_gate() -> &'static Mutex<()> {
     SYNC_GATE.get_or_init(|| Mutex::new(()))
+}
+
+/// A separate lock for Scan (dry-run compare). Scan is read-only and must NOT
+/// block the real backup, so it does not take [`sync_gate`]; this only prevents
+/// two scans of the same process from overlapping.
+fn scan_gate() -> &'static Mutex<()> {
+    SCAN_GATE.get_or_init(|| Mutex::new(()))
 }
 
 pub fn sync_is_running() -> bool {
@@ -240,10 +248,12 @@ pub fn scan_destination_now(
     source_id: &str,
     destination_id: &str,
 ) -> Result<ScanReport> {
-    let _serialized = sync_gate()
+    // Scan is read-only: it serializes only against other scans, never against
+    // the real backup, so a long compare cannot stall syncing.
+    let _serialized = scan_gate()
         .try_lock()
-        .map_err(|_| anyhow!("sync already in progress"))?;
-    let _kind = set_sync_kind("scan");
+        .map_err(|_| anyhow!("a scan is already in progress"))?;
+    let _kind = set_sync_kind_if_empty("scan");
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
     progress::configure_progress_file(&cfg.app.data_db);
 
