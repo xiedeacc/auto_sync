@@ -59,10 +59,13 @@ pub struct NativeSyncConfig {
     /// cross-platform timestamp granularity (Windows ↔ Linux/ZFS) from forcing
     /// endless re-transfers. Only used when checksum is disabled.
     pub modify_window_secs: u64,
-    /// fsync every received file (and its directory) for crash durability. Off
-    /// by default, matching rsync: on sync filesystems (e.g. ZFS) an fsync per
-    /// file collapses small-file throughput (~100 files/s vs ~20k/s). A backup
-    /// re-verifies and resumes each cycle, so durability is recoverable.
+    /// fsync every received file (and its parent directory) before the atomic
+    /// rename, for crash/power-loss durability. On by default: without it a
+    /// crash after the rename returns but before write-back can leave a
+    /// zero-length or stale destination file even though the sync reported
+    /// success. Can be disabled for max throughput on sync filesystems where an
+    /// fsync per file is costly; a backup re-verifies each cycle so the data is
+    /// recoverable, but the published "verified" state would briefly be a lie.
     pub fsync: bool,
 }
 
@@ -229,7 +232,7 @@ impl Default for NativeSyncConfig {
             bwlimit_kbps: 0,
             max_parallel_transfers: DEFAULT_MAX_PARALLEL_TRANSFERS,
             modify_window_secs: DEFAULT_MODIFY_WINDOW_SECS,
-            fsync: false,
+            fsync: true,
         }
     }
 }

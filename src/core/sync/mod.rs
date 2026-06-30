@@ -40,8 +40,11 @@ const TRANSFER_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 /// Files at least this large that already exist on the destination are sent as
 /// an rsync-style delta (only changed regions) instead of being re-sent whole.
 const DELTA_MIN_SIZE: u64 = 256 * 1024;
-/// Never load a delta basis larger than this into memory; fall back to chunked.
-const DELTA_MAX_SIZE: u64 = 1024 * 1024 * 1024;
+/// Upper bound on files eligible for delta. The sender still buffers the new
+/// file (and the encoded delta) in memory, so this is kept bounded to limit peak
+/// RAM under parallel transfers; larger changed files use the chunked streaming
+/// path (16 MiB buffer) instead. The receiver basis is read as a stream.
+const DELTA_MAX_SIZE: u64 = 512 * 1024 * 1024;
 
 /// Serializes every run of the sync engine within a process. With the daemon,
 /// web server and (optional) desktop UI now sharing one process, the scheduled
@@ -337,6 +340,11 @@ pub struct TransferFinishFileRequest {
     pub root: PathBuf,
     pub cycle_id: i64,
     pub entry: SnapshotEntry,
+    /// blake3 of the whole source file, computed by the sender while streaming.
+    /// The receiver re-hashes the assembled file and rejects a mismatch
+    /// (end-to-end integrity). Optional for back-compat with older senders.
+    #[serde(default)]
+    pub full_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +356,10 @@ pub struct TransferReceiveSymlinkRequest {
     pub mode: u32,
     pub hash: Option<String>,
     pub target: String,
+    /// Whether the link points to a directory (decided by the sender). Needed so
+    /// a Linux directory-symlink is recreated as a directory-symlink on Windows.
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +457,10 @@ pub struct TransferPutFileQuery {
     pub size: i64,
     pub mtime_ns: i64,
     pub mode: u32,
+    /// blake3 of the file body for end-to-end integrity (see
+    /// [`TransferFinishFileRequest::full_hash`]). Optional for back-compat.
+    #[serde(default)]
+    pub full_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -712,7 +728,13 @@ pub fn transfer_finish_file(req: TransferFinishFileRequest) -> Result<TransferAc
             req.entry.size
         );
     }
-    finish_received_file(&req.root, req.cycle_id, &req.entry, &tmp, &final_path)?;
+    // Carry the streamed full-file hash into the entry so finish_received_file
+    // verifies the assembled chunks end-to-end before publishing.
+    let mut entry = req.entry;
+    if entry.hash.is_none() {
+        entry.hash = req.full_hash;
+    }
+    finish_received_file(&req.root, req.cycle_id, &entry, &tmp, &final_path)?;
     Ok(transfer_ack())
 }
 
@@ -730,13 +752,21 @@ pub fn transfer_put_file(query: TransferPutFileQuery, bytes: &[u8]) -> Result<Tr
             size
         );
     }
+    // Verify content end-to-end against the sender's hash before writing, so a
+    // bit flipped in transit (which TCP's checksum can miss) is rejected.
+    if let Some(expected) = &query.full_hash {
+        let actual = blake3::hash(bytes).to_hex().to_string();
+        if &actual != expected {
+            bail!("put-file content hash mismatch for {}", query.rel_path);
+        }
+    }
     let entry = SnapshotEntry {
         rel_path: query.rel_path.clone(),
         file_type: "file".to_string(),
         size: query.size,
         mtime_ns: query.mtime_ns,
         mode: query.mode,
-        hash: None,
+        hash: query.full_hash.clone(),
     };
     let final_path = safe_join_rel(&root, &entry.rel_path)?;
     let tmp = tmp_path(&root, query.cycle_id, &entry.rel_path);
@@ -762,12 +792,14 @@ pub fn transfer_block_sums(req: TransferBlockSumsRequest) -> Result<delta::Block
             });
         }
     };
-    let data = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let block_len = delta::block_len_for(metadata.len());
+    let file = File::open(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let blocks = delta::compute_block_sums_from_reader(io::BufReader::new(file), block_len)
+        .with_context(|| format!("failed to checksum {}", path.display()))?;
     Ok(delta::BlockSums {
         block_len: block_len as u32,
-        file_size: data.len() as u64,
-        blocks: delta::compute_block_sums(&data, block_len),
+        file_size: metadata.len(),
+        blocks,
     })
 }
 
@@ -822,7 +854,7 @@ pub fn transfer_receive_symlink(req: TransferReceiveSymlinkRequest) -> Result<Tr
         mode: req.mode,
         hash: req.hash,
     };
-    receive_symlink_target(&req.root, req.cycle_id, &entry, &req.target)?;
+    receive_symlink_target(&req.root, req.cycle_id, &entry, &req.target, req.is_dir)?;
     Ok(transfer_ack())
 }
 
@@ -883,6 +915,7 @@ fn receive_symlink_target(
     cycle_id: i64,
     entry: &SnapshotEntry,
     target: &str,
+    is_dir: bool,
 ) -> Result<()> {
     reject_dangerous_destination(dst_root)?;
     if entry.file_type != "symlink" {
@@ -896,7 +929,7 @@ fn receive_symlink_target(
     if tmp.exists() || fs::symlink_metadata(&tmp).is_ok() {
         remove_any(&tmp)?;
     }
-    create_symlink(&final_path, Path::new(target), &tmp)
+    create_symlink_kind(Path::new(target), &tmp, is_dir)
         .with_context(|| format!("failed to create symlink {}", tmp.display()))?;
     if Some(hash_symlink(&tmp)?) != entry.hash {
         remove_any(&tmp).ok();
@@ -921,13 +954,16 @@ fn finish_received_file(
             bail!("received file hash mismatch at {}", entry.rel_path);
         }
     }
+    // Flush data before tightening mode and renaming: a swallowed fsync error
+    // here could publish a zero-length/stale file as "verified" after a crash.
+    fsync_file(tmp)
+        .with_context(|| format!("failed to fsync received file {}", entry.rel_path))?;
     set_mode(tmp, entry.mode).ok();
     let mtime = FileTime::from_unix_time(
         entry.mtime_ns / 1_000_000_000,
         (entry.mtime_ns % 1_000_000_000) as u32,
     );
     set_file_mtime(tmp, mtime).ok();
-    fsync_file(tmp).ok();
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -981,28 +1017,40 @@ fn send_file_tcp(
     }
     let _ = destination_id;
     let mut file = File::open(src).with_context(|| format!("failed to read {}", src.display()))?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut sent = offset;
+    // Read from the start so we can hash the whole file end-to-end, but only
+    // send the bytes from `offset` onward (resume). The 16 MiB buffer bounds
+    // memory regardless of file size.
+    let mut hasher = blake3::Hasher::new();
+    let mut pos = 0_u64;
     let mut buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
-    while sent < total_size {
-        let remaining = (total_size - sent).min(TRANSFER_CHUNK_SIZE as u64) as usize;
+    while pos < total_size {
+        let remaining = (total_size - pos).min(TRANSFER_CHUNK_SIZE as u64) as usize;
         let n = file.read(&mut buf[..remaining])?;
         if n == 0 {
             bail!("source ended while sending {}", entry.rel_path);
         }
-        let path = receive_file_chunk_api_path(destination_root, cycle_id, entry, sent);
-        let ack: TransferAck = remote_post_bytes(destination, &path, &buf[..n], timeout)?;
-        if !ack.ok {
-            bail!("peer rejected TCP file chunk");
+        hasher.update(&buf[..n]);
+        let chunk_end = pos + n as u64;
+        if chunk_end > offset {
+            let skip = offset.saturating_sub(pos) as usize;
+            let send_at = pos + skip as u64;
+            let path = receive_file_chunk_api_path(destination_root, cycle_id, entry, send_at);
+            let ack: TransferAck =
+                remote_post_bytes(destination, &path, &buf[skip..n], timeout)?;
+            if !ack.ok {
+                bail!("peer rejected TCP file chunk");
+            }
+            let sent_now = n - skip;
+            progress::record_transfer(&entry.rel_path, sent_now as u64);
+            throttle_after_transfer(sent_now, bwlimit_kbps);
         }
-        sent += n as u64;
-        progress::record_transfer(&entry.rel_path, n as u64);
-        throttle_after_transfer(n, bwlimit_kbps);
+        pos = chunk_end;
     }
     let finish = TransferFinishFileRequest {
         root: destination_root.to_path_buf(),
         cycle_id,
         entry: entry.clone(),
+        full_hash: Some(hasher.finalize().to_hex().to_string()),
     };
     let ack: TransferAck =
         remote_post_json(destination, "/api/transfer/finish-file", &finish, timeout)?;
@@ -1034,7 +1082,8 @@ fn send_put_file_tcp(
         );
     }
     let _ = destination_id;
-    let path = put_file_api_path(destination_root, cycle_id, entry);
+    let full_hash = blake3::hash(&bytes).to_hex().to_string();
+    let path = put_file_api_path(destination_root, cycle_id, entry, &full_hash);
     let ack: TransferAck = remote_post_bytes(destination, &path, &bytes, timeout)?;
     if !ack.ok {
         bail!("peer rejected put-file transfer");
@@ -1130,15 +1179,16 @@ fn apply_delta_api_path(
     )
 }
 
-fn put_file_api_path(root: &Path, cycle_id: i64, entry: &SnapshotEntry) -> String {
+fn put_file_api_path(root: &Path, cycle_id: i64, entry: &SnapshotEntry, full_hash: &str) -> String {
     format!(
-        "/api/transfer/put-file?root={}&rel_path={}&cycle_id={}&size={}&mtime_ns={}&mode={}",
+        "/api/transfer/put-file?root={}&rel_path={}&cycle_id={}&size={}&mtime_ns={}&mode={}&full_hash={}",
         encode_query_component(&root.to_string_lossy()),
         encode_query_component(&entry.rel_path),
         cycle_id,
         entry.size,
         entry.mtime_ns,
-        entry.mode
+        entry.mode,
+        encode_query_component(full_hash)
     )
 }
 
@@ -1162,6 +1212,7 @@ fn send_symlink_tcp(
         mode: entry.mode,
         hash: entry.hash.clone(),
         target,
+        is_dir: symlink_points_to_dir(src),
     };
     let ack: TransferAck =
         remote_post_json(destination, "/api/transfer/receive-symlink", &req, timeout)?;
@@ -3061,6 +3112,35 @@ fn resolve_parallelism(configured: usize, work_items: usize) -> usize {
     requested.clamp(1, work_items.max(1))
 }
 
+const TRANSFER_RETRY_ATTEMPTS: u32 = 3;
+
+/// Run a single-file transfer, retrying transient failures with exponential
+/// backoff before giving up. Each transfer path is idempotent on retry (chunked
+/// resumes from the receiver's offset, put-file/delta overwrite the temp file),
+/// so a retry cannot corrupt a partial result.
+fn with_transfer_retry<F>(label: &str, mut attempt_fn: F) -> Result<()>
+where
+    F: FnMut() -> Result<()>,
+{
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        match attempt_fn() {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < TRANSFER_RETRY_ATTEMPTS => {
+                warn!(
+                    rel_path = label,
+                    attempt,
+                    error = %err,
+                    "transfer attempt failed; retrying after backoff"
+                );
+                thread::sleep(Duration::from_millis(200_u64 << (attempt - 1)));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// Transfer the given entries to the destination using a bounded worker pool.
 /// Returns the number of entries transferred. On the first failure the workers
 /// stop pulling new work and that error is returned.
@@ -3106,20 +3186,21 @@ fn push_entries_parallel(
                         break;
                     }
                     let (entry, use_delta) = entries[idx];
-                    match push_entry_between_machines(
-                        source_machine_id,
-                        source_machine,
-                        source_root,
-                        dst_machine,
-                        dst_root,
-                        destination_id,
-                        cycle_id,
-                        entry,
-                        use_delta,
-                        sync,
-                    )
-                    .with_context(|| format!("failed to transfer {}", entry.rel_path))
-                    {
+                    match with_transfer_retry(&entry.rel_path, || {
+                        push_entry_between_machines(
+                            source_machine_id,
+                            source_machine,
+                            source_root,
+                            dst_machine,
+                            dst_root,
+                            destination_id,
+                            cycle_id,
+                            entry,
+                            use_delta,
+                            sync,
+                        )
+                        .with_context(|| format!("failed to transfer {}", entry.rel_path))
+                    }) {
                         Ok(()) => {
                             done.fetch_add(1, Ordering::Relaxed);
                         }
@@ -4807,13 +4888,15 @@ fn copy_file(
             bail!("source changed while copying {}", entry.rel_path);
         }
     }
+    // fsync data before tightening mode (a read-only mode would block the
+    // writable handle fsync needs on Windows).
+    fsync_file(&tmp).with_context(|| format!("failed to fsync {}", entry.rel_path))?;
     set_mode(&tmp, entry.mode).ok();
     let mtime = FileTime::from_unix_time(
         entry.mtime_ns / 1_000_000_000,
         (entry.mtime_ns % 1_000_000_000) as u32,
     );
     set_file_mtime(&tmp, mtime).ok();
-    fsync_file(&tmp).ok();
     replace_path(&tmp, final_path)?;
     fsync_parent(final_path).ok();
     Ok(())
@@ -4957,7 +5040,7 @@ fn copy_symlink(
     if tmp.exists() {
         remove_any(&tmp)?;
     }
-    create_symlink(src, &target, &tmp)
+    create_symlink_kind(&target, &tmp, symlink_points_to_dir(src))
         .with_context(|| format!("failed to create symlink {}", tmp.display()))?;
     if Some(hash_symlink(&tmp)?) != entry.hash {
         remove_any(&tmp).ok();
@@ -5189,18 +5272,29 @@ fn set_permissions_mode(perms: &mut fs::Permissions, mode: u32) {
     perms.set_readonly(mode & 0o222 == 0);
 }
 
+/// Create a symlink at `tmp` pointing to `target`. `is_dir` says whether the
+/// link points to a directory — required on Windows, which has distinct
+/// directory- and file-symlink kinds. The source decides `is_dir` (it can see
+/// the link's target); the destination cannot, since the link does not exist
+/// there yet (this was the Linux-dir-symlink → Windows-file-symlink bug).
 #[cfg(unix)]
-fn create_symlink(_src: &Path, target: &Path, tmp: &Path) -> io::Result<()> {
+fn create_symlink_kind(target: &Path, tmp: &Path, _is_dir: bool) -> io::Result<()> {
     symlink(target, tmp)
 }
 
 #[cfg(windows)]
-fn create_symlink(src: &Path, target: &Path, tmp: &Path) -> io::Result<()> {
-    if fs::metadata(src).map(|meta| meta.is_dir()).unwrap_or(false) {
+fn create_symlink_kind(target: &Path, tmp: &Path, is_dir: bool) -> io::Result<()> {
+    if is_dir {
         symlink_dir(target, tmp)
     } else {
         symlink_file(target, tmp)
     }
+}
+
+/// Whether the symlink at `src` resolves to a directory (follows the link).
+/// Dangling links report `false` (best guess; the target type is unknowable).
+fn symlink_points_to_dir(src: &Path) -> bool {
+    fs::metadata(src).map(|meta| meta.is_dir()).unwrap_or(false)
 }
 
 /// Whether received files are fsync'd for durability. Off by default; an fsync
@@ -5220,16 +5314,33 @@ fn fsync_file(path: &Path) -> io::Result<()> {
     if !fsync_enabled() {
         return Ok(());
     }
-    File::open(path)?.sync_all()
+    // FlushFileBuffers on Windows (and durability semantics generally) needs a
+    // writable handle, so open for write rather than read. A read-only attribute
+    // (e.g. copied from a read-only source) would block that open on Windows, so
+    // clear it first; the caller applies the final mode afterwards.
+    #[cfg(windows)]
+    {
+        let mut perms = fs::metadata(path)?.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            fs::set_permissions(path, perms)?;
+        }
+    }
+    OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 fn fsync_parent(path: &Path) -> io::Result<()> {
     if !fsync_enabled() {
         return Ok(());
     }
+    // A directory handle cannot be opened as a writable File on Windows; the
+    // file fsync plus the rename is the durability point there.
+    #[cfg(not(windows))]
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }
+    #[cfg(windows)]
+    let _ = path;
     Ok(())
 }
 
@@ -5521,6 +5632,7 @@ mod tests {
             root: root.clone(),
             cycle_id: 11,
             entry,
+            full_hash: Some(blake3::hash(&bytes[..]).to_hex().to_string()),
         })
         .unwrap();
 

@@ -467,6 +467,11 @@ fn persist_fid_name_event(
     event: &[u8],
 ) -> Result<()> {
     let records = fid_records(event)?;
+    // Deletes/moves-away invalidate the cached handle→path entry for the gone
+    // path (and its subtree); keeping them would leak memory and, on inode
+    // reuse, resolve a future event to the wrong path.
+    let is_removal =
+        meta.mask & (FAN_DELETE | FAN_MOVED_FROM | FAN_DELETE_SELF | FAN_MOVE_SELF) != 0;
     let mut recorded = false;
     for source in &mut *sources {
         for record in &records {
@@ -484,7 +489,11 @@ fn persist_fid_name_event(
                 false,
             )?;
             recorded = true;
-            track_new_path_and_mark_directory(source, fanotify_fd, mark_mask, &path);
+            if is_removal {
+                remove_handle_paths_under(source, &path);
+            } else {
+                track_new_path_and_mark_directory(source, fanotify_fd, mark_mask, &path);
+            }
         }
     }
     if !recorded {
@@ -676,6 +685,15 @@ fn build_handle_path_map(root: &Path, is_file: bool) -> Result<HashMap<Vec<u8>, 
         insert_handle_path(&mut handles, entry.path());
     }
     Ok(handles)
+}
+
+/// Drop cached handle→path entries for `path` and anything beneath it (a
+/// directory removal takes its whole subtree with it). Keyed by value because
+/// the inode is gone, so its handle can no longer be computed from the path.
+fn remove_handle_paths_under(source: &mut SourceRoot, path: &Path) {
+    source
+        .handle_paths
+        .retain(|_, cached| cached != path && !cached.starts_with(path));
 }
 
 fn insert_handle_path(handles: &mut HashMap<Vec<u8>, PathBuf>, path: &Path) {

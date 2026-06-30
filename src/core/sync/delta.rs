@@ -110,6 +110,38 @@ pub fn compute_block_sums(data: &[u8], block_len: usize) -> Vec<BlockSum> {
     blocks
 }
 
+/// Streaming equivalent of [`compute_block_sums`] that reads full-size blocks
+/// from `reader` without buffering the whole basis file in memory. The tail
+/// (shorter than `block_len`) is ignored, matching the slice version.
+pub fn compute_block_sums_from_reader<R: Read>(
+    mut reader: R,
+    block_len: usize,
+) -> Result<Vec<BlockSum>> {
+    let mut blocks = Vec::new();
+    if block_len == 0 {
+        return Ok(blocks);
+    }
+    let mut buf = vec![0_u8; block_len];
+    loop {
+        let mut filled = 0;
+        while filled < block_len {
+            let n = reader.read(&mut buf[filled..])?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled < block_len {
+            break; // tail shorter than a block is not summed
+        }
+        blocks.push(BlockSum {
+            weak: Rolling::new(&buf).digest(),
+            strong: strong_hash(&buf),
+        });
+    }
+    Ok(blocks)
+}
+
 /// Build an encoded delta turning the destination's old file (described by
 /// `sums`) into `new_data`. Returns the encoded op stream.
 pub fn build_delta(new_data: &[u8], sums: &BlockSums) -> Vec<u8> {

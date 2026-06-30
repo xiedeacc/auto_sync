@@ -1,9 +1,17 @@
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+
+/// Serializes the heaviest/most-frequent writers across the in-process openers
+/// (scheduler, watcher, web) so a long `replace_snapshot` transaction and the
+/// watcher's per-event `record_event` queue on this lock instead of racing on
+/// SQLite's single writer lock and surfacing "database is locked". All State
+/// instances in the process share one DB file, so one lock covers them.
+static DB_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 use crate::core::config::AppConfig;
 use crate::core::config::ScheduleMode;
@@ -78,7 +86,7 @@ impl State {
             .with_context(|| format!("failed to open state db {}", path.display()))?;
         // Multiple openers (scheduler + web/UI) may touch this DB; wait rather
         // than fail immediately on a transient writer lock.
-        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -717,6 +725,7 @@ impl State {
         rel_path: Option<&str>,
         rescan_required: bool,
     ) -> Result<i64> {
+        let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let cycle_id = self.ensure_open_cycle(source_id, Utc::now())?;
         let now = now_string();
         self.conn.execute(
@@ -999,6 +1008,7 @@ impl State {
         source_id: &str,
         entries: &[SnapshotEntry],
     ) -> Result<()> {
+        let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let tx = self.conn.transaction()?;
         tx.execute(
             "DELETE FROM path_snapshot WHERE cycle_id=?1 AND source_id=?2",
