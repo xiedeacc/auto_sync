@@ -42,6 +42,17 @@ pub struct AppSection {
     pub port: u16,
     pub tcp_connection_pool_size: usize,
     pub sync: NativeSyncConfig,
+    /// Start auto_sync automatically when the user logs in (desktop only).
+    #[serde(default = "default_true")]
+    pub autostart: bool,
+    /// Closing the main window minimizes to the system tray instead of quitting
+    /// (keeps the daemon running). Desktop only.
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +229,8 @@ impl Default for AppSection {
             port: default_app_port(),
             tcp_connection_pool_size: DEFAULT_TCP_CONNECTION_POOL_SIZE,
             sync: NativeSyncConfig::default(),
+            autostart: true,
+            close_to_tray: true,
         }
     }
 }

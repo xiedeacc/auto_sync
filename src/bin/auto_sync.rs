@@ -279,11 +279,141 @@ fn spawn_web(backend: Backend, addr: SocketAddr) {
 }
 
 #[cfg(feature = "gui")]
+static CLOSE_TO_TRAY: AtomicBool = AtomicBool::new(true);
+
+/// Create or remove the login autostart entry to match the setting. Best-effort:
+/// failures are logged, not fatal. On Windows this manages the same Startup
+/// launcher the deploy script writes; on Linux a ~/.config/autostart entry.
+#[cfg(feature = "gui")]
+fn apply_autostart(enabled: bool, config_path: &std::path::Path) {
+    if let Err(err) = apply_autostart_inner(enabled, config_path) {
+        warn!(error = %err, enabled, "failed to update autostart entry");
+    }
+}
+
+#[cfg(all(feature = "gui", windows))]
+fn apply_autostart_inner(enabled: bool, config_path: &std::path::Path) -> std::io::Result<()> {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return Ok(());
+    };
+    let startup = PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup");
+    let launcher = startup.join("auto_sync-start.vbs");
+    if enabled {
+        std::fs::create_dir_all(&startup)?;
+        let exe = std::env::current_exe()?
+            .display()
+            .to_string()
+            .replace('"', "\"\"");
+        let cfg = config_path.display().to_string().replace('"', "\"\"");
+        let script = format!(
+            "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.Run \"\"\"{exe}\"\" --config \"\"{cfg}\"\"\", 0, False\r\n"
+        );
+        std::fs::write(&launcher, script)?;
+    } else if launcher.exists() {
+        std::fs::remove_file(&launcher)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "gui", not(windows)))]
+fn apply_autostart_inner(enabled: bool, config_path: &std::path::Path) -> std::io::Result<()> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(());
+    };
+    let dir = PathBuf::from(home).join(".config").join("autostart");
+    let entry = dir.join("auto_sync.desktop");
+    if enabled {
+        std::fs::create_dir_all(&dir)?;
+        let exe = std::env::current_exe()?;
+        let content = format!(
+            "[Desktop Entry]\nType=Application\nName=auto_sync\nExec=\"{}\" --config \"{}\"\nX-GNOME-Autostart-enabled=true\n",
+            exe.display(),
+            config_path.display()
+        );
+        std::fs::write(&entry, content)?;
+    } else if entry.exists() {
+        std::fs::remove_file(&entry)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gui")]
+fn show_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(feature = "gui")]
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    let show = MenuItemBuilder::with_id("show", "Show auto_sync").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit auto_sync").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../../icons/icon.png"))?;
+    let _tray = TrayIconBuilder::with_id("main")
+        .icon(icon)
+        .tooltip("auto_sync")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+#[cfg(feature = "gui")]
 fn run_with_desktop(backend: Backend, addr: SocketAddr) {
     spawn_web(backend.clone(), addr);
+    let config_path = backend.config_path();
+    if let Ok(cfg) = backend.get_config() {
+        CLOSE_TO_TRAY.store(cfg.app.close_to_tray, Ordering::Relaxed);
+        apply_autostart(cfg.app.autostart, config_path.as_path());
+    }
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(backend)
+        .setup(|app| {
+            if let Err(err) = build_tray(app.handle()) {
+                warn!(error = %err, "failed to create system tray");
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if CLOSE_TO_TRAY.load(Ordering::Relaxed) {
+                    // Minimize to tray instead of quitting (daemon keeps running).
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else {
+                    // Close means quit: stop the whole process (daemon included).
+                    use tauri::Manager;
+                    window.app_handle().exit(0);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_config_command,
@@ -453,7 +583,10 @@ fn save_config_command(
     backend: tauri::State<'_, Backend>,
     cfg: AppConfig,
 ) -> Result<AppConfig, String> {
-    backend.save_config(&cfg).map_err(error_text)
+    let saved = backend.save_config(&cfg).map_err(error_text)?;
+    CLOSE_TO_TRAY.store(saved.app.close_to_tray, Ordering::Relaxed);
+    apply_autostart(saved.app.autostart, backend.config_path().as_path());
+    Ok(saved)
 }
 
 #[cfg(feature = "gui")]

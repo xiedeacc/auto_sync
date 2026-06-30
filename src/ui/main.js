@@ -98,6 +98,8 @@ const el = {
   settingsSyncMirror: document.getElementById("settings-sync-mirror"),
   settingsSyncChecksum: document.getElementById("settings-sync-checksum"),
   settingsSyncDebug: document.getElementById("settings-sync-debug"),
+  settingsAutostart: document.getElementById("settings-autostart"),
+  settingsCloseToTray: document.getElementById("settings-close-to-tray"),
   settingsSyncTimeout: document.getElementById("settings-sync-timeout"),
   settingsSyncBwlimit: document.getElementById("settings-sync-bwlimit"),
   settingsTcpPool: document.getElementById("settings-tcp-pool"),
@@ -1110,6 +1112,8 @@ function normalizeAppConfig(app) {
     status_log_interval_secs: Number(app.status_log_interval_secs || 300),
     port: Number(app.port || appPortFromLegacyBind(app.web_bind) || 18765),
     tcp_connection_pool_size: Number(app.tcp_connection_pool_size ?? 100),
+    autostart: app.autostart !== false,
+    close_to_tray: app.close_to_tray !== false,
     sync: normalizeNativeSyncConfig(app.sync || {}),
   };
 }
@@ -1675,6 +1679,8 @@ function openSettingsModal(event) {
   el.settingsSyncTimeout.value = String(sync.transfer_timeout_secs || 120);
   el.settingsSyncBwlimit.value = String(sync.bwlimit_kbps || 0);
   el.settingsTcpPool.value = String(cfg.app.tcp_connection_pool_size ?? 100);
+  el.settingsAutostart.checked = cfg.app.autostart !== false;
+  el.settingsCloseToTray.checked = cfg.app.close_to_tray !== false;
   el.settingsModal.hidden = false;
 }
 
@@ -1686,6 +1692,8 @@ async function saveSettings() {
   updateCfgFromForm();
   cfg.app = normalizeAppConfig(cfg.app || {});
   cfg.app.tcp_connection_pool_size = clampInteger(el.settingsTcpPool.value, 0, 10000);
+  cfg.app.autostart = el.settingsAutostart.checked;
+  cfg.app.close_to_tray = el.settingsCloseToTray.checked;
   const baseSync = normalizeNativeSyncConfig(cfg.app.sync || {});
   cfg.app.sync = normalizeNativeSyncConfig({
     ...baseSync,
