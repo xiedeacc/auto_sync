@@ -1756,6 +1756,9 @@ pub fn sync_cycle_for_source(
                         }
                     }
                 }
+                // Reaching here means no zfs diff base was usable, so this is a
+                // full source+dst reconcile; reflect that in the status type.
+                let _kind = set_sync_kind("full");
                 let sync_result = sync_destination_fast_missing_dirs(
                     src_root,
                     dst_root,
@@ -2391,6 +2394,13 @@ fn sync_cycle_with_transfer(
     let source_checksum = any_ready_destination_needs_checksum(cfg, source, &ready_destinations);
     let source_timeout = ready_destination_timeout(cfg, source, &ready_destinations);
     state.mark_cycle_status(cycle.id, "planning")?;
+    // Cross-machine reconcile is a full source+dst pass (no zfs diff); reflect
+    // that in the status type, unless this is a manual Changed Since.
+    let _kind = if cycle.manual_changed_since_rescan {
+        None
+    } else {
+        Some(set_sync_kind("full"))
+    };
     let source_snapshot = snapshot_on_machine(
         source_machine_id,
         &source_machine,

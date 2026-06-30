@@ -726,12 +726,11 @@ fn sync_in_progress_suffix(kind: Option<&str>) -> String {
         return String::new();
     }
     let label = match kind {
-        "incremental" => "incremental",
-        "full" => "full",
-        "changed_since" => "changed since",
-        "automatic" => "automatic",
-        "scan" => "compare",
-        other => other,
+        "incremental" | "automatic" => "Incremental",
+        "full" => "Full",
+        "changed_since" => "Changed Since",
+        "scan" => "Compare",
+        _ => return String::new(),
     };
     format!(" ({label})")
 }

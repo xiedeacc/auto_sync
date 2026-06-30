@@ -886,7 +886,7 @@ function renderSyncRows(source, group) {
           <option value="incremental">Incremental</option>
           <option value="changed_since">Changed Since</option>
           <option value="full">Full</option>
-          <option value="scan">Compare (no changes)</option>
+          <option value="scan">Compare</option>
         </select>
         <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
       </div>
@@ -2088,11 +2088,11 @@ function activityIsSyncing(activity) {
 
 function syncKindLabel(kind) {
   switch (String(kind || "").trim()) {
-    case "incremental": return "incremental";
-    case "full": return "full";
-    case "changed_since": return "changed since";
-    case "automatic": return "automatic";
-    case "scan": return "compare";
+    case "incremental":
+    case "automatic": return "Incremental";
+    case "full": return "Full";
+    case "changed_since": return "Changed Since";
+    case "scan": return "Compare";
     default: return "";
   }
 }
