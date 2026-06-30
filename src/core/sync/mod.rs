@@ -574,9 +574,9 @@ pub fn transfer_prepare_dir(req: TransferPrepareDirRequest) -> Result<TransferAc
     };
     fs::create_dir_all(&path)
         .with_context(|| format!("failed to create directory {}", path.display()))?;
-    if let Some(mode) = req.mode {
-        set_mode(&path, mode).ok();
-    }
+    // Mode is applied later via set-dir-mtimes (deepest-first) so a read-only
+    // directory does not block writing its children during transfer.
+    let _ = req.mode;
     Ok(transfer_ack())
 }
 
@@ -606,7 +606,7 @@ pub fn transfer_prepare_dirs(req: TransferPrepareDirsRequest) -> Result<Transfer
         };
         fs::create_dir_all(&path)
             .with_context(|| format!("failed to create directory {}", path.display()))?;
-        set_mode(&path, dir.mode).ok();
+        // Mode applied later via set-dir-mtimes (deepest-first).
     }
     Ok(transfer_ack())
 }
@@ -3899,7 +3899,8 @@ fn sync_destination(
             }
             fs::create_dir_all(&target)
                 .with_context(|| format!("failed to create directory {}", target.display()))?;
-            set_mode(&target, entry.mode).ok();
+            // Directory mode is applied at end-of-cycle (deepest-first) so a
+            // read-only source dir does not block writing its children.
         }
 
         let to_copy: Vec<&SnapshotEntry> = source_snapshot
@@ -4000,7 +4001,8 @@ fn sync_destination_fast_missing_dirs(
             }
             fs::create_dir_all(&target)
                 .with_context(|| format!("failed to create directory {}", target.display()))?;
-            set_mode(&target, entry.mode).ok();
+            // Directory mode is applied at end-of-cycle (deepest-first) so a
+            // read-only source dir does not block writing its children.
         }
 
         let to_copy: Vec<&SnapshotEntry> = source_snapshot
@@ -4162,7 +4164,7 @@ fn copy_missing_directory_tree(
         }
         fs::create_dir_all(&target)
             .with_context(|| format!("failed to create directory {}", target.display()))?;
-        set_mode(&target, entry.mode).ok();
+        // Mode applied at end via set_dir_mtimes (deepest-first), after children.
         copied_paths.insert(entry.rel_path.clone());
         dir_specs.push(TransferDirSpec {
             rel_path: entry.rel_path.clone(),
@@ -4358,7 +4360,7 @@ fn sync_changed_entries_local(
         let target = dst_root.join(&entry.rel_path);
         fs::create_dir_all(&target)
             .with_context(|| format!("failed to create directory {}", target.display()))?;
-        set_mode(&target, entry.mode).ok();
+        // Mode applied at end via set_snapshot_dir_mtimes (deepest-first).
     }
 
     for entry in source_snapshot

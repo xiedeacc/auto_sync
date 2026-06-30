@@ -11,8 +11,8 @@ Restart=always
 RestartSec=5
 User=root
 Group=root
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
 NoNewPrivileges=false
 
 [Install]
