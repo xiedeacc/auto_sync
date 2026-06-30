@@ -353,6 +353,40 @@ impl Default for DeployTarget {
     }
 }
 
+/// Resolve which config file to use.
+///
+/// If the user passed `--config` explicitly we honour it exactly. Otherwise we
+/// look for an existing `conf/auto_sync.toml`, first relative to the current
+/// directory and then relative to the executable (so launching the binary from
+/// `bin\` finds the repository's `conf\auto_sync.toml` one level up instead of a
+/// stray `bin\conf\auto_sync.toml`). When nothing exists yet we fall back to the
+/// current-directory relative path, which gets created on first run.
+pub fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    let relative = Path::new("conf").join("auto_sync.toml");
+    if relative.exists() {
+        return relative;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // exe in `bin\`: the real config lives in the parent's `conf\`.
+            if let Some(parent) = exe_dir.parent() {
+                let candidate = parent.join("conf").join("auto_sync.toml");
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+            let candidate = exe_dir.join("conf").join("auto_sync.toml");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    relative
+}
+
 pub fn load_or_create_config(path: &Path) -> Result<AppConfig> {
     if !path.exists() {
         let cfg = AppConfig::default();

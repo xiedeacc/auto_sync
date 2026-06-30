@@ -50,8 +50,11 @@ use auto_sync::core::sync::SyncRequestMode;
 #[command(name = "auto_sync")]
 #[command(about = "auto_sync — directory sync daemon, web UI, and optional desktop app")]
 struct Args {
-    #[arg(long, default_value = "conf/auto_sync.toml")]
-    config: PathBuf,
+    /// Path to the config file. If omitted, auto_sync looks for
+    /// conf/auto_sync.toml relative to the current directory, then relative to
+    /// the executable (so launching from bin\ finds the repo config one level up).
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// Run web-only, never opening the desktop window even on a GUI build.
     #[arg(long)]
     no_gui: bool,
@@ -66,11 +69,12 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let cfg = load_or_create_config(&args.config)?;
+    let config_arg = auto_sync::core::config::resolve_config_path(args.config.as_deref());
+    let cfg = load_or_create_config(&config_arg)?;
     let _log_guard = init_logging(&cfg.app.log_dir, "auto_sync")?;
-    info!(config = %args.config.display(), "auto_sync starting");
+    info!(config = %config_arg.display(), "auto_sync starting");
     #[cfg(windows)]
-    if maybe_relaunch_elevated_on_windows(&args)? {
+    if maybe_relaunch_elevated_on_windows(&args, &config_arg)? {
         return Ok(());
     }
 
@@ -78,10 +82,9 @@ fn main() -> Result<()> {
     // pushes) honours it even though it never runs the scheduler loop.
     auto_sync::core::sync::configure_fsync(cfg.app.sync.fsync);
 
-    let config_path = args
-        .config
+    let config_path = config_arg
         .canonicalize()
-        .unwrap_or_else(|_| args.config.clone());
+        .unwrap_or_else(|_| config_arg.clone());
     let addr = bind_addr_for_port(cfg.app.port);
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -125,7 +128,7 @@ fn bind_addr_for_port(port: u16) -> SocketAddr {
 }
 
 #[cfg(windows)]
-fn maybe_relaunch_elevated_on_windows(args: &Args) -> Result<bool> {
+fn maybe_relaunch_elevated_on_windows(args: &Args, config_arg: &std::path::Path) -> Result<bool> {
     if args.elevation_attempted || unsafe { IsUserAnAdmin() } != 0 {
         return Ok(false);
     }
@@ -133,10 +136,9 @@ fn maybe_relaunch_elevated_on_windows(args: &Args) -> Result<bool> {
 
     let exe = std::env::current_exe().context("failed to locate current executable")?;
     let working_dir = std::env::current_dir().context("failed to locate current directory")?;
-    let config = args
-        .config
+    let config = config_arg
         .canonicalize()
-        .unwrap_or_else(|_| args.config.clone());
+        .unwrap_or_else(|_| config_arg.to_path_buf());
     let mut relaunch_args = vec![
         OsString::from("--config"),
         config.into_os_string(),
@@ -144,6 +146,9 @@ fn maybe_relaunch_elevated_on_windows(args: &Args) -> Result<bool> {
     ];
     if args.no_gui {
         relaunch_args.push(OsString::from("--no-gui"));
+    }
+    if args.hidden {
+        relaunch_args.push(OsString::from("--hidden"));
     }
     let parameters = join_windows_command_line(&relaunch_args);
     let operation = wide_null(OsStr::new("runas"));

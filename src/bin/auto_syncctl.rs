@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use auto_sync::core::config::{AppConfig, load_config, load_or_create_config, save_config};
+use auto_sync::core::config::{
+    AppConfig, load_config, load_or_create_config, resolve_config_path, save_config,
+};
 use auto_sync::core::state::State;
 use auto_sync::core::sync::{sync_all_now, sync_all_pending};
 use clap::{Parser, Subcommand};
@@ -12,8 +14,10 @@ use clap::{Parser, Subcommand};
 #[command(name = "auto_syncctl")]
 #[command(about = "Control utility for auto_sync")]
 struct Args {
-    #[arg(long, default_value = "conf/auto_sync.toml")]
-    config: PathBuf,
+    /// Path to the config file. If omitted, the same lookup as auto_sync is used
+    /// (conf/auto_sync.toml relative to the current dir, then to the executable).
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: CommandKind,
@@ -45,20 +49,21 @@ enum CommandKind {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let config_path = resolve_config_path(args.config.as_deref());
     match args.command {
         CommandKind::InitConfig => {
-            let cfg = load_or_create_config(&args.config)?;
-            save_config(&args.config, &cfg)?;
-            println!("initialized {}", args.config.display());
+            let cfg = load_or_create_config(&config_path)?;
+            save_config(&config_path, &cfg)?;
+            println!("initialized {}", config_path.display());
         }
         CommandKind::Status => {
-            let cfg = load_config(&args.config)?;
+            let cfg = load_config(&config_path)?;
             let state = State::open(&cfg.app.data_db)?;
             state.ensure_config(&cfg)?;
             print_status(&state, &cfg)?;
         }
         CommandKind::SyncNow { close_current } => {
-            let cfg = load_config(&args.config)?;
+            let cfg = load_config(&config_path)?;
             let mut state = State::open(&cfg.app.data_db)?;
             state.ensure_config(&cfg)?;
             state.ensure_open_cycles(&cfg)?;
@@ -79,8 +84,8 @@ fn main() -> Result<()> {
             user,
             install_dir,
         } => {
-            let cfg = load_config(&args.config)?;
-            deploy_nas(&cfg, &args.config, &host, port, &user, &install_dir)?;
+            let cfg = load_config(&config_path)?;
+            deploy_nas(&cfg, &config_path, &host, port, &user, &install_dir)?;
         }
     }
     Ok(())
