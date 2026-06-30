@@ -886,7 +886,7 @@ function renderSyncRows(source, group) {
           <option value="incremental">Incremental</option>
           <option value="changed_since">Changed Since</option>
           <option value="full">Full</option>
-          <option value="scan">Scan (compare only)</option>
+          <option value="scan">Compare (no changes)</option>
         </select>
         <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
       </div>
@@ -960,7 +960,7 @@ function renderSyncRows(source, group) {
         // progress shows, kick it off, and poll for the report when it lands.
         const key = scanReportKey(source.id, dst.id);
         openDestinationLogModal(source, dst, "scan");
-        runBusy(`Starting scan ${source.id} -> ${dst.id}...`, async () => {
+        runBusy(`Starting compare ${source.id} -> ${dst.id}...`, async () => {
           await saveConfig();
           const previous = await invoke("scan_destination_now", {
             sourceId: source.id,
@@ -974,7 +974,7 @@ function renderSyncRows(source, group) {
           if (previous) {
             scanReports[key] = previous;
           }
-          setMessage("Scan running — progress and result appear in the info panel.");
+          setMessage("Compare running — progress and result appear in the info panel.");
           renderDestinationLogModal();
         }, { showMainMessage: false });
         return;
@@ -1809,7 +1809,7 @@ function renderDestinationLogModal() {
   const dst = source && (source.destinations || []).find((item) => item.id === dstLogViewer.destinationId);
   const scanMode = dstLogViewer.mode === "scan";
   if (el.dstLogTitle) {
-    el.dstLogTitle.textContent = scanMode ? "Scan" : "Destination Log";
+    el.dstLogTitle.textContent = scanMode ? "Compare" : "Destination Log";
   }
   if (!source || !dst) {
     el.dstLogSummary.textContent = "Destination no longer exists";
@@ -1831,7 +1831,7 @@ function renderDestinationLogModal() {
   if (scanMode) {
     // Scan view: only scan progress + report, never the sync runtime/transfer.
     if (scan) {
-      rows.push(["Scanning", scan.current_path || scan.root_path || "-"]);
+      rows.push(["Comparing", scan.current_path || scan.root_path || "-"]);
       rows.push(["Entries", String(Number(scan.entries_seen || 0))]);
     }
   } else {
@@ -1888,7 +1888,7 @@ function renderScanReportSection(source, dst) {
     return "";
   }
   const total = (report.to_add || 0) + (report.to_update || 0) + (report.to_delete || 0) + (report.type_mismatch || 0);
-  const title = `<div class="dst-log-section-title">Last scan — ${escapeHtml(formatScanTime(report.scanned_at))} (${total} difference${total === 1 ? "" : "s"})</div>`;
+  const title = `<div class="dst-log-section-title">Last compare — ${escapeHtml(formatScanTime(report.scanned_at))} (${total} difference${total === 1 ? "" : "s"})</div>`;
   const diffRows = SCAN_DIFF_KINDS.map(({ kind, label, field }) => {
     const count = report[field] || 0;
     const button = count > 0
