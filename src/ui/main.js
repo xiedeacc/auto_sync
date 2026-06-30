@@ -1489,18 +1489,25 @@ function keyToTaskRef(key) {
 function defaultDestinationSchedule() {
   return {
     mode: "realtime",
-    time: "02:00",
+    time: "14:00",
     timezone: "local",
     weekday: "monday",
     sync_current_cycle_manually: false,
   };
 }
 
+const WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+
+function normalizeWeekday(value) {
+  const lower = String(value || "monday").trim().toLowerCase();
+  return WEEKDAYS.includes(lower) ? lower : "monday";
+}
+
 function normalizeSchedule(schedule) {
   const defaults = defaultDestinationSchedule();
   const next = Object.assign({}, defaults, schedule || {});
   next.time = normalizeScheduleTime((schedule && schedule.time) || defaults.time);
-  next.weekday = (schedule && schedule.weekday) || "monday";
+  next.weekday = normalizeWeekday(schedule && schedule.weekday);
   return next;
 }
 
@@ -1531,10 +1538,10 @@ function destinationSyncTitle(dst) {
 }
 
 function normalizeScheduleTime(value) {
-  const text = String(value || "02:00");
+  const text = String(value || "14:00");
   const match = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(text);
   if (!match) {
-    return "02:00";
+    return "14:00";
   }
   const hour = Math.min(23, Number(match[1]));
   const minute = Math.min(59, Number(match[2]));
@@ -1607,7 +1614,7 @@ function openScheduleModal(schedule, onApply) {
   scheduleEditor = { draft, onApply };
   el.cycleMode.value = draft.mode;
   el.cycleTime.value = formatScheduleTime(draft.time);
-  el.cycleWeekday.value = draft.weekday || "monday";
+  el.cycleWeekday.value = normalizeWeekday(draft.weekday);
   updateScheduleModalFields();
   el.scheduleModal.hidden = false;
 }
@@ -1623,9 +1630,9 @@ function closeScheduleModal(apply) {
   if (apply && scheduleEditor) {
     const schedule = normalizeSchedule({
       mode: el.cycleMode.value,
-      time: normalizeScheduleTime(el.cycleTime.value || "02:00"),
+      time: normalizeScheduleTime(el.cycleTime.value || "14:00"),
       timezone: "local",
-      weekday: el.cycleWeekday.value || "monday",
+      weekday: normalizeWeekday(el.cycleWeekday.value),
       sync_current_cycle_manually: false,
     });
     scheduleEditor.onApply(schedule);
