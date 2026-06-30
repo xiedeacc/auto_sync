@@ -937,7 +937,7 @@ th {
 }
 
 .machine-modal-panel {
-  width: min(var(--panel-width), calc(100vw - 48px));
+  width: min(880px, calc(100vw - 48px));
   max-height: min(760px, calc(100vh - 48px));
   overflow-x: hidden;
   overflow-y: auto;
