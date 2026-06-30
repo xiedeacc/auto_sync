@@ -2121,17 +2121,8 @@ function destinationStatusText(status) {
 }
 
 function runtimeSyncLabel(runtime) {
-  const kind = String((runtime && runtime.sync_kind) || "").trim();
-  if (!kind) {
-    return "syncing";
-  }
-  const labels = {
-    incremental: "incremental",
-    full: "full",
-    changed_since: "changed since",
-    automatic: "automatic",
-  };
-  return `syncing (${labels[kind] || kind})`;
+  const kind = syncKindLabel(runtime && runtime.sync_kind);
+  return kind ? `syncing (${kind})` : "syncing";
 }
 
 function sourceHasBlockedDestination(sourceId) {

@@ -1681,12 +1681,15 @@ pub fn sync_cycle_for_source(
     let source_view = SourceReadView::prepare(source, &live_source_endpoint, cycle.id)?;
     let source_endpoint = source_view.endpoint.clone();
 
+    info!(source = source.id, cycle_id = cycle.id, "reconcile: source view ready, marking cycle syncing");
     state.mark_cycle_status(cycle.id, "planning")?;
     state.mark_cycle_status(cycle.id, "syncing")?;
+    info!(source = source.id, cycle_id = cycle.id, ready = ready_destinations.len(), "reconcile: entering destination loop");
     let mut shared_source_snapshot: Option<Vec<SnapshotEntry>> = None;
     for (dst_index, dst_endpoint) in ready_destinations {
         let dst = &source.destinations[dst_index];
         let sync = effective_sync_config(cfg, dst);
+        info!(source = source.id, destination = dst.id, cycle_id = cycle.id, "reconcile: processing destination");
         if let (
             SourceEndpoint::Dir { root: src_root, .. },
             DestinationEndpoint::Dir { root: dst_root },
@@ -1759,6 +1762,7 @@ pub fn sync_cycle_for_source(
                 // Reaching here means no zfs diff base was usable, so this is a
                 // full source+dst reconcile; reflect that in the status type.
                 let _kind = set_sync_kind("full");
+                info!(source = source.id, destination = dst.id, cycle_id = cycle.id, "reconcile: starting full reconcile (fast_missing_dirs)");
                 let sync_result = sync_destination_fast_missing_dirs(
                     src_root,
                     dst_root,
@@ -4245,9 +4249,11 @@ fn sync_destination_fast_missing_dirs(
     let result = (|| {
         let mut changing_paths = BTreeSet::new();
         let mut copied_paths = BTreeSet::new();
+        info!(destination = destination_id, "reconcile: scanning destination tree");
         let dst_snapshot =
             take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
         let dst_map = map_entries(&dst_snapshot);
+        info!(destination = destination_id, dst_entries = dst_snapshot.len(), "reconcile: scanning source tree + copying missing dirs");
         let mut source_snapshot = Vec::new();
         // Total is unknown up front (scan and copy interleave); the meter still
         // tracks throughput so the UI shows a live, non-zero transfer speed.
@@ -4289,6 +4295,7 @@ fn sync_destination_fast_missing_dirs(
                 None => true,
             })
             .collect();
+        info!(destination = destination_id, source_entries = source_snapshot.len(), to_copy = to_copy.len(), "reconcile: copying changed/missing files");
         changing_paths.extend(copy_entries_parallel(
             src_root,
             dst_root,
@@ -4315,7 +4322,9 @@ fn sync_destination_fast_missing_dirs(
         }
 
         set_snapshot_dir_mtimes(dst_root, &source_snapshot)?;
+        info!(destination = destination_id, "reconcile: verifying destination");
         verify_destination(dst_root, &source_snapshot, &changing_paths, excludes, sync)?;
+        info!(destination = destination_id, "reconcile: verified ok");
         if !changing_paths.is_empty() {
             return Err(source_changing_error(&changing_paths));
         }
