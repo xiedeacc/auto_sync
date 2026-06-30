@@ -1489,7 +1489,7 @@ function keyToTaskRef(key) {
 function defaultDestinationSchedule() {
   return {
     mode: "realtime",
-    time: "14:00",
+    time: "19:00",
     timezone: "local",
     weekday: "monday",
     sync_current_cycle_manually: false,
@@ -1538,10 +1538,10 @@ function destinationSyncTitle(dst) {
 }
 
 function normalizeScheduleTime(value) {
-  const text = String(value || "14:00");
+  const text = String(value || "19:00");
   const match = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(text);
   if (!match) {
-    return "14:00";
+    return "19:00";
   }
   const hour = Math.min(23, Number(match[1]));
   const minute = Math.min(59, Number(match[2]));
@@ -1613,7 +1613,12 @@ function openScheduleModal(schedule, onApply) {
   const draft = cloneSchedule(schedule);
   scheduleEditor = { draft, onApply };
   el.cycleMode.value = draft.mode;
-  el.cycleTime.value = formatScheduleTime(draft.time);
+  // A realtime schedule has no meaningful time; show the default so switching
+  // to Daily/Weekly starts from it instead of a stale leftover value.
+  const timeForField = draft.mode === "realtime"
+    ? defaultDestinationSchedule().time
+    : draft.time;
+  el.cycleTime.value = formatScheduleTime(timeForField);
   el.cycleWeekday.value = normalizeWeekday(draft.weekday);
   updateScheduleModalFields();
   el.scheduleModal.hidden = false;
@@ -1630,7 +1635,7 @@ function closeScheduleModal(apply) {
   if (apply && scheduleEditor) {
     const schedule = normalizeSchedule({
       mode: el.cycleMode.value,
-      time: normalizeScheduleTime(el.cycleTime.value || "14:00"),
+      time: normalizeScheduleTime(el.cycleTime.value || "19:00"),
       timezone: "local",
       weekday: normalizeWeekday(el.cycleWeekday.value),
       sync_current_cycle_manually: false,

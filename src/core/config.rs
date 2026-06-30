@@ -241,7 +241,7 @@ impl Default for ScheduleConfig {
     fn default() -> Self {
         Self {
             mode: ScheduleMode::Realtime,
-            time: "14:00".to_string(),
+            time: "19:00".to_string(),
             timezone: "local".to_string(),
             weekday: Some("monday".to_string()),
             sync_current_cycle_manually: false,
