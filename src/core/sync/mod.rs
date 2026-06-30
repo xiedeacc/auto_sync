@@ -4582,6 +4582,12 @@ fn sync_destination_event_paths(
             sync.checksum,
         )?;
         let mut changing_paths = BTreeSet::new();
+        let total_bytes: u64 = source_snapshot
+            .iter()
+            .filter(|e| e.file_type == "file")
+            .map(|e| e.size.max(0) as u64)
+            .sum();
+        let transfer_guard = progress::begin_transfer(destination_id, dst_root, total_bytes);
         sync_changed_entries_local(
             src_root,
             dst_root,
@@ -4594,6 +4600,7 @@ fn sync_destination_event_paths(
             sync,
             &mut changing_paths,
         )?;
+        drop(transfer_guard);
 
         let actual = take_snapshot_paths_with_excludes(
             dst_root,
@@ -4650,27 +4657,22 @@ fn sync_changed_entries_local(
         // Mode applied at end via set_snapshot_dir_mtimes (deepest-first).
     }
 
-    for entry in source_snapshot
+    let to_copy: Vec<&SnapshotEntry> = source_snapshot
         .iter()
         .filter(|e| e.file_type == "file" || e.file_type == "symlink")
-    {
-        let needs_copy = match dst_map.get(&entry.rel_path) {
-            Some(existing) => !entries_match(entry, existing, sync),
+        .filter(|e| match dst_map.get(&e.rel_path) {
+            Some(existing) => !entries_match(e, existing, sync),
             None => true,
-        };
-        if !needs_copy {
-            continue;
-        }
-        if let Err(err) = copy_entry(src_root, dst_root, destination_id, cycle_id, entry)
-            .with_context(|| format!("failed to copy {}", entry.rel_path))
-        {
-            let paths = source_changed_paths(&err);
-            if paths.is_empty() {
-                return Err(err);
-            }
-            changing_paths.extend(paths);
-        }
-    }
+        })
+        .collect();
+    changing_paths.extend(copy_entries_parallel(
+        src_root,
+        dst_root,
+        destination_id,
+        cycle_id,
+        &to_copy,
+        sync,
+    )?);
 
     if sync.mirror {
         let mut extra_paths: Vec<String> = dst_map
