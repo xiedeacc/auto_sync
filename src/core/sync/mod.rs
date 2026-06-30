@@ -1443,8 +1443,11 @@ fn normalize_rel_path(rel_path: &str) -> Result<PathBuf> {
     for component in rel.components() {
         match component {
             Component::Normal(part) => {
-                let part_text = part.to_string_lossy();
-                if part_text.contains(':') {
+                // ':' is a drive-letter / alternate-data-stream hazard on Windows
+                // but a perfectly valid filename byte on Linux/ZFS (e.g. Perl
+                // man pages like "APR::Base64.3pm"), so only reject it there.
+                #[cfg(windows)]
+                if part.to_string_lossy().contains(':') {
                     bail!("unsafe relative path: {rel_path}");
                 }
                 out.push(part);
