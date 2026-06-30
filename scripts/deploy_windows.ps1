@@ -631,10 +631,11 @@ function Ensure-AutoSyncStartup {
     $escapedExe = $autoSyncExe.Replace('"', '""')
     $escapedConfig = $ConfigPath.Replace('"', '""')
     # One process: scheduler + watcher + web + desktop window (auto_sync opens
-    # the GUI itself when a desktop session is available).
+    # the GUI itself when a desktop session is available). --hidden starts it
+    # minimized to the tray at login instead of popping the window open.
     $script = @(
         'Set shell = CreateObject("WScript.Shell")',
-        "shell.Run """"""$escapedExe"""" --config """"$escapedConfig"""""", 0, False"
+        "shell.Run """"""$escapedExe"""" --config """"$escapedConfig"""" --hidden"", 0, False"
     )
     Set-Content -LiteralPath $launcher -Value $script -Encoding ascii
 

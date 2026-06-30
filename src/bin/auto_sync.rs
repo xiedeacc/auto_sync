@@ -55,6 +55,9 @@ struct Args {
     /// Run web-only, never opening the desktop window even on a GUI build.
     #[arg(long)]
     no_gui: bool,
+    /// Start with the main window hidden (tray only). Used by the autostart launcher.
+    #[arg(long)]
+    hidden: bool,
     /// Internal guard to avoid repeated UAC relaunch attempts.
     #[cfg(windows)]
     #[arg(long, hide = true)]
@@ -230,7 +233,7 @@ fn run_foreground(backend: Backend, addr: SocketAddr, args: &Args) {
     #[cfg(feature = "gui")]
     {
         if !args.no_gui && desktop_available() {
-            run_with_desktop(backend, addr);
+            run_with_desktop(backend, addr, args.hidden);
             return;
         }
         info!("no desktop session detected; running web-only");
@@ -311,7 +314,7 @@ fn apply_autostart_inner(enabled: bool, config_path: &std::path::Path) -> std::i
             .replace('"', "\"\"");
         let cfg = config_path.display().to_string().replace('"', "\"\"");
         let script = format!(
-            "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.Run \"\"\"{exe}\"\" --config \"\"{cfg}\"\"\", 0, False\r\n"
+            "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.Run \"\"\"{exe}\"\" --config \"\"{cfg}\"\" --hidden\", 0, False\r\n"
         );
         std::fs::write(&launcher, script)?;
     } else if launcher.exists() {
@@ -331,7 +334,7 @@ fn apply_autostart_inner(enabled: bool, config_path: &std::path::Path) -> std::i
         std::fs::create_dir_all(&dir)?;
         let exe = std::env::current_exe()?;
         let content = format!(
-            "[Desktop Entry]\nType=Application\nName=auto_sync\nExec=\"{}\" --config \"{}\"\nX-GNOME-Autostart-enabled=true\n",
+            "[Desktop Entry]\nType=Application\nName=auto_sync\nExec=\"{}\" --config \"{}\" --hidden\nX-GNOME-Autostart-enabled=true\n",
             exe.display(),
             config_path.display()
         );
@@ -385,7 +388,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 #[cfg(feature = "gui")]
-fn run_with_desktop(backend: Backend, addr: SocketAddr) {
+fn run_with_desktop(backend: Backend, addr: SocketAddr, start_hidden: bool) {
     spawn_web(backend.clone(), addr);
     let config_path = backend.config_path();
     if let Ok(cfg) = backend.get_config() {
@@ -395,9 +398,14 @@ fn run_with_desktop(backend: Backend, addr: SocketAddr) {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(backend)
-        .setup(|app| {
+        .setup(move |app| {
             if let Err(err) = build_tray(app.handle()) {
                 warn!(error = %err, "failed to create system tray");
+            }
+            // The window is created hidden (tauri.conf.json visible:false); show it
+            // now unless we were launched into the tray (e.g. via autostart).
+            if !start_hidden {
+                show_main_window(app.handle());
             }
             Ok(())
         })
