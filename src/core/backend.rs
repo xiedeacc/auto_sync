@@ -699,16 +699,41 @@ fn ensure_remote_machine_not_syncing(machine: &MachineConfig) -> Result<()> {
             },
         )?;
     if status.syncing {
-        anyhow::bail!("sync already in progress on {}", machine_label(machine));
+        anyhow::bail!(
+            "sync already in progress on {}{}",
+            machine_label(machine),
+            sync_in_progress_suffix(status.sync_kind.as_deref())
+        );
     }
     Ok(())
 }
 
 fn ensure_local_not_syncing() -> Result<()> {
     if sync_is_running() {
-        anyhow::bail!("sync already in progress");
+        anyhow::bail!(
+            "sync already in progress{}",
+            sync_in_progress_suffix(current_sync_kind().as_deref())
+        );
     }
     Ok(())
+}
+
+/// " (full)", " (incremental)", " (compare)", … to append to an "in progress"
+/// message. Empty when the kind is unknown.
+fn sync_in_progress_suffix(kind: Option<&str>) -> String {
+    let kind = kind.map(str::trim).unwrap_or("");
+    if kind.is_empty() {
+        return String::new();
+    }
+    let label = match kind {
+        "incremental" => "incremental",
+        "full" => "full",
+        "changed_since" => "changed since",
+        "automatic" => "automatic",
+        "scan" => "compare",
+        other => other,
+    };
+    format!(" ({label})")
 }
 
 fn machine_label(machine: &MachineConfig) -> String {

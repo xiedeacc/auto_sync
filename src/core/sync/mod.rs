@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 use crate::core::config::{
     AppConfig, DEFAULT_MAX_PARALLEL_TRANSFERS, DEFAULT_TRANSFER_TIMEOUT_SECS, DestinationConfig,
     NativeSyncConfig, ScheduleMode, SnapshotBackend, SourceGroupConfig, SyncTaskRef,
-    machine_id_or_local,
+    machine_id_or_local, machine_is_local,
 };
 use crate::core::machines::{
     configure_tcp_connection_pool, encode_query_component, find_machine, remote_get_json,
@@ -1474,7 +1474,7 @@ pub fn sync_cycle_for_source(
         "sync cycle started"
     );
 
-    if cycle_has_remote_target(state, source, cycle)? {
+    if cycle_has_remote_target(cfg, state, source, cycle)? {
         return sync_cycle_with_transfer(cfg, state, source, cycle);
     }
 
@@ -2141,16 +2141,20 @@ fn snapshot_entry_changed(left: &SnapshotEntry, right: &SnapshotEntry) -> bool {
 }
 
 fn cycle_has_remote_target(
+    cfg: &AppConfig,
     state: &State,
     source: &SourceGroupConfig,
     cycle: &Cycle,
 ) -> Result<bool> {
-    if machine_id_or_local(&source.machine_id) != "local" {
+    // A destination on THIS machine (even if it's labelled with the host's name
+    // rather than "local") must use the local ZFS-snapshot path, not the
+    // cross-machine transfer path against ourselves.
+    if !machine_is_local(cfg, &source.machine_id) {
         return Ok(true);
     }
     for dst in source.destinations.iter().filter(|dst| dst.enabled) {
         if state.destination_target_cycle(&source.id, &dst.id)? == Some(cycle.id)
-            && machine_id_or_local(&dst.machine_id) != "local"
+            && !machine_is_local(cfg, &dst.machine_id)
         {
             return Ok(true);
         }

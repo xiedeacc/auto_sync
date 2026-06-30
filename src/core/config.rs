@@ -794,6 +794,24 @@ pub fn machine_matches_reference(machine: &MachineConfig, value: &str) -> bool {
     machine.host.trim().eq_ignore_ascii_case(value)
 }
 
+/// Whether `machine_id` refers to the machine this process runs on. A
+/// same-machine destination is sometimes labelled with the host's name (e.g.
+/// "nas") instead of "local"; without recognizing that, the daemon would route
+/// its own destination through the cross-machine transfer path (live source
+/// reads, no ZFS snapshot, no zfs diff).
+pub fn machine_is_local(cfg: &AppConfig, machine_id: &str) -> bool {
+    let value = machine_id_or_local(machine_id);
+    if value.eq_ignore_ascii_case("local") {
+        return true;
+    }
+    if value.eq_ignore_ascii_case(local_hostname().trim()) {
+        return true;
+    }
+    normalized_machines(cfg)
+        .iter()
+        .any(|machine| machine.id == "local" && machine_matches_reference(machine, value))
+}
+
 pub fn machine_display_name(machine: &MachineConfig) -> String {
     let alias = machine.alias_name.trim();
     if !alias.is_empty() {
