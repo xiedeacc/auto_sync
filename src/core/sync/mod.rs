@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -46,6 +46,11 @@ const DELTA_MIN_SIZE: u64 = 256 * 1024;
 /// RAM under parallel transfers; larger changed files use the chunked streaming
 /// path (16 MiB buffer) instead. The receiver basis is read as a stream.
 const DELTA_MAX_SIZE: u64 = 512 * 1024 * 1024;
+/// Cap on the total bytes of whole-file buffers held concurrently by transfer
+/// workers (the delta sender buffers file + encoded delta, ~2x file size). A
+/// worker over budget waits until others release; a single request larger than
+/// the whole budget is still allowed to run alone so it cannot deadlock.
+const TRANSFER_MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
 
 /// Serializes every run of the sync engine within a process. With the daemon,
 /// web server and (optional) desktop UI now sharing one process, the scheduled
@@ -53,6 +58,40 @@ const DELTA_MAX_SIZE: u64 = 512 * 1024 * 1024;
 static SYNC_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 static SCAN_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 static SYNC_KIND: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static TRANSFER_MEMORY: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+
+fn transfer_memory() -> &'static (Mutex<u64>, Condvar) {
+    TRANSFER_MEMORY.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+/// Permit for `bytes` of in-memory transfer buffer, released on drop.
+struct TransferMemoryPermit {
+    bytes: u64,
+}
+
+impl Drop for TransferMemoryPermit {
+    fn drop(&mut self) {
+        let (used, available) = transfer_memory();
+        let mut used = used.lock().unwrap_or_else(|err| err.into_inner());
+        *used = used.saturating_sub(self.bytes);
+        available.notify_all();
+    }
+}
+
+/// Block until `bytes` fit under [`TRANSFER_MEMORY_BUDGET`], then reserve them.
+/// A request larger than the whole budget proceeds once nothing else holds a
+/// permit, so oversized files degrade to serialized rather than deadlocking.
+fn acquire_transfer_memory(bytes: u64) -> TransferMemoryPermit {
+    let (used, available) = transfer_memory();
+    let mut used = used.lock().unwrap_or_else(|err| err.into_inner());
+    while *used > 0 && used.saturating_add(bytes) > TRANSFER_MEMORY_BUDGET {
+        used = available
+            .wait(used)
+            .unwrap_or_else(|err| err.into_inner());
+    }
+    *used = used.saturating_add(bytes);
+    TransferMemoryPermit { bytes }
+}
 
 struct SyncKindGuard {
     previous: Option<String>,
@@ -1207,7 +1246,9 @@ fn send_file_tcp(
         let remaining = (total_size - pos).min(TRANSFER_CHUNK_SIZE as u64) as usize;
         let n = file.read(&mut buf[..remaining])?;
         if n == 0 {
-            bail!("source ended while sending {}", entry.rel_path);
+            // The file shrank below its snapshot size mid-stream; report it in
+            // the canonical, parseable source-changing form.
+            bail!("source changed while copying {}", entry.rel_path);
         }
         hasher.update(&buf[..n]);
         let chunk_end = pos + n as u64;
@@ -1254,12 +1295,15 @@ fn send_put_file_tcp(
     let total_size = entry.size.max(0) as u64;
     let bytes = fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
     if bytes.len() as u64 != total_size {
-        bail!(
-            "source changed size while sending {} (expected {}, read {})",
-            entry.rel_path,
-            total_size,
-            bytes.len()
+        // Canonical message: callers (possibly across the HTTP hop) parse it
+        // via `source_changed_paths` to classify the failure as tolerable.
+        warn!(
+            rel_path = entry.rel_path,
+            expected = total_size,
+            read = bytes.len(),
+            "source size changed while sending"
         );
+        bail!("source changed while copying {}", entry.rel_path);
     }
     let _ = destination_id;
     let full_hash = blake3::hash(&bytes).to_hex().to_string();
@@ -1306,19 +1350,29 @@ fn send_file_delta(
         );
     }
 
+    // The sender holds the whole new file plus the encoded delta in memory;
+    // bound the aggregate across parallel workers so a batch of large changed
+    // files cannot balloon resident memory (see `acquire_transfer_memory`).
+    let memory_permit = acquire_transfer_memory((entry.size.max(0) as u64).saturating_mul(2));
     let new_data = fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
     if new_data.len() as u64 != entry.size.max(0) as u64 {
-        bail!(
-            "source changed size while sending {} (expected {}, read {})",
-            entry.rel_path,
-            entry.size,
-            new_data.len()
+        warn!(
+            rel_path = entry.rel_path,
+            expected = entry.size,
+            read = new_data.len(),
+            "source size changed while sending delta"
         );
+        bail!("source changed while copying {}", entry.rel_path);
     }
     let delta_bytes = delta::build_delta(&new_data, &sums);
     // If the delta saves little, a plain chunked transfer avoids the basis read
     // on the destination; fall back unless we beat ~90% of the file size.
     if delta_bytes.len() as u64 >= new_data.len() as u64 / 10 * 9 {
+        // Release the buffers (and their memory permit) before the chunked
+        // send, which streams with a small buffer and can run for minutes.
+        drop(delta_bytes);
+        drop(new_data);
+        drop(memory_permit);
         return send_file_tcp(
             destination,
             destination_root,
@@ -1630,13 +1684,8 @@ pub fn sync_cycle_for_source(
                         Err(err) => {
                             all_verified = false;
                             had_unblocked_failure = true;
-                            state.clear_destination_issues(&source.id, &dst.id)?;
-                            state.upsert_destination_status(
-                                &source.id,
-                                &dst.id,
-                                None,
-                                "red",
-                                &short_reason(&err),
+                            record_destination_failure(
+                                state, &source.id, &dst.id, cycle.id, &err,
                             )?;
                         }
                     }
@@ -1810,33 +1859,7 @@ pub fn sync_cycle_for_source(
                             error = %err,
                             "destination sync failed"
                         );
-                        let changing_paths = source_changed_paths(&err);
-                        if changing_paths.is_empty() {
-                            state.clear_destination_issues(&source.id, &dst.id)?;
-                            state.upsert_destination_status(
-                                &source.id,
-                                &dst.id,
-                                None,
-                                "red",
-                                &short_reason(&err),
-                            )?;
-                        } else {
-                            state.replace_destination_issues(
-                                &source.id,
-                                &dst.id,
-                                cycle.id,
-                                "source_changing",
-                                &changing_paths,
-                                "source file changed while copying",
-                            )?;
-                            state.upsert_destination_status(
-                                &source.id,
-                                &dst.id,
-                                None,
-                                "yellow",
-                                "source_changed_while_copying",
-                            )?;
-                        }
+                        record_destination_failure(state, &source.id, &dst.id, cycle.id, &err)?;
                     }
                 }
                 continue;
@@ -1914,33 +1937,7 @@ pub fn sync_cycle_for_source(
                     error = %err,
                     "destination sync failed"
                 );
-                let changing_paths = source_changed_paths(&err);
-                if changing_paths.is_empty() {
-                    state.clear_destination_issues(&source.id, &dst.id)?;
-                    state.upsert_destination_status(
-                        &source.id,
-                        &dst.id,
-                        None,
-                        "red",
-                        &short_reason(&err),
-                    )?;
-                } else {
-                    state.replace_destination_issues(
-                        &source.id,
-                        &dst.id,
-                        cycle.id,
-                        "source_changing",
-                        &changing_paths,
-                        "source file changed while copying",
-                    )?;
-                    state.upsert_destination_status(
-                        &source.id,
-                        &dst.id,
-                        None,
-                        "yellow",
-                        "source_changing",
-                    )?;
-                }
+                record_destination_failure(state, &source.id, &dst.id, cycle.id, &err)?;
             }
         }
     }
@@ -2330,13 +2327,8 @@ fn sync_cycle_with_transfer(
                         Err(err) => {
                             all_verified = false;
                             had_unblocked_failure = true;
-                            state.clear_destination_issues(&source.id, &dst.id)?;
-                            state.upsert_destination_status(
-                                &source.id,
-                                &dst.id,
-                                None,
-                                "red",
-                                &short_reason(&err),
+                            record_destination_failure(
+                                state, &source.id, &dst.id, cycle.id, &err,
                             )?;
                         }
                     }
@@ -2401,26 +2393,32 @@ fn sync_cycle_with_transfer(
     let source_checksum = any_ready_destination_needs_checksum(cfg, source, &ready_destinations);
     let source_timeout = ready_destination_timeout(cfg, source, &ready_destinations);
     state.mark_cycle_status(cycle.id, "planning")?;
-    // Cross-machine reconcile is a full source+dst pass (no zfs diff); reflect
-    // that in the status type, unless this is a manual Changed Since.
-    let _kind = if cycle.manual_changed_since_rescan {
-        None
+
+    // Stable read view when the source lives on this machine: reads come from
+    // a ZFS snapshot (immutable), which both eliminates mid-copy source-change
+    // races at the root and enables `zfs diff` incremental planning against the
+    // base snapshot each destination last verified. Remote sources are read
+    // live (their snapshotting would have to run on the remote machine).
+    let source_view = if source_machine_id == "local" {
+        let live_endpoint = SourceEndpoint::Dir {
+            root: source_info.base.clone(),
+            add_directory: source.add_directory,
+        };
+        Some(SourceReadView::prepare(source, &live_endpoint, cycle.id)?)
     } else {
-        Some(set_sync_kind("full"))
+        None
     };
-    let source_snapshot = snapshot_on_machine(
-        source_machine_id,
-        &source_machine,
-        &source_info.base,
-        TransferSnapshotMode::Source,
-        &source.excludes,
-        source_checksum,
-        source_timeout,
-    )
-    .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
-    state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
+    let read_root: PathBuf = match source_view.as_ref().map(|view| &view.endpoint) {
+        Some(SourceEndpoint::Dir { root, .. }) => root.clone(),
+        Some(SourceEndpoint::File { path }) => path.clone(),
+        None => source_info.base.clone(),
+    };
+    let zfs_snapshot = source_view.as_ref().and_then(|view| view.zfs_snapshot.as_ref());
 
     state.mark_cycle_status(cycle.id, "syncing")?;
+    // The full source snapshot is taken lazily: when every destination syncs
+    // via `zfs diff` the whole-tree source scan is skipped entirely.
+    let mut full_source_snapshot: Option<Vec<SnapshotEntry>> = None;
     for dst_index in ready_destinations {
         let dst = &source.destinations[dst_index];
         let sync = effective_sync_config(cfg, dst);
@@ -2441,6 +2439,99 @@ fn sync_cycle_with_transfer(
             }
         };
         let dst_root = destination_root_for_source(source, &source_info, &dst.path, &dst_machine);
+
+        // ZFS diff incremental (mirrors the local path): sync only the paths
+        // `zfs diff` reports against the destination's verified base snapshot.
+        // Skipped for event-loss and manual Full reconciles, which must
+        // re-verify the whole destination; falls back to a full transfer on
+        // any failure.
+        if !cycle.manual_changed_since_rescan
+            && !is_event_loss_reconcile
+            && !cycle.manual_full_rescan
+        {
+            if let Some(zfs) = zfs_snapshot {
+                if let Some(base) = state.destination_verified_snapshot(&source.id, &dst.id)? {
+                    if let Some(rel_paths) =
+                        zfs_diff_changed_paths(&base, &zfs.full_name, &zfs.source_live_root)
+                    {
+                        info!(
+                            source = source.id,
+                            destination = dst.id,
+                            cycle_id = cycle.id,
+                            base = base,
+                            changed = rel_paths.len(),
+                            "zfs diff incremental transfer sync"
+                        );
+                        match sync_directory_event_paths_with_transfer(
+                            source_machine_id,
+                            &source_machine,
+                            &read_root,
+                            dst_machine_id,
+                            &dst_machine,
+                            &dst_root,
+                            &dst.id,
+                            cycle.id,
+                            &rel_paths,
+                            &source.excludes,
+                            &sync,
+                        ) {
+                            Ok(()) => {
+                                progressed |= !rel_paths.is_empty();
+                                state.clear_destination_issues(&source.id, &dst.id)?;
+                                state.upsert_destination_status(
+                                    &source.id,
+                                    &dst.id,
+                                    Some(cycle.id),
+                                    "green",
+                                    "verified",
+                                )?;
+                                state.set_destination_verified_snapshot(
+                                    &source.id,
+                                    &dst.id,
+                                    Some(&zfs.full_name),
+                                )?;
+                                continue;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    source = source.id,
+                                    destination = dst.id,
+                                    error = %err,
+                                    "zfs diff incremental transfer failed; falling back to full transfer"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Full source+dst transfer pass; reflect that in the status type,
+        // unless this is a manual Changed Since.
+        let _kind = if cycle.manual_changed_since_rescan {
+            None
+        } else {
+            Some(set_sync_kind("full"))
+        };
+        let source_snapshot = if let Some(snapshot) = full_source_snapshot.as_ref() {
+            snapshot
+        } else {
+            let snapshot = snapshot_on_machine(
+                source_machine_id,
+                &source_machine,
+                &read_root,
+                TransferSnapshotMode::Source,
+                &source.excludes,
+                source_checksum,
+                source_timeout,
+            )
+            .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
+            state.replace_snapshot(cycle.id, &source.id, &snapshot)?;
+            full_source_snapshot = Some(snapshot);
+            full_source_snapshot
+                .as_ref()
+                .expect("full source snapshot was just stored")
+        };
         info!(
             source = source.id,
             destination = dst.id,
@@ -2452,7 +2543,7 @@ fn sync_cycle_with_transfer(
                 state,
                 &source.id,
                 &dst.id,
-                &source_snapshot,
+                source_snapshot,
                 &source.excludes,
             )?
         } else {
@@ -2462,7 +2553,7 @@ fn sync_cycle_with_transfer(
             sync_directory_event_paths_with_transfer(
                 source_machine_id,
                 &source_machine,
-                &source_info.base,
+                &read_root,
                 dst_machine_id,
                 &dst_machine,
                 &dst_root,
@@ -2476,13 +2567,13 @@ fn sync_cycle_with_transfer(
             sync_directory_with_transfer(
                 source_machine_id,
                 &source_machine,
-                &source_info.base,
+                &read_root,
                 dst_machine_id,
                 &dst_machine,
                 &dst_root,
                 &dst.id,
                 cycle.id,
-                &source_snapshot,
+                source_snapshot,
                 &source.excludes,
                 &sync,
             )
@@ -2500,24 +2591,35 @@ fn sync_cycle_with_transfer(
                     "green",
                     "verified",
                 )?;
+                // Record the base snapshot for the next zfs diff (or clear it
+                // for non-ZFS sources so no stale base lingers).
+                state.set_destination_verified_snapshot(
+                    &source.id,
+                    &dst.id,
+                    zfs_snapshot.map(|zfs| zfs.full_name.as_str()),
+                )?;
             }
             Err(err) => {
                 all_verified = false;
                 had_unblocked_failure = true;
-                state.clear_destination_issues(&source.id, &dst.id)?;
-                state.upsert_destination_status(
-                    &source.id,
-                    &dst.id,
-                    None,
-                    "red",
-                    &short_reason(&err),
-                )?;
+                error!(
+                    source = source.id,
+                    destination = dst.id,
+                    cycle_id = cycle.id,
+                    error = %err,
+                    "destination sync failed"
+                );
+                record_destination_failure(state, &source.id, &dst.id, cycle.id, &err)?;
             }
         }
     }
 
     if targeted_count == 0 || all_verified {
         state.mark_cycle_status(cycle.id, "verified")?;
+        if let Some(view) = &source_view {
+            let referenced = state.source_referenced_snapshots(&source.id)?;
+            view.cleanup(source, &referenced);
+        }
     } else if blocked_count > 0 && !had_unblocked_failure {
         state.mark_cycle_status(cycle.id, "closed")?;
     } else {
@@ -2610,7 +2712,7 @@ fn sync_directory_with_transfer(
         })
         .collect();
     let transfer_started = Instant::now();
-    let transferred = push_entries_parallel(
+    let outcome = push_entries_parallel(
         source_machine_id,
         source_machine,
         source_root,
@@ -2625,7 +2727,9 @@ fn sync_directory_with_transfer(
         destination = destination_id,
         cycle_id,
         dirs = dirs.len(),
-        files = transferred,
+        files = outcome.transferred,
+        changing = outcome.changing.len(),
+        failed = outcome.failed.len(),
         elapsed_ms = transfer_started.elapsed().as_millis() as u64,
         "destination transfer phase complete"
     );
@@ -2656,17 +2760,13 @@ fn sync_directory_with_transfer(
 
     cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, timeout).ok();
 
-    let actual = snapshot_on_machine(
-        dst_machine_id,
-        dst_machine,
-        dst_root,
-        TransferSnapshotMode::Destination,
-        &[],
-        sync.checksum,
-        timeout,
-    )?;
-    verify_snapshot_entries(source_snapshot, &actual, excludes, sync)?;
-    Ok(())
+    // No end-of-cycle destination re-scan: every transferred file was verified
+    // end-to-end at receipt (blake3 full hash checked before the atomic rename,
+    // acked per file), removals ack per path, and untouched entries were
+    // compared against the fresh destination scan taken above. Re-walking a
+    // multi-terabyte destination tree here doubled the cycle cost for no
+    // additional guarantee.
+    outcome.into_result()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2774,7 +2874,7 @@ fn sync_directory_event_paths_with_transfer(
             None => Some((entry, false)),
         })
         .collect();
-    let transferred = push_entries_parallel(
+    let outcome = push_entries_parallel(
         source_machine_id,
         source_machine,
         source_root,
@@ -2790,7 +2890,9 @@ fn sync_directory_event_paths_with_transfer(
         cycle_id,
         changed_paths = rel_paths.len(),
         dirs = dirs.len(),
-        files = transferred,
+        files = outcome.transferred,
+        changing = outcome.changing.len(),
+        failed = outcome.failed.len(),
         "destination realtime event transfer phase complete"
     );
 
@@ -2808,8 +2910,14 @@ fn sync_directory_event_paths_with_transfer(
         sync.checksum,
         timeout,
     )?;
-    verify_snapshot_entries(&source_snapshot, &actual, excludes, sync)?;
-    Ok(())
+    verify_snapshot_entries(
+        &source_snapshot,
+        &actual,
+        &outcome.unverifiable_paths(),
+        excludes,
+        sync,
+    )?;
+    outcome.into_result()
 }
 
 fn sync_cycle_file_with_transfer(
@@ -2910,14 +3018,7 @@ fn sync_cycle_file_with_transfer(
             Err(err) => {
                 all_verified = false;
                 had_unblocked_failure = true;
-                state.clear_destination_issues(&source.id, &dst.id)?;
-                state.upsert_destination_status(
-                    &source.id,
-                    &dst.id,
-                    None,
-                    "red",
-                    &short_reason(&err),
-                )?;
+                record_destination_failure(state, &source.id, &dst.id, cycle.id, &err)?;
             }
         }
     }
@@ -2998,16 +3099,23 @@ fn sync_file_with_transfer(
             )?;
         }
     }
-    let actual = snapshot_on_machine(
+    // Verify just the transferred file paths instead of re-walking the whole
+    // destination directory.
+    let rel_paths: Vec<String> = source_snapshot
+        .iter()
+        .map(|entry| entry.rel_path.clone())
+        .collect();
+    let actual = snapshot_paths_on_machine(
         dst_machine_id,
         dst_machine,
         dst_root,
+        &rel_paths,
         TransferSnapshotMode::Destination,
         &[],
         sync.checksum,
         timeout,
     )?;
-    verify_snapshot_entries(source_snapshot, &actual, &[], sync)?;
+    verify_snapshot_entries(source_snapshot, &actual, &BTreeSet::new(), &[], sync)?;
     Ok(())
 }
 
@@ -3315,10 +3423,40 @@ fn resolve_parallelism(configured: usize, work_items: usize) -> usize {
 
 const TRANSFER_RETRY_ATTEMPTS: u32 = 3;
 
+/// Errors whose retry can never succeed within this cycle: the source mutated
+/// under us, so re-reading just races again. The caller records them as a
+/// tolerated `source_changing` issue instead of retrying or failing red.
+fn transfer_error_is_source_changing(err: &anyhow::Error) -> bool {
+    !source_changed_paths(err).is_empty()
+}
+
+/// Connection-level failures: the destination (or the pushing source machine)
+/// is unreachable, so every remaining file would fail the same way. The worker
+/// pool aborts immediately instead of burning retries per file.
+fn transfer_error_is_fatal(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        if let Some(io_err) = cause.downcast_ref::<io::Error>() {
+            return matches!(
+                io_err.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::AddrNotAvailable
+            );
+        }
+        let text = cause.to_string();
+        text.contains("peer closed connection") || text.contains("HTTP request failed")
+    })
+}
+
 /// Run a single-file transfer, retrying transient failures with exponential
 /// backoff before giving up. Each transfer path is idempotent on retry (chunked
 /// resumes from the receiver's offset, put-file/delta overwrite the temp file),
-/// so a retry cannot corrupt a partial result.
+/// so a retry cannot corrupt a partial result. Source-changing errors are
+/// terminal for this cycle and returned without retry.
 fn with_transfer_retry<F>(label: &str, mut attempt_fn: F) -> Result<()>
 where
     F: FnMut() -> Result<()>,
@@ -3328,7 +3466,10 @@ where
         attempt += 1;
         match attempt_fn() {
             Ok(()) => return Ok(()),
-            Err(err) if attempt < TRANSFER_RETRY_ATTEMPTS => {
+            Err(err)
+                if attempt < TRANSFER_RETRY_ATTEMPTS
+                    && !transfer_error_is_source_changing(&err) =>
+            {
                 warn!(
                     rel_path = label,
                     attempt,
@@ -3342,9 +3483,51 @@ where
     }
 }
 
+/// A completed transfer/copy phase: how many entries transferred, which source
+/// paths changed mid-copy (tolerated; the destination goes yellow and the next
+/// cycle converges them), and which entries failed for per-file reasons (the
+/// rest of the batch still transferred, so progress is preserved).
+struct TransferOutcome {
+    transferred: usize,
+    changing: BTreeSet<String>,
+    failed: Vec<(String, anyhow::Error)>,
+}
+
+impl TransferOutcome {
+    /// Paths that must be excluded from post-copy verification: they are known
+    /// not to match the source snapshot (changed mid-copy or failed to copy).
+    fn unverifiable_paths(&self) -> BTreeSet<String> {
+        let mut paths = self.changing.clone();
+        paths.extend(self.failed.iter().map(|(path, _)| path.clone()));
+        paths
+    }
+
+    /// The error this outcome implies, if any: per-file failures dominate
+    /// (red), otherwise tolerated source changes (yellow via
+    /// `source_changing_error`), otherwise success.
+    fn into_result(self) -> Result<()> {
+        let failed_count = self.failed.len();
+        if let Some((path, err)) = self.failed.into_iter().next() {
+            return Err(err.context(format!(
+                "{failed_count} file transfer(s) failed (first: {path})"
+            )));
+        }
+        if !self.changing.is_empty() {
+            return Err(source_changing_error(&self.changing));
+        }
+        Ok(())
+    }
+}
+
+/// Per-file failures tolerated before the worker pool gives up: a broken
+/// destination fails every file the same way, and there is no point burning
+/// retries on hundreds of thousands of doomed transfers.
+const MAX_PER_FILE_TRANSFER_FAILURES: usize = 20;
+
 /// Transfer the given entries to the destination using a bounded worker pool.
-/// Returns the number of entries transferred. On the first failure the workers
-/// stop pulling new work and that error is returned.
+/// Source-changing failures are collected (not fatal); other per-file failures
+/// are collected up to [`MAX_PER_FILE_TRANSFER_FAILURES`]; connection-level
+/// failures abort the pool immediately and are returned as the error.
 #[allow(clippy::too_many_arguments)]
 fn push_entries_parallel(
     source_machine_id: &str,
@@ -3356,9 +3539,13 @@ fn push_entries_parallel(
     cycle_id: i64,
     entries: &[(&SnapshotEntry, bool)],
     sync: &NativeSyncConfig,
-) -> Result<usize> {
+) -> Result<TransferOutcome> {
     if entries.is_empty() {
-        return Ok(0);
+        return Ok(TransferOutcome {
+            transferred: 0,
+            changing: BTreeSet::new(),
+            failed: Vec::new(),
+        });
     }
     let total_bytes: u64 = entries
         .iter()
@@ -3369,13 +3556,15 @@ fn push_entries_parallel(
     let workers = resolve_parallelism(sync.max_parallel_transfers, entries.len());
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
-    let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let fatal_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let changing: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let failed: Mutex<Vec<(String, anyhow::Error)>> = Mutex::new(Vec::new());
 
     thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
                 loop {
-                    if first_error
+                    if fatal_error
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
                         .is_some()
@@ -3405,12 +3594,41 @@ fn push_entries_parallel(
                         Ok(()) => {
                             done.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(err) => {
-                            let mut slot = first_error.lock().unwrap_or_else(|e| e.into_inner());
+                        Err(err) if transfer_error_is_source_changing(&err) => {
+                            changing
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(entry.rel_path.clone());
+                        }
+                        Err(err) if transfer_error_is_fatal(&err) => {
+                            let mut slot = fatal_error.lock().unwrap_or_else(|e| e.into_inner());
                             if slot.is_none() {
                                 *slot = Some(err);
                             }
                             break;
+                        }
+                        Err(err) => {
+                            warn!(
+                                rel_path = entry.rel_path,
+                                error = %err,
+                                "file transfer failed; continuing with remaining files"
+                            );
+                            let mut list = failed.lock().unwrap_or_else(|e| e.into_inner());
+                            list.push((entry.rel_path.clone(), err));
+                            if list.len() >= MAX_PER_FILE_TRANSFER_FAILURES {
+                                let (path, err) = list
+                                    .pop()
+                                    .expect("failure list cannot be empty at its cap");
+                                let mut slot =
+                                    fatal_error.lock().unwrap_or_else(|e| e.into_inner());
+                                if slot.is_none() {
+                                    *slot = Some(err.context(format!(
+                                        "giving up after {MAX_PER_FILE_TRANSFER_FAILURES} \
+                                         file transfer failures (last: {path})"
+                                    )));
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -3418,19 +3636,24 @@ fn push_entries_parallel(
         }
     });
 
-    if let Some(err) = first_error
+    if let Some(err) = fatal_error
         .into_inner()
         .unwrap_or_else(|err| err.into_inner())
     {
         return Err(err);
     }
-    Ok(done.load(Ordering::Relaxed) as usize)
+    Ok(TransferOutcome {
+        transferred: done.load(Ordering::Relaxed) as usize,
+        changing: changing.into_inner().unwrap_or_else(|err| err.into_inner()),
+        failed: failed.into_inner().unwrap_or_else(|err| err.into_inner()),
+    })
 }
 
 /// Copy local file/symlink entries to the destination using a bounded worker
-/// pool. Returns the set of paths whose source changed mid-copy (so the caller
-/// can record a `source_changing` issue); any other error stops the pool and is
-/// propagated. An aggregate transfer meter must already be active.
+/// pool. Source-changing failures are collected (tolerated); other per-file
+/// failures are collected up to [`MAX_PER_FILE_TRANSFER_FAILURES`] so one bad
+/// file does not discard the progress of the rest of the batch. An aggregate
+/// transfer meter must already be active.
 fn copy_entries_parallel(
     src_root: &Path,
     dst_root: &Path,
@@ -3438,20 +3661,26 @@ fn copy_entries_parallel(
     cycle_id: i64,
     entries: &[&SnapshotEntry],
     sync: &NativeSyncConfig,
-) -> Result<BTreeSet<String>> {
+) -> Result<TransferOutcome> {
     if entries.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok(TransferOutcome {
+            transferred: 0,
+            changing: BTreeSet::new(),
+            failed: Vec::new(),
+        });
     }
     let workers = resolve_parallelism(sync.max_parallel_transfers, entries.len());
     let next = AtomicUsize::new(0);
-    let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let done = AtomicU64::new(0);
+    let fatal_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let changing: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let failed: Mutex<Vec<(String, anyhow::Error)>> = Mutex::new(Vec::new());
 
     thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
                 loop {
-                    if first_error
+                    if fatal_error
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
                         .is_some()
@@ -3466,21 +3695,39 @@ fn copy_entries_parallel(
                     match copy_entry(src_root, dst_root, destination_id, cycle_id, entry)
                         .with_context(|| format!("failed to copy {}", entry.rel_path))
                     {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            done.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(err) => {
                             let paths = source_changed_paths(&err);
-                            if paths.is_empty() {
+                            if !paths.is_empty() {
+                                changing
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .extend(paths);
+                                continue;
+                            }
+                            warn!(
+                                rel_path = entry.rel_path,
+                                error = %err,
+                                "file copy failed; continuing with remaining files"
+                            );
+                            let mut list = failed.lock().unwrap_or_else(|e| e.into_inner());
+                            list.push((entry.rel_path.clone(), err));
+                            if list.len() >= MAX_PER_FILE_TRANSFER_FAILURES {
+                                let (path, err) = list
+                                    .pop()
+                                    .expect("failure list cannot be empty at its cap");
                                 let mut slot =
-                                    first_error.lock().unwrap_or_else(|e| e.into_inner());
+                                    fatal_error.lock().unwrap_or_else(|e| e.into_inner());
                                 if slot.is_none() {
-                                    *slot = Some(err);
+                                    *slot = Some(err.context(format!(
+                                        "giving up after {MAX_PER_FILE_TRANSFER_FAILURES} \
+                                         file copy failures (last: {path})"
+                                    )));
                                 }
                                 break;
                             }
-                            changing
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .extend(paths);
                         }
                     }
                 }
@@ -3488,24 +3735,32 @@ fn copy_entries_parallel(
         }
     });
 
-    if let Some(err) = first_error
+    if let Some(err) = fatal_error
         .into_inner()
         .unwrap_or_else(|err| err.into_inner())
     {
         return Err(err);
     }
-    Ok(changing.into_inner().unwrap_or_else(|err| err.into_inner()))
+    Ok(TransferOutcome {
+        transferred: done.load(Ordering::Relaxed) as usize,
+        changing: changing.into_inner().unwrap_or_else(|err| err.into_inner()),
+        failed: failed.into_inner().unwrap_or_else(|err| err.into_inner()),
+    })
 }
 
 fn verify_snapshot_entries(
     expected: &[SnapshotEntry],
     actual: &[SnapshotEntry],
+    ignored_paths: &BTreeSet<String>,
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
 ) -> Result<()> {
     let expected = map_entries(expected);
     let actual = map_entries(actual);
     for (rel, want) in &expected {
+        if ignored_paths.contains(rel) {
+            continue;
+        }
         match actual.get(rel) {
             Some(got) if entries_match(want, got, sync) => {}
             Some(_) => bail!("destination mismatch at {rel}"),
@@ -3514,7 +3769,7 @@ fn verify_snapshot_entries(
     }
     if sync.mirror {
         for rel in actual.keys() {
-            if is_rel_excluded(Path::new(rel), excludes) {
+            if is_rel_excluded(Path::new(rel), excludes) || ignored_paths.contains(rel) {
                 continue;
             }
             if !expected.contains_key(rel) {
@@ -4168,7 +4423,6 @@ fn sync_destination(
         )
     })?;
     let result = (|| {
-        let mut changing_paths = BTreeSet::new();
         let source_map = map_entries(source_snapshot);
         let dst_snapshot =
             take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
@@ -4199,14 +4453,14 @@ fn sync_destination(
             .map(|e| e.size.max(0) as u64)
             .sum();
         let transfer_guard = progress::begin_transfer(destination_id, dst_root, total_bytes);
-        changing_paths.extend(copy_entries_parallel(
+        let outcome = copy_entries_parallel(
             src_root,
             dst_root,
             destination_id,
             cycle_id,
             &to_copy,
             sync,
-        )?);
+        )?;
         drop(transfer_guard);
 
         if sync.mirror {
@@ -4225,11 +4479,15 @@ fn sync_destination(
         }
 
         set_snapshot_dir_mtimes(dst_root, source_snapshot)?;
-        verify_destination(dst_root, source_snapshot, &changing_paths, excludes, sync)?;
-        if !changing_paths.is_empty() {
-            return Err(source_changing_error(&changing_paths));
-        }
-        Ok(())
+        // Verify what this cycle wrote; untouched entries were compared against
+        // the fresh destination scan above, so re-walking the tree is redundant.
+        verify_copied_entries(
+            dst_root,
+            to_copy.iter().copied(),
+            &outcome.unverifiable_paths(),
+            sync,
+        )?;
+        outcome.into_result()
     })();
     cleanup_tmp_cycle(dst_root, cycle_id);
     result
@@ -4299,14 +4557,14 @@ fn sync_destination_fast_missing_dirs(
             })
             .collect();
         info!(destination = destination_id, source_entries = source_snapshot.len(), to_copy = to_copy.len(), "reconcile: copying changed/missing files");
-        changing_paths.extend(copy_entries_parallel(
+        let outcome = copy_entries_parallel(
             src_root,
             dst_root,
             destination_id,
             cycle_id,
             &to_copy,
             sync,
-        )?);
+        )?;
         drop(transfer_guard);
 
         if sync.mirror {
@@ -4325,9 +4583,29 @@ fn sync_destination_fast_missing_dirs(
         }
 
         set_snapshot_dir_mtimes(dst_root, &source_snapshot)?;
-        info!(destination = destination_id, "reconcile: verifying destination");
-        verify_destination(dst_root, &source_snapshot, &changing_paths, excludes, sync)?;
+        info!(destination = destination_id, "reconcile: verifying copied entries");
+        // Verify everything this cycle wrote: the bulk-copied missing subtrees
+        // and the changed-file batch. Untouched entries were compared against
+        // the fresh destination scan above.
+        let mut ignored = outcome.unverifiable_paths();
+        ignored.extend(changing_paths.iter().cloned());
+        let bulk_copied = source_snapshot
+            .iter()
+            .filter(|e| copied_paths.contains(&e.rel_path));
+        verify_copied_entries(
+            dst_root,
+            to_copy.iter().copied().chain(bulk_copied),
+            &ignored,
+            sync,
+        )?;
         info!(destination = destination_id, "reconcile: verified ok");
+        changing_paths.extend(outcome.changing.iter().cloned());
+        let failed_count = outcome.failed.len();
+        if let Some((path, err)) = outcome.failed.into_iter().next() {
+            return Err(err.context(format!(
+                "{failed_count} file transfer(s) failed (first: {path})"
+            )));
+        }
         if !changing_paths.is_empty() {
             return Err(source_changing_error(&changing_paths));
         }
@@ -4609,7 +4887,7 @@ fn sync_destination_event_paths(
             &[],
             sync.checksum,
         )?;
-        verify_snapshot_entries(&source_snapshot, &actual, excludes, sync)?;
+        verify_snapshot_entries(&source_snapshot, &actual, &changing_paths, excludes, sync)?;
         if !changing_paths.is_empty() {
             return Err(source_changing_error(&changing_paths));
         }
@@ -4665,14 +4943,23 @@ fn sync_changed_entries_local(
             None => true,
         })
         .collect();
-    changing_paths.extend(copy_entries_parallel(
+    let outcome = copy_entries_parallel(
         src_root,
         dst_root,
         destination_id,
         cycle_id,
         &to_copy,
         sync,
-    )?);
+    )?;
+    changing_paths.extend(outcome.changing.iter().cloned());
+    let failed_count = outcome.failed.len();
+    if let Some((path, err)) = outcome.failed.into_iter().next() {
+        // The rest of the batch still copied; surface the per-file failures so
+        // the destination goes red and the next cycle retries just these.
+        return Err(err.context(format!(
+            "{failed_count} file transfer(s) failed (first: {path})"
+        )));
+    }
 
     if sync.mirror {
         let mut extra_paths: Vec<String> = dst_map
@@ -5303,35 +5590,32 @@ fn move_to_trash(dst_root: &Path, rel: &str, cycle_id: i64) -> Result<()> {
     }
 }
 
-fn verify_destination(
+/// Re-check just the entries this cycle wrote (per-path lstat, plus re-hash in
+/// checksum mode) instead of re-walking the whole destination tree. Untouched
+/// entries were already compared against the fresh destination scan at the
+/// start of the cycle, and mirror removals propagate their own errors, so a
+/// full end-of-cycle re-scan only repeats work — on multi-terabyte trees it
+/// used to double the cycle cost.
+fn verify_copied_entries<'a, I>(
     dst_root: &Path,
-    source_snapshot: &[SnapshotEntry],
+    copied: I,
     ignored_paths: &BTreeSet<String>,
-    excludes: &[PathBuf],
     sync: &NativeSyncConfig,
-) -> Result<()> {
-    let expected = map_entries(source_snapshot);
-    let actual_snapshot =
-        take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
-    let actual = map_entries(&actual_snapshot);
-    for (rel, want) in &expected {
-        if ignored_paths.contains(rel) {
+) -> Result<()>
+where
+    I: IntoIterator<Item = &'a SnapshotEntry>,
+{
+    for want in copied {
+        if want.file_type == "dir" || ignored_paths.contains(&want.rel_path) {
             continue;
         }
-        match actual.get(rel) {
-            Some(got) if entries_match(want, got, sync) => {}
-            Some(_) => bail!("destination mismatch at {rel}"),
-            None => bail!("destination missing {rel}"),
+        let path = safe_join_rel(dst_root, &want.rel_path)?;
+        if fs::symlink_metadata(&path).is_err() {
+            bail!("destination missing {}", want.rel_path);
         }
-    }
-    if sync.mirror {
-        for rel in actual.keys() {
-            if is_rel_excluded(Path::new(rel), excludes) {
-                continue;
-            }
-            if !expected.contains_key(rel) {
-                bail!("destination has extra path {rel}");
-            }
+        let got = snapshot_entry(&path, want.rel_path.clone(), sync.checksum)?;
+        if !entries_match(want, &got, sync) {
+            bail!("destination mismatch at {}", want.rel_path);
         }
     }
     Ok(())
@@ -5591,6 +5875,46 @@ fn short_reason(err: &anyhow::Error) -> String {
         .collect::<Vec<_>>()
         .join(": ");
     text.chars().take(120).collect()
+}
+
+/// Record a destination sync failure: tolerated source-changing errors become
+/// yellow `source_changing` issues (the next cycle converges them); everything
+/// else goes red with a short reason.
+fn record_destination_failure(
+    state: &State,
+    source_id: &str,
+    destination_id: &str,
+    cycle_id: i64,
+    err: &anyhow::Error,
+) -> Result<()> {
+    let changing_paths = source_changed_paths(err);
+    if changing_paths.is_empty() {
+        state.clear_destination_issues(source_id, destination_id)?;
+        state.upsert_destination_status(
+            source_id,
+            destination_id,
+            None,
+            "red",
+            &short_reason(err),
+        )?;
+    } else {
+        state.replace_destination_issues(
+            source_id,
+            destination_id,
+            cycle_id,
+            "source_changing",
+            &changing_paths,
+            "source file changed while copying",
+        )?;
+        state.upsert_destination_status(
+            source_id,
+            destination_id,
+            None,
+            "yellow",
+            "source_changing",
+        )?;
+    }
+    Ok(())
 }
 
 fn source_changed_paths(err: &anyhow::Error) -> Vec<String> {
@@ -6950,5 +7274,109 @@ mod tests {
         sync.mirror = false;
         let report = build_scan_report("s", "d", &source, &dst, &[], &sync);
         assert_eq!(report.to_delete, 0);
+    }
+
+    #[test]
+    fn source_changed_paths_survives_peer_http_wrapper() {
+        // The push-file hop wraps the peer's error text into the non-200
+        // message body; the canonical prefix must still parse out of it.
+        let err = anyhow!(
+            "peer returned non-200 response: HTTP/1.1 500: source changed while copying a/b c.txt"
+        );
+        assert_eq!(source_changed_paths(&err), vec!["a/b c.txt".to_string()]);
+        assert!(transfer_error_is_source_changing(&err));
+    }
+
+    #[test]
+    fn transfer_error_fatal_classification() {
+        let refused = anyhow::Error::from(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ))
+        .context("failed to transfer a.txt");
+        assert!(transfer_error_is_fatal(&refused));
+
+        let closed = anyhow!("peer closed connection before HTTP headers");
+        assert!(transfer_error_is_fatal(&closed));
+
+        let per_file = anyhow!("peer returned non-200 response: HTTP/1.1 500: permission denied");
+        assert!(!transfer_error_is_fatal(&per_file));
+
+        let not_found = anyhow::Error::from(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no such file",
+        ))
+        .context("failed to read source");
+        assert!(!transfer_error_is_fatal(&not_found));
+    }
+
+    #[test]
+    fn transfer_outcome_result_precedence() {
+        // Per-file failures dominate (red)...
+        let outcome = TransferOutcome {
+            transferred: 3,
+            changing: BTreeSet::from(["a.txt".to_string()]),
+            failed: vec![("b.txt".to_string(), anyhow!("permission denied"))],
+        };
+        let ignored = outcome.unverifiable_paths();
+        assert!(ignored.contains("a.txt") && ignored.contains("b.txt"));
+        let err = outcome.into_result().unwrap_err();
+        assert!(source_changed_paths(&err).is_empty(), "failed beats changing: {err:#}");
+
+        // ...tolerated source changes alone stay classifiable (yellow).
+        let outcome = TransferOutcome {
+            transferred: 3,
+            changing: BTreeSet::from(["a.txt".to_string()]),
+            failed: Vec::new(),
+        };
+        let err = outcome.into_result().unwrap_err();
+        assert_eq!(source_changed_paths(&err), vec!["a.txt".to_string()]);
+
+        let outcome = TransferOutcome {
+            transferred: 3,
+            changing: BTreeSet::new(),
+            failed: Vec::new(),
+        };
+        assert!(outcome.into_result().is_ok());
+    }
+
+    #[test]
+    fn verify_copied_entries_checks_only_given_paths() -> Result<()> {
+        let temp = temp_dir("verify_copied_entries");
+        let dst = temp.join("dst");
+        fs::create_dir_all(&dst)?;
+        fs::write(dst.join("ok.txt"), b"hello")?;
+        let sync = NativeSyncConfig::default();
+
+        let ok = snapshot_entry(&dst.join("ok.txt"), "ok.txt".to_string(), false)?;
+        verify_copied_entries(&dst, [&ok], &BTreeSet::new(), &sync)?;
+
+        // A missing file fails...
+        let missing = test_file_entry("missing.txt", 5);
+        assert!(verify_copied_entries(&dst, [&missing], &BTreeSet::new(), &sync).is_err());
+        // ...unless it is in the ignored (changed/failed mid-copy) set.
+        let ignored = BTreeSet::from(["missing.txt".to_string()]);
+        verify_copied_entries(&dst, [&missing], &ignored, &sync)?;
+
+        // A size mismatch fails.
+        let mut wrong = ok.clone();
+        wrong.size += 1;
+        assert!(verify_copied_entries(&dst, [&wrong], &BTreeSet::new(), &sync).is_err());
+        fs::remove_dir_all(&temp).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn transfer_memory_permits_do_not_deadlock_oversized_requests() {
+        // A request larger than the whole budget must proceed once the budget
+        // is otherwise idle, and release its reservation on drop.
+        let permit = acquire_transfer_memory(TRANSFER_MEMORY_BUDGET * 4);
+        drop(permit);
+        let small_a = acquire_transfer_memory(1024);
+        let small_b = acquire_transfer_memory(1024);
+        drop(small_a);
+        drop(small_b);
+        let (used, _) = transfer_memory();
+        assert_eq!(*used.lock().unwrap(), 0);
     }
 }

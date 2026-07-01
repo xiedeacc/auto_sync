@@ -818,8 +818,22 @@ fn http_request_on_stream(
     if !response.status_line.starts_with("HTTP/1.1 200")
         && !response.status_line.starts_with("HTTP/1.0 200")
     {
+        // Include the (truncated) body: peer errors carry their reason there,
+        // and callers classify some of them (e.g. "source changed while
+        // copying <path>") to decide yellow-vs-red handling.
+        let detail: String = String::from_utf8_lossy(&response.body)
+            .trim()
+            .chars()
+            .take(2048)
+            .collect();
+        if detail.is_empty() {
+            bail!(
+                "peer returned non-200 response: {}",
+                response.status_line.trim()
+            );
+        }
         bail!(
-            "peer returned non-200 response: {}",
+            "peer returned non-200 response: {}: {detail}",
             response.status_line.trim()
         );
     }
