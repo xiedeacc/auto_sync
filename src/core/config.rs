@@ -564,8 +564,13 @@ fn local_machine_from_config(machines: &[MachineConfig]) -> MachineConfig {
         return local;
     };
 
+    // Prefer the live hostname (already set by MachineConfig::local()). Only
+    // fall back to a previously-stored name when hostname detection failed, so a
+    // renamed host (e.g. "tiger" -> "nas") updates instead of persisting a stale
+    // name, while a machine that genuinely can't resolve its hostname keeps a
+    // sensible label.
     let configured_name = configured.name.trim();
-    if !is_placeholder_local_name(configured_name) {
+    if is_placeholder_local_name(&local.name) && !is_placeholder_local_name(configured_name) {
         local.name = configured_name.to_string();
     }
     local.alias_name = clean_id(&configured.alias_name);
