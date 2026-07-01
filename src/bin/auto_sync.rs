@@ -6,7 +6,7 @@
 //! in a single process removes the old daemon/GUI contention over the shared
 //! SQLite database and the destination machines.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use auto_sync::core::backend::Backend;
-use auto_sync::core::config::{AppConfig, load_config, load_or_create_config};
+use auto_sync::core::config::{
+    AppConfig, load_config, load_or_create_config, preferred_local_host,
+};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::state::State;
 use auto_sync::core::sync::sync_all_pending;
@@ -104,7 +106,7 @@ fn main() -> Result<()> {
     // pushes) honours it even though it never runs the scheduler loop.
     auto_sync::core::sync::configure_fsync(cfg.app.sync.fsync);
 
-    let addr = bind_addr_for_port(cfg.app.port);
+    let addrs = bind_addrs_for_port(cfg.app.port);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -130,8 +132,8 @@ fn main() -> Result<()> {
             .context("failed to start scheduler thread")?
     };
 
-    let backend = Backend::new(config_path, addr.port());
-    run_foreground(backend, addr, &args);
+    let backend = Backend::new(config_path, cfg.app.port);
+    run_foreground(backend, addrs, &args);
 
     shutdown.store(true, Ordering::SeqCst);
     let _ = scheduler.join();
@@ -139,11 +141,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn bind_addr_for_port(port: u16) -> SocketAddr {
-    // Bind ALL interfaces: LAN peers reach us via the LAN IP, local tools via
-    // 127.0.0.1, and a DHCP address change cannot strand the listener on a
-    // stale IP (binding the specific LAN IP had all three problems).
-    SocketAddr::from(([0, 0, 0, 0], port))
+/// The addresses the web API listens on: the LAN IP (peer machines dial it)
+/// plus loopback (local tools). Deliberately NOT 0.0.0.0 — the port must not
+/// be reachable through other interfaces (VPN, WAN-facing NICs). Only when
+/// the LAN IP cannot be determined do we fall back to 0.0.0.0, because LAN
+/// peer communication must keep working.
+fn bind_addrs_for_port(port: u16) -> Vec<SocketAddr> {
+    let loopback = SocketAddr::from(([127, 0, 0, 1], port));
+    match preferred_local_host().parse::<IpAddr>() {
+        Ok(ip) if ip.is_loopback() => vec![loopback],
+        Ok(ip) => vec![SocketAddr::new(ip, port), loopback],
+        Err(_) => {
+            warn!("could not determine the LAN address; binding all interfaces");
+            vec![SocketAddr::from(([0, 0, 0, 0], port))]
+        }
+    }
 }
 
 /// Holds the OS-level exclusive lock on the single-instance lock file for the
@@ -387,21 +399,21 @@ mod windows_tests {
 }
 
 /// Run the web server, and the desktop window when one is available.
-fn run_foreground(backend: Backend, addr: SocketAddr, args: &Args) {
+fn run_foreground(backend: Backend, addrs: Vec<SocketAddr>, args: &Args) {
     #[cfg(feature = "gui")]
     {
         if !args.no_gui && desktop_available() {
-            run_with_desktop(backend, addr, args.hidden);
+            run_with_desktop(backend, addrs, args.hidden);
             return;
         }
         info!("no desktop session detected; running web-only");
     }
     #[cfg(not(feature = "gui"))]
     let _ = args;
-    run_web_only(backend, addr);
+    run_web_only(backend, addrs);
 }
 
-fn run_web_only(backend: Backend, addr: SocketAddr) {
+fn run_web_only(backend: Backend, addrs: Vec<SocketAddr>) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -412,8 +424,8 @@ fn run_web_only(backend: Backend, addr: SocketAddr) {
             return;
         }
     };
-    if let Err(err) = runtime.block_on(web_api::serve(backend, addr)) {
-        error!(error = %err, %addr, "web server stopped");
+    if let Err(err) = runtime.block_on(web_api::serve(backend, addrs)) {
+        error!(error = %err, "web server stopped");
     }
 }
 
@@ -430,10 +442,10 @@ fn desktop_available() -> bool {
 }
 
 #[cfg(feature = "gui")]
-fn spawn_web(backend: Backend, addr: SocketAddr) {
+fn spawn_web(backend: Backend, addrs: Vec<SocketAddr>) {
     let result = thread::Builder::new()
         .name("auto_sync_web".to_string())
-        .spawn(move || run_web_only(backend, addr));
+        .spawn(move || run_web_only(backend, addrs));
     if let Err(err) = result {
         warn!(error = %err, "failed to spawn web server thread");
     }
@@ -587,8 +599,8 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 #[cfg(feature = "gui")]
-fn run_with_desktop(backend: Backend, addr: SocketAddr, start_hidden: bool) {
-    spawn_web(backend.clone(), addr);
+fn run_with_desktop(backend: Backend, addrs: Vec<SocketAddr>, start_hidden: bool) {
+    spawn_web(backend.clone(), addrs);
     let config_path = backend.config_path();
     if let Ok(cfg) = backend.get_config() {
         CLOSE_TO_TRAY.store(cfg.app.close_to_tray, Ordering::Relaxed);

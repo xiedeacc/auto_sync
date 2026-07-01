@@ -98,24 +98,50 @@ pub fn router(backend: Backend) -> Router {
         .with_state(backend)
 }
 
-pub async fn serve(backend: Backend, addr: SocketAddr) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+/// Serve the web API on each given address (typically the LAN IP plus
+/// loopback — deliberately NOT 0.0.0.0, so the port is not exposed on other
+/// interfaces such as VPN/WAN-facing ones). Addresses that fail to bind are
+/// logged and skipped as long as at least one listener comes up.
+pub async fn serve(backend: Backend, addrs: Vec<SocketAddr>) -> Result<()> {
     let _discovery = spawn_discovery_responder(backend.config_path(), backend.port());
     let app = router(backend);
-    // The listener binds 0.0.0.0; show the reachable LAN address instead.
-    let display_host = if addr.ip().is_unspecified() {
-        crate::core::config::preferred_local_host()
-    } else {
-        addr.ip().to_string()
-    };
-    let url = format!("http://{display_host}:{}/", addr.port());
-    info!(url = %url, "auto_sync web listening");
-    println!("auto_sync Web UI: {url}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let mut listeners = Vec::new();
+    for addr in addrs {
+        if listeners
+            .iter()
+            .any(|(bound, _): &(SocketAddr, tokio::net::TcpListener)| *bound == addr)
+        {
+            continue;
+        }
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                let url = format!("http://{addr}/");
+                info!(url = %url, "auto_sync web listening");
+                println!("auto_sync Web UI: {url}");
+                listeners.push((addr, listener));
+            }
+            Err(err) => {
+                tracing::warn!(%addr, error = %err, "failed to bind web listener; skipping address");
+            }
+        }
+    }
+    if listeners.is_empty() {
+        anyhow::bail!("no web listener could be bound");
+    }
+    let mut tasks = Vec::new();
+    for (_, listener) in listeners {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await
+        }));
+    }
+    for task in tasks {
+        task.await??;
+    }
     Ok(())
 }
 
