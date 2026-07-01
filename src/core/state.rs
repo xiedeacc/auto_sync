@@ -619,6 +619,40 @@ impl State {
         Ok(count > 0)
     }
 
+    /// Events recorded in cycles AFTER `after_cycle_id` and up to (including)
+    /// `through_cycle_id` — the accumulated backlog a destination must apply
+    /// to advance from its last verified cycle to the target cycle. Scheduled
+    /// destinations skip many intermediate cycles, so a single cycle's events
+    /// are not enough for them.
+    pub fn events_between_cycles(
+        &self,
+        source_id: &str,
+        after_cycle_id: i64,
+        through_cycle_id: i64,
+    ) -> Result<Vec<CycleEvent>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT event_id, event_kind, rel_path, rescan_required
+            FROM event_log
+            WHERE source_id=?1 AND cycle_id>?2 AND cycle_id<=?3
+            ORDER BY event_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![source_id, after_cycle_id, through_cycle_id],
+            |row| {
+                Ok(CycleEvent {
+                    event_id: row.get(0)?,
+                    event_kind: row.get(1)?,
+                    rel_path: row.get(2)?,
+                    rescan_required: row.get::<_, i64>(3)? != 0,
+                })
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn cycle_events(&self, source_id: &str, cycle_id: i64) -> Result<Vec<CycleEvent>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -734,20 +768,14 @@ impl State {
     }
 
     pub fn mark_cycle_status(&self, cycle_id: i64, status: &str) -> Result<()> {
+        // NOTE: verified cycles must NOT eagerly delete their events (the old
+        // startup_mtime_scan special case): a scheduled destination
+        // accumulates events across many cycles and applies them at its
+        // schedule time, so events live until every enabled destination has
+        // verified past their cycle (see `prune_event_log`).
         self.conn.execute(
             "UPDATE sync_cycle SET status=?1, updated_at=?2 WHERE id=?3",
             params![status, now_string(), cycle_id],
-        )?;
-        if status == "verified" {
-            self.delete_cycle_startup_mtime_events(cycle_id)?;
-        }
-        Ok(())
-    }
-
-    fn delete_cycle_startup_mtime_events(&self, cycle_id: i64) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM event_log WHERE cycle_id=?1 AND event_kind='startup_mtime_scan'",
-            params![cycle_id],
         )?;
         Ok(())
     }
@@ -1650,8 +1678,12 @@ mod tests {
     }
 
     #[test]
-    fn verified_cycle_deletes_only_startup_mtime_events() {
-        let temp = temp_dir("state_delete_startup_events");
+    fn verified_cycle_keeps_events_for_lagging_scheduled_destinations() {
+        // A verified cycle must NOT eagerly delete its events: a scheduled
+        // destination accumulates them across cycles and applies the backlog
+        // at its schedule time. Cleanup happens via prune_event_log once every
+        // enabled destination has verified past the cycle.
+        let temp = temp_dir("state_keep_cycle_events");
         let db = temp.join("state.sqlite");
         let state = State::open(&db).unwrap();
         let cycle_id = state.ensure_open_cycle("src_1", Utc::now()).unwrap();
@@ -1662,13 +1694,21 @@ mod tests {
             .record_event("src_1", 0, "modify", Some("b.txt"), false)
             .unwrap();
 
-        state.mark_cycle_status(cycle_id, "failed").unwrap();
+        state.mark_cycle_status(cycle_id, "verified").unwrap();
         assert_eq!(state.cycle_events("src_1", cycle_id).unwrap().len(), 2);
 
-        state.mark_cycle_status(cycle_id, "verified").unwrap();
-        let events = state.cycle_events("src_1", cycle_id).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_kind, "modify");
+        // The accumulated backlog spans cycles: events after a destination's
+        // last verified cycle up to (including) its target cycle.
+        let backlog = state
+            .events_between_cycles("src_1", cycle_id - 1, cycle_id)
+            .unwrap();
+        assert_eq!(backlog.len(), 2);
+        assert!(
+            state
+                .events_between_cycles("src_1", cycle_id, cycle_id)
+                .unwrap()
+                .is_empty()
+        );
 
         std::fs::remove_dir_all(temp).ok();
     }

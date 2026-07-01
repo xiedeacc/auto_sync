@@ -39,7 +39,7 @@ use windows_sys::Win32::System::Ioctl::{
     USN_REASON_STREAM_CHANGE, USN_RECORD_COMMON_HEADER, USN_RECORD_V2,
 };
 
-use crate::core::config::{AppConfig, ScheduleMode, SourceGroupConfig, machine_id_or_local};
+use crate::core::config::{AppConfig, SourceGroupConfig, machine_id_or_local};
 use crate::core::state::State;
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -113,7 +113,7 @@ fn source_needs_usn(source: &SourceGroupConfig) -> bool {
         && source
             .destinations
             .iter()
-            .any(|dst| dst.enabled && dst.schedule.mode == ScheduleMode::Realtime)
+            .any(|dst| dst.enabled)
 }
 
 fn check_source_usn_access(source: &SourceGroupConfig) -> Result<()> {

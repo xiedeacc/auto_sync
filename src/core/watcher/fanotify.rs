@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
 
-use crate::core::config::{AppConfig, ScheduleMode, SourceGroupConfig, machine_id_or_local};
+use crate::core::config::{AppConfig, SourceGroupConfig, machine_id_or_local};
 use crate::core::state::State;
 
 const FAN_CLOEXEC: u32 = 0x0000_0001;
@@ -162,7 +162,7 @@ fn source_needs_fanotify(source: &SourceGroupConfig) -> bool {
         && source
             .destinations
             .iter()
-            .any(|dst| dst.enabled && dst.schedule.mode == ScheduleMode::Realtime)
+            .any(|dst| dst.enabled)
 }
 
 fn run_fanotify_loop(cfg: AppConfig, db_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<()> {

@@ -1842,7 +1842,7 @@ pub fn sync_cycle_for_source(
         .map(|(dst_index, _)| *dst_index)
         .collect();
     let source_checksum = any_ready_destination_needs_checksum(cfg, source, &ready_indexes);
-    if let Some(plan) = realtime_incremental_plan(state, source, cycle, &ready_indexes)? {
+    if let Some(plan) = event_incremental_plan(state, source, cycle, &ready_indexes)? {
         match plan {
             RealtimeIncrementalPlan::Unusable(reason) => {
                 for dst_index in ready_indexes {
@@ -1856,17 +1856,21 @@ pub fn sync_cycle_for_source(
                     blocked: false,
                 });
             }
-            RealtimeIncrementalPlan::Apply(rel_paths) => {
+            RealtimeIncrementalPlan::Apply(per_dst_paths) => {
+                let paths_by_index: BTreeMap<usize, Vec<String>> =
+                    per_dst_paths.into_iter().collect();
                 state.mark_cycle_status(cycle.id, "syncing")?;
                 for (dst_index, dst_endpoint) in ready_destinations {
                     let dst = &source.destinations[dst_index];
                     let sync = effective_sync_config(cfg, dst);
+                    let empty = Vec::new();
+                    let rel_paths = paths_by_index.get(&dst_index).unwrap_or(&empty);
                     match sync_endpoint_event_paths(
                         &live_source_endpoint,
                         &dst_endpoint,
                         &dst.id,
                         cycle.id,
-                        &rel_paths,
+                        rel_paths,
                         &source.excludes,
                         &sync,
                     ) {
@@ -2224,11 +2228,16 @@ fn sync_task_label(task: &SyncTaskRef) -> String {
 }
 
 enum RealtimeIncrementalPlan {
-    Apply(Vec<String>),
+    /// Per ready-destination accumulated event paths: `(dst_index, rel_paths)`.
+    /// Realtime destinations track every cycle so their backlog is just the
+    /// target cycle's events; scheduled destinations accumulate events across
+    /// every cycle since their last verified one and apply them all at their
+    /// schedule time.
+    Apply(Vec<(usize, Vec<String>)>),
     Unusable(&'static str),
 }
 
-fn realtime_incremental_plan(
+fn event_incremental_plan(
     state: &State,
     source: &SourceGroupConfig,
     cycle: &Cycle,
@@ -2237,61 +2246,53 @@ fn realtime_incremental_plan(
     if ready_destinations.is_empty() {
         return Ok(None);
     }
-    for dst_index in ready_destinations {
-        let dst = &source.destinations[*dst_index];
-        if dst.schedule.mode != ScheduleMode::Realtime {
-            return Ok(None);
-        }
-        if state
-            .destination_last_verified(&source.id, &dst.id)?
-            .is_none()
-        {
-            return Ok(None);
-        }
-    }
-
-    let events = state.cycle_events(&source.id, cycle.id)?;
-    let actionable: Vec<&CycleEvent> = events
-        .iter()
-        .filter(|event| event.rel_path.is_some() || event.rescan_required)
-        .collect();
     if cycle.manual_full_rescan {
         return Ok(None);
     }
     if cycle.manual_changed_since_rescan {
         return Ok(None);
     }
-    if cycle.needs_full_rescan || actionable.iter().any(|event| event.rescan_required) {
-        // A possible-event-loss signal (queue overflow, USN gap, startup gap)
-        // or a periodic reconcile. Fall through to a full reconcile that
-        // re-scans source+dst and repairs every difference (incl. deletes the
-        // event stream may have missed). Checked BEFORE the empty-plan fast
-        // path: a rescan-flagged cycle with no actionable events must still
-        // reconcile, not rubber-stamp green.
+    if cycle.needs_full_rescan {
+        // A possible-event-loss signal (queue overflow, USN gap). Fall through
+        // to a full reconcile that re-scans source+dst and repairs every
+        // difference (incl. deletes the event stream may have missed) instead
+        // of rubber-stamping green from an incomplete event backlog.
         return Ok(None);
     }
-    if actionable.is_empty() {
-        return Ok(Some(RealtimeIncrementalPlan::Apply(Vec::new())));
-    }
 
-    let mut paths = BTreeSet::new();
-    for event in actionable {
-        let Some(rel_path) = event.rel_path.as_deref() else {
-            return Ok(Some(RealtimeIncrementalPlan::Unusable(
-                "realtime_event_path_unavailable",
-            )));
+    let mut plans = Vec::with_capacity(ready_destinations.len());
+    for &dst_index in ready_destinations {
+        let dst = &source.destinations[dst_index];
+        let Some(last_verified) = state.destination_last_verified(&source.id, &dst.id)? else {
+            // First sync must be a full pass.
+            return Ok(None);
         };
-        let rel = normalize_rel_path(rel_path).with_context(|| {
-            format!(
-                "invalid realtime event path in cycle {}: {rel_path}",
-                cycle.id
-            )
-        })?;
-        paths.insert(rel_to_string(&rel)?);
+        let events = state.events_between_cycles(&source.id, last_verified, cycle.id)?;
+        let actionable: Vec<&CycleEvent> = events
+            .iter()
+            .filter(|event| event.rel_path.is_some() || event.rescan_required)
+            .collect();
+        if actionable.iter().any(|event| event.rescan_required) {
+            return Ok(None);
+        }
+        let mut paths = BTreeSet::new();
+        for event in actionable {
+            let Some(rel_path) = event.rel_path.as_deref() else {
+                return Ok(Some(RealtimeIncrementalPlan::Unusable(
+                    "realtime_event_path_unavailable",
+                )));
+            };
+            let rel = normalize_rel_path(rel_path).with_context(|| {
+                format!(
+                    "invalid event path in cycle {}: {rel_path}",
+                    cycle.id
+                )
+            })?;
+            paths.insert(rel_to_string(&rel)?);
+        }
+        plans.push((dst_index, paths.into_iter().collect()));
     }
-    Ok(Some(RealtimeIncrementalPlan::Apply(
-        paths.into_iter().collect(),
-    )))
+    Ok(Some(RealtimeIncrementalPlan::Apply(plans)))
 }
 
 /// Compute the source paths that changed since the destination's last verified
@@ -2517,7 +2518,7 @@ fn sync_cycle_with_transfer(
         });
     }
 
-    if let Some(plan) = realtime_incremental_plan(state, source, cycle, &ready_destinations)? {
+    if let Some(plan) = event_incremental_plan(state, source, cycle, &ready_destinations)? {
         match plan {
             RealtimeIncrementalPlan::Unusable(reason) => {
                 for dst_index in ready_destinations {
@@ -2531,11 +2532,15 @@ fn sync_cycle_with_transfer(
                     blocked: false,
                 });
             }
-            RealtimeIncrementalPlan::Apply(rel_paths) if source_info.kind == "dir" => {
+            RealtimeIncrementalPlan::Apply(per_dst_paths) if source_info.kind == "dir" => {
+                let paths_by_index: BTreeMap<usize, Vec<String>> =
+                    per_dst_paths.into_iter().collect();
                 state.mark_cycle_status(cycle.id, "syncing")?;
                 for dst_index in ready_destinations {
                     let dst = &source.destinations[dst_index];
                     let sync = effective_sync_config(cfg, dst);
+                    let empty = Vec::new();
+                    let rel_paths = paths_by_index.get(&dst_index).unwrap_or(&empty);
                     let dst_machine_id = machine_id_or_local(&dst.machine_id);
                     let dst_machine = match find_machine(cfg, dst_machine_id) {
                         Some(machine) => machine,
@@ -2563,7 +2568,7 @@ fn sync_cycle_with_transfer(
                         &dst_root,
                         &dst.id,
                         cycle.id,
-                        &rel_paths,
+                        rel_paths,
                         &source.excludes,
                         &sync,
                     ) {
@@ -7621,6 +7626,83 @@ mod tests {
         let mut bigger = without_hash.clone();
         bigger.size += 1;
         assert!(snapshot_entry_changed(&without_hash, &bigger));
+    }
+
+    #[test]
+    fn scheduled_destination_applies_event_backlog_across_cycles() -> Result<()> {
+        // A scheduled (non-realtime) destination accumulates watcher events
+        // across every cycle since its last verified one and applies the whole
+        // backlog when its schedule comes due — not just the target cycle's
+        // events, and no full re-scan.
+        let temp = temp_dir("scheduled_event_backlog");
+        let db = temp.join("state.sqlite");
+        let source = SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: temp.join("src"),
+            add_directory: true,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: temp.join("dst"),
+                enabled: true,
+                schedule: ScheduleConfig {
+                    mode: crate::core::config::ScheduleMode::Daily,
+                    ..ScheduleConfig::default()
+                },
+                sync: None,
+            }],
+        };
+        let state = State::open(&db)?;
+
+        // Baseline: destination verified at cycle A.
+        let cycle_a = state.ensure_open_cycle("src_1", Utc::now())?;
+        state.close_current_cycle_for_source("src_1")?;
+        state.upsert_destination_status("src_1", "dst_1", Some(cycle_a), "green", "verified")?;
+
+        // Two later cycles each accumulate events the destination never saw.
+        state.record_event("src_1", 0, "modify", Some("first.txt"), false)?;
+        state.close_current_cycle_for_source("src_1")?;
+        state.record_event("src_1", 0, "modify", Some("second.txt"), false)?;
+        let target = state
+            .close_current_cycle_for_source("src_1")?
+            .expect("target cycle");
+        state.set_destination_target("src_1", "dst_1", target.id)?;
+
+        let plan = event_incremental_plan(&state, &source, &target, &[0])?
+            .expect("scheduled destinations are event-plan eligible");
+        match plan {
+            RealtimeIncrementalPlan::Apply(per_dst) => {
+                assert_eq!(per_dst.len(), 1);
+                let (dst_index, paths) = &per_dst[0];
+                assert_eq!(*dst_index, 0);
+                assert_eq!(
+                    paths,
+                    &vec!["first.txt".to_string(), "second.txt".to_string()],
+                    "backlog spans every cycle since last verified"
+                );
+            }
+            RealtimeIncrementalPlan::Unusable(reason) => panic!("unusable: {reason}"),
+        }
+
+        // A rescan-required event anywhere in the backlog forces a full pass.
+        state.record_event("src_1", 0, "queue_overflow", None, true)?;
+        let target = state
+            .close_current_cycle_for_source("src_1")?
+            .expect("overflow cycle");
+        state.set_destination_target("src_1", "dst_1", target.id)?;
+        assert!(
+            event_incremental_plan(&state, &source, &target, &[0])?.is_none(),
+            "possible event loss must fall back to full reconcile"
+        );
+
+        fs::remove_dir_all(&temp).ok();
+        Ok(())
     }
 
     #[test]

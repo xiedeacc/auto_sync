@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use walkdir::WalkDir;
 
-use crate::core::config::{AppConfig, ScheduleMode, SourceGroupConfig, machine_id_or_local};
+use crate::core::config::{AppConfig, SourceGroupConfig, machine_id_or_local};
 use crate::core::state::State;
 
 #[cfg(target_os = "linux")]
@@ -39,7 +39,7 @@ fn source_needs_startup_scan(source: &SourceGroupConfig) -> bool {
         && source
             .destinations
             .iter()
-            .any(|dst| dst.enabled && dst.schedule.mode == ScheduleMode::Realtime)
+            .any(|dst| dst.enabled)
 }
 
 fn record_source_startup_mtime_events(source: &SourceGroupConfig, state: &State) -> Result<usize> {

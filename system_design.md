@@ -407,6 +407,7 @@ Realtime + ZFS：
 - `daily` schedule 以配置的本地时间每天触发。
 - `weekly` schedule 以配置的星期几和时间触发。
 - `realtime` schedule 使用 fanotify/USN 尽快触发小批量同步。不做后台周期性对账（用户明确决定，2026-07-02）：疑似丢事件（overflow、USN gap、启动 gap）会自动触发一次完整 reconcile 修复；除此之外的漂移由用户手动 `Scan`（对账不同步）检查、手动 `Full`（对账并同步差异）修复。`reconcile_interval` 配置保留但当前不驱动任何周期任务。
+- `daily`/`weekly` 计划模式同样监听源目录（只要 source 有任一 enabled destination 就启动 watcher）：事件持续累积在 event_log 中，schedule 到点时把该 destination 自上次 verified cycle 以来所有 cycle 的事件积压一次性应用（event-path 增量），而不是全树扫描。积压中出现 rescan_required 事件（overflow/USN gap）或 destination 从未完成首次全量时，退回完整 reconcile。事件因此保留到所有 enabled destination 都 verified 越过其 cycle 才修剪（verified cycle 不再提前删除 startup 补漏事件）。
 - source group 不再依赖一个全局 daily/weekly schedule。
 
 流程：
