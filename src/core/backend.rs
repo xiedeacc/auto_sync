@@ -14,8 +14,8 @@ use crate::core::config::{
 };
 use crate::core::machines::{
     MachineHealth, MachineStatus, configure_tcp_connection_pool, discover_lan,
-    encode_query_component, find_machine, local_health, machine_id_from_path, merge_discovered,
-    remote_get_json, remote_post_json,
+    encode_query_component, find_machine, local_health, machine_id_from_path, machine_matches_health,
+    merge_discovered, remote_get_json, remote_post_json,
 };
 use crate::core::progress::{
     ScanProgressView, TransferProgressView, configure_progress_file, current_scan_progress,
@@ -386,22 +386,38 @@ impl Backend {
     }
 
     fn refresh_machine_cache(&self, min_interval: Duration) -> Result<MachineStatus> {
-        let mut cache = self
-            .machine_cache
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        if let (Some(status), Some(refreshed_at)) = (&cache.status, cache.refreshed_at) {
-            if refreshed_at.elapsed() < min_interval {
-                return Ok(status.clone());
+        {
+            let cache = self
+                .machine_cache
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if let (Some(status), Some(refreshed_at)) = (&cache.status, cache.refreshed_at) {
+                if refreshed_at.elapsed() < min_interval {
+                    return Ok(status.clone());
+                }
             }
         }
 
-        let cfg = load_or_create_config(&self.config_path)?;
+        // Discover without holding the cache lock (the sweep takes ~700ms, and
+        // persisting a hostname fix below clears the cache -- same lock).
+        let mut cfg = load_or_create_config(&self.config_path)?;
         apply_runtime_config(&cfg);
         let discovered = discover_lan(Duration::from_millis(700))?;
+        if refresh_machine_names_from_health(&mut cfg, &discovered) {
+            // A machine reported a different hostname (e.g. a rename tiger->nas);
+            // persist the corrected name. Use the plain config save, not the
+            // delegating one -- a cosmetic name refresh needn't re-push anything.
+            cfg = save_config(&self.config_path, &cfg)?;
+        }
         let status = merge_discovered(&cfg, discovered);
-        cache.status = Some(status.clone());
-        cache.refreshed_at = Some(Instant::now());
+        {
+            let mut cache = self
+                .machine_cache
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            cache.status = Some(status.clone());
+            cache.refreshed_at = Some(Instant::now());
+        }
         Ok(status)
     }
 
@@ -919,6 +935,35 @@ fn reset_changed_destination_offsets(
     Ok(())
 }
 
+/// Update stored remote-machine names to the hostnames reported by discovery so
+/// a renamed host (e.g. "tiger" -> "nas") stops showing a stale name. Only the
+/// factual `name` (hostname) is touched; the user's alias is left alone. Returns
+/// true if any name changed.
+fn refresh_machine_names_from_health(cfg: &mut AppConfig, discovered: &[MachineHealth]) -> bool {
+    let mut changed = false;
+    for machine in &mut cfg.machines {
+        if machine.id == "local" {
+            continue;
+        }
+        let Some(health) = discovered
+            .iter()
+            .find(|health| machine_matches_health(machine, health))
+        else {
+            continue;
+        };
+        let hostname = health.name.trim();
+        if !hostname.is_empty()
+            && hostname != "This machine"
+            && !hostname.eq_ignore_ascii_case("local")
+            && machine.name.trim() != hostname
+        {
+            machine.name = hostname.to_string();
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Latest non-fatal config problems, refreshed whenever the config is loaded or
 /// saved and surfaced through runtime status for the UI status bar.
 static CONFIG_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1229,6 +1274,44 @@ mod tests {
             saved.machines.iter().any(|m| m.id == "peer"),
             "remote peer should be retained"
         );
+    }
+
+    #[test]
+    fn discovery_refreshes_stale_remote_hostname() {
+        let mut cfg = AppConfig::default();
+        cfg.machines.push(MachineConfig {
+            id: "nas".to_string(),
+            alias_name: "nas".to_string(),
+            name: "tiger".to_string(), // stale hostname from before a rename
+            host: "192.168.2.247".to_string(),
+            port: 18765,
+            ssh_user: "root".to_string(),
+            ssh_port: 10022,
+            os: "linux".to_string(),
+            install_dir: PathBuf::from("/opt/auto_sync"),
+            enabled: true,
+            manual: true,
+        });
+        let discovered = vec![MachineHealth {
+            id: "local".to_string(),
+            alias_name: String::new(),
+            name: "nas".to_string(), // the machine reports its real hostname
+            host: "192.168.2.247".to_string(),
+            port: 18765,
+            ssh_user: "root".to_string(),
+            ssh_port: 10022,
+            os: "linux".to_string(),
+            version: String::new(),
+        }];
+
+        let changed = refresh_machine_names_from_health(&mut cfg, &discovered);
+        assert!(changed);
+        let nas = cfg.machines.iter().find(|m| m.id == "nas").unwrap();
+        assert_eq!(nas.name, "nas");
+        assert_eq!(nas.alias_name, "nas", "alias must be preserved");
+
+        // Idempotent: a second pass with the same health makes no change.
+        assert!(!refresh_machine_names_from_health(&mut cfg, &discovered));
     }
 
     #[test]

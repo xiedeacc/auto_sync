@@ -702,6 +702,19 @@ fn resolve_machine(machines: &[MachineConfig], machine_id: &str) -> Option<Machi
         .cloned()
 }
 
+/// Match a stored `MachineConfig` against a discovered health record (by alias,
+/// non-local id, or host+port), mirroring `machine_view_matches_health`.
+pub fn machine_matches_health(machine: &MachineConfig, health: &MachineHealth) -> bool {
+    let alias = health.alias_name.trim();
+    (!alias.is_empty()
+        && !machine.alias_name.trim().is_empty()
+        && machine.alias_name.eq_ignore_ascii_case(alias))
+        || (health.id.trim() != "local"
+            && !health.id.trim().is_empty()
+            && machine.id.eq_ignore_ascii_case(health.id.trim()))
+        || (machine.host == health.host && machine.port == health.port)
+}
+
 fn machine_view_matches_health(machine: &MachineView, health: &MachineHealth) -> bool {
     let alias = health.alias_name.trim();
     (!alias.is_empty()
