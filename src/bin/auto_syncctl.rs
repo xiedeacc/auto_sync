@@ -87,9 +87,11 @@ fn main() -> Result<()> {
         }
         CommandKind::Cancel { scope, local_only } => {
             let cfg = load_config(&config_path)?;
+            // The daemon binds its preferred LAN address (not loopback); use
+            // the same resolution to reach it.
             let local = auto_sync::core::config::MachineConfig {
                 id: "local".to_string(),
-                host: "127.0.0.1".to_string(),
+                host: auto_sync::core::config::preferred_local_host(),
                 port: cfg.app.port,
                 ..Default::default()
             };
