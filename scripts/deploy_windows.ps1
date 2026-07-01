@@ -628,17 +628,13 @@ function Ensure-AutoSyncStartup {
     New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
     Remove-Item -LiteralPath (Join-Path $startupDir "auto_syncd-start.vbs") -Force -ErrorAction SilentlyContinue
     $launcher = Join-Path $startupDir "auto_sync-start.vbs"
-    $escapedExe = $autoSyncExe.Replace('"', '""')
-    $escapedConfig = $ConfigPath.Replace('"', '""')
-    # One process: scheduler + watcher + web + desktop window (auto_sync opens
-    # the GUI itself when a desktop session is available). --hidden starts it
-    # minimized to the tray at login instead of popping the window open.
-    $script = @(
-        'Set shell = CreateObject("WScript.Shell")',
-        "shell.Run """"""$escapedExe"""" --config """"$escapedConfig"""" --hidden"", 0, False"
-    )
-    Set-Content -LiteralPath $launcher -Value $script -Encoding ascii
 
+    # auto_sync manages its own autostart entry (a Highest-privilege scheduled
+    # task plus this Startup-folder script that triggers it) every time it
+    # starts, keyed off the app.autostart config setting -- see
+    # apply_autostart_inner in src/bin/auto_sync.rs. That avoids an interactive
+    # UAC prompt at logon: the task is pre-authorized, elevated, the first time
+    # the process below runs and writes it. We just start the process here.
     Start-Process -FilePath $autoSyncExe `
         -ArgumentList @("--config", $ConfigPath) `
         -WorkingDirectory (Split-Path -Parent $BinDir)

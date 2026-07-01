@@ -299,6 +299,14 @@ fn apply_autostart(enabled: bool, config_path: &std::path::Path) {
     }
 }
 
+/// Name of the Highest-privilege scheduled task used to start auto_sync at
+/// logon without an interactive UAC prompt. Task Scheduler pre-authorizes the
+/// elevation when the task is created (which itself requires the creating
+/// process to already be elevated -- true here, since apply_autostart only
+/// runs after the startup elevation check in main() has already completed).
+#[cfg(all(feature = "gui", windows))]
+const AUTOSTART_TASK_NAME: &str = "auto_sync";
+
 #[cfg(all(feature = "gui", windows))]
 fn apply_autostart_inner(enabled: bool, config_path: &std::path::Path) -> std::io::Result<()> {
     let Some(appdata) = std::env::var_os("APPDATA") else {
@@ -313,17 +321,51 @@ fn apply_autostart_inner(enabled: bool, config_path: &std::path::Path) -> std::i
     let launcher = startup.join("auto_sync-start.vbs");
     if enabled {
         std::fs::create_dir_all(&startup)?;
-        let exe = std::env::current_exe()?
-            .display()
-            .to_string()
-            .replace('"', "\"\"");
-        let cfg = config_path.display().to_string().replace('"', "\"\"");
+        let exe = std::env::current_exe()?;
+        let target = format!(
+            "\"{}\" --config \"{}\" --hidden",
+            exe.display(),
+            config_path.display()
+        );
+        let created = std::process::Command::new("schtasks")
+            .args([
+                "/create",
+                "/tn",
+                AUTOSTART_TASK_NAME,
+                "/tr",
+                &target,
+                "/sc",
+                "onlogon",
+                "/rl",
+                "highest",
+                "/f",
+            ])
+            .status();
+        match created {
+            Ok(status) if status.success() => {
+                // Disable the task's own "onlogon" trigger -- schtasks /run
+                // still works on a disabled task -- so only the Startup-folder
+                // script below fires it, avoiding a double launch.
+                let _ = std::process::Command::new("schtasks")
+                    .args(["/change", "/tn", AUTOSTART_TASK_NAME, "/disable"])
+                    .status();
+            }
+            Ok(status) => warn!(code = ?status.code(), "schtasks /create returned non-zero"),
+            Err(err) => warn!(error = %err, "failed to invoke schtasks /create"),
+        }
+        // Triggers the pre-authorized elevated task instead of launching the
+        // exe directly, so no UAC prompt appears at logon.
         let script = format!(
-            "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.Run \"\"\"{exe}\"\" --config \"\"{cfg}\"\" --hidden\", 0, False\r\n"
+            "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.Run \"schtasks /run /tn \"\"{AUTOSTART_TASK_NAME}\"\"\", 0, False\r\n"
         );
         std::fs::write(&launcher, script)?;
-    } else if launcher.exists() {
-        std::fs::remove_file(&launcher)?;
+    } else {
+        let _ = std::process::Command::new("schtasks")
+            .args(["/delete", "/tn", AUTOSTART_TASK_NAME, "/f"])
+            .status();
+        if launcher.exists() {
+            std::fs::remove_file(&launcher)?;
+        }
     }
     Ok(())
 }
