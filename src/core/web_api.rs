@@ -15,7 +15,8 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::core::backend::{
-    Backend, BrowseResponse, DelegatedSourceGroupsRequest, RuntimeStatus, SyncActivityStatus,
+    Backend, BrowseResponse, CancelActivityRequest, CancelOutcome, DelegatedSourceGroupsRequest,
+    RuntimeStatus, SyncActivityStatus,
 };
 use crate::core::config::{AppConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
@@ -53,6 +54,7 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/sync-now", post(api_sync_now))
         .route("/api/sync-source-now", post(api_sync_source_now))
         .route("/api/sync-destination-now", post(api_sync_destination_now))
+        .route("/api/cancel-activity", post(api_cancel_activity))
         .route("/api/scan-destination-now", post(api_scan_destination_now))
         .route("/api/scan-report", get(api_scan_report))
         .route("/api/transfer/snapshot", post(api_transfer_snapshot))
@@ -241,6 +243,18 @@ async fn api_sync_destination_now(
             &req.destination_id,
             mode,
         )?))
+    })
+    .await
+}
+
+async fn api_cancel_activity(
+    AxumState(backend): AxumState<Backend>,
+    Json(req): Json<CancelActivityRequest>,
+) -> Result<Json<CancelOutcome>, ApiError> {
+    blocking(move || {
+        Ok(Json(
+            backend.cancel_activity(req.scope.as_deref(), req.propagate)?,
+        ))
     })
     .await
 }

@@ -21,13 +21,14 @@ use tracing::{error, info, warn};
 
 use crate::core::config::{
     AppConfig, DEFAULT_MAX_PARALLEL_TRANSFERS, DEFAULT_TRANSFER_TIMEOUT_SECS, DestinationConfig,
-    NativeSyncConfig, ScheduleMode, SnapshotBackend, SourceGroupConfig, SyncTaskRef,
+    NativeSyncConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef,
     machine_id_or_local, machine_is_local,
 };
 use crate::core::machines::{
     configure_tcp_connection_pool, encode_query_component, find_machine, remote_get_json,
     remote_post_bytes, remote_post_json,
 };
+use crate::core::cancel;
 use crate::core::progress;
 use crate::core::state::{Cycle, CycleEvent, ScanDiffEntry, ScanReport, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
@@ -163,6 +164,7 @@ fn set_sync_kind_if_empty(kind: &str) -> SyncKindGuard {
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     let _serialized = sync_gate().lock().unwrap_or_else(|err| err.into_inner());
     let _kind = set_sync_kind_if_empty("automatic");
+    let _cancellable = cancel::begin(cancel::KIND_SYNC);
     sync_all_pending_inner(cfg, state)
 }
 
@@ -196,6 +198,7 @@ pub fn queue_destination_sync(
 pub fn run_pending_with_kind(cfg: &AppConfig, state: &mut State, kind: &str) -> Result<()> {
     let _serialized = sync_gate().lock().unwrap_or_else(|err| err.into_inner());
     let _kind = set_sync_kind(kind);
+    let _cancellable = cancel::begin(cancel::KIND_SYNC);
     sync_all_pending_inner(cfg, state)
 }
 
@@ -214,6 +217,7 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
         {
             let cycles = state.closed_cycles_for_source(&source.id)?;
             for cycle in cycles {
+                cancel::check()?;
                 if state.source_has_target_cycle(&source.id, cycle.id)? {
                     let outcome = sync_cycle_for_source(cfg, state, source, &cycle)?;
                     progressed |= outcome.progressed;
@@ -337,6 +341,7 @@ pub fn scan_destination_now(
         .try_lock()
         .map_err(|_| anyhow!("{SCAN_ALREADY_RUNNING}"))?;
     let _kind = set_sync_kind_if_empty("scan");
+    let _cancellable = cancel::begin(cancel::KIND_COMPARE);
     // Tag tree walks started here as compare progress so they do not fight a
     // concurrently running sync's scan for the UI progress display.
     let _compare = progress::enter_compare_context();
@@ -370,9 +375,11 @@ pub fn scan_destination_now(
     // (they usually live on different machines), halving the compare's scan
     // phase versus scanning serially.
     let in_compare = progress::in_compare_context();
+    let cancel_token = cancel::current_token();
     let (source_result, dst_result) = thread::scope(|scope| {
         let dst_handle = scope.spawn(|| {
             let _compare = in_compare.then(progress::enter_compare_context);
+            let _cancel = cancel::enter(cancel_token.clone());
             if source_info.kind == "dir" {
                 snapshot_on_machine(
                     dst_machine_id,
@@ -664,6 +671,11 @@ pub struct TransferSnapshotRequest {
     pub excludes: Vec<PathBuf>,
     #[serde(default)]
     pub checksum: bool,
+    /// What the requester is doing ("sync" or "compare"): the peer registers
+    /// the served walk under this kind so a propagated cancel of a compare
+    /// does not kill a sync's scan (and vice versa). Empty from old senders.
+    #[serde(default)]
+    pub purpose: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -675,6 +687,9 @@ pub struct TransferSnapshotPathsRequest {
     pub excludes: Vec<PathBuf>,
     #[serde(default)]
     pub checksum: bool,
+    /// See [`TransferSnapshotRequest::purpose`].
+    #[serde(default)]
+    pub purpose: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -917,7 +932,20 @@ fn ready_destination_timeout(
         .unwrap_or_else(|| transfer_timeout(&cfg.app.sync))
 }
 
+/// The cancel kind for a snapshot request: what the requester declared, or
+/// "sync" for old senders that carry no purpose. Registering here makes a
+/// peer-served walk individually cancellable — a propagated cancel reaches
+/// the machine actually burning disk time.
+fn snapshot_request_cancel_kind(purpose: &str) -> &str {
+    if purpose == cancel::KIND_COMPARE {
+        cancel::KIND_COMPARE
+    } else {
+        cancel::KIND_SYNC
+    }
+}
+
 pub fn transfer_snapshot(req: TransferSnapshotRequest) -> Result<Vec<SnapshotEntry>> {
+    let _cancellable = cancel::begin(snapshot_request_cancel_kind(&req.purpose));
     match req.mode {
         TransferSnapshotMode::Source => take_snapshot_with_excludes(
             &req.root,
@@ -936,6 +964,7 @@ pub fn transfer_snapshot(req: TransferSnapshotRequest) -> Result<Vec<SnapshotEnt
 }
 
 pub fn transfer_snapshot_paths(req: TransferSnapshotPathsRequest) -> Result<Vec<SnapshotEntry>> {
+    let _cancellable = cancel::begin(snapshot_request_cancel_kind(&req.purpose));
     match req.mode {
         TransferSnapshotMode::Source => take_snapshot_paths_with_excludes(
             &req.root,
@@ -1436,6 +1465,9 @@ fn send_file_tcp(
     let mut pos = 0_u64;
     let mut buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
     while pos < total_size {
+        // Per-chunk poll so a multi-gigabyte file aborts mid-stream instead of
+        // holding the cancel until the file completes.
+        cancel::check()?;
         let remaining = (total_size - pos).min(TRANSFER_CHUNK_SIZE as u64) as usize;
         let n = file.read(&mut buf[..remaining])?;
         if n == 0 {
@@ -2784,9 +2816,11 @@ fn sync_cycle_with_transfer(
             snapshot
         } else {
             let prescan_dst = !cycle.manual_changed_since_rescan;
+            let cancel_token = cancel::current_token();
             let (source_result, dst_result) = thread::scope(|scope| {
                 let dst_handle = prescan_dst.then(|| {
                     scope.spawn(|| {
+                        let _cancel = cancel::enter(cancel_token.clone());
                         snapshot_on_machine(
                             dst_machine_id,
                             &dst_machine,
@@ -3447,11 +3481,22 @@ fn snapshot_on_machine(
         mode,
         excludes: excludes.to_vec(),
         checksum,
+        purpose: snapshot_purpose().to_string(),
     };
     if machine_id == "local" {
         transfer_snapshot(req)
     } else {
         remote_snapshot_with_progress(machine, root, &req, timeout)
+    }
+}
+
+/// The cancel kind a snapshot requested right now should register under on
+/// the serving peer: compares tag their walks via the compare context.
+fn snapshot_purpose() -> &'static str {
+    if progress::in_compare_context() {
+        cancel::KIND_COMPARE
+    } else {
+        cancel::KIND_SYNC
     }
 }
 
@@ -3471,6 +3516,7 @@ fn snapshot_paths_on_machine(
         rel_paths: rel_paths.to_vec(),
         excludes: excludes.to_vec(),
         checksum,
+        purpose: snapshot_purpose().to_string(),
     };
     if machine_id == "local" {
         transfer_snapshot_paths(req)
@@ -3732,6 +3778,11 @@ fn transfer_error_is_source_changing(err: &anyhow::Error) -> bool {
 /// is unreachable, so every remaining file would fail the same way. The worker
 /// pool aborts immediately instead of burning retries per file.
 fn transfer_error_is_fatal(err: &anyhow::Error) -> bool {
+    // A user cancellation dooms every remaining file the same way a dead
+    // connection does: abort the pool instead of failing files one by one.
+    if cancel::error_is_cancelled(err) {
+        return true;
+    }
     err.chain().any(|cause| {
         if let Some(io_err) = cause.downcast_ref::<io::Error>() {
             return matches!(
@@ -3766,7 +3817,8 @@ where
             Ok(()) => return Ok(()),
             Err(err)
                 if attempt < TRANSFER_RETRY_ATTEMPTS
-                    && !transfer_error_is_source_changing(&err) =>
+                    && !transfer_error_is_source_changing(&err)
+                    && !cancel::error_is_cancelled(&err) =>
             {
                 warn!(
                     rel_path = label,
@@ -3857,16 +3909,27 @@ fn push_entries_parallel(
     let fatal_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let changing: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
     let failed: Mutex<Vec<(String, anyhow::Error)>> = Mutex::new(Vec::new());
+    // Thread-locals do not cross spawn; carry the cancel token explicitly so
+    // a cancel request stops the workers, not just the coordinating thread.
+    let cancel_token = cancel::current_token();
 
     thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
+                let _cancel = cancel::enter(cancel_token.clone());
                 loop {
                     if fatal_error
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
                         .is_some()
                     {
+                        break;
+                    }
+                    if let Err(err) = cancel::check() {
+                        let mut slot = fatal_error.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(err);
+                        }
                         break;
                     }
                     let idx = next.fetch_add(1, Ordering::Relaxed);
@@ -3973,16 +4036,25 @@ fn copy_entries_parallel(
     let fatal_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let changing: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
     let failed: Mutex<Vec<(String, anyhow::Error)>> = Mutex::new(Vec::new());
+    let cancel_token = cancel::current_token();
 
     thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
+                let _cancel = cancel::enter(cancel_token.clone());
                 loop {
                     if fatal_error
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
                         .is_some()
                     {
+                        break;
+                    }
+                    if let Err(err) = cancel::check() {
+                        let mut slot = fatal_error.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(err);
+                        }
                         break;
                     }
                     let idx = next.fetch_add(1, Ordering::Relaxed);
@@ -5470,6 +5542,10 @@ fn snapshot_entry_if_supported(
     rel_path: String,
     checksum: bool,
 ) -> Result<Option<SnapshotEntry>> {
+    // Per-entry cancellation poll: a single flat directory can hold hundreds
+    // of thousands of entries (worse in checksum mode, where each file is
+    // fully re-hashed), so per-directory polling alone is not enough.
+    cancel::check()?;
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to read metadata {}", path.display()))?;
     let file_type = if metadata.file_type().is_symlink() {
@@ -5540,6 +5616,10 @@ where
 }
 
 fn sorted_read_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+    // Every tree walk funnels through here: one cancellation poll per
+    // directory keeps even multi-hundred-thousand-entry scans promptly
+    // cancellable without instrumenting each walk loop.
+    cancel::check()?;
     let mut children = Vec::new();
     for entry in
         fs::read_dir(dir).with_context(|| format!("failed to read directory {}", dir.display()))?
@@ -6219,6 +6299,18 @@ fn record_destination_failure(
     cycle_id: i64,
     err: &anyhow::Error,
 ) -> Result<()> {
+    if cancel::error_is_cancelled(err) {
+        // Cancelled means STOP: drop the manual Full/Changed-Since flags and
+        // the in-flight target so the scheduler does not immediately restart
+        // the same heavy pass. The verified baseline stays; the destination
+        // re-targets on its schedule, the next event, or a manual sync.
+        // Event-loss repairs are NOT lost — the rescan_required event rows
+        // still force a full reconcile once a new target is set.
+        state.clear_cycle_needs_rescan(cycle_id)?;
+        state.clear_destination_issues(source_id, destination_id)?;
+        state.clear_destination_target(source_id, destination_id, "cancelled")?;
+        return Ok(());
+    }
     let changing_paths = source_changed_paths(err);
     if changing_paths.is_empty() {
         state.clear_destination_issues(source_id, destination_id)?;
@@ -6294,6 +6386,7 @@ fn cleanup_tmp_cycle(dst_root: &Path, cycle_id: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::ScheduleMode;
     use crate::core::config::{
         AppConfig, DestinationConfig, MachineConfig, ScheduleConfig, SnapshotBackend,
         SnapshotConfig, SourceGroupConfig, SyncMode, SyncOrderRule, SyncTaskRef,
@@ -6621,6 +6714,31 @@ mod tests {
 
         assert_eq!(paths, vec!["a", "b.txt", "a/deep.txt"]);
         fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn cancelled_operation_aborts_tree_walk() {
+        let temp = temp_dir("cancel_aborts_walk");
+        let src = temp.join("src");
+        fs::create_dir_all(src.join("a")).unwrap();
+        fs::write(src.join("a").join("f.txt"), b"f").unwrap();
+
+        // Unique kind: the registry is process-global and tests run in
+        // parallel — cancelling "sync"/"compare" could hit other tests' ops.
+        let _op = cancel::begin("test-cancel-walk");
+        cancel::request(Some("test-cancel-walk"));
+        let err =
+            take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap_err();
+        assert!(cancel::error_is_cancelled(&err), "got: {err:#}");
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn snapshot_purpose_maps_to_cancel_kinds() {
+        assert_eq!(snapshot_request_cancel_kind("compare"), cancel::KIND_COMPARE);
+        assert_eq!(snapshot_request_cancel_kind("sync"), cancel::KIND_SYNC);
+        // Old senders carry no purpose: treated as sync work.
+        assert_eq!(snapshot_request_cancel_kind(""), cancel::KIND_SYNC);
     }
 
     #[test]

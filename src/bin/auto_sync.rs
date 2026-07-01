@@ -636,6 +636,7 @@ fn run_with_desktop(backend: Backend, addr: SocketAddr, start_hidden: bool) {
             sync_now,
             sync_source_now,
             sync_destination_now,
+            cancel_activity,
             scan_destination_now,
             scan_report,
             browse_paths
@@ -852,6 +853,17 @@ fn get_sync_activity(backend: tauri::State<'_, Backend>) -> Result<SyncActivityS
 #[tauri::command]
 async fn sync_now(backend: tauri::State<'_, Backend>) -> Result<Vec<DestinationView>, String> {
     backend.sync_now().map_err(error_text)
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn cancel_activity(
+    backend: tauri::State<'_, Backend>,
+    scope: Option<String>,
+) -> Result<auto_sync::core::backend::CancelOutcome, String> {
+    backend
+        .cancel_activity(scope.as_deref(), true)
+        .map_err(error_text)
 }
 
 #[cfg(feature = "gui")]

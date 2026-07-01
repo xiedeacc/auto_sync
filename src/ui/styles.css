@@ -796,7 +796,7 @@ th {
   z-index: 900;
   height: 42px;
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) minmax(150px, auto);
+  grid-template-columns: 32px minmax(0, 1fr) auto auto minmax(150px, auto);
   align-items: center;
   gap: 10px;
   padding: 0 12px;
@@ -834,6 +834,29 @@ th {
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: center;
+}
+
+.status-cancel {
+  flex: 0 0 auto;
+  min-height: 24px;
+  border: 1px solid #b45309;
+  border-radius: 6px;
+  background: rgba(180, 83, 9, 0.1);
+  color: #b45309;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.status-cancel:hover {
+  background: rgba(180, 83, 9, 0.2);
+}
+
+.status-cancel:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .status-config-error {
@@ -1277,7 +1300,7 @@ th {
   }
 
   .status-bar {
-    grid-template-columns: 32px minmax(0, 1fr) minmax(96px, 28vw);
+    grid-template-columns: 32px minmax(0, 1fr) auto auto minmax(96px, 28vw);
   }
 
   .status-transfer {

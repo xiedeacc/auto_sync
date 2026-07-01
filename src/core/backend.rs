@@ -284,6 +284,51 @@ impl Backend {
         self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
+    /// Cancel long-running activity (sync passes, compares, and the tree
+    /// walks they run — including walks served for a peer). `scope` limits
+    /// the cancel to "sync" or "compare"; `None` cancels both. When
+    /// `propagate` is set the request is forwarded to every known runtime
+    /// machine (best effort), so the machine actually burning disk time stops
+    /// too; forwarded requests arrive with `propagate = false` and stay local.
+    pub fn cancel_activity(&self, scope: Option<&str>, propagate: bool) -> Result<CancelOutcome> {
+        let cancelled_local = crate::core::cancel::request(scope);
+        let mut machines = Vec::new();
+        if propagate {
+            let cfg = load_config(&self.config_path)?;
+            apply_runtime_config(&cfg);
+            let req = CancelActivityRequest {
+                scope: scope.map(ToString::to_string),
+                propagate: false,
+            };
+            for (machine_id, machine) in remote_runtime_machine_refs(&cfg) {
+                match remote_post_json::<_, CancelOutcome>(
+                    &machine,
+                    "/api/cancel-activity",
+                    &req,
+                    Duration::from_secs(5),
+                ) {
+                    Ok(outcome) => machines.push(MachineCancelView {
+                        machine_id,
+                        cancelled: outcome.cancelled_local,
+                        error: None,
+                    }),
+                    Err(err) => {
+                        warn!(machine = machine_id, error = %err, "failed to propagate cancel");
+                        machines.push(MachineCancelView {
+                            machine_id,
+                            cancelled: 0,
+                            error: Some(err.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(CancelOutcome {
+            cancelled_local,
+            machines,
+        })
+    }
+
     /// Start a dry-run Scan (compare source vs destination, no changes). The
     /// scan runs in the background — a large tree can take many minutes and must
     /// not hold the request open or block the backup — and persists its report;
@@ -580,6 +625,37 @@ struct ScanDestinationRequest {
 
 #[derive(Debug, Serialize)]
 struct EmptyRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelActivityRequest {
+    /// "sync", "compare", or absent for both.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Forward the cancel to peer machines. Defaults to true for UI/API
+    /// callers; propagated requests carry false to stop the fan-out.
+    #[serde(default = "default_true")]
+    pub propagate: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelOutcome {
+    /// How many local operations were signalled to stop.
+    pub cancelled_local: usize,
+    /// Per-machine propagation results (empty when not propagating).
+    #[serde(default)]
+    pub machines: Vec<MachineCancelView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineCancelView {
+    pub machine_id: String,
+    pub cancelled: usize,
+    pub error: Option<String>,
+}
 
 fn delegated_groups_for_machine(
     cfg: &AppConfig,

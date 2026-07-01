@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::mem;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -81,7 +81,19 @@ struct SourceRoot {
     id: String,
     root: PathBuf,
     is_file: bool,
+    /// handle→path cache. With lazy resolution (see `mount_fd`) it starts
+    /// nearly empty and fills with directories as events arrive; without it,
+    /// it is pre-built by walking the whole tree at startup.
     handle_paths: HashMap<Vec<u8>, PathBuf>,
+    /// An O_PATH fd of the source root for `open_by_handle_at`, present when
+    /// the kernel/caps allow resolving file handles directly. This replaces
+    /// the startup walk of the whole tree (minutes on an HDD with hundreds of
+    /// thousands of entries) with an on-demand syscall per unseen handle.
+    mount_fd: Option<Arc<OwnedFd>>,
+    /// True when the filesystem-wide mark failed and the source is watched via
+    /// per-directory marks: newly created directories must then be marked too.
+    /// With a filesystem mark this is false and new directories need nothing.
+    recursive_marks: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,7 +200,7 @@ fn run_fanotify_loop(cfg: AppConfig, db_path: PathBuf, shutdown: Arc<AtomicBool>
         | FAN_DELETE_SELF
         | FAN_MOVE_SELF
         | FAN_ONDIR;
-    let (fd, mode, mask) = match setup_fid_name_fanotify(&sources, fid_mask) {
+    let (fd, mode, mask) = match setup_fid_name_fanotify(&mut sources, fid_mask) {
         Ok(fd) => {
             info!("fanotify FID/name watcher enabled");
             (fd, FanotifyMode::FidName, fid_mask)
@@ -230,7 +242,7 @@ fn run_fanotify_loop(cfg: AppConfig, db_path: PathBuf, shutdown: Arc<AtomicBool>
     Ok(())
 }
 
-fn setup_fid_name_fanotify(sources: &[SourceRoot], mask: u64) -> Result<RawFd> {
+fn setup_fid_name_fanotify(sources: &mut [SourceRoot], mask: u64) -> Result<RawFd> {
     let fd = fanotify_init(
         FAN_REPORT_DIR_FID | FAN_REPORT_NAME | FAN_REPORT_FID | FAN_REPORT_TARGET_FID,
     )
@@ -268,7 +280,7 @@ fn fanotify_init(report_flags: u32) -> Result<RawFd> {
     Ok(fd)
 }
 
-fn mark_sources_fid(fd: RawFd, sources: &[SourceRoot], mask: u64) -> Result<()> {
+fn mark_sources_fid(fd: RawFd, sources: &mut [SourceRoot], mask: u64) -> Result<()> {
     for source in sources {
         mark_source_fid(fd, source, mask)
             .with_context(|| format!("failed to mark source {}", source.root.display()))?;
@@ -277,7 +289,7 @@ fn mark_sources_fid(fd: RawFd, sources: &[SourceRoot], mask: u64) -> Result<()> 
     Ok(())
 }
 
-fn mark_source_fid(fd: RawFd, source: &SourceRoot, mask: u64) -> Result<()> {
+fn mark_source_fid(fd: RawFd, source: &mut SourceRoot, mask: u64) -> Result<()> {
     let root = &source.root;
     if try_mark(fd, root, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, mask).is_ok() {
         return Ok(());
@@ -297,6 +309,7 @@ fn mark_source_fid(fd: RawFd, source: &SourceRoot, mask: u64) -> Result<()> {
         error = %fs_err,
         "fanotify FID/name filesystem mark failed; trying recursive directory marks"
     );
+    source.recursive_marks = true;
     mark_directory_tree(fd, root, mask | FAN_EVENT_ON_CHILD)
 }
 
@@ -588,13 +601,36 @@ fn parse_fid_name(bytes: &[u8]) -> Option<OsString> {
     }
 }
 
-fn fid_record_path(source: &SourceRoot, record: &FidRecord) -> Result<Option<PathBuf>> {
-    let Some(base) = source.handle_paths.get(&record.handle) else {
-        return Ok(None);
+fn fid_record_path(source: &mut SourceRoot, record: &FidRecord) -> Result<Option<PathBuf>> {
+    let base = match source.handle_paths.get(&record.handle) {
+        Some(base) => base.clone(),
+        None => {
+            // Lazy resolution: ask the kernel for the handle's current path.
+            // ESTALE (inode already gone — e.g. DELETE_SELF of the removed
+            // dir itself) stays unresolved; the accompanying parent-based
+            // DELETE event still records the removal.
+            let Some(mount_fd) = source.mount_fd.as_ref() else {
+                return Ok(None);
+            };
+            let Some(path) = path_from_handle(mount_fd.as_raw_fd(), &record.handle) else {
+                return Ok(None);
+            };
+            // Only paths inside (or equal to) the root belong to this source;
+            // a filesystem-wide mark also reports sibling trees on the same
+            // fs. A file source additionally needs its parent directory (the
+            // DFID base of its own events).
+            let file_parent =
+                source.is_file && Some(path.as_path()) == source.root.parent();
+            if !path.starts_with(&source.root) && !file_parent {
+                return Ok(None);
+            }
+            source.handle_paths.insert(record.handle.clone(), path.clone());
+            path
+        }
     };
     Ok(Some(match &record.name {
         Some(name) => base.join(name),
-        None => base.clone(),
+        None => base,
     }))
 }
 
@@ -607,6 +643,8 @@ fn track_new_path_and_mark_directory(
     let Ok(metadata) = std::fs::metadata(path) else {
         return;
     };
+    // With lazy handle resolution the cache fills on demand; pre-inserting
+    // here just saves the first open_by_handle_at for the new path.
     let newly_tracked = match handle_key_from_path(path) {
         Ok(handle) => source
             .handle_paths
@@ -618,6 +656,11 @@ fn track_new_path_and_mark_directory(
         return;
     }
     if !newly_tracked {
+        return;
+    }
+    // A filesystem-wide mark already covers new directories; only the
+    // per-directory fallback must mark each created subtree explicitly.
+    if !source.recursive_marks {
         return;
     }
     if let Err(err) = mark_directory_tree(fanotify_fd, path, mark_mask | FAN_EVENT_ON_CHILD) {
@@ -661,13 +704,107 @@ fn source_root(source: &SourceGroupConfig) -> Result<SourceRoot> {
     if !metadata.is_dir() && !metadata.is_file() {
         bail!("source is neither file nor directory: {}", root.display());
     }
-    let handle_paths = build_handle_path_map(&root, metadata.is_file())?;
+    // Prefer lazy handle resolution: probe open_by_handle_at with the root's
+    // own handle. When it works (needs CAP_DAC_READ_SEARCH), unseen handles
+    // resolve on demand and the multi-minute startup walk of a large tree is
+    // skipped entirely. Otherwise fall back to pre-building the full map.
+    let mount_fd = probe_lazy_handle_resolution(&root);
+    let handle_paths = if mount_fd.is_some() {
+        let mut handles = HashMap::new();
+        if let Some(parent) = root.parent() {
+            insert_handle_path(&mut handles, parent);
+        }
+        insert_handle_path(&mut handles, &root);
+        handles
+    } else {
+        warn!(
+            root = %root.display(),
+            "open_by_handle_at unavailable; pre-building fanotify handle map (slow on large trees)"
+        );
+        build_handle_path_map(&root, metadata.is_file())?
+    };
     Ok(SourceRoot {
         id: source.id.clone(),
         root,
         is_file: metadata.is_file(),
         handle_paths,
+        mount_fd,
+        recursive_marks: false,
     })
+}
+
+/// Opens the source root as the mount fd for `open_by_handle_at` and verifies
+/// the call actually works here (kernel support + CAP_DAC_READ_SEARCH) by
+/// resolving the root's own handle. Returns None when unusable.
+fn probe_lazy_handle_resolution(root: &Path) -> Option<Arc<OwnedFd>> {
+    let c_path = CString::new(root.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        warn!(
+            root = %root.display(),
+            error = %std::io::Error::last_os_error(),
+            "failed to open source root for handle resolution"
+        );
+        return None;
+    }
+    let mount_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let root_handle = match handle_key_from_path(root) {
+        Ok(handle) => handle,
+        Err(err) => {
+            warn!(root = %root.display(), error = %err, "failed to compute root file handle");
+            return None;
+        }
+    };
+    match path_from_handle(mount_fd.as_raw_fd(), &root_handle) {
+        Some(path) if path == root => Some(Arc::new(mount_fd)),
+        Some(path) => {
+            warn!(
+                root = %root.display(),
+                resolved = %path.display(),
+                "open_by_handle_at resolved the root to an unexpected path; using eager handle map"
+            );
+            None
+        }
+        None => None,
+    }
+}
+
+/// Resolves a stored handle key back to a path via `open_by_handle_at` +
+/// /proc/self/fd readlink. Returns None for gone inodes (ESTALE) or when the
+/// call is not permitted.
+fn path_from_handle(mount_fd: RawFd, handle_key: &[u8]) -> Option<PathBuf> {
+    #[repr(C)]
+    struct HandleBuf {
+        header: FileHandleHeader,
+        bytes: [u8; MAX_HANDLE_SZ],
+    }
+
+    let header_len = mem::size_of::<FileHandleHeader>();
+    if handle_key.len() < header_len || handle_key.len() > header_len + MAX_HANDLE_SZ {
+        return None;
+    }
+    let mut buf = HandleBuf {
+        header: FileHandleHeader {
+            handle_bytes: (handle_key.len() - header_len) as u32,
+            handle_type: i32::from_ne_bytes(handle_key[4..8].try_into().ok()?),
+        },
+        bytes: [0; MAX_HANDLE_SZ],
+    };
+    buf.bytes[..handle_key.len() - header_len].copy_from_slice(&handle_key[header_len..]);
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_by_handle_at,
+            mount_fd,
+            (&mut buf.header as *mut FileHandleHeader).cast::<libc::c_void>(),
+            libc::O_PATH | libc::O_CLOEXEC,
+        ) as RawFd
+    };
+    if fd < 0 {
+        return None;
+    }
+    let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok();
+    close_event_fd(fd);
+    path
 }
 
 fn build_handle_path_map(root: &Path, is_file: bool) -> Result<HashMap<Vec<u8>, PathBuf>> {

@@ -1070,6 +1070,29 @@ impl State {
         Ok(())
     }
 
+    /// Drop only the in-flight target (keeping the verified baseline intact),
+    /// so a cancelled destination stops being re-driven by the scheduler until
+    /// its schedule, a new event, or a manual sync targets it again.
+    pub fn clear_destination_target(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE destination_offset
+            SET target_cycle_id=NULL,
+                status='red',
+                status_reason=?3,
+                updated_at=?4
+            WHERE source_id=?1 AND destination_id=?2
+            "#,
+            params![source_id, destination_id, reason, now_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn reset_destination_offset(
         &self,
         source_id: &str,

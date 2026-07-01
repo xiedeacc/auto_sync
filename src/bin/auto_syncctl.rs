@@ -31,6 +31,16 @@ enum CommandKind {
         #[arg(long)]
         close_current: bool,
     },
+    /// Cancel running activity on the local daemon (and, unless --local-only,
+    /// on every known peer machine): sync passes, compares, and tree walks.
+    Cancel {
+        /// Limit to one kind: "sync" or "compare". Default cancels both.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Do not forward the cancel to peer machines.
+        #[arg(long)]
+        local_only: bool,
+    },
     PrintSystemd {
         #[arg(long, default_value = "/opt/auto_sync")]
         install_dir: PathBuf,
@@ -74,6 +84,39 @@ fn main() -> Result<()> {
                 sync_all_pending(&cfg, &mut state)?;
             }
             print_status(&state, &cfg)?;
+        }
+        CommandKind::Cancel { scope, local_only } => {
+            let cfg = load_config(&config_path)?;
+            let local = auto_sync::core::config::MachineConfig {
+                id: "local".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: cfg.app.port,
+                ..Default::default()
+            };
+            let req = serde_json::json!({
+                "scope": scope,
+                "propagate": !local_only,
+            });
+            let outcome: auto_sync::core::backend::CancelOutcome =
+                auto_sync::core::machines::remote_post_json(
+                    &local,
+                    "/api/cancel-activity",
+                    &req,
+                    std::time::Duration::from_secs(10),
+                )
+                .context("failed to reach the local auto_sync daemon")?;
+            println!("cancelled {} local operation(s)", outcome.cancelled_local);
+            for machine in outcome.machines {
+                match machine.error {
+                    None => println!(
+                        "machine {}: cancelled {} operation(s)",
+                        machine.machine_id, machine.cancelled
+                    ),
+                    Some(err) => {
+                        println!("machine {}: cancel failed: {err}", machine.machine_id)
+                    }
+                }
+            }
         }
         CommandKind::PrintSystemd { install_dir } => {
             print!("{}", systemd_unit(&install_dir));

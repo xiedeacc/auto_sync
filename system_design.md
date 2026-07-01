@@ -302,7 +302,9 @@ Linux 后台进程对 `schedule.mode = "realtime"` 的 source 使用 fanotify。
 
 - 当前 Linux watcher 优先使用 FID/name 模式：`FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME | FAN_REPORT_TARGET_FID`。
 - FID/name 模式注册 `FAN_MODIFY | FAN_CLOSE_WRITE | FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO | FAN_DELETE_SELF | FAN_MOVE_SELF | FAN_ONDIR`，用于覆盖 modify/create/delete/move 以及目录自身变化。
-- watcher 启动时为 source 下所有文件和目录建立 `file handle -> path` 表；带 name 的事件用 parent directory handle + name 拼路径，不带 name 的 target FID 事件用对象 handle 查路径。新建文件/目录被解析后会补充进 handle 表，新建目录还会递归注册 mark。
+- `file handle -> path` 解析优先走懒加载：watcher 启动时探测 `open_by_handle_at`（需要 CAP_DAC_READ_SEARCH，systemd unit 已授予），可用时不再预建全树 handle 表（90 万条目的 HDD 上预建需要约 3 分钟），事件到达时按需把 handle 解析成路径并缓存；解析出的路径必须落在 source root 内（filesystem mark 会上报同文件系统的其他目录树）。`open_by_handle_at` 不可用时回退到启动全树预建。带 name 的事件用 parent directory handle + name 拼路径，不带 name 的 target FID 事件用对象 handle 查路径。
+- 已删除 inode 的 handle（如子目录自身的 DELETE_SELF）懒解析返回 ESTALE 无法解析，但伴随的父目录 DELETE 事件仍会记录删除，语义不受影响。
+- 只有在 filesystem mark 不可用、退化为逐目录 mark 时，新建目录才需要递归补注册 mark；filesystem mark 模式下新建目录天然被覆盖，不再做多余的递归遍历。
 - 如果 FID/name 模式或 filesystem mark 不可用，会回退到传统 fd-path 模式；fd-path 模式只注册 `FAN_MODIFY | FAN_CLOSE_WRITE`。
 - 若 filesystem/mount mark 不可用，会回退到对 src 目录树逐目录注册 inode mark。
 - 无法解析路径的 FID/name 附属记录不会把 realtime cycle 标记为 Full/rescan；realtime 自动同步仍只按已解析的 event path 做增量同步。queue overflow 仍会写入需要 reconcile 的事件。
@@ -686,6 +688,14 @@ fanotify overflow / USN gap（疑似丢事件）：
 
 - 临时文件保留在 `.auto_sync_tmp`。
 - 重启或下一次同步时清理同 cycle 旧临时文件并重做任务。
+
+手动取消（sync / compare）：
+
+- 长时间运行的同步与 compare 支持协作式取消：所有目录遍历（每目录 + 每条目轮询）、并行传输 worker（每文件）、分块大文件发送（每 16MiB 块）都设有取消检查点，几十万条目的 HDD 扫描也能在中途秒级停止。
+- 入口：HTTP `POST /api/cancel-activity`（body `{scope?: "sync"|"compare", propagate?: bool}`）、UI 状态栏 Cancel 按钮、`auto_syncctl cancel [--scope sync|compare] [--local-only]`、桌面端 Tauri command。
+- 跨机器传播：`propagate = true` 时把取消转发到所有已知 runtime 机器（转发请求带 `propagate = false` 防止风暴）。peer 为对端服务的整树扫描（`/api/transfer/snapshot*`）按请求方声明的 `purpose`（sync/compare）注册，因此取消 compare 不会误杀正在进行的 sync 扫描；peer 端扫描中止后返回 500，等待方随即解除阻塞。
+- 取消后的状态：cycle 的手动 Full/Changed-Since 标记被清除，destination 的 in-flight target 被撤销（verified 基准保留），状态红点 `cancelled`——调度器不会在 5 秒后原样重启这次重活；destination 会在下一次 schedule、新事件或手动同步时重新拿到 target，最终一致性不受影响。事件丢失触发的 reconcile 需求不会丢：`rescan_required` 事件行仍在，下次拿到 target 时照常升级为完整对账。
+- 取消的错误以固定文案 `cancelled by user request` 贯穿错误链（含跨机 HTTP 错误体），传输重试逻辑对其不重试，worker pool 视其为致命错误立即整体停止。
 
 ## 14. 安全设计
 

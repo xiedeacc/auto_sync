@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod cancel;
 pub mod config;
 pub mod logging;
 pub mod machines;

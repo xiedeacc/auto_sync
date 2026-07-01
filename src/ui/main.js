@@ -69,6 +69,7 @@ const el = {
   config: document.getElementById("config"),
   statusConfig: document.getElementById("status-config"),
   statusText: document.getElementById("status-text"),
+  statusCancel: document.getElementById("status-cancel"),
   statusConfigError: document.getElementById("status-config-error"),
   statusBuild: document.getElementById("status-build"),
   refresh: document.getElementById("refresh"),
@@ -384,6 +385,7 @@ function updateStatusBar() {
     el.statusText.title = message;
   }
 
+  updateCancelButton();
   updateConfigErrorIndicator();
 
   const build = runtimeStatus && runtimeStatus.build;
@@ -414,6 +416,65 @@ function updateConfigErrorIndicator() {
 
 function scanStatusLabel(scan) {
   return scan && scan.kind === "compare" ? "Comparing" : "Checking changes";
+}
+
+// What is cancellable right now, across the local runtime and every machine
+// in the activity poll: {any, scope} where scope is "sync", "compare", or
+// null (both kinds active -> cancel everything).
+function activeCancelScope() {
+  const runtimes = [runtimeStatus];
+  for (const machine of (syncActivity && syncActivity.machines) || []) {
+    if (machine && machine.runtime && !machine.local) {
+      runtimes.push(machine.runtime);
+    }
+  }
+  let sync = false;
+  let compare = false;
+  for (const runtime of runtimes) {
+    if (!runtime) continue;
+    if (runtime.syncing || runtime.transfer) sync = true;
+    if (runtime.scan) {
+      if (runtime.scan.kind === "compare") compare = true;
+      else sync = true;
+    }
+  }
+  if (sync && compare) return { any: true, scope: null };
+  if (compare) return { any: true, scope: "compare" };
+  if (sync) return { any: true, scope: "sync" };
+  return { any: false, scope: null };
+}
+
+function updateCancelButton() {
+  if (!el.statusCancel) return;
+  const cancel = activeCancelScope();
+  el.statusCancel.hidden = !cancel.any;
+  if (cancel.any) {
+    el.statusCancel.textContent =
+      cancel.scope === "compare" ? "Cancel compare" : "Cancel";
+  }
+}
+
+async function cancelActivity() {
+  const cancel = activeCancelScope();
+  if (!cancel.any || el.statusCancel.disabled) return;
+  el.statusCancel.disabled = true;
+  try {
+    const outcome = await invoke("cancel_activity", { scope: cancel.scope });
+    const remote = (outcome.machines || []).reduce(
+      (total, machine) => total + (machine.cancelled || 0),
+      0,
+    );
+    const total = (outcome.cancelled_local || 0) + remote;
+    setMessage(
+      total
+        ? `Cancel requested (${total} operation${total === 1 ? "" : "s"})`
+        : "Nothing to cancel",
+    );
+    await loadRuntimeStatus().catch(() => {});
+    updateStatusBar();
+  } finally {
+    el.statusCancel.disabled = false;
+  }
 }
 
 function renderScanLikeStatus(verb, scan) {
@@ -2715,6 +2776,7 @@ el.dstSyncReset.onclick = () => resetDestinationSync().catch((error) => setMessa
 el.machineClose.onclick = closeMachineModal;
 el.machineDiscover.onclick = () => discoverMachines().catch((error) => setMessage(String(error)));
 el.machineAdd.onclick = () => addMachine().catch((error) => setMessage(String(error)));
+el.statusCancel.onclick = () => cancelActivity().catch((error) => setMessage(String(error)));
 el.issueClose.onclick = closeIssueModal;
 el.dstLogClose.onclick = closeDestinationLogModal;
 el.scanDiffClose.onclick = closeScanDiffModal;
@@ -2753,6 +2815,7 @@ async function invokeWeb(command, payload = {}) {
     sync_source_now: ["POST", "/api/sync-source-now"],
     sync_destination_now: ["POST", "/api/sync-destination-now"],
     scan_destination_now: ["POST", "/api/scan-destination-now"],
+    cancel_activity: ["POST", "/api/cancel-activity"],
     scan_report: ["GET", "/api/scan-report"],
     browse_paths: ["GET", "/api/browse-paths"],
   };
@@ -2790,6 +2853,11 @@ async function invokeWeb(command, payload = {}) {
       options.body = JSON.stringify({
         source_id: payload.sourceId || payload.source_id,
         destination_id: payload.destinationId || payload.destination_id,
+      });
+    } else if (command === "cancel_activity") {
+      options.body = JSON.stringify({
+        scope: payload.scope || null,
+        propagate: true,
       });
     } else if (command === "add_machine") {
       options.body = JSON.stringify(payload.machine);
