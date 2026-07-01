@@ -32,6 +32,11 @@ pub struct Cycle {
     pub needs_full_rescan: bool,
     pub manual_full_rescan: bool,
     pub manual_changed_since_rescan: bool,
+    /// Set when this cycle was created because a realtime destination's
+    /// reconcile interval elapsed (not because events arrived or loss was
+    /// suspected). Runs the same full-reconcile flow as event loss, but the
+    /// destination is not painted red while it runs.
+    pub periodic_reconcile: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +120,10 @@ pub struct ScanReport {
 
 pub struct State {
     conn: Connection,
+    /// Fingerprint of the last config applied via [`Self::ensure_config`], so
+    /// a long-lived State (the scheduler polls every few seconds) does not
+    /// re-upsert identical config rows into the database on every tick.
+    applied_config_fingerprint: std::cell::Cell<Option<u64>>,
 }
 
 impl State {
@@ -131,7 +140,10 @@ impl State {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let state = Self { conn };
+        let state = Self {
+            conn,
+            applied_config_fingerprint: std::cell::Cell::new(None),
+        };
         state.init_schema()?;
         Ok(state)
     }
@@ -254,6 +266,21 @@ impl State {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         self.ensure_column("destination_offset", "last_verified_snapshot_name", "TEXT")?;
+        self.ensure_column(
+            "sync_cycle",
+            "periodic_reconcile",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column("destination_offset", "last_reconciled_at", "TEXT")?;
+        // Per-source scalars that must survive event_log pruning.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS source_meta (
+                source_id TEXT PRIMARY KEY,
+                last_event_observed_at TEXT
+            );
+            "#,
+        )?;
         Ok(())
     }
 
@@ -273,6 +300,13 @@ impl State {
     }
 
     pub fn ensure_config(&self, cfg: &AppConfig) -> Result<()> {
+        // Skip the per-source/destination upserts when nothing changed: the
+        // scheduler calls this every tick, and unconditional writes churn the
+        // WAL and contend with UI writers even on a fully idle system.
+        let fingerprint = config_fingerprint(cfg);
+        if self.applied_config_fingerprint.get() == Some(fingerprint) {
+            return Ok(());
+        }
         let now = now_string();
         for source in &cfg.source_groups {
             self.conn.execute(
@@ -316,6 +350,7 @@ impl State {
                 self.ensure_destination_offset(&source.id, &dst.id)?;
             }
         }
+        self.applied_config_fingerprint.set(Some(fingerprint));
         Ok(())
     }
 
@@ -407,7 +442,11 @@ impl State {
                 continue;
             };
             let open_has_events = self.cycle_has_actionable_events(cycle.id)?;
+            let reconcile_interval = chrono::Duration::seconds(
+                source.snapshot.reconcile_interval_secs.max(1) as i64,
+            );
             let mut due_destinations = Vec::new();
+            let mut reconcile_due = false;
 
             for dst in source.destinations.iter().filter(|d| d.enabled) {
                 let offset = self.destination_offset(&source.id, &dst.id)?;
@@ -419,14 +458,22 @@ impl State {
 
                 let first_sync =
                     offset.target_cycle_id.is_none() && offset.last_verified_cycle_id.is_none();
+                let mut dst_reconcile_due = false;
                 let due = if first_sync {
                     true
                 } else if dst.schedule.mode == ScheduleMode::Realtime {
-                    open_has_events
+                    // Event-path syncs verify only the event subset; a periodic
+                    // full reconcile bounds how long drift from lost events (or
+                    // a never-completed initial pass) can hide behind green.
+                    dst_reconcile_due = offset
+                        .last_reconciled_at
+                        .is_none_or(|at| now - at >= reconcile_interval);
+                    open_has_events || dst_reconcile_due
                 } else {
                     scheduler::cycle_is_due(cycle.starts_at, now, &dst.schedule)
                 };
                 if due {
+                    reconcile_due |= dst_reconcile_due;
                     due_destinations.push(dst.id.clone());
                 }
             }
@@ -446,6 +493,9 @@ impl State {
                 })
             {
                 self.clear_cycle_needs_rescan(closed_cycle.id)?;
+            }
+            if reconcile_due {
+                self.mark_cycle_periodic_reconcile(closed_cycle.id)?;
             }
             for destination_id in &due_destinations {
                 self.set_destination_target(&source.id, destination_id, closed_cycle.id)?;
@@ -545,7 +595,7 @@ impl State {
             .query_row(
                 r#"
                 SELECT id, source_id, starts_at, ends_at, status, needs_full_rescan,
-                       manual_full_rescan, manual_changed_since_rescan
+                       manual_full_rescan, manual_changed_since_rescan, periodic_reconcile
                 FROM sync_cycle
                 WHERE source_id=?1 AND status='open'
                 ORDER BY id DESC
@@ -562,7 +612,7 @@ impl State {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, source_id, starts_at, ends_at, status, needs_full_rescan,
-                   manual_full_rescan, manual_changed_since_rescan
+                   manual_full_rescan, manual_changed_since_rescan, periodic_reconcile
             FROM sync_cycle
             WHERE source_id=?1 AND status IN ('closed', 'planning', 'syncing', 'failed')
             ORDER BY id ASC
@@ -617,6 +667,20 @@ impl State {
     }
 
     pub fn latest_event_observed_at(&self, source_id: &str) -> Result<Option<DateTime<Utc>>> {
+        // Prefer the pruning-proof scalar; fall back to scanning event_log for
+        // databases written before source_meta existed.
+        let meta: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT last_event_observed_at FROM source_meta WHERE source_id=?1",
+                params![source_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(value) = meta {
+            return Ok(Some(parse_db_time(&value)?));
+        }
         let value: Option<String> = self
             .conn
             .query_row(
@@ -684,7 +748,7 @@ impl State {
             .query_row(
                 r#"
                 SELECT id, source_id, starts_at, ends_at, status, needs_full_rescan,
-                       manual_full_rescan, manual_changed_since_rescan
+                       manual_full_rescan, manual_changed_since_rescan, periodic_reconcile
                 FROM sync_cycle
                 WHERE source_id=?1 AND id=?2
                 "#,
@@ -717,6 +781,21 @@ impl State {
     pub fn mark_cycle_needs_rescan(&self, cycle_id: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE sync_cycle SET needs_full_rescan=1, updated_at=?1 WHERE id=?2",
+            params![now_string(), cycle_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a cycle as a periodic realtime reconcile: it runs the full
+    /// reconcile flow (repairing anything the event stream missed) without the
+    /// red "event loss" status while it runs.
+    pub fn mark_cycle_periodic_reconcile(&self, cycle_id: i64) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE sync_cycle
+            SET needs_full_rescan=1, periodic_reconcile=1, updated_at=?1
+            WHERE id=?2
+            "#,
             params![now_string(), cycle_id],
         )?;
         Ok(())
@@ -794,10 +873,25 @@ impl State {
                 bool_to_int(rescan_required)
             ],
         )?;
+        let event_id = self.conn.last_insert_rowid();
+        // Keep the per-source "latest event" scalar; the startup gap scan must
+        // survive event_log pruning.
+        self.conn.execute(
+            r#"
+            INSERT INTO source_meta (source_id, last_event_observed_at)
+            VALUES (?1, ?2)
+            ON CONFLICT(source_id) DO UPDATE SET
+                last_event_observed_at=MAX(COALESCE(last_event_observed_at, ''), excluded.last_event_observed_at)
+            "#,
+            params![source_id, now],
+        )?;
         if rescan_required {
             self.mark_open_cycle_needs_rescan(source_id)?;
         }
-        Ok(self.conn.last_insert_rowid())
+        // Wake the scheduler so realtime changes sync immediately instead of
+        // waiting out its polling interval.
+        crate::core::signal::notify_scheduler();
+        Ok(event_id)
     }
 
     pub fn upsert_destination_status(
@@ -1254,6 +1348,32 @@ impl State {
         )
     }
 
+    /// Delete event rows for cycles every destination has already verified
+    /// past; those cycles can never be re-driven, so their events are dead
+    /// weight (realtime sources append events continuously and nothing else
+    /// removes them). `keep_from_cycle` is the minimum last-verified cycle
+    /// across the source's destinations; the caller passes `None` to skip
+    /// pruning (e.g. a destination that has never verified). Chunked so a
+    /// large first prune cannot starve other writers.
+    pub fn prune_event_log(&self, source_id: &str, keep_from_cycle: i64) -> Result<usize> {
+        let sql = format!(
+            "DELETE FROM event_log WHERE rowid IN \
+             (SELECT rowid FROM event_log WHERE source_id=?1 AND cycle_id<?2 \
+              LIMIT {SNAPSHOT_WRITE_CHUNK})"
+        );
+        let mut total = 0_usize;
+        loop {
+            let removed = {
+                let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+                self.conn.execute(&sql, params![source_id, keep_from_cycle])?
+            };
+            total += removed;
+            if removed < SNAPSHOT_WRITE_CHUNK {
+                return Ok(total);
+            }
+        }
+    }
+
     pub fn snapshot_entries(&self, cycle_id: i64, source_id: &str) -> Result<Vec<SnapshotEntry>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -1318,6 +1438,11 @@ pub struct DestinationOffset {
     pub status: String,
     pub status_reason: String,
     pub updated_at: String,
+    /// When this destination last completed a whole-tree reconcile (full or
+    /// zfs-diff cycle), as opposed to an event-subset sync. Realtime
+    /// destinations become due for a periodic reconcile when this is older
+    /// than the source's reconcile interval.
+    pub last_reconciled_at: Option<DateTime<Utc>>,
 }
 
 impl State {
@@ -1331,31 +1456,58 @@ impl State {
             .query_row(
                 r#"
                 SELECT target_cycle_id, last_completed_cycle_id, last_verified_cycle_id,
-                       status, status_reason, updated_at
+                       status, status_reason, updated_at, last_reconciled_at
                 FROM destination_offset
                 WHERE source_id=?1 AND destination_id=?2
                 "#,
                 params![source_id, destination_id],
                 |row| {
-                    Ok(DestinationOffset {
-                        target_cycle_id: row.get(0)?,
-                        last_completed_cycle_id: row.get(1)?,
-                        last_verified_cycle_id: row.get(2)?,
-                        status: row.get(3)?,
-                        status_reason: row.get(4)?,
-                        updated_at: row.get(5)?,
-                    })
+                    Ok((
+                        DestinationOffset {
+                            target_cycle_id: row.get(0)?,
+                            last_completed_cycle_id: row.get(1)?,
+                            last_verified_cycle_id: row.get(2)?,
+                            status: row.get(3)?,
+                            status_reason: row.get(4)?,
+                            updated_at: row.get(5)?,
+                            last_reconciled_at: None,
+                        },
+                        row.get::<_, Option<String>>(6)?,
+                    ))
                 },
             )
             .optional()?;
-        Ok(row.unwrap_or(DestinationOffset {
-            target_cycle_id: None,
-            last_completed_cycle_id: None,
-            last_verified_cycle_id: None,
-            status: "red".to_string(),
-            status_reason: "not_verified".to_string(),
-            updated_at: now_string(),
-        }))
+        Ok(match row {
+            Some((mut offset, reconciled_at)) => {
+                offset.last_reconciled_at =
+                    reconciled_at.as_deref().map(parse_db_time).transpose()?;
+                offset
+            }
+            None => DestinationOffset {
+                target_cycle_id: None,
+                last_completed_cycle_id: None,
+                last_verified_cycle_id: None,
+                status: "red".to_string(),
+                status_reason: "not_verified".to_string(),
+                updated_at: now_string(),
+                last_reconciled_at: None,
+            },
+        })
+    }
+
+    /// Record that this destination just completed a whole-tree reconcile
+    /// (full manifest compare or an authoritative zfs-diff sync).
+    pub fn set_destination_reconciled_now(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE destination_offset SET last_reconciled_at=?3, updated_at=?3 \
+             WHERE source_id=?1 AND destination_id=?2",
+            params![source_id, destination_id, now_string()],
+        )?;
+        Ok(())
     }
 }
 
@@ -1434,7 +1586,27 @@ fn cycle_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cycle> {
         needs_full_rescan: row.get::<_, i64>(5)? != 0,
         manual_full_rescan: row.get::<_, i64>(6)? != 0,
         manual_changed_since_rescan: row.get::<_, i64>(7)? != 0,
+        periodic_reconcile: row.get::<_, i64>(8)? != 0,
     })
+}
+
+/// Hash of the config fields [`State::ensure_config`] persists (source ids,
+/// paths, enabled flags, destination ids/paths/enabled). Serialization order
+/// is stable, so equal configs hash equal.
+fn config_fingerprint(cfg: &AppConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for source in &cfg.source_groups {
+        source.id.hash(&mut hasher);
+        source.src.hash(&mut hasher);
+        source.enabled.hash(&mut hasher);
+        for dst in &source.destinations {
+            dst.id.hash(&mut hasher);
+            dst.path.hash(&mut hasher);
+            dst.enabled.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 fn parse_db_time(value: &str) -> Result<DateTime<Utc>> {
@@ -1475,8 +1647,8 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn realtime_does_not_advance_only_because_reconcile_interval_elapsed() {
-        let temp = temp_dir("state_realtime_no_reconcile");
+    fn realtime_periodic_reconcile_advances_when_interval_elapses() {
+        let temp = temp_dir("state_realtime_periodic_reconcile");
         let db = temp.join("state.sqlite");
         let src = temp.join("src");
         let dst = temp.join("dst");
@@ -1495,7 +1667,7 @@ mod tests {
             enabled: true,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
-                reconcile_interval_secs: 1,
+                reconcile_interval_secs: 3600,
                 ..SnapshotConfig::default()
             },
             destinations: vec![DestinationConfig {
@@ -1519,7 +1691,11 @@ mod tests {
         state
             .upsert_destination_status("src_1", "dst_1", Some(1), "green", "verified")
             .unwrap();
+        state
+            .set_destination_reconciled_now("src_1", "dst_1")
+            .unwrap();
 
+        // Freshly reconciled, no events: nothing due.
         assert!(
             state
                 .advance_due_destination_targets(&cfg)
@@ -1527,6 +1703,7 @@ mod tests {
                 .is_empty()
         );
 
+        // Non-actionable events alone still do not advance.
         state
             .record_event("src_1", 0, "usn_cursor_reconcile", None, false)
             .unwrap();
@@ -1537,13 +1714,43 @@ mod tests {
                 .is_empty()
         );
 
+        // Reconcile interval elapsed: a periodic reconcile cycle advances,
+        // flagged for a full re-scan but NOT as event loss.
+        state
+            .conn
+            .execute(
+                "UPDATE destination_offset SET last_reconciled_at=?1 \
+                 WHERE source_id='src_1' AND destination_id='dst_1'",
+                params![(Utc::now() - chrono::Duration::try_hours(2).unwrap()).to_rfc3339()],
+            )
+            .unwrap();
+        let closed = state.advance_due_destination_targets(&cfg).unwrap();
+        assert_eq!(closed.len(), 1);
+        let cycle = state
+            .cycle_by_id("src_1", closed[0].id)
+            .unwrap()
+            .expect("closed cycle exists");
+        assert!(cycle.needs_full_rescan);
+        assert!(cycle.periodic_reconcile);
+        assert!(!cycle.manual_full_rescan);
+
+        // Actionable events still advance the (new) open cycle as before.
+        state
+            .upsert_destination_status("src_1", "dst_1", Some(cycle.id), "green", "verified")
+            .unwrap();
+        state
+            .set_destination_reconciled_now("src_1", "dst_1")
+            .unwrap();
         state
             .record_event("src_1", 0, "modify", Some("file.txt"), false)
             .unwrap();
-        assert_eq!(
-            state.advance_due_destination_targets(&cfg).unwrap().len(),
-            1
-        );
+        let closed = state.advance_due_destination_targets(&cfg).unwrap();
+        assert_eq!(closed.len(), 1);
+        let cycle = state
+            .cycle_by_id("src_1", closed[0].id)
+            .unwrap()
+            .expect("event cycle exists");
+        assert!(!cycle.periodic_reconcile, "event-driven cycle is not periodic");
 
         std::fs::remove_dir_all(temp).ok();
     }
@@ -1568,6 +1775,35 @@ mod tests {
         let events = state.cycle_events("src_1", cycle_id).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_kind, "modify");
+
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn prune_event_log_drops_old_cycles_but_keeps_latest_observed_at() {
+        let temp = temp_dir("state_prune_events");
+        let db = temp.join("state.sqlite");
+        let state = State::open(&db).unwrap();
+
+        let first_cycle = state.ensure_open_cycle("src_1", Utc::now()).unwrap();
+        state
+            .record_event("src_1", 0, "modify", Some("a.txt"), false)
+            .unwrap();
+        let observed = state.latest_event_observed_at("src_1").unwrap();
+        assert!(observed.is_some());
+        state.close_current_cycle_for_source("src_1").unwrap();
+        let second_cycle = state.ensure_open_cycle("src_1", Utc::now()).unwrap();
+        state
+            .record_event("src_1", 0, "modify", Some("b.txt"), false)
+            .unwrap();
+
+        // Everything verified through the first cycle: its events can go.
+        let removed = state.prune_event_log("src_1", second_cycle).unwrap();
+        assert_eq!(removed, 1);
+        assert!(state.cycle_events("src_1", first_cycle).unwrap().is_empty());
+        assert_eq!(state.cycle_events("src_1", second_cycle).unwrap().len(), 1);
+        // The startup-gap scalar survives pruning.
+        assert!(state.latest_event_observed_at("src_1").unwrap().is_some());
 
         std::fs::remove_dir_all(temp).ok();
     }

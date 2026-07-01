@@ -707,7 +707,9 @@ fn run_scheduler(
             last_status_log = Instant::now();
         }
 
-        thread::sleep(Duration::from_secs(5));
+        // Wake immediately when a watcher records an event (realtime latency
+        // in milliseconds); the 5s timeout remains the schedule heartbeat.
+        auto_sync::core::signal::wait_for_activity(Duration::from_secs(5));
     }
 
     stop_watcher(&mut watcher_state);

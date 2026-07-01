@@ -4,6 +4,7 @@ pub mod logging;
 pub mod machines;
 pub mod progress;
 pub mod scheduler;
+pub mod signal;
 pub mod state;
 pub mod status;
 pub mod sync;

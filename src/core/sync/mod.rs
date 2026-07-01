@@ -242,10 +242,39 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
                     warn!(source = source.id, error = %err, "failed to prune stored source snapshots");
                 }
             }
+            // Same for events: cycles every destination verified past can
+            // never be re-driven, so their event rows are dead weight.
+            if let Err(err) = prune_verified_cycle_events(state, source) {
+                warn!(source = source.id, error = %err, "failed to prune event log");
+            }
         }
         if !progressed || !blocked {
             break;
         }
+    }
+    Ok(())
+}
+
+/// Delete event rows for cycles that every enabled destination of this source
+/// has verified past; they can never be re-driven. Skipped while any
+/// destination has never verified (conservative: everything might still
+/// matter to its first pass).
+fn prune_verified_cycle_events(state: &State, source: &SourceGroupConfig) -> Result<()> {
+    let mut min_verified: Option<i64> = None;
+    for dst in source.destinations.iter().filter(|dst| dst.enabled) {
+        match state.destination_last_verified(&source.id, &dst.id)? {
+            Some(verified) => {
+                min_verified = Some(min_verified.map_or(verified, |min| min.min(verified)));
+            }
+            None => return Ok(()),
+        }
+    }
+    let Some(keep_from) = min_verified else {
+        return Ok(());
+    };
+    let removed = state.prune_event_log(&source.id, keep_from)?;
+    if removed > 0 {
+        info!(source = source.id, removed, keep_from, "pruned verified cycle events");
     }
     Ok(())
 }
@@ -1774,7 +1803,8 @@ pub fn sync_cycle_for_source(
     // returns to green only after its full re-scan verifies.
     let is_event_loss_reconcile = cycle.needs_full_rescan
         && !cycle.manual_full_rescan
-        && !cycle.manual_changed_since_rescan;
+        && !cycle.manual_changed_since_rescan
+        && !cycle.periodic_reconcile;
     if is_event_loss_reconcile {
         warn!(
             source = source.id,
@@ -1859,6 +1889,7 @@ pub fn sync_cycle_for_source(
                                             &dst.id,
                                             Some(&zfs.full_name),
                                         )?;
+                                        state.set_destination_reconciled_now(&source.id, &dst.id)?;
                                         continue;
                                     }
                                     Err(err) => {
@@ -1905,6 +1936,7 @@ pub fn sync_cycle_for_source(
                             &dst.id,
                             source_view.zfs_snapshot.as_ref().map(|z| z.full_name.as_str()),
                         )?;
+                        state.set_destination_reconciled_now(&source.id, &dst.id)?;
                         info!(
                             source = source.id,
                             destination = dst.id,
@@ -1990,6 +2022,11 @@ pub fn sync_cycle_for_source(
                     &dst.id,
                     source_view.zfs_snapshot.as_ref().map(|z| z.full_name.as_str()),
                 )?;
+                if changed_since_paths.is_none() {
+                    // A full endpoint sync is a whole-tree reconcile; a manual
+                    // Changed Since only covers a subset and does not count.
+                    state.set_destination_reconciled_now(&source.id, &dst.id)?;
+                }
                 info!(
                     source = source.id,
                     destination = dst.id,
@@ -2124,15 +2161,17 @@ fn realtime_incremental_plan(
     if cycle.manual_changed_since_rescan {
         return Ok(None);
     }
+    if cycle.needs_full_rescan || actionable.iter().any(|event| event.rescan_required) {
+        // A possible-event-loss signal (queue overflow, USN gap, startup gap)
+        // or a periodic reconcile. Fall through to a full reconcile that
+        // re-scans source+dst and repairs every difference (incl. deletes the
+        // event stream may have missed). Checked BEFORE the empty-plan fast
+        // path: a rescan-flagged cycle with no actionable events must still
+        // reconcile, not rubber-stamp green.
+        return Ok(None);
+    }
     if actionable.is_empty() {
         return Ok(Some(RealtimeIncrementalPlan::Apply(Vec::new())));
-    }
-    if cycle.needs_full_rescan || actionable.iter().any(|event| event.rescan_required) {
-        // A possible-event-loss signal (queue overflow, USN gap, startup gap).
-        // Fall through to a full reconcile that re-scans source+dst and repairs
-        // every difference (incl. deletes the event stream may have missed),
-        // instead of stalling on a yellow "needs manual Full".
-        return Ok(None);
     }
 
     let mut paths = BTreeSet::new();
@@ -2486,7 +2525,8 @@ fn sync_cycle_with_transfer(
     // re-scan runs; each returns to green only after it verifies.
     let is_event_loss_reconcile = cycle.needs_full_rescan
         && !cycle.manual_full_rescan
-        && !cycle.manual_changed_since_rescan;
+        && !cycle.manual_changed_since_rescan
+        && !cycle.periodic_reconcile;
     if is_event_loss_reconcile {
         warn!(
             source = source.id,
@@ -2606,6 +2646,7 @@ fn sync_cycle_with_transfer(
                                     &dst.id,
                                     Some(&zfs.full_name),
                                 )?;
+                                state.set_destination_reconciled_now(&source.id, &dst.id)?;
                                 continue;
                             }
                             Err(err) => {
@@ -2714,6 +2755,11 @@ fn sync_cycle_with_transfer(
                     &dst.id,
                     zfs_snapshot.map(|zfs| zfs.full_name.as_str()),
                 )?;
+                if changed_since_paths.is_none() {
+                    // A full transfer pass is a whole-tree reconcile; a manual
+                    // Changed Since only covers a subset and does not count.
+                    state.set_destination_reconciled_now(&source.id, &dst.id)?;
+                }
             }
             Err(err) => {
                 all_verified = false;
@@ -3133,6 +3179,8 @@ fn sync_cycle_file_with_transfer(
                     "green",
                     "verified",
                 )?;
+                // A file sync verifies the whole (single-file) tree.
+                state.set_destination_reconciled_now(&source.id, &dst.id)?;
             }
             Err(err) => {
                 all_verified = false;
@@ -7112,6 +7160,108 @@ mod tests {
             .unwrap();
         assert_eq!(view.status, "green");
         assert_eq!(view.target_cycle_id, view.last_verified_cycle_id);
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn realtime_periodic_reconcile_repairs_drift_without_events() {
+        // Drift the event stream never mentioned (files added while the
+        // watcher was down) must be repaired by the periodic reconcile once
+        // the interval elapses — previously it hid behind green forever.
+        let temp = temp_dir("realtime_periodic_reconcile");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("hello.txt"), b"hello").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            add_directory: true,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                reconcile_interval_secs: 3600,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+                sync: None,
+            }],
+        });
+
+        let mut state = State::open(&db).unwrap();
+        sync_all_now(&cfg, &mut state).unwrap();
+        let effective_dst = dst.join("src");
+        assert_eq!(fs::read(effective_dst.join("hello.txt")).unwrap(), b"hello");
+
+        // The initial full sync counts as a reconcile: not due again yet.
+        assert!(
+            state
+                .advance_due_destination_targets(&cfg)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Files change with NO events recorded (watcher down / events lost).
+        fs::write(src.join("missed.txt"), b"missed").unwrap();
+        fs::write(effective_dst.join("dst-only.txt"), b"extra").unwrap();
+
+        // Still not due while the reconcile is fresh...
+        assert!(
+            state
+                .advance_due_destination_targets(&cfg)
+                .unwrap()
+                .is_empty()
+        );
+
+        // ...but once the interval elapses, a periodic reconcile cycle runs
+        // and repairs everything, without an event-loss red status.
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE destination_offset SET last_reconciled_at='2000-01-01T00:00:00Z' \
+                 WHERE source_id='src_1' AND destination_id='dst_1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            state.advance_due_destination_targets(&cfg).unwrap().len(),
+            1
+        );
+        sync_all_pending(&cfg, &mut state).unwrap();
+
+        assert_eq!(fs::read(effective_dst.join("missed.txt")).unwrap(), b"missed");
+        assert!(!effective_dst.join("dst-only.txt").exists());
+
+        let views = state.destination_views(&cfg).unwrap();
+        let view = views
+            .iter()
+            .find(|v| v.destination_id == "dst_1")
+            .unwrap();
+        assert_eq!(view.status, "green");
+        assert_eq!(view.target_cycle_id, view.last_verified_cycle_id);
+
+        // The reconcile stamped a fresh timestamp: not due again.
+        assert!(
+            state
+                .advance_due_destination_targets(&cfg)
+                .unwrap()
+                .is_empty()
+        );
 
         fs::remove_dir_all(temp).ok();
     }
