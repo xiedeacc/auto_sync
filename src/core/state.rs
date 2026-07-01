@@ -1134,6 +1134,92 @@ impl State {
             .map_err(Into::into)
     }
 
+    /// The newest cycle at or before `cycle_id` that has stored snapshot rows
+    /// for this source. Changed-Since uses it as the comparison baseline when
+    /// the destination's exact last-verified cycle wrote no snapshot (event and
+    /// zfs-diff cycles do not): an OLDER baseline is safe — it only widens the
+    /// changed-path set — while a newer one could miss changes.
+    pub fn latest_snapshot_cycle_at_or_before(
+        &self,
+        source_id: &str,
+        cycle_id: i64,
+    ) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT cycle_id FROM path_snapshot
+                WHERE source_id=?1 AND cycle_id<=?2
+                ORDER BY cycle_id DESC
+                LIMIT 1
+                "#,
+                params![source_id, cycle_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Delete stored source snapshots this source no longer needs. Kept per
+    /// destination: its in-flight target cycle's snapshot and its Changed-Since
+    /// baseline (the newest snapshot cycle at or before its last verified
+    /// cycle). Without this, every full cycle's whole-tree snapshot (up to
+    /// hundreds of thousands of rows) accumulates in the database forever.
+    pub fn prune_path_snapshots(&self, source_id: &str) -> Result<usize> {
+        let mut keep: Vec<i64> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT target_cycle_id, last_verified_cycle_id
+                FROM destination_offset
+                WHERE source_id=?1
+                "#,
+            )?;
+            let rows = stmt.query_map(params![source_id], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                ))
+            })?;
+            for row in rows {
+                let (target, last_verified) = row?;
+                if let Some(target) = target {
+                    keep.push(target);
+                }
+                if let Some(last_verified) = last_verified {
+                    if let Some(baseline) =
+                        self.latest_snapshot_cycle_at_or_before(source_id, last_verified)?
+                    {
+                        keep.push(baseline);
+                    }
+                }
+            }
+        }
+        keep.sort_unstable();
+        keep.dedup();
+        let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        if keep.is_empty() {
+            let removed = self.conn.execute(
+                "DELETE FROM path_snapshot WHERE source_id=?1",
+                params![source_id],
+            )?;
+            return Ok(removed);
+        }
+        let placeholders = keep
+            .iter()
+            .map(|_| "?".to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM path_snapshot WHERE source_id=? AND cycle_id NOT IN ({placeholders})"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&source_id];
+        for id in &keep {
+            params.push(id);
+        }
+        let removed = self.conn.execute(&sql, params.as_slice())?;
+        Ok(removed)
+    }
+
     pub fn snapshot_entries(&self, cycle_id: i64, source_id: &str) -> Result<Vec<SnapshotEntry>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -1448,6 +1534,53 @@ mod tests {
         let events = state.cycle_events("src_1", cycle_id).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_kind, "modify");
+
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn prune_path_snapshots_keeps_targets_and_baselines() {
+        let temp = temp_dir("state_prune_snapshots");
+        let db = temp.join("state.sqlite");
+        let mut state = State::open(&db).unwrap();
+
+        let entry = |rel: &str| SnapshotEntry {
+            rel_path: rel.to_string(),
+            file_type: "file".to_string(),
+            size: 1,
+            mtime_ns: 1,
+            mode: 0o644,
+            hash: None,
+        };
+        // Snapshots for cycles 1, 3, 5 (cycles 2 and 4 wrote none, like event
+        // or zfs-diff cycles).
+        for cycle_id in [1_i64, 3, 5] {
+            state
+                .replace_snapshot(cycle_id, "src_1", &[entry(&format!("f{cycle_id}"))])
+                .unwrap();
+        }
+        // dst_1 last verified cycle 4 (no snapshot of its own → baseline is 3),
+        // targeting cycle 5.
+        state.set_destination_target("src_1", "dst_1", 5).unwrap();
+        state
+            .upsert_destination_status("src_1", "dst_1", Some(4), "green", "verified")
+            .unwrap();
+
+        assert_eq!(
+            state.latest_snapshot_cycle_at_or_before("src_1", 4).unwrap(),
+            Some(3)
+        );
+
+        let removed = state.prune_path_snapshots("src_1").unwrap();
+        assert_eq!(removed, 1, "only cycle 1's snapshot should be pruned");
+        assert!(state.snapshot_entries(1, "src_1").unwrap().is_empty());
+        assert_eq!(state.snapshot_entries(3, "src_1").unwrap().len(), 1);
+        assert_eq!(state.snapshot_entries(5, "src_1").unwrap().len(), 1);
+
+        // Another source's snapshots are untouched.
+        state.replace_snapshot(1, "src_2", &[entry("x")]).unwrap();
+        state.prune_path_snapshots("src_1").unwrap();
+        assert_eq!(state.snapshot_entries(1, "src_2").unwrap().len(), 1);
 
         std::fs::remove_dir_all(temp).ok();
     }

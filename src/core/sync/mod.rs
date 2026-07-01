@@ -230,6 +230,18 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
                     state.mark_cycle_status(cycle.id, "verified")?;
                 }
             }
+            // Drop stored snapshots no destination still needs (each keeps its
+            // in-flight target and its Changed-Since baseline); without this
+            // every full cycle's whole-tree snapshot accumulates forever.
+            match state.prune_path_snapshots(&source.id) {
+                Ok(removed) if removed > 0 => {
+                    info!(source = source.id, removed, "pruned stored source snapshots");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(source = source.id, error = %err, "failed to prune stored source snapshots");
+                }
+            }
         }
         if !progressed || !blocked {
             break;
@@ -1971,6 +1983,13 @@ pub fn sync_cycle_for_source(
                     "green",
                     "verified",
                 )?;
+                // Advance (or clear) the zfs diff base like the other success
+                // paths do; leaving a stale base forces redundant re-syncs.
+                state.set_destination_verified_snapshot(
+                    &source.id,
+                    &dst.id,
+                    source_view.zfs_snapshot.as_ref().map(|z| z.full_name.as_str()),
+                )?;
                 info!(
                     source = source.id,
                     destination = dst.id,
@@ -2136,6 +2155,10 @@ fn realtime_incremental_plan(
     )))
 }
 
+/// Compute the source paths that changed since the destination's last verified
+/// baseline. Returns `None` when no usable baseline exists — the caller then
+/// runs a full sync instead (safe, just not the cheap mode the user asked for),
+/// so every degradation is logged with its reason.
 fn changed_since_scan_paths(
     state: &State,
     source_id: &str,
@@ -2143,19 +2166,53 @@ fn changed_since_scan_paths(
     source_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
 ) -> Result<Option<Vec<String>>> {
-    let Some(base_cycle_id) = state.destination_last_verified(source_id, destination_id)? else {
+    let Some(last_verified) = state.destination_last_verified(source_id, destination_id)? else {
+        info!(
+            source = source_id,
+            destination = destination_id,
+            "changed-since: destination never verified; running full sync instead"
+        );
+        return Ok(None);
+    };
+    // Event and zfs-diff cycles verify without storing a snapshot, so the
+    // exact last-verified cycle often has none. Any OLDER stored snapshot is a
+    // safe baseline — it only widens the changed-path set.
+    let Some(base_cycle_id) =
+        state.latest_snapshot_cycle_at_or_before(source_id, last_verified)?
+    else {
+        info!(
+            source = source_id,
+            destination = destination_id,
+            last_verified,
+            "changed-since: no stored baseline snapshot; running full sync instead"
+        );
         return Ok(None);
     };
     let Some(base_cycle) = state.cycle_by_id(source_id, base_cycle_id)? else {
+        info!(
+            source = source_id,
+            destination = destination_id,
+            base_cycle_id,
+            "changed-since: baseline cycle record missing; running full sync instead"
+        );
         return Ok(None);
     };
     let baseline = state.snapshot_entries(base_cycle_id, source_id)?;
     if baseline.is_empty() {
         return Ok(None);
     }
+    if base_cycle_id != last_verified {
+        info!(
+            source = source_id,
+            destination = destination_id,
+            last_verified,
+            base_cycle_id,
+            "changed-since: using older stored snapshot as baseline"
+        );
+    }
     let cutoff_ns = cycle_cutoff_mtime_ns(&base_cycle);
-    let baseline_map = map_entries(&baseline);
-    let source_map = map_entries(source_snapshot);
+    let baseline_map = map_entry_refs(&baseline);
+    let source_map = map_entry_refs(source_snapshot);
     let mut paths = BTreeSet::new();
 
     for entry in source_snapshot {
@@ -2163,20 +2220,20 @@ fn changed_since_scan_paths(
             continue;
         }
         let differs_from_baseline = baseline_map
-            .get(&entry.rel_path)
+            .get(entry.rel_path.as_str())
             .is_none_or(|base| snapshot_entry_changed(base, entry));
         if entry.mtime_ns > cutoff_ns || differs_from_baseline {
             paths.insert(entry.rel_path.clone());
         }
     }
 
-    for entry in baseline {
-        if source_map.contains_key(&entry.rel_path)
+    for entry in &baseline {
+        if source_map.contains_key(entry.rel_path.as_str())
             || is_rel_excluded(Path::new(&entry.rel_path), excludes)
         {
             continue;
         }
-        paths.insert(entry.rel_path);
+        paths.insert(entry.rel_path.clone());
     }
 
     Ok(Some(paths.into_iter().collect()))
@@ -2191,11 +2248,18 @@ fn cycle_cutoff_mtime_ns(cycle: &Cycle) -> i64 {
 }
 
 fn snapshot_entry_changed(left: &SnapshotEntry, right: &SnapshotEntry) -> bool {
+    // Hashes participate only when BOTH sides have one: the baseline and the
+    // current snapshot may have been taken under different checksum settings,
+    // and a bare presence difference would mark every file as changed.
+    let hash_changed = match (&left.hash, &right.hash) {
+        (Some(left), Some(right)) => left != right,
+        _ => false,
+    };
     left.file_type != right.file_type
         || left.size != right.size
         || left.mtime_ns != right.mtime_ns
         || left.mode != right.mode
-        || left.hash != right.hash
+        || hash_changed
 }
 
 fn cycle_has_remote_target(
@@ -7342,6 +7406,26 @@ mod tests {
         sync.mirror = false;
         let report = build_scan_report("s", "d", &source, &dst, &[], &sync);
         assert_eq!(report.to_delete, 0);
+    }
+
+    #[test]
+    fn changed_since_hash_presence_mismatch_is_not_a_change() {
+        // Baseline recorded under checksum mode, current snapshot without (or
+        // vice versa): the bare presence difference must not mark the file as
+        // changed — that would silently turn Changed Since into a full sync.
+        let mut with_hash = test_file_entry("a.txt", 5);
+        with_hash.hash = Some("abc".to_string());
+        let without_hash = test_file_entry("a.txt", 5);
+        assert!(!snapshot_entry_changed(&with_hash, &without_hash));
+        assert!(!snapshot_entry_changed(&without_hash, &with_hash));
+
+        let mut other_hash = with_hash.clone();
+        other_hash.hash = Some("def".to_string());
+        assert!(snapshot_entry_changed(&with_hash, &other_hash));
+
+        let mut bigger = without_hash.clone();
+        bigger.size += 1;
+        assert!(snapshot_entry_changed(&without_hash, &bigger));
     }
 
     #[test]
