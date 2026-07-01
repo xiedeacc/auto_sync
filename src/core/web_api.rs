@@ -133,77 +133,78 @@ async fn styles_css() -> Response {
 async fn api_get_config(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<AppConfig>, ApiError> {
-    Ok(Json(backend.get_config()?))
+    blocking(move || Ok(Json(backend.get_config()?))).await
 }
 
 async fn api_save_config(
     AxumState(backend): AxumState<Backend>,
     Json(cfg): Json<AppConfig>,
 ) -> Result<Json<AppConfig>, ApiError> {
-    Ok(Json(backend.save_config(&cfg)?))
+    blocking(move || Ok(Json(backend.save_config(&cfg)?))).await
 }
 
 async fn api_delegated_source_groups(
     AxumState(backend): AxumState<Backend>,
     Json(req): Json<DelegatedSourceGroupsRequest>,
 ) -> Result<Json<AppConfig>, ApiError> {
-    Ok(Json(backend.apply_delegated_source_groups(req)?))
+    blocking(move || Ok(Json(backend.apply_delegated_source_groups(req)?))).await
 }
 
 async fn api_health(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<MachineHealth>, ApiError> {
-    Ok(Json(backend.health()?))
+    blocking(move || Ok(Json(backend.health()?))).await
 }
 
 async fn api_machines(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<MachineStatus>, ApiError> {
-    Ok(Json(backend.machines()?))
+    blocking(move || Ok(Json(backend.machines()?))).await
 }
 
 async fn api_discover_machines(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<MachineStatus>, ApiError> {
-    Ok(Json(backend.discover_machines()?))
+    blocking(move || Ok(Json(backend.discover_machines()?))).await
 }
 
 async fn api_add_machine(
     AxumState(backend): AxumState<Backend>,
     Json(machine): Json<MachineConfig>,
 ) -> Result<Json<AppConfig>, ApiError> {
-    Ok(Json(backend.add_machine(machine)?))
+    blocking(move || Ok(Json(backend.add_machine(machine)?))).await
 }
 
 async fn api_remove_machine(
     AxumState(backend): AxumState<Backend>,
     AxumPath(machine_id): AxumPath<String>,
 ) -> Result<Json<AppConfig>, ApiError> {
-    Ok(Json(backend.remove_machine(&machine_id)?))
+    blocking(move || Ok(Json(backend.remove_machine(&machine_id)?))).await
 }
 
 async fn api_status(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<Vec<DestinationView>>, ApiError> {
-    Ok(Json(backend.status()?))
+    blocking(move || Ok(Json(backend.status()?))).await
 }
 
 async fn api_runtime_status(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<RuntimeStatus>, ApiError> {
+    // Reads in-memory atomics/progress only; safe to serve on the async path.
     Ok(Json(backend.runtime_status()))
 }
 
 async fn api_sync_activity(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<SyncActivityStatus>, ApiError> {
-    Ok(Json(backend.sync_activity()?))
+    blocking(move || Ok(Json(backend.sync_activity()?))).await
 }
 
 async fn api_sync_now(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<Vec<DestinationView>>, ApiError> {
-    Ok(Json(backend.sync_now()?))
+    blocking(move || Ok(Json(backend.sync_now()?))).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,7 +216,7 @@ async fn api_sync_source_now(
     AxumState(backend): AxumState<Backend>,
     Json(req): Json<SyncSourceRequest>,
 ) -> Result<Json<Vec<DestinationView>>, ApiError> {
-    Ok(Json(backend.sync_source_now(&req.source_id)?))
+    blocking(move || Ok(Json(backend.sync_source_now(&req.source_id)?))).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,11 +235,14 @@ async fn api_sync_destination_now(
         .as_deref()
         .unwrap_or("incremental")
         .parse::<SyncRequestMode>()?;
-    Ok(Json(backend.sync_destination_now(
-        &req.source_id,
-        &req.destination_id,
-        mode,
-    )?))
+    blocking(move || {
+        Ok(Json(backend.sync_destination_now(
+            &req.source_id,
+            &req.destination_id,
+            mode,
+        )?))
+    })
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,9 +255,12 @@ async fn api_scan_destination_now(
     AxumState(backend): AxumState<Backend>,
     Json(req): Json<ScanDestinationRequest>,
 ) -> Result<Json<Option<ScanReport>>, ApiError> {
-    Ok(Json(
-        backend.scan_destination_now(&req.source_id, &req.destination_id)?,
-    ))
+    blocking(move || {
+        Ok(Json(
+            backend.scan_destination_now(&req.source_id, &req.destination_id)?,
+        ))
+    })
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,114 +273,117 @@ async fn api_scan_report(
     AxumState(backend): AxumState<Backend>,
     Query(query): Query<ScanReportQuery>,
 ) -> Result<Json<Option<ScanReport>>, ApiError> {
-    Ok(Json(
-        backend.scan_report(&query.source_id, &query.destination_id)?,
-    ))
+    blocking(move || {
+        Ok(Json(
+            backend.scan_report(&query.source_id, &query.destination_id)?,
+        ))
+    })
+    .await
 }
 
 async fn api_transfer_snapshot(
     Json(req): Json<TransferSnapshotRequest>,
 ) -> Result<Json<Vec<SnapshotEntry>>, ApiError> {
-    Ok(Json(transfer_snapshot(req)?))
+    blocking(move || Ok(Json(transfer_snapshot(req)?))).await
 }
 
 async fn api_transfer_snapshot_paths(
     Json(req): Json<TransferSnapshotPathsRequest>,
 ) -> Result<Json<Vec<SnapshotEntry>>, ApiError> {
-    Ok(Json(transfer_snapshot_paths(req)?))
+    blocking(move || Ok(Json(transfer_snapshot_paths(req)?))).await
 }
 
 async fn api_transfer_path_info(
     Json(req): Json<TransferPathInfoRequest>,
 ) -> Result<Json<TransferPathInfo>, ApiError> {
-    Ok(Json(transfer_path_info(req)?))
+    blocking(move || Ok(Json(transfer_path_info(req)?))).await
 }
 
 async fn api_transfer_prepare_dir(
     Json(req): Json<TransferPrepareDirRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_prepare_dir(req)?))
+    blocking(move || Ok(Json(transfer_prepare_dir(req)?))).await
 }
 
 async fn api_transfer_prepare_dirs(
     Json(req): Json<TransferPrepareDirsRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_prepare_dirs(req)?))
+    blocking(move || Ok(Json(transfer_prepare_dirs(req)?))).await
 }
 
 async fn api_transfer_set_dir_mtimes(
     Json(req): Json<TransferSetDirMtimesRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_set_dir_mtimes(req)?))
+    blocking(move || Ok(Json(transfer_set_dir_mtimes(req)?))).await
 }
 
 async fn api_transfer_remove_path(
     Json(req): Json<TransferRemovePathRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_remove_path(req)?))
+    blocking(move || Ok(Json(transfer_remove_path(req)?))).await
 }
 
 async fn api_transfer_remove_paths(
     Json(req): Json<TransferRemovePathsRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_remove_paths(req)?))
+    blocking(move || Ok(Json(transfer_remove_paths(req)?))).await
 }
 
 async fn api_transfer_cleanup_tmp(
     Json(req): Json<TransferCleanupTmpRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_cleanup_tmp(req)?))
+    blocking(move || Ok(Json(transfer_cleanup_tmp(req)?))).await
 }
 
 async fn api_transfer_put_file(
     Query(query): Query<TransferPutFileQuery>,
     body: Bytes,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_put_file(query, &body)?))
+    blocking(move || Ok(Json(transfer_put_file(query, &body)?))).await
 }
 
 async fn api_transfer_block_sums(
     Json(req): Json<TransferBlockSumsRequest>,
 ) -> Result<Json<crate::core::sync::delta::BlockSums>, ApiError> {
-    Ok(Json(transfer_block_sums(req)?))
+    blocking(move || Ok(Json(transfer_block_sums(req)?))).await
 }
 
 async fn api_transfer_apply_delta(
     Query(query): Query<TransferApplyDeltaQuery>,
     body: Bytes,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_apply_delta(query, &body)?))
+    blocking(move || Ok(Json(transfer_apply_delta(query, &body)?))).await
 }
 
 async fn api_transfer_file_offset(
     Json(req): Json<crate::core::sync::TransferFileOffsetRequest>,
 ) -> Result<Json<crate::core::sync::TransferFileOffset>, ApiError> {
-    Ok(Json(transfer_file_offset(req)?))
+    blocking(move || Ok(Json(transfer_file_offset(req)?))).await
 }
 
 async fn api_transfer_receive_file_chunk(
     Query(query): Query<TransferReceiveFileChunkQuery>,
     body: Bytes,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_receive_file_chunk(query, &body)?))
+    blocking(move || Ok(Json(transfer_receive_file_chunk(query, &body)?))).await
 }
 
 async fn api_transfer_finish_file(
     Json(req): Json<crate::core::sync::TransferFinishFileRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_finish_file(req)?))
+    blocking(move || Ok(Json(transfer_finish_file(req)?))).await
 }
 
 async fn api_transfer_receive_symlink(
     Json(req): Json<TransferReceiveSymlinkRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_receive_symlink(req)?))
+    blocking(move || Ok(Json(transfer_receive_symlink(req)?))).await
 }
 
 async fn api_transfer_push_file(
     Json(req): Json<TransferPushFileRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
-    Ok(Json(transfer_push_file(req)?))
+    blocking(move || Ok(Json(transfer_push_file(req)?))).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,7 +396,7 @@ async fn api_browse_paths(
     AxumState(backend): AxumState<Backend>,
     Query(query): Query<BrowseQuery>,
 ) -> Result<Json<BrowseResponse>, ApiError> {
-    Ok(Json(backend.browse_paths(query.path, query.machine_id)?))
+    blocking(move || Ok(Json(backend.browse_paths(query.path, query.machine_id)?))).await
 }
 
 struct ApiError(anyhow::Error);
@@ -404,4 +414,22 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
     }
+}
+
+/// Run a blocking handler body on Tokio's blocking thread pool.
+///
+/// Handlers call synchronous code (rusqlite, filesystem walks, blocking peer
+/// HTTP) that can take seconds to minutes while a sync holds the DB. Running it
+/// directly on an async worker thread starves the runtime: once every worker is
+/// parked in blocking code, no request completes -- not even static routes -- so
+/// the whole server appears hung (connections pile up in CLOSE-WAIT). Off-loading
+/// to the blocking pool keeps the async workers free to accept and serve.
+async fn blocking<T, F>(f: F) -> Result<T, ApiError>
+where
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|err| ApiError(anyhow::anyhow!("request worker failed: {err}")))?
 }
