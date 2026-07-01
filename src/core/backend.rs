@@ -403,10 +403,10 @@ impl Backend {
         let mut cfg = load_or_create_config(&self.config_path)?;
         apply_runtime_config(&cfg);
         let discovered = discover_lan(Duration::from_millis(700))?;
-        if refresh_machine_names_from_health(&mut cfg, &discovered) {
-            // A machine reported a different hostname (e.g. a rename tiger->nas);
-            // persist the corrected name. Use the plain config save, not the
-            // delegating one -- a cosmetic name refresh needn't re-push anything.
+        if refresh_machine_metadata_from_health(&mut cfg, &discovered) {
+            // A machine reported different metadata (rename, moved endpoint, new
+            // ssh port, ...); persist it. Use the plain config save, not the
+            // delegating one -- syncing discovered metadata needn't re-push.
             cfg = save_config(&self.config_path, &cfg)?;
         }
         let status = merge_discovered(&cfg, discovered);
@@ -935,11 +935,14 @@ fn reset_changed_destination_offsets(
     Ok(())
 }
 
-/// Update stored remote-machine names to the hostnames reported by discovery so
-/// a renamed host (e.g. "tiger" -> "nas") stops showing a stale name. Only the
-/// factual `name` (hostname) is touched; the user's alias is left alone. Returns
-/// true if any name changed.
-fn refresh_machine_names_from_health(cfg: &mut AppConfig, discovered: &[MachineHealth]) -> bool {
+/// Update a stored remote machine's metadata from what it reports over
+/// discovery, so a rename or moved endpoint stops showing stale values. Every
+/// discovered field is authoritative EXCEPT `alias_name`, which is always
+/// user-configured and never touched. SSH details are only *upgraded* (an
+/// advertised non-empty user / non-default port), never downgraded to a default,
+/// so a working controller->machine SSH config isn't clobbered by a machine that
+/// can't advertise its own reachable port. Returns true if anything changed.
+fn refresh_machine_metadata_from_health(cfg: &mut AppConfig, discovered: &[MachineHealth]) -> bool {
     let mut changed = false;
     for machine in &mut cfg.machines {
         if machine.id == "local" {
@@ -951,6 +954,7 @@ fn refresh_machine_names_from_health(cfg: &mut AppConfig, discovered: &[MachineH
         else {
             continue;
         };
+
         let hostname = health.name.trim();
         if !hostname.is_empty()
             && hostname != "This machine"
@@ -958,6 +962,41 @@ fn refresh_machine_names_from_health(cfg: &mut AppConfig, discovered: &[MachineH
             && machine.name.trim() != hostname
         {
             machine.name = hostname.to_string();
+            changed = true;
+        }
+
+        let host = health.host.trim();
+        if !host.is_empty() && machine.host.trim() != host {
+            machine.host = host.to_string();
+            changed = true;
+        }
+
+        if health.port != 0 && machine.port != health.port {
+            machine.port = health.port;
+            changed = true;
+        }
+
+        let os = health.os.trim();
+        if !os.is_empty() && !machine.os.trim().eq_ignore_ascii_case(os) {
+            machine.os = os.to_string();
+            changed = true;
+        }
+
+        let install_dir = health.install_dir.trim();
+        if !install_dir.is_empty() && machine.install_dir.to_string_lossy() != install_dir {
+            machine.install_dir = PathBuf::from(install_dir);
+            changed = true;
+        }
+
+        let ssh_user = health.ssh_user.trim();
+        if !ssh_user.is_empty() && machine.ssh_user.trim() != ssh_user {
+            machine.ssh_user = ssh_user.to_string();
+            changed = true;
+        }
+
+        let ssh_port = health.ssh_port;
+        if ssh_port != 0 && ssh_port != 22 && machine.ssh_port != ssh_port {
+            machine.ssh_port = ssh_port;
             changed = true;
         }
     }
@@ -1277,18 +1316,18 @@ mod tests {
     }
 
     #[test]
-    fn discovery_refreshes_stale_remote_hostname() {
+    fn discovery_refreshes_stale_remote_metadata() {
         let mut cfg = AppConfig::default();
         cfg.machines.push(MachineConfig {
             id: "nas".to_string(),
             alias_name: "nas".to_string(),
-            name: "tiger".to_string(), // stale hostname from before a rename
+            name: "tiger".to_string(),   // stale hostname from before a rename
             host: "192.168.2.247".to_string(),
             port: 18765,
             ssh_user: "root".to_string(),
-            ssh_port: 10022,
+            ssh_port: 22,                    // stale default; health advertises 10022
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/opt/auto_sync"),
+            install_dir: PathBuf::from("/old/dir"), // stale; health reports /opt/auto_sync
             enabled: true,
             manual: true,
         });
@@ -1301,17 +1340,20 @@ mod tests {
             ssh_user: "root".to_string(),
             ssh_port: 10022,
             os: "linux".to_string(),
+            install_dir: "/opt/auto_sync".to_string(),
             version: String::new(),
         }];
 
-        let changed = refresh_machine_names_from_health(&mut cfg, &discovered);
+        let changed = refresh_machine_metadata_from_health(&mut cfg, &discovered);
         assert!(changed);
         let nas = cfg.machines.iter().find(|m| m.id == "nas").unwrap();
         assert_eq!(nas.name, "nas");
+        assert_eq!(nas.install_dir, PathBuf::from("/opt/auto_sync"));
+        assert_eq!(nas.ssh_port, 10022);
         assert_eq!(nas.alias_name, "nas", "alias must be preserved");
 
         // Idempotent: a second pass with the same health makes no change.
-        assert!(!refresh_machine_names_from_health(&mut cfg, &discovered));
+        assert!(!refresh_machine_metadata_from_health(&mut cfg, &discovered));
     }
 
     #[test]

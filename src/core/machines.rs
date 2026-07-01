@@ -47,6 +47,8 @@ pub struct MachineHealth {
     #[serde(default = "default_ssh_port")]
     pub ssh_port: u16,
     pub os: String,
+    #[serde(default)]
+    pub install_dir: String,
     pub version: String,
 }
 
@@ -93,6 +95,7 @@ pub fn local_health(cfg: &AppConfig, port: u16) -> MachineHealth {
         ssh_user,
         ssh_port,
         os: std::env::consts::OS.to_string(),
+        install_dir: local.install_dir.to_string_lossy().into_owned(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
@@ -1050,6 +1053,7 @@ mod tests {
                     ssh_user: "root".to_string(),
                     ssh_port: 10022,
                     os: "linux".to_string(),
+                    install_dir: String::new(),
                     version: "0.1.0".to_string(),
                 },
                 MachineHealth {
@@ -1061,6 +1065,7 @@ mod tests {
                     ssh_user: "Administrator".to_string(),
                     ssh_port: 2222,
                     os: "linux".to_string(),
+                    install_dir: String::new(),
                     version: "0.1.0".to_string(),
                 },
             ],
@@ -1249,6 +1254,7 @@ mod tests {
                 ssh_user: "root".to_string(),
                 ssh_port: 10022,
                 os: "linux".to_string(),
+                install_dir: String::new(),
                 version: "0.1.0".to_string(),
             }],
         );
@@ -1325,6 +1331,7 @@ mod tests {
                 ssh_user: "root".to_string(),
                 ssh_port: 10022,
                 os: "linux".to_string(),
+                install_dir: String::new(),
                 version: "0.1.0".to_string(),
             }],
         );
