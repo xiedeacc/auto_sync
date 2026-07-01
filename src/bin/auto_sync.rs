@@ -78,13 +78,26 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let config_path = config_arg
+        .canonicalize()
+        .unwrap_or_else(|_| config_arg.clone());
+
+    // Only one auto_sync process may run against a given install at a time --
+    // two live instances would each run their own scheduler/watcher and race
+    // on the shared destinations. If another instance already holds the lock,
+    // stop it and take over rather than refusing to start. Held for the rest
+    // of the process lifetime; the OS releases it automatically on exit, even
+    // a forced kill.
+    let lock_path = config_path
+        .parent()
+        .map(|dir| dir.join(".auto_sync.lock"))
+        .unwrap_or_else(|| PathBuf::from(".auto_sync.lock"));
+    let _instance_lock = acquire_single_instance_lock(&lock_path)?;
+
     // Apply receiver-side policy up front so the web server (the destination of
     // pushes) honours it even though it never runs the scheduler loop.
     auto_sync::core::sync::configure_fsync(cfg.app.sync.fsync);
 
-    let config_path = config_arg
-        .canonicalize()
-        .unwrap_or_else(|_| config_arg.clone());
     let addr = bind_addr_for_port(cfg.app.port);
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -124,6 +137,130 @@ fn bind_addr_for_port(port: u16) -> SocketAddr {
     match preferred_local_host().parse::<IpAddr>() {
         Ok(ip) => SocketAddr::new(ip, port),
         Err(_) => SocketAddr::from(([0, 0, 0, 0], port)),
+    }
+}
+
+/// Holds the OS-level exclusive lock on the single-instance lock file for the
+/// life of the process. Dropping (or the process exiting, even via a kill)
+/// releases it automatically.
+struct InstanceLock {
+    _file: std::fs::File,
+}
+
+/// Ensure only one auto_sync process runs against this install at a time. If
+/// another instance already holds the lock, verify it's really an auto_sync
+/// process (by PID + image name, to avoid killing an unrelated recycled PID),
+/// stop it, and take the lock over rather than refusing to start.
+fn acquire_single_instance_lock(path: &std::path::Path) -> Result<InstanceLock> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open lock file {}", path.display()))?;
+
+    if try_lock_file(&file)? {
+        write_lock_pid(&mut file)?;
+        return Ok(InstanceLock { _file: file });
+    }
+
+    if let Some(pid) = read_lock_pid(path) {
+        if pid != std::process::id() && process_is_auto_sync(pid) {
+            warn!(pid, "another auto_sync instance is running; stopping it");
+            kill_process(pid);
+        }
+    }
+
+    for _ in 0..25 {
+        thread::sleep(Duration::from_millis(200));
+        if try_lock_file(&file)? {
+            write_lock_pid(&mut file)?;
+            return Ok(InstanceLock { _file: file });
+        }
+    }
+
+    anyhow::bail!(
+        "another auto_sync instance still holds {} after attempting to stop it",
+        path.display()
+    );
+}
+
+fn read_lock_pid(path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn write_lock_pid(file: &mut std::fs::File) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    write!(file, "{}", std::process::id())?;
+    file.flush()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn try_lock_file(file: &std::fs::File) -> Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    Ok(ok != 0)
+}
+
+#[cfg(unix)]
+fn try_lock_file(file: &std::fs::File) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    Ok(rc == 0)
+}
+
+#[cfg(windows)]
+fn process_is_auto_sync(pid: u32) -> bool {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .to_lowercase()
+            .contains("auto_sync.exe"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+fn process_is_auto_sync(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim() == "auto_sync")
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status();
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
     }
 }
 
