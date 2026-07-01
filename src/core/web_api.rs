@@ -102,8 +102,15 @@ pub async fn serve(backend: Backend, addr: SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let _discovery = spawn_discovery_responder(backend.config_path(), backend.port());
     let app = router(backend);
-    info!(url = %format!("http://{addr}/"), "auto_sync web listening");
-    println!("auto_sync Web UI: http://{addr}/");
+    // The listener binds 0.0.0.0; show the reachable LAN address instead.
+    let display_host = if addr.ip().is_unspecified() {
+        crate::core::config::preferred_local_host()
+    } else {
+        addr.ip().to_string()
+    };
+    let url = format!("http://{display_host}:{}/", addr.port());
+    info!(url = %url, "auto_sync web listening");
+    println!("auto_sync Web UI: {url}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

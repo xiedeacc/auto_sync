@@ -795,8 +795,10 @@ th {
   bottom: 0;
   z-index: 900;
   height: 42px;
-  display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) auto auto minmax(150px, auto);
+  /* Flex, not grid: the cancel/config-error buttons are usually hidden, and
+     display:none flex items leave no empty tracks or stray gaps behind, so
+     the text stays centered and the build info hugs the right edge. */
+  display: flex;
   align-items: center;
   gap: 10px;
   padding: 0 12px;
@@ -827,6 +829,7 @@ th {
 }
 
 .status-text {
+  flex: 1 1 0;
   min-width: 0;
   overflow: hidden;
   color: var(--muted);
@@ -876,6 +879,7 @@ th {
 }
 
 .status-build {
+  flex: 0 0 auto;
   min-width: 0;
   max-width: 260px;
   overflow: hidden;
@@ -1299,8 +1303,8 @@ th {
     flex: 1;
   }
 
-  .status-bar {
-    grid-template-columns: 32px minmax(0, 1fr) auto auto minmax(96px, 28vw);
+  .status-bar .status-build {
+    max-width: 28vw;
   }
 
   .status-transfer {

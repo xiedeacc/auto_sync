@@ -6,7 +6,7 @@
 //! in a single process removes the old daemon/GUI contention over the shared
 //! SQLite database and the destination machines.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,9 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use auto_sync::core::backend::Backend;
-use auto_sync::core::config::{
-    AppConfig, load_config, load_or_create_config, preferred_local_host,
-};
+use auto_sync::core::config::{AppConfig, load_config, load_or_create_config};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::state::State;
 use auto_sync::core::sync::sync_all_pending;
@@ -142,10 +140,10 @@ fn main() -> Result<()> {
 }
 
 fn bind_addr_for_port(port: u16) -> SocketAddr {
-    match preferred_local_host().parse::<IpAddr>() {
-        Ok(ip) => SocketAddr::new(ip, port),
-        Err(_) => SocketAddr::from(([0, 0, 0, 0], port)),
-    }
+    // Bind ALL interfaces: LAN peers reach us via the LAN IP, local tools via
+    // 127.0.0.1, and a DHCP address change cannot strand the listener on a
+    // stale IP (binding the specific LAN IP had all three problems).
+    SocketAddr::from(([0, 0, 0, 0], port))
 }
 
 /// Holds the OS-level exclusive lock on the single-instance lock file for the
