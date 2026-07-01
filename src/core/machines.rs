@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 use crate::core::config::{
     AppConfig, DEFAULT_TCP_CONNECTION_POOL_SIZE, MachineConfig, default_machine_port, load_config,
     local_hostname, machine_matches_reference, normalized_machines, preferred_local_host,
+    process_user,
 };
 
 pub const DISCOVERY_PORT: u16 = 18766;
@@ -273,7 +274,9 @@ fn advertised_ssh_user(cfg: &AppConfig, local: &MachineConfig, ssh_port: u16) ->
             })
         })
         .map(|machine| machine.ssh_user.trim().to_string())
-        .unwrap_or_default()
+        // Nothing in the config tells us the user; advertise the account this
+        // process runs as, which is who a peer would SSH in with.
+        .unwrap_or_else(|| process_user().unwrap_or_default())
 }
 
 fn is_localish_host(host: &str, local_host: &str) -> bool {

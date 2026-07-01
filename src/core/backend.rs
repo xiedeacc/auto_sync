@@ -938,10 +938,10 @@ fn reset_changed_destination_offsets(
 /// Update a stored remote machine's metadata from what it reports over
 /// discovery, so a rename or moved endpoint stops showing stale values. Every
 /// discovered field is authoritative EXCEPT `alias_name`, which is always
-/// user-configured and never touched. SSH details are only *upgraded* (an
-/// advertised non-empty user / non-default port), never downgraded to a default,
-/// so a working controller->machine SSH config isn't clobbered by a machine that
-/// can't advertise its own reachable port. Returns true if anything changed.
+/// user-configured and never touched. SSH user/port are preferred from the
+/// advertisement (each machine detects its own sshd port and the account it runs
+/// as); only an empty user / zero port -- an advertisement carrying no info -- is
+/// ignored. Returns true if anything changed.
 fn refresh_machine_metadata_from_health(cfg: &mut AppConfig, discovered: &[MachineHealth]) -> bool {
     let mut changed = false;
     for machine in &mut cfg.machines {
@@ -988,15 +988,18 @@ fn refresh_machine_metadata_from_health(cfg: &mut AppConfig, discovered: &[Machi
             changed = true;
         }
 
+        // SSH: prefer what the machine advertises. It detects its own sshd port
+        // and the account this process runs as, so the advertisement is the
+        // source of truth for how to reach it. Only skip an empty user / zero
+        // port (an advertisement that carries no information).
         let ssh_user = health.ssh_user.trim();
         if !ssh_user.is_empty() && machine.ssh_user.trim() != ssh_user {
             machine.ssh_user = ssh_user.to_string();
             changed = true;
         }
 
-        let ssh_port = health.ssh_port;
-        if ssh_port != 0 && ssh_port != 22 && machine.ssh_port != ssh_port {
-            machine.ssh_port = ssh_port;
+        if health.ssh_port != 0 && machine.ssh_port != health.ssh_port {
+            machine.ssh_port = health.ssh_port;
             changed = true;
         }
     }
@@ -1324,7 +1327,7 @@ mod tests {
             name: "tiger".to_string(),   // stale hostname from before a rename
             host: "192.168.2.247".to_string(),
             port: 18765,
-            ssh_user: "root".to_string(),
+            ssh_user: "olduser".to_string(), // stale; health advertises root
             ssh_port: 22,                    // stale default; health advertises 10022
             os: "linux".to_string(),
             install_dir: PathBuf::from("/old/dir"), // stale; health reports /opt/auto_sync
@@ -1349,7 +1352,8 @@ mod tests {
         let nas = cfg.machines.iter().find(|m| m.id == "nas").unwrap();
         assert_eq!(nas.name, "nas");
         assert_eq!(nas.install_dir, PathBuf::from("/opt/auto_sync"));
-        assert_eq!(nas.ssh_port, 10022);
+        assert_eq!(nas.ssh_user, "root", "ssh user preferred from discovery");
+        assert_eq!(nas.ssh_port, 10022, "ssh port preferred from discovery");
         assert_eq!(nas.alias_name, "nas", "alias must be preserved");
 
         // Idempotent: a second pass with the same health makes no change.

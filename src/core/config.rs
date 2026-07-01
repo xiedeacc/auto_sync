@@ -1006,6 +1006,34 @@ fn hostname_command_name() -> Option<String> {
     })
 }
 
+/// The OS user this process runs as -- the account a peer would SSH in with.
+/// Tries the usual environment variables first, then falls back to `whoami`
+/// (which, unlike env vars, is populated even under systemd). Windows `whoami`
+/// returns `DOMAIN\user`, so we keep only the user part.
+pub fn process_user() -> Option<String> {
+    for var in ["USER", "LOGNAME", "USERNAME"] {
+        if let Ok(value) = std::env::var(var) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    let mut command = Command::new("whoami");
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    command.output().ok().and_then(|output| {
+        let value = String::from_utf8(output.stdout).ok()?;
+        let value = value.trim();
+        let value = value.rsplit(['\\', '/']).next().unwrap_or(value).trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
+
 fn detect_local_ip_for(peer: Ipv4Addr) -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     socket.connect(SocketAddr::from((peer, 9))).ok()?;
