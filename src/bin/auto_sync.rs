@@ -479,19 +479,18 @@ fn apply_autostart_inner(enabled: bool, config_path: &std::path::Path) -> std::i
             ])
             .status();
         match created {
-            Ok(status) if status.success() => {
-                // Disable the task's own "onlogon" trigger -- schtasks /run
-                // still works on a disabled task -- so only the Startup-folder
-                // script below fires it, avoiding a double launch.
-                let _ = std::process::Command::new("schtasks")
-                    .args(["/change", "/tn", AUTOSTART_TASK_NAME, "/disable"])
-                    .status();
-            }
+            Ok(status) if status.success() => {}
             Ok(status) => warn!(code = ?status.code(), "schtasks /create returned non-zero"),
             Err(err) => warn!(error = %err, "failed to invoke schtasks /create"),
         }
-        // Triggers the pre-authorized elevated task instead of launching the
-        // exe directly, so no UAC prompt appears at logon.
+        // The task's own "onlogon" trigger does the actual elevated launch --
+        // Task Scheduler starts a Highest-privilege task via its trigger
+        // without any interactive UAC prompt, unlike a manual `schtasks /run`
+        // (which we verified requires the *caller* to already be elevated and
+        // would otherwise fail with Access Denied at real logon, since the
+        // Startup-folder script itself runs unelevated). So this .vbs is kept
+        // only as a best-effort fallback trigger, not the primary mechanism;
+        // it commonly no-ops with Access Denied, which is harmless.
         let script = format!(
             "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.Run \"schtasks /run /tn \"\"{AUTOSTART_TASK_NAME}\"\"\", 0, False\r\n"
         );

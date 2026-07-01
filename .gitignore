@@ -5,6 +5,7 @@
 # inside /opt/auto_sync without generated files making the worktree dirty.
 /conf/auto_sync.toml
 /conf/state/
+/conf/.auto_sync.lock
 /runtime/
 /logs/*
 !/logs/.gitkeep
