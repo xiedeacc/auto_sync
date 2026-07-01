@@ -92,7 +92,15 @@ fn main() -> Result<()> {
         .parent()
         .map(|dir| dir.join(".auto_sync.lock"))
         .unwrap_or_else(|| PathBuf::from(".auto_sync.lock"));
-    let _instance_lock = acquire_single_instance_lock(&lock_path)?;
+    let _instance_lock = match acquire_single_instance_lock(&lock_path) {
+        Ok(lock) => lock,
+        Err(err) => {
+            // A GUI-subsystem build has no console, so a plain returned Err
+            // would otherwise vanish silently instead of reaching the user.
+            error!(error = %err, "refusing to start: could not stop the previous auto_sync instance");
+            return Ok(());
+        }
+    };
 
     // Apply receiver-side policy up front so the web server (the destination of
     // pushes) honours it even though it never runs the scheduler loop.
@@ -167,10 +175,20 @@ fn acquire_single_instance_lock(path: &std::path::Path) -> Result<InstanceLock> 
         return Ok(InstanceLock { _file: file });
     }
 
-    if let Some(pid) = read_lock_pid(path) {
-        if pid != std::process::id() && process_is_auto_sync(pid) {
+    match read_lock_pid(path) {
+        Some(pid) if pid == std::process::id() => {}
+        Some(pid) if process_is_auto_sync(pid) => {
             warn!(pid, "another auto_sync instance is running; stopping it");
             kill_process(pid);
+        }
+        Some(pid) => {
+            warn!(
+                pid,
+                "lock file's PID is not an auto_sync process (stale/recycled); not killing it"
+            );
+        }
+        None => {
+            warn!("lock is held but its PID could not be read from the lock file");
         }
     }
 
