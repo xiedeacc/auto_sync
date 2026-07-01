@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 /// instances in the process share one DB file, so one lock covers them.
 static DB_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Rows per transaction for bulk path_snapshot writes/deletes. Small enough
+/// that no single transaction holds SQLite's writer long (keeping UI and
+/// watcher writes responsive), large enough to amortize commit cost.
+const SNAPSHOT_WRITE_CHUNK: usize = 20_000;
+
 use crate::core::config::AppConfig;
 use crate::core::config::ScheduleMode;
 use crate::core::scheduler;
@@ -1087,41 +1092,77 @@ impl State {
         Ok(views)
     }
 
+    /// Replace the stored snapshot for a cycle in CHUNKED transactions. A
+    /// whole-tree snapshot can be hundreds of thousands of rows; writing it in
+    /// one transaction holds SQLite's writer for tens of seconds, starving
+    /// every other writer (UI requests, watcher events) past their busy
+    /// timeout ("database is locked"). Only the sync engine writes
+    /// path_snapshot (serialized by the sync gate), so releasing the writer
+    /// between chunks is safe; readers never use a cycle's rows until its
+    /// destinations verify afterwards.
     pub fn replace_snapshot(
         &mut self,
         cycle_id: i64,
         source_id: &str,
         entries: &[SnapshotEntry],
     ) -> Result<()> {
-        let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM path_snapshot WHERE cycle_id=?1 AND source_id=?2",
+        self.delete_path_snapshot_rows_chunked(
+            "cycle_id=?1 AND source_id=?2",
             params![cycle_id, source_id],
         )?;
-        {
-            let mut stmt = tx.prepare(
-                r#"
-                INSERT INTO path_snapshot
-                    (cycle_id, source_id, rel_path, file_type, size, mtime_ns, mode, hash)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                "#,
-            )?;
-            for entry in entries {
-                stmt.execute(params![
-                    cycle_id,
-                    source_id,
-                    entry.rel_path,
-                    entry.file_type,
-                    entry.size,
-                    entry.mtime_ns,
-                    entry.mode as i64,
-                    entry.hash
-                ])?;
+        for chunk in entries.chunks(SNAPSHOT_WRITE_CHUNK) {
+            let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let tx = self.conn.transaction()?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    r#"
+                    INSERT INTO path_snapshot
+                        (cycle_id, source_id, rel_path, file_type, size, mtime_ns, mode, hash)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "#,
+                )?;
+                for entry in chunk {
+                    stmt.execute(params![
+                        cycle_id,
+                        source_id,
+                        entry.rel_path,
+                        entry.file_type,
+                        entry.size,
+                        entry.mtime_ns,
+                        entry.mode as i64,
+                        entry.hash
+                    ])?;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Delete matching path_snapshot rows in bounded batches (rowid subquery —
+    /// works without SQLite's DELETE...LIMIT compile flag), releasing the
+    /// process write lock between batches so concurrent small writers are
+    /// never starved by a bulk delete.
+    fn delete_path_snapshot_rows_chunked(
+        &self,
+        where_clause: &str,
+        where_params: &[&dyn rusqlite::ToSql],
+    ) -> Result<usize> {
+        let sql = format!(
+            "DELETE FROM path_snapshot WHERE rowid IN \
+             (SELECT rowid FROM path_snapshot WHERE {where_clause} LIMIT {SNAPSHOT_WRITE_CHUNK})"
+        );
+        let mut total = 0_usize;
+        loop {
+            let removed = {
+                let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+                self.conn.execute(&sql, where_params)?
+            };
+            total += removed;
+            if removed < SNAPSHOT_WRITE_CHUNK {
+                return Ok(total);
             }
         }
-        tx.commit()?;
-        Ok(())
     }
 
     pub fn snapshot_count(&self, cycle_id: i64, source_id: &str) -> Result<i64> {
@@ -1196,28 +1237,21 @@ impl State {
         }
         keep.sort_unstable();
         keep.dedup();
-        let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        // Chunked delete: the first prune of a long-lived database can drop
+        // millions of accumulated rows, and doing that in one statement holds
+        // SQLite's writer long enough to starve every other writer.
         if keep.is_empty() {
-            let removed = self.conn.execute(
-                "DELETE FROM path_snapshot WHERE source_id=?1",
-                params![source_id],
-            )?;
-            return Ok(removed);
+            return self.delete_path_snapshot_rows_chunked("source_id=?1", params![source_id]);
         }
-        let placeholders = keep
+        let id_list = keep
             .iter()
-            .map(|_| "?".to_string())
+            .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!(
-            "DELETE FROM path_snapshot WHERE source_id=? AND cycle_id NOT IN ({placeholders})"
-        );
-        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&source_id];
-        for id in &keep {
-            params.push(id);
-        }
-        let removed = self.conn.execute(&sql, params.as_slice())?;
-        Ok(removed)
+        self.delete_path_snapshot_rows_chunked(
+            &format!("source_id=?1 AND cycle_id NOT IN ({id_list})"),
+            params![source_id],
+        )
     }
 
     pub fn snapshot_entries(&self, cycle_id: i64, source_id: &str) -> Result<Vec<SnapshotEntry>> {
