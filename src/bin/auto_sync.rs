@@ -464,18 +464,15 @@ const AUTOSTART_TASK_NAME: &str = "auto_sync";
 
 #[cfg(all(feature = "gui", windows))]
 fn apply_autostart_inner(enabled: bool, config_path: &std::path::Path) -> std::io::Result<()> {
-    let Some(appdata) = std::env::var_os("APPDATA") else {
-        return Ok(());
-    };
-    let startup = PathBuf::from(appdata)
-        .join("Microsoft")
-        .join("Windows")
-        .join("Start Menu")
-        .join("Programs")
-        .join("Startup");
-    let launcher = startup.join("auto_sync-start.vbs");
+    // The scheduled task's own "at logon" trigger is the entire autostart
+    // mechanism: Task Scheduler launches a Highest-privilege task via its
+    // trigger with no interactive UAC prompt. We used to also drop a
+    // Startup-folder .vbs, but that only ever tried `schtasks /run`, which
+    // fails with Access Denied from an unelevated logon context -- so it was
+    // dead weight. Remove any such leftover from earlier versions.
+    remove_legacy_startup_vbs();
+
     if enabled {
-        std::fs::create_dir_all(&startup)?;
         let exe = std::env::current_exe()?;
         let target = format!(
             "\"{}\" --config \"{}\" --hidden",
@@ -501,27 +498,30 @@ fn apply_autostart_inner(enabled: bool, config_path: &std::path::Path) -> std::i
             Ok(status) => warn!(code = ?status.code(), "schtasks /create returned non-zero"),
             Err(err) => warn!(error = %err, "failed to invoke schtasks /create"),
         }
-        // The task's own "onlogon" trigger does the actual elevated launch --
-        // Task Scheduler starts a Highest-privilege task via its trigger
-        // without any interactive UAC prompt, unlike a manual `schtasks /run`
-        // (which we verified requires the *caller* to already be elevated and
-        // would otherwise fail with Access Denied at real logon, since the
-        // Startup-folder script itself runs unelevated). So this .vbs is kept
-        // only as a best-effort fallback trigger, not the primary mechanism;
-        // it commonly no-ops with Access Denied, which is harmless.
-        let script = format!(
-            "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.Run \"schtasks /run /tn \"\"{AUTOSTART_TASK_NAME}\"\"\", 0, False\r\n"
-        );
-        std::fs::write(&launcher, script)?;
     } else {
         let _ = std::process::Command::new("schtasks")
             .args(["/delete", "/tn", AUTOSTART_TASK_NAME, "/f"])
             .status();
-        if launcher.exists() {
-            std::fs::remove_file(&launcher)?;
-        }
     }
     Ok(())
+}
+
+/// Remove the obsolete Startup-folder launcher scripts that earlier versions
+/// wrote. Best-effort; missing files are fine.
+#[cfg(all(feature = "gui", windows))]
+fn remove_legacy_startup_vbs() {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return;
+    };
+    let startup = PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup");
+    for name in ["auto_sync-start.vbs", "auto_syncd-start.vbs"] {
+        let _ = std::fs::remove_file(startup.join(name));
+    }
 }
 
 #[cfg(all(feature = "gui", not(windows)))]

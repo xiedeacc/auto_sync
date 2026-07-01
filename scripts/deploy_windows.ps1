@@ -621,26 +621,26 @@ function Ensure-AutoSyncStartup {
         throw "Missing binary: $autoSyncExe"
     }
 
+    # Clean up obsolete Startup-folder launchers from earlier versions; the
+    # scheduled task is now the sole autostart mechanism.
     $startupDir = [Environment]::GetFolderPath("Startup")
-    if ([string]::IsNullOrWhiteSpace($startupDir)) {
-        throw "Could not locate current user's Startup folder."
+    if (-not [string]::IsNullOrWhiteSpace($startupDir)) {
+        Remove-Item -LiteralPath (Join-Path $startupDir "auto_syncd-start.vbs") -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $startupDir "auto_sync-start.vbs") -Force -ErrorAction SilentlyContinue
     }
-    New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
-    Remove-Item -LiteralPath (Join-Path $startupDir "auto_syncd-start.vbs") -Force -ErrorAction SilentlyContinue
-    $launcher = Join-Path $startupDir "auto_sync-start.vbs"
 
-    # auto_sync manages its own autostart entry (a Highest-privilege scheduled
-    # task plus this Startup-folder script that triggers it) every time it
-    # starts, keyed off the app.autostart config setting -- see
-    # apply_autostart_inner in src/bin/auto_sync.rs. That avoids an interactive
-    # UAC prompt at logon: the task is pre-authorized, elevated, the first time
-    # the process below runs and writes it. We just start the process here.
+    # auto_sync manages its own autostart entry -- a Highest-privilege scheduled
+    # task with an "at logon" trigger -- every time it starts, keyed off the
+    # app.autostart config setting (see apply_autostart_inner in
+    # src/bin/auto_sync.rs). The task fires elevated at logon with no
+    # interactive UAC prompt. It's created/refreshed the first time the process
+    # below runs elevated, so we just start the process here.
     Start-Process -FilePath $autoSyncExe `
         -ArgumentList @("--config", $ConfigPath) `
         -WorkingDirectory (Split-Path -Parent $BinDir)
 
     [PSCustomObject]@{
-        Launcher = $launcher
+        Launcher = "scheduled task 'auto_sync' (at logon)"
         Processes = "auto_sync started"
     }
 }
