@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 #[cfg(windows)]
@@ -857,6 +857,76 @@ pub fn machine_is_local(cfg: &AppConfig, machine_id: &str) -> bool {
     normalized_machines(cfg)
         .iter()
         .any(|machine| machine.id == "local" && machine_matches_reference(machine, value))
+}
+
+/// Whether a whole `MachineConfig` entry refers to the machine this process runs
+/// on. Broader than [`machine_is_local`]: it also recognizes the entry by its
+/// host being our LAN address, loopback, or hostname -- so a delegated peer that
+/// carries our own LAN IP (e.g. the controller pushing the "nas" machine to the
+/// NAS) is detected as ourselves and not treated as a separate remote peer.
+pub fn machine_is_self(cfg: &AppConfig, machine: &MachineConfig) -> bool {
+    if machine.id == "local" {
+        return true;
+    }
+    for reference in [machine.id.as_str(), machine.alias_name.as_str()] {
+        if !reference.trim().is_empty() && machine_is_local(cfg, reference) {
+            return true;
+        }
+    }
+    let host = machine.host.trim();
+    !host.is_empty()
+        && (host.eq_ignore_ascii_case("127.0.0.1")
+            || host.eq_ignore_ascii_case("::1")
+            || host.eq_ignore_ascii_case("localhost")
+            || host.eq_ignore_ascii_case(preferred_local_host().trim())
+            || host.eq_ignore_ascii_case(local_hostname().trim()))
+}
+
+/// Non-fatal configuration problems, surfaced in the UI status bar. Unlike
+/// [`AppConfig::validate`] (which rejects the config outright), these flag likely
+/// misconfigurations -- e.g. two machine entries sharing one IP -- so the user
+/// can see and fix them without the daemon refusing to run.
+pub fn config_warnings(cfg: &AppConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    let mut by_host: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for machine in &cfg.machines {
+        let host = machine.host.trim().to_ascii_lowercase();
+        if host.is_empty() {
+            continue;
+        }
+        by_host
+            .entry(host)
+            .or_default()
+            .push(machine_display_name(machine));
+    }
+    for (host, mut names) in by_host {
+        if names.len() > 1 {
+            names.sort();
+            names.dedup();
+            if names.len() > 1 {
+                warnings.push(format!(
+                    "multiple machines share host {host}: {}",
+                    names.join(", ")
+                ));
+            }
+        }
+    }
+
+    let self_machines: Vec<String> = cfg
+        .machines
+        .iter()
+        .filter(|machine| machine_is_self(cfg, machine))
+        .map(machine_display_name)
+        .collect();
+    if self_machines.len() > 1 {
+        warnings.push(format!(
+            "multiple machine entries refer to this machine: {}",
+            self_machines.join(", ")
+        ));
+    }
+
+    warnings
 }
 
 pub fn machine_display_name(machine: &MachineConfig) -> String {

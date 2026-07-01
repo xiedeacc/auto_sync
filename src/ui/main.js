@@ -69,6 +69,7 @@ const el = {
   config: document.getElementById("config"),
   statusConfig: document.getElementById("status-config"),
   statusText: document.getElementById("status-text"),
+  statusConfigError: document.getElementById("status-config-error"),
   statusBuild: document.getElementById("status-build"),
   refresh: document.getElementById("refresh"),
   machineStatus: document.getElementById("machine-status"),
@@ -383,12 +384,32 @@ function updateStatusBar() {
     el.statusText.title = message;
   }
 
+  updateConfigErrorIndicator();
+
   const build = runtimeStatus && runtimeStatus.build;
   const commit = (build && build.commit) || "unknown";
   const time = (build && build.commit_time_beijing) || "unknown";
   const buildText = `${commit} · ${time}`;
   el.statusBuild.textContent = buildText;
   el.statusBuild.title = buildText;
+}
+
+function updateConfigErrorIndicator() {
+  if (!el.statusConfigError) {
+    return;
+  }
+  const errors = (runtimeStatus && runtimeStatus.config_errors) || [];
+  if (!errors.length) {
+    el.statusConfigError.hidden = true;
+    el.statusConfigError.textContent = "";
+    el.statusConfigError.title = "";
+    return;
+  }
+  const label =
+    errors.length === 1 ? "1 config issue" : `${errors.length} config issues`;
+  el.statusConfigError.hidden = false;
+  el.statusConfigError.textContent = `⚠ ${label}`;
+  el.statusConfigError.title = errors.join("\n");
 }
 
 function renderScanLikeStatus(verb, scan) {

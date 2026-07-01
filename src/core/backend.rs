@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::core::config::{
-    AppConfig, MachineConfig, SourceGroupConfig, clean_config_for_save, load_config,
-    load_or_create_config, machine_id_or_local, machine_matches_reference, save_config,
+    AppConfig, MachineConfig, SourceGroupConfig, clean_config_for_save, config_warnings,
+    load_config, load_or_create_config, machine_id_or_local, machine_is_local, machine_is_self,
+    machine_matches_reference, save_config,
 };
 use crate::core::machines::{
     MachineHealth, MachineStatus, configure_tcp_connection_pool, discover_lan,
@@ -71,7 +72,8 @@ impl Backend {
         let current = load_config(&self.config_path)
             .ok()
             .map(|cfg| clean_config_for_save(&cfg));
-        let cfg = preserve_current_machines(&self.config_path, cfg);
+        let mut cfg = preserve_current_machines(&self.config_path, cfg);
+        normalize_local_machine_config(&mut cfg, &[]);
         reject_locked_source_path_changes(&self.config_path, &cfg)?;
         let next = clean_config_for_save(&cfg);
         let cfg = save_config(&self.config_path, &cfg)?;
@@ -98,6 +100,7 @@ impl Backend {
             cfg.source_groups.push(source);
         }
         merge_delegated_machines(&mut cfg, &req.machines);
+        normalize_local_machine_config(&mut cfg, &req.machines);
         let cfg = save_config(&self.config_path, &cfg)?;
         apply_runtime_config(&cfg);
         let state_db = DbState::open(&cfg.app.data_db)?;
@@ -168,6 +171,7 @@ impl Backend {
             transfer: current_transfer_progress(),
             scan: current_scan_progress(),
             build: BuildInfo::current(),
+            config_errors: current_config_warnings(),
         }
     }
 
@@ -666,6 +670,13 @@ fn offline_views_for_source(source: &SourceGroupConfig, reason: &str) -> Vec<Des
 
 fn merge_delegated_machines(cfg: &mut AppConfig, incoming: &[MachineConfig]) {
     for machine in incoming.iter().filter(|machine| machine.id != "local") {
+        // A controller pushes its full machine list, which includes an entry for
+        // THIS machine (e.g. the NAS receiving "nas"/its own LAN IP). Never add
+        // that as a separate peer -- we already know ourselves as "local", and a
+        // duplicate self-entry would make us try to sync/HTTP to ourselves.
+        if machine_is_self(cfg, machine) {
+            continue;
+        }
         if let Some(existing) = cfg.machines.iter_mut().find(|existing| {
             non_empty_machine_match(existing, &machine.id)
                 || non_empty_machine_match(existing, &machine.alias_name)
@@ -678,6 +689,46 @@ fn merge_delegated_machines(cfg: &mut AppConfig, incoming: &[MachineConfig]) {
             cfg.machines.push(machine.clone());
         }
     }
+}
+
+/// Adapt a config to the machine it now lives on: rewrite any source/destination
+/// that points at this host (by "local", hostname, LAN IP, or a machine id/alias
+/// that resolves to us) to the canonical "local" id, then drop duplicate machine
+/// entries that are really this host. Idempotent and safe on every machine --
+/// only entries that genuinely resolve to the *local* host are collapsed, so a
+/// controller keeps its remote peers untouched.
+fn normalize_local_machine_config(cfg: &mut AppConfig, reference_machines: &[MachineConfig]) {
+    // Resolve references against our own machines plus any the controller sent,
+    // since a self-machine the controller pushed is intentionally NOT kept in
+    // our list (merge_delegated_machines drops it) yet a source/destination may
+    // still reference it by that id.
+    let mut snapshot = cfg.clone();
+    snapshot
+        .machines
+        .extend(reference_machines.iter().cloned());
+    let is_self_ref = |machine_id: &str| -> bool {
+        if machine_is_local(&snapshot, machine_id) {
+            return true;
+        }
+        snapshot
+            .machines
+            .iter()
+            .any(|m| machine_matches_reference(m, machine_id) && machine_is_self(&snapshot, m))
+    };
+    for source in &mut cfg.source_groups {
+        if is_self_ref(&source.machine_id) {
+            source.machine_id = "local".to_string();
+        }
+        for dst in &mut source.destinations {
+            if is_self_ref(&dst.machine_id) {
+                dst.machine_id = "local".to_string();
+            }
+        }
+    }
+    // Drop any machine entry already in the config that is really this host.
+    let prune_snapshot = cfg.clone();
+    cfg.machines
+        .retain(|m| m.id == "local" || !machine_is_self(&prune_snapshot, m));
 }
 
 fn sync_request_mode_wire_value(mode: SyncRequestMode) -> &'static str {
@@ -757,6 +808,8 @@ pub struct RuntimeStatus {
     pub transfer: Option<TransferProgressView>,
     pub scan: Option<ScanProgressView>,
     pub build: BuildInfo,
+    #[serde(default)]
+    pub config_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -866,9 +919,21 @@ fn reset_changed_destination_offsets(
     Ok(())
 }
 
+/// Latest non-fatal config problems, refreshed whenever the config is loaded or
+/// saved and surfaced through runtime status for the UI status bar.
+static CONFIG_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 fn apply_runtime_config(cfg: &AppConfig) {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
     configure_progress_file(&cfg.app.data_db);
+    *CONFIG_WARNINGS.lock().unwrap_or_else(|err| err.into_inner()) = config_warnings(cfg);
+}
+
+fn current_config_warnings() -> Vec<String> {
+    CONFIG_WARNINGS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1084,6 +1149,86 @@ mod tests {
         assert_eq!(source.managed_by, "controller-1");
         assert_eq!(source.machine_id, "local");
         assert_eq!(source.src, PathBuf::from("/zfs"));
+    }
+
+    #[test]
+    fn delegated_config_collapses_self_references_and_prunes_self_machine() {
+        let temp = temp_dir("backend_delegated_self");
+        let config_path = temp.join("auto_sync.toml");
+        let mut initial = AppConfig::default();
+        initial.app.data_db = temp.join("state").join("auto_sync.sqlite");
+        initial.app.log_dir = temp.join("logs");
+        crate::core::config::save_config(&config_path, &initial).unwrap();
+
+        let backend = Backend::new(config_path.clone(), 18765);
+        // Controller pushes a machine list that includes an entry for THIS host
+        // (loopback) plus a genuine remote peer, and a source whose source and
+        // destination still reference the self-entry by id.
+        let self_machine = MachineConfig {
+            id: "selfhost".to_string(),
+            alias_name: "selfhost".to_string(),
+            name: "selfhost".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 18765,
+            ssh_user: "root".to_string(),
+            ssh_port: 10022,
+            os: "linux".to_string(),
+            install_dir: PathBuf::from("/opt/auto_sync"),
+            enabled: true,
+            manual: true,
+        };
+        let remote_machine = MachineConfig {
+            id: "peer".to_string(),
+            host: "192.168.240.9".to_string(),
+            ..self_machine.clone()
+        };
+        let delegated = crate::core::config::SourceGroupConfig {
+            id: "src_self".to_string(),
+            machine_id: "selfhost".to_string(),
+            src: PathBuf::from("/zfs"),
+            add_directory: false,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: crate::core::config::SyncMode::Mirror,
+            snapshot: crate::core::config::SnapshotConfig::default(),
+            destinations: vec![crate::core::config::DestinationConfig {
+                id: "dst_self".to_string(),
+                machine_id: "selfhost".to_string(),
+                path: PathBuf::from("/zfs_pool"),
+                enabled: true,
+                schedule: crate::core::config::ScheduleConfig::default(),
+                sync: None,
+            }],
+        };
+
+        backend
+            .apply_delegated_source_groups(DelegatedSourceGroupsRequest {
+                controller_id: "controller-1".to_string(),
+                machines: vec![self_machine, remote_machine],
+                source_groups: vec![delegated],
+            })
+            .unwrap();
+
+        let saved = crate::core::config::load_config(&config_path).unwrap();
+        let source = saved
+            .source_groups
+            .iter()
+            .find(|s| s.id == "src_self")
+            .unwrap();
+        // Self references collapsed to "local".
+        assert_eq!(source.machine_id, "local");
+        assert_eq!(source.destinations[0].machine_id, "local");
+        // The self-entry was not added as a duplicate machine; the genuine
+        // remote peer was kept.
+        assert!(
+            !saved.machines.iter().any(|m| m.id == "selfhost"),
+            "self machine should be pruned"
+        );
+        assert!(
+            saved.machines.iter().any(|m| m.id == "peer"),
+            "remote peer should be retained"
+        );
     }
 
     #[test]

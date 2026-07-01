@@ -836,6 +836,22 @@ th {
   text-align: center;
 }
 
+.status-config-error {
+  flex: 0 0 auto;
+  max-width: 320px;
+  overflow: hidden;
+  border: 1px solid #dc2626;
+  border-radius: 6px;
+  background: rgba(220, 38, 38, 0.12);
+  color: #dc2626;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  cursor: help;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .status-build {
   min-width: 0;
   max-width: 260px;
