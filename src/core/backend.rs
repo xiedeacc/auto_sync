@@ -22,10 +22,7 @@ use crate::core::progress::{
     current_transfer_progress,
 };
 use crate::core::state::{DestinationView, ScanReport, State as DbState};
-use crate::core::sync::{
-    SyncRequestMode, current_sync_kind, sync_is_running, try_sync_all_now,
-    try_sync_destination_now_with_mode, try_sync_source_now,
-};
+use crate::core::sync::{SyncRequestMode, current_sync_kind, sync_is_running};
 
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MANUAL_DISCOVERY_MIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -213,12 +210,7 @@ impl Backend {
     pub fn sync_now(&self) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
-        ensure_local_not_syncing()?;
-        let remote_machines = remote_source_machines(&cfg);
-        for machine in &remote_machines {
-            ensure_remote_machine_not_syncing(&machine)?;
-        }
-        for machine in remote_machines {
+        for machine in remote_source_machines(&cfg) {
             let _: Vec<DestinationView> = remote_post_json(
                 &machine,
                 "/api/sync-now",
@@ -226,9 +218,14 @@ impl Backend {
                 Duration::from_secs(30),
             )?;
         }
-        let mut state_db = DbState::open(&cfg.app.data_db)?;
+        let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
-        try_sync_all_now(&cfg, &mut state_db)?;
+        // Record the request synchronously so the returned statuses show the
+        // new targets, then run the engine in the background: a busy engine
+        // queues the work instead of rejecting it, and a long sync cannot
+        // time out the caller (delegated requests included).
+        state_db.force_target_all_destinations(&cfg)?;
+        spawn_background_sync(cfg.clone(), "incremental");
         self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
@@ -236,7 +233,6 @@ impl Backend {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
         if let Some(machine) = source_execution_machine(&cfg, source_id)? {
-            ensure_remote_machine_not_syncing(&machine)?;
             let _: Vec<DestinationView> = remote_post_json(
                 &machine,
                 "/api/sync-source-now",
@@ -247,9 +243,10 @@ impl Backend {
             )?;
             return self.status();
         }
-        let mut state_db = DbState::open(&cfg.app.data_db)?;
+        let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
-        try_sync_source_now(&cfg, &mut state_db, source_id)?;
+        state_db.force_target_source(&cfg, source_id)?;
+        spawn_background_sync(cfg.clone(), "incremental");
         self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
@@ -262,7 +259,6 @@ impl Backend {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
         if let Some(machine) = source_execution_machine(&cfg, source_id)? {
-            ensure_remote_machine_not_syncing(&machine)?;
             let _: Vec<DestinationView> = remote_post_json(
                 &machine,
                 "/api/sync-destination-now",
@@ -275,9 +271,16 @@ impl Backend {
             )?;
             return self.status();
         }
-        let mut state_db = DbState::open(&cfg.app.data_db)?;
+        let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
-        try_sync_destination_now_with_mode(&cfg, &mut state_db, source_id, destination_id, mode)?;
+        crate::core::sync::queue_destination_sync(
+            &cfg,
+            &state_db,
+            source_id,
+            destination_id,
+            mode,
+        )?;
+        spawn_background_sync(cfg.clone(), sync_request_mode_wire_value(mode));
         self.merge_remote_source_statuses(&cfg, state_db.destination_views(&cfg)?)
     }
 
@@ -771,51 +774,20 @@ fn sync_request_mode_wire_value(mode: SyncRequestMode) -> &'static str {
     }
 }
 
-fn ensure_remote_machine_not_syncing(machine: &MachineConfig) -> Result<()> {
-    let status: RuntimeStatus =
-        remote_get_json(machine, "/api/runtime-status", Duration::from_secs(3)).with_context(
-            || {
-                format!(
-                    "failed to query sync status from {}",
-                    machine_label(machine)
-                )
-            },
-        )?;
-    if status.syncing {
-        anyhow::bail!(
-            "sync already in progress on {}{}",
-            machine_label(machine),
-            sync_in_progress_suffix(status.sync_kind.as_deref())
-        );
-    }
-    Ok(())
-}
-
-fn ensure_local_not_syncing() -> Result<()> {
-    if sync_is_running() {
-        anyhow::bail!(
-            "sync already in progress{}",
-            sync_in_progress_suffix(current_sync_kind().as_deref())
-        );
-    }
-    Ok(())
-}
-
-/// " (full)", " (incremental)", " (compare)", … to append to an "in progress"
-/// message. Empty when the kind is unknown.
-fn sync_in_progress_suffix(kind: Option<&str>) -> String {
-    let kind = kind.map(str::trim).unwrap_or("");
-    if kind.is_empty() {
-        return String::new();
-    }
-    let label = match kind {
-        "incremental" | "automatic" => "Incremental",
-        "full" => "Full",
-        "changed_since" => "Changed Since",
-        "scan" => "Compare",
-        _ => return String::new(),
-    };
-    format!(" ({label})")
+/// Run the sync engine on a detached thread: waits for any running pass to
+/// finish (so a queued manual request executes right afterwards) and drives
+/// all pending cycles. Errors are logged; the destination statuses carry the
+/// outcome for the UI's polling.
+fn spawn_background_sync(cfg: AppConfig, kind: &str) {
+    let kind = kind.to_string();
+    std::thread::spawn(move || match DbState::open(&cfg.app.data_db) {
+        Ok(mut state) => {
+            if let Err(err) = crate::core::sync::run_pending_with_kind(&cfg, &mut state, &kind) {
+                tracing::warn!(error = %err, kind, "manual sync run failed");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "manual sync could not open state db"),
+    });
 }
 
 fn machine_label(machine: &MachineConfig) -> String {

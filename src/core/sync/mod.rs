@@ -166,35 +166,18 @@ pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     sync_all_pending_inner(cfg, state)
 }
 
-pub fn try_sync_all_now(cfg: &AppConfig, state: &mut State) -> Result<()> {
-    let _serialized = sync_gate()
-        .try_lock()
-        .map_err(|_| anyhow!("sync already in progress"))?;
-    let _kind = set_sync_kind("incremental");
-    state.force_target_all_destinations(cfg)?;
-    sync_all_pending_inner(cfg, state)
-}
-
-pub fn try_sync_source_now(cfg: &AppConfig, state: &mut State, source_id: &str) -> Result<()> {
-    let _serialized = sync_gate()
-        .try_lock()
-        .map_err(|_| anyhow!("sync already in progress"))?;
-    let _kind = set_sync_kind("incremental");
-    state.force_target_source(cfg, source_id)?;
-    sync_all_pending_inner(cfg, state)
-}
-
-pub fn try_sync_destination_now_with_mode(
+/// Record a manual sync request for one destination WITHOUT running the
+/// engine: close the open cycle, target this destination, and set the mode
+/// flags. Plain DB writes — safe while a sync is running; the engine (or the
+/// next scheduler tick) picks the target up on its own, so a busy engine
+/// queues the request instead of failing it with "sync already in progress".
+pub fn queue_destination_sync(
     cfg: &AppConfig,
-    state: &mut State,
+    state: &State,
     source_id: &str,
     destination_id: &str,
     mode: SyncRequestMode,
 ) -> Result<()> {
-    let _serialized = sync_gate()
-        .try_lock()
-        .map_err(|_| anyhow!("sync already in progress"))?;
-    let _kind = set_sync_kind(sync_request_mode_wire_value(mode));
     if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
         match mode {
             SyncRequestMode::Incremental => {}
@@ -204,6 +187,15 @@ pub fn try_sync_destination_now_with_mode(
             }
         }
     }
+    Ok(())
+}
+
+/// Drive all pending cycles under a manual sync kind, WAITING for a running
+/// engine pass to finish instead of failing. Intended for background threads
+/// serving a queued manual request.
+pub fn run_pending_with_kind(cfg: &AppConfig, state: &mut State, kind: &str) -> Result<()> {
+    let _serialized = sync_gate().lock().unwrap_or_else(|err| err.into_inner());
+    let _kind = set_sync_kind(kind);
     sync_all_pending_inner(cfg, state)
 }
 

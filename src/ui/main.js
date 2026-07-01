@@ -855,12 +855,8 @@ function bindSourceControls(source, sourceIndex, group) {
       updateStatusUi();
       return;
     }
-    const activity = activityForSource(source);
-    if (activityIsSyncing(activity)) {
-      setMessage(activitySyncingLabel(activity));
-      updateStatusUi();
-      return;
-    }
+    // A sync already in flight is fine: the backend queues the request and
+    // the engine picks it up right after the current pass.
     runBusy("Checking changes...", async () => {
       await saveConfig();
       statuses = await invoke("sync_source_now", { sourceId: source.id });
@@ -975,12 +971,8 @@ function renderSyncRows(source, group) {
         updateStatusUi();
         return;
       }
-      const activity = activityForSource(source);
-      if (activityIsSyncing(activity)) {
-        setMessage(activitySyncingLabel(activity));
-        updateStatusUi();
-        return;
-      }
+      // A sync already in flight is fine: the backend queues the request and
+      // the engine picks it up right after the current pass.
       if (mode === "scan") {
         // The scan runs in the background (it can take many minutes on a large
         // tree and must not block the backup). Open the info panel so live
