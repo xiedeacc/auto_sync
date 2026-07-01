@@ -33,6 +33,11 @@ pub struct ScanProgressView {
     pub current_path: String,
     pub entries_seen: u64,
     pub updated_at_ms: u128,
+    /// "sync" for backup tree walks, "compare" for dry-run Scan walks; lets the
+    /// UI show each activity only in its own view instead of the two stealing
+    /// one shared progress display.
+    #[serde(default)]
+    pub kind: String,
 }
 
 #[derive(Debug)]
@@ -60,6 +65,34 @@ struct ScanProgressState {
     updated_at: Instant,
     last_write_at: Instant,
     updated_at_ms: u128,
+    kind: String,
+}
+
+thread_local! {
+    /// Marks the current thread as running a dry-run compare; tree walks it
+    /// starts are tagged "compare" instead of "sync" in the progress view.
+    static IN_COMPARE_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII marker for compare (dry-run Scan) work on this thread. Threads spawned
+/// while it is held do NOT inherit it — spawn-site code must re-enter.
+pub struct CompareContextGuard {
+    previous: bool,
+}
+
+impl Drop for CompareContextGuard {
+    fn drop(&mut self) {
+        IN_COMPARE_CONTEXT.with(|flag| flag.set(self.previous));
+    }
+}
+
+pub fn enter_compare_context() -> CompareContextGuard {
+    let previous = IN_COMPARE_CONTEXT.with(|flag| flag.replace(true));
+    CompareContextGuard { previous }
+}
+
+pub fn in_compare_context() -> bool {
+    IN_COMPARE_CONTEXT.with(|flag| flag.get())
 }
 
 pub struct TransferProgressGuard {
@@ -205,6 +238,7 @@ pub fn start_scan(root_path: &Path) -> ScanProgressGuard {
         updated_at: now,
         last_write_at: now,
         updated_at_ms: now_ms(),
+        kind: if in_compare_context() { "compare" } else { "sync" }.to_string(),
     });
     if let Some(state) = progress.as_ref() {
         write_scan_progress_file(&state.view());
@@ -364,6 +398,7 @@ impl ScanProgressState {
             current_path: self.current_path.clone(),
             entries_seen: self.entries_seen,
             updated_at_ms: self.updated_at_ms,
+            kind: self.kind.clone(),
         }
     }
 }

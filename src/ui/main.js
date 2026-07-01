@@ -372,9 +372,9 @@ function updateStatusBar() {
       ...runtimeStatus.scan,
       received_at_ms: Date.now(),
     };
-    renderScanLikeStatus("Checking changes", lastRuntimeScan);
+    renderScanLikeStatus(scanStatusLabel(lastRuntimeScan), lastRuntimeScan);
   } else if (busy && lastRuntimeScan) {
-    renderScanLikeStatus("Checking changes", lastRuntimeScan);
+    renderScanLikeStatus(scanStatusLabel(lastRuntimeScan), lastRuntimeScan);
   } else {
     if (!busy) {
       lastRuntimeScan = null;
@@ -410,6 +410,10 @@ function updateConfigErrorIndicator() {
   el.statusConfigError.hidden = false;
   el.statusConfigError.textContent = `⚠ ${label}`;
   el.statusConfigError.title = errors.join("\n");
+}
+
+function scanStatusLabel(scan) {
+  return scan && scan.kind === "compare" ? "Comparing" : "Checking changes";
 }
 
 function renderScanLikeStatus(verb, scan) {
@@ -1861,7 +1865,11 @@ function renderDestinationLogModal() {
   const activity = activityForSource(source);
   const runtime = activityRuntime(activity, source);
   const transfer = matchingTransfer(runtime, dst);
-  const scan = runtime && runtime.scan;
+  // Scan progress is tagged by kind; the Compare view (the only consumer of
+  // `scan` here) must not display a concurrent sync's tree walk. A missing
+  // kind (older peer build) keeps the legacy shared behavior.
+  const rawScan = runtime && runtime.scan;
+  const scan = rawScan && rawScan.kind === "sync" ? null : rawScan;
   const rows = [
     ["Task", `${source.id} -> ${dst.id}`],
     ["Source Path", machinePathLabel(source.machine_id, source.src)],
@@ -1927,6 +1935,12 @@ function renderScanReportSection(source, dst) {
   const report = scanReports[scanReportKey(source.id, dst.id)];
   if (!report) {
     return "";
+  }
+  if (report.error) {
+    return `
+      <div class="dst-log-section-title">Last compare — ${escapeHtml(formatScanTime(report.scanned_at))}</div>
+      <div class="scan-diff-error">Compare failed: ${escapeHtml(report.error)}</div>
+    `;
   }
   const total = (report.to_add || 0) + (report.to_update || 0) + (report.to_delete || 0) + (report.type_mismatch || 0);
   const title = `<div class="dst-log-section-title">Last compare — ${escapeHtml(formatScanTime(report.scanned_at))} (${total} difference${total === 1 ? "" : "s"})</div>`;

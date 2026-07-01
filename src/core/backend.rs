@@ -320,6 +320,22 @@ impl Backend {
                     &destination_id,
                 ) {
                     tracing::warn!(error = %err, source = source_id, destination = destination_id, "scan failed");
+                    // Persist the failure (with a fresh scanned_at) so the UI's
+                    // report poll terminates and surfaces the error instead of
+                    // showing "compare running" forever. A concurrent-scan
+                    // rejection must not clobber the other scan's report.
+                    if !crate::core::sync::scan_error_is_already_running(&err) {
+                        let failure = ScanReport {
+                            source_id: source_id.clone(),
+                            destination_id: destination_id.clone(),
+                            scanned_at: chrono::Utc::now().to_rfc3339(),
+                            error: format!("{err:#}").chars().take(500).collect(),
+                            ..Default::default()
+                        };
+                        if let Err(err) = state.put_scan_report(&failure) {
+                            tracing::warn!(error = %err, "failed to persist scan failure report");
+                        }
+                    }
                 }
             }
             Err(err) => tracing::warn!(error = %err, "scan could not open state db"),

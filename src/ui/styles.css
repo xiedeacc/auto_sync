@@ -1072,6 +1072,12 @@ th {
   color: #2e9e5b;
 }
 
+.scan-diff-error {
+  margin-top: 8px;
+  color: #c0392b;
+  overflow-wrap: anywhere;
+}
+
 .scan-diff-more {
   margin-top: 6px;
   color: var(--muted);

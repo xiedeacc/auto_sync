@@ -117,6 +117,15 @@ fn scan_gate() -> &'static Mutex<()> {
     SCAN_GATE.get_or_init(|| Mutex::new(()))
 }
 
+const SCAN_ALREADY_RUNNING: &str = "a compare is already in progress";
+
+/// True when `err` is the scan gate's concurrent-run rejection; callers use
+/// this to avoid overwriting the running scan's report with a failure record.
+pub fn scan_error_is_already_running(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains(SCAN_ALREADY_RUNNING))
+}
+
 pub fn sync_is_running() -> bool {
     sync_gate().try_lock().is_err()
 }
@@ -293,8 +302,11 @@ pub fn scan_destination_now(
     // the real backup, so a long compare cannot stall syncing.
     let _serialized = scan_gate()
         .try_lock()
-        .map_err(|_| anyhow!("a scan is already in progress"))?;
+        .map_err(|_| anyhow!("{SCAN_ALREADY_RUNNING}"))?;
     let _kind = set_sync_kind_if_empty("scan");
+    // Tag tree walks started here as compare progress so they do not fight a
+    // concurrently running sync's scan for the UI progress display.
+    let _compare = progress::enter_compare_context();
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
     progress::configure_progress_file(&cfg.app.data_db);
 
@@ -309,7 +321,9 @@ pub fn scan_destination_now(
         .find(|d| d.id == destination_id && d.enabled)
         .ok_or_else(|| anyhow!("destination not found or disabled: {destination_id}"))?;
     let sync = effective_sync_config(cfg, dst);
-    let timeout = Duration::from_secs(sync.transfer_timeout_secs.max(1));
+    // Whole-tree snapshot responses arrive only after the peer finishes its
+    // walk; the per-file transfer timeout is far too small for that.
+    let timeout = snapshot_timeout(&sync);
 
     let source_machine_id = machine_id_or_local(&source.machine_id);
     let source_machine = machine_or_local(cfg, source_machine_id)?;
@@ -328,18 +342,35 @@ pub fn scan_destination_now(
         sync.checksum,
         timeout,
     )?;
+    let mut dst_snapshot = if source_info.kind == "dir" {
+        snapshot_on_machine(
+            dst_machine_id,
+            &dst_machine,
+            &dst_root,
+            TransferSnapshotMode::Destination,
+            &[],
+            sync.checksum,
+            timeout,
+        )?
+    } else {
+        // A file source syncs exactly one destination path and never deletes
+        // anything else; snapshot just that path so mirror mode does not report
+        // the destination directory's other files as pending deletions.
+        snapshot_paths_on_machine(
+            dst_machine_id,
+            &dst_machine,
+            &dst_root,
+            std::slice::from_ref(&source_info.name),
+            TransferSnapshotMode::Destination,
+            &[],
+            sync.checksum,
+            timeout,
+        )?
+    };
     if source_info.kind != "dir" {
         source_snapshot.retain(|entry| entry.rel_path == source_info.name);
+        dst_snapshot.retain(|entry| entry.rel_path == source_info.name);
     }
-    let dst_snapshot = snapshot_on_machine(
-        dst_machine_id,
-        &dst_machine,
-        &dst_root,
-        TransferSnapshotMode::Destination,
-        &[],
-        sync.checksum,
-        timeout,
-    )?;
 
     let report = build_scan_report(
         source_id,
@@ -378,8 +409,10 @@ fn build_scan_report(
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
 ) -> ScanReport {
-    let source_map = map_entries(source_snapshot);
-    let dst_map = map_entries(dst_snapshot);
+    // Reference maps: the snapshots can each hold hundreds of thousands of
+    // entries, and cloning both into owned maps doubles peak memory.
+    let source_map = map_entry_refs(source_snapshot);
+    let dst_map = map_entry_refs(dst_snapshot);
     let mut report = ScanReport {
         source_id: source_id.to_string(),
         destination_id: destination_id.to_string(),
@@ -407,7 +440,7 @@ fn build_scan_report(
         if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
             continue;
         }
-        match dst_map.get(&entry.rel_path) {
+        match dst_map.get(entry.rel_path.as_str()) {
             None => {
                 report.to_add += 1;
                 push(&entry.rel_path, "add", &entry.file_type);
@@ -433,7 +466,7 @@ fn build_scan_report(
             if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
                 continue;
             }
-            if !source_map.contains_key(&entry.rel_path) {
+            if !source_map.contains_key(entry.rel_path.as_str()) {
                 report.to_delete += 1;
                 push(&entry.rel_path, "delete", &entry.file_type);
             }
@@ -700,6 +733,24 @@ fn default_transfer_timeout_secs() -> u64 {
 
 fn transfer_timeout(sync: &NativeSyncConfig) -> Duration {
     Duration::from_secs(sync.transfer_timeout_secs.max(1))
+}
+
+/// Minimum timeout for whole-tree snapshot requests. Unlike per-file transfer
+/// calls, the response only starts after the peer finishes walking the entire
+/// tree (and re-hashing every file in checksum mode), so the configured
+/// transfer timeout — sized for one file — would kill any large-tree snapshot.
+/// A genuinely hung peer still fails, just later.
+fn snapshot_timeout_floor(checksum: bool) -> Duration {
+    if checksum {
+        // Full-content re-hash of the tree: hours on multi-terabyte trees.
+        Duration::from_secs(6 * 3600)
+    } else {
+        Duration::from_secs(3600)
+    }
+}
+
+fn snapshot_timeout(sync: &NativeSyncConfig) -> Duration {
+    transfer_timeout(sync).max(snapshot_timeout_floor(sync.checksum))
 }
 
 fn effective_sync_config(cfg: &AppConfig, dst: &DestinationConfig) -> NativeSyncConfig {
@@ -2391,7 +2442,8 @@ fn sync_cycle_with_transfer(
     }
 
     let source_checksum = any_ready_destination_needs_checksum(cfg, source, &ready_destinations);
-    let source_timeout = ready_destination_timeout(cfg, source, &ready_destinations);
+    let source_timeout = ready_destination_timeout(cfg, source, &ready_destinations)
+        .max(snapshot_timeout_floor(source_checksum));
     state.mark_cycle_status(cycle.id, "planning")?;
 
     // Stable read view when the source lives on this machine: reads come from
@@ -2654,7 +2706,8 @@ fn sync_directory_with_transfer(
         TransferSnapshotMode::Destination,
         &[],
         sync.checksum,
-        timeout,
+        // Whole-tree walk on the peer: the per-file timeout is far too small.
+        snapshot_timeout(sync),
     )?;
     let dst_map = map_entries(&dst_snapshot);
 
@@ -2941,14 +2994,16 @@ fn sync_cycle_file_with_transfer(
             targeted_indexes.push(dst_index);
         }
     }
+    let source_checksum = any_ready_destination_needs_checksum(cfg, source, &targeted_indexes);
     let mut source_snapshot = snapshot_on_machine(
         source_machine_id,
         &source_machine,
         &source_info.base,
         TransferSnapshotMode::Source,
         &source.excludes,
-        any_ready_destination_needs_checksum(cfg, source, &targeted_indexes),
-        ready_destination_timeout(cfg, source, &targeted_indexes),
+        source_checksum,
+        ready_destination_timeout(cfg, source, &targeted_indexes)
+            .max(snapshot_timeout_floor(source_checksum)),
     )?;
     source_snapshot.retain(|entry| entry.rel_path == source_info.name);
     state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
@@ -3058,7 +3113,7 @@ fn sync_file_with_transfer(
             TransferSnapshotMode::Destination,
             &[],
             sync.checksum,
-            timeout,
+            snapshot_timeout(sync),
         )?;
         let dst_map = map_entries(&dst_snapshot);
         let needs_copy = match dst_map.get(&entry.rel_path) {
@@ -3195,7 +3250,11 @@ fn remote_snapshot_with_progress(
     let poll_stop = Arc::clone(&stop);
     let poll_machine = machine.clone();
     let poll_root = root.to_path_buf();
+    // Thread-locals do not cross spawn; carry the compare tag explicitly so the
+    // mirrored remote progress lands in the right UI view.
+    let compare_context = progress::in_compare_context();
     let poller = thread::spawn(move || {
+        let _compare = compare_context.then(progress::enter_compare_context);
         let scan_progress = progress::start_scan(&poll_root);
         while !poll_stop.load(Ordering::Relaxed) {
             if let Ok(status) = remote_get_json::<PeerRuntimeStatus>(
@@ -5663,6 +5722,15 @@ fn map_entries(entries: &[SnapshotEntry]) -> BTreeMap<String, SnapshotEntry> {
         .collect()
 }
 
+/// Borrowing variant of [`map_entries`] for read-only comparisons over large
+/// snapshots, avoiding a full deep copy of every entry.
+fn map_entry_refs(entries: &[SnapshotEntry]) -> BTreeMap<&str, &SnapshotEntry> {
+    entries
+        .iter()
+        .map(|entry| (entry.rel_path.as_str(), entry))
+        .collect()
+}
+
 fn hash_file(path: &Path) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -7274,6 +7342,73 @@ mod tests {
         sync.mirror = false;
         let report = build_scan_report("s", "d", &source, &dst, &[], &sync);
         assert_eq!(report.to_delete, 0);
+    }
+
+    #[test]
+    fn scan_report_error_field_defaults_for_legacy_json() {
+        // Reports persisted by older builds have no `error` field; they must
+        // keep deserializing (and an empty error means success).
+        let legacy = r#"{
+            "source_id":"s","destination_id":"d","scanned_at":"t",
+            "source_entries":1,"dst_entries":1,"in_sync":1,"to_add":0,
+            "to_update":0,"to_delete":0,"type_mismatch":0,
+            "differences":[],"truncated":false
+        }"#;
+        let report: ScanReport = serde_json::from_str(legacy).unwrap();
+        assert!(report.error.is_empty());
+    }
+
+    #[test]
+    fn snapshot_entry_omits_missing_hash_and_still_round_trips() {
+        let entry = test_file_entry("a.txt", 5);
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("hash"), "null hash must be omitted: {json}");
+        let back: SnapshotEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entry);
+        // Legacy peers still send an explicit null.
+        let legacy: SnapshotEntry = serde_json::from_str(
+            r#"{"rel_path":"a.txt","file_type":"file","size":5,"mtime_ns":123,"mode":420,"hash":null}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.hash, None);
+    }
+
+    #[test]
+    fn snapshot_timeout_floors_the_per_file_transfer_timeout() {
+        let mut sync = NativeSyncConfig::default();
+        sync.transfer_timeout_secs = 120;
+        sync.checksum = false;
+        assert_eq!(snapshot_timeout(&sync), Duration::from_secs(3600));
+        sync.checksum = true;
+        assert_eq!(snapshot_timeout(&sync), Duration::from_secs(6 * 3600));
+        sync.transfer_timeout_secs = 24 * 3600;
+        assert_eq!(snapshot_timeout(&sync), Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
+    fn detects_concurrent_scan_rejection() {
+        let err = anyhow!("{SCAN_ALREADY_RUNNING}").context("scan wrapper");
+        assert!(scan_error_is_already_running(&err));
+        assert!(!scan_error_is_already_running(&anyhow!("disk on fire")));
+    }
+
+    #[test]
+    fn compare_context_tags_scan_progress() {
+        // Hold both engine gates so no parallel test's tree walk replaces the
+        // global scan-progress slot mid-assertion.
+        let _sync_held = sync_gate().lock().unwrap_or_else(|e| e.into_inner());
+        let _scan_held = scan_gate().lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let _compare = progress::enter_compare_context();
+            let guard = progress::start_scan(Path::new("compare_root"));
+            let view = progress::current_scan_progress().unwrap();
+            assert_eq!(view.kind, "compare");
+            drop(guard);
+        }
+        let guard = progress::start_scan(Path::new("sync_root"));
+        let view = progress::current_scan_progress().unwrap();
+        assert_eq!(view.kind, "sync");
+        drop(guard);
     }
 
     #[test]

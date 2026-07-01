@@ -44,6 +44,10 @@ pub struct SnapshotEntry {
     pub size: i64,
     pub mtime_ns: i64,
     pub mode: u32,
+    /// Omitted from JSON when absent: whole-tree snapshots cross the wire with
+    /// hundreds of thousands of entries, and a literal `"hash":null` per entry
+    /// adds megabytes for nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
 }
 
@@ -83,6 +87,9 @@ pub struct ScanDiffEntry {
 
 /// Result of a dry-run Scan: how source and destination differ, without making
 /// any change. `differences` is a capped sample; `truncated` flags more.
+/// A non-empty `error` marks a failed scan attempt (the counts are then
+/// meaningless); it is persisted so the UI can surface the failure instead of
+/// waiting forever for a report that will never arrive.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ScanReport {
     pub source_id: String,
@@ -97,6 +104,8 @@ pub struct ScanReport {
     pub type_mismatch: u64,
     pub differences: Vec<ScanDiffEntry>,
     pub truncated: bool,
+    #[serde(default)]
+    pub error: String,
 }
 
 pub struct State {
