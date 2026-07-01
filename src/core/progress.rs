@@ -49,6 +49,9 @@ struct TransferProgressState {
     transferred_bytes: u64,
     total_bytes: u64,
     bytes_per_sec: u64,
+    /// True once at least one speed sample window has completed; gates the
+    /// average-since-start fallback in [`Self::view`].
+    sampled: bool,
     last_bytes: u64,
     started_at: Instant,
     last_sample_at: Instant,
@@ -211,6 +214,7 @@ pub fn start_transfer(
         transferred_bytes: transferred_bytes.min(total_bytes),
         total_bytes,
         bytes_per_sec: 0,
+        sampled: false,
         last_bytes: transferred_bytes.min(total_bytes),
         started_at: now,
         last_sample_at: now,
@@ -266,6 +270,7 @@ pub fn begin_transfer(
         transferred_bytes: 0,
         total_bytes,
         bytes_per_sec: 0,
+        sampled: false,
         last_bytes: 0,
         started_at: now,
         last_sample_at: now,
@@ -362,11 +367,21 @@ impl TransferProgressState {
         }
         let byte_delta = self.transferred_bytes.saturating_sub(self.last_bytes);
         if byte_delta == 0 {
-            return false;
+            // A stalled transfer must not keep showing its last speed forever:
+            // decay the EWMA toward zero on empty sample windows (reached via
+            // the periodic status poll).
+            if self.bytes_per_sec == 0 {
+                return false;
+            }
+            self.bytes_per_sec = ewma_speed(self.bytes_per_sec, 0);
+            self.sampled = true;
+            self.last_sample_at = now;
+            return true;
         }
         let millis = elapsed.as_millis().max(1);
         let sample = ((byte_delta as u128) * 1000 / millis) as u64;
         self.bytes_per_sec = ewma_speed(self.bytes_per_sec, sample);
+        self.sampled = true;
         self.last_bytes = self.transferred_bytes;
         self.last_sample_at = now;
         true
@@ -374,7 +389,10 @@ impl TransferProgressState {
 
     fn view(&self) -> TransferProgressView {
         let elapsed = self.started_at.elapsed().as_secs().max(1);
-        let bytes_per_sec = if self.bytes_per_sec == 0 && self.transferred_bytes > 0 {
+        // Before the first real sample lands, show the average since start so
+        // the reading is never a misleading zero; once sampled, trust the EWMA
+        // (including a genuine decay to zero on stall).
+        let bytes_per_sec = if !self.sampled && self.transferred_bytes > 0 {
             self.transferred_bytes / elapsed
         } else {
             self.bytes_per_sec
@@ -515,6 +533,39 @@ mod tests {
     }
 
     #[test]
+    fn transfer_speed_decays_to_zero_when_stalled() {
+        let now = std::time::Instant::now();
+        let mut state = TransferProgressState {
+            token: 1,
+            destination_id: "d".to_string(),
+            destination_path: "p".to_string(),
+            rel_path: "f".to_string(),
+            transferred_bytes: 1_000,
+            total_bytes: 10_000,
+            bytes_per_sec: 0,
+            sampled: false,
+            last_bytes: 0,
+            started_at: now - std::time::Duration::from_secs(1),
+            last_sample_at: now - std::time::Duration::from_millis(500),
+            updated_at: now,
+            updated_at_ms: 0,
+        };
+        assert!(state.sample_speed(now, false));
+        let initial = state.bytes_per_sec;
+        assert!(initial > 0);
+
+        // No new bytes across later windows: the speed must decay, not freeze.
+        let mut later = now;
+        for _ in 0..40 {
+            later += std::time::Duration::from_millis(500);
+            state.sample_speed(later, false);
+        }
+        assert_eq!(state.bytes_per_sec, 0, "stalled speed decays to zero");
+        // ...and the view must not resurrect it via the since-start average.
+        assert_eq!(state.view().bytes_per_sec, 0);
+    }
+
+    #[test]
     fn transfer_speed_ewma_smooths_new_samples() {
         assert_eq!(ewma_speed(1_000, 2_000), 1_350);
         assert_eq!(ewma_speed(2_000, 1_000), 1_650);
@@ -531,6 +582,7 @@ mod tests {
             transferred_bytes: 10_000,
             total_bytes: 20_000,
             bytes_per_sec: 0,
+            sampled: false,
             last_bytes: 0,
             started_at: now - Duration::from_secs(5),
             last_sample_at: now - Duration::from_secs(5),

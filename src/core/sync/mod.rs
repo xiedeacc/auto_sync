@@ -458,6 +458,110 @@ fn machine_or_local(
     bail!("unknown machine: {machine_id}")
 }
 
+/// The single manifest-comparison result shared by Scan (report), the
+/// cross-machine full transfer, and the local full sync — so "what differs"
+/// can never diverge between the difference report and the actual repair.
+/// Comparison is by relative path (traversal order is irrelevant); files
+/// compare size+mtime (or hash in checksum mode), symlinks compare target,
+/// and directories only count as different on add/type-mismatch — an
+/// mtime-only touch on a directory must not trigger any work.
+struct ManifestDiff<'a> {
+    /// Files/symlinks to copy: (source entry, existing same-type dst entry
+    /// usable as a delta basis).
+    transfer: Vec<(&'a SnapshotEntry, Option<&'a SnapshotEntry>)>,
+    /// Source entries whose destination path holds a DIFFERENT file type
+    /// (must be removed before the source version is written).
+    type_mismatch: Vec<&'a SnapshotEntry>,
+    /// Source directories missing from the destination.
+    missing_dirs: Vec<&'a SnapshotEntry>,
+    /// Destination-only entries (mirror delete candidates), excludes applied.
+    extras: Vec<&'a SnapshotEntry>,
+    /// Source entries already matching on the destination.
+    in_sync: u64,
+}
+
+fn diff_manifests<'a>(
+    source_snapshot: &'a [SnapshotEntry],
+    dst_snapshot: &'a [SnapshotEntry],
+    excludes: &[PathBuf],
+    sync: &NativeSyncConfig,
+) -> ManifestDiff<'a> {
+    // Reference maps: the snapshots can each hold hundreds of thousands of
+    // entries, and cloning both into owned maps doubles peak memory.
+    let source_map = map_entry_refs(source_snapshot);
+    let dst_map = map_entry_refs(dst_snapshot);
+    let mut diff = ManifestDiff {
+        transfer: Vec::new(),
+        type_mismatch: Vec::new(),
+        missing_dirs: Vec::new(),
+        extras: Vec::new(),
+        in_sync: 0,
+    };
+    for entry in source_snapshot {
+        if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
+            continue;
+        }
+        match dst_map.get(entry.rel_path.as_str()) {
+            None => {
+                if entry.file_type == "dir" {
+                    diff.missing_dirs.push(entry);
+                } else {
+                    diff.transfer.push((entry, None));
+                }
+            }
+            Some(existing) if existing.file_type != entry.file_type => {
+                diff.type_mismatch.push(entry);
+            }
+            Some(existing) => {
+                if entry.file_type == "dir" || entries_match(entry, existing, sync) {
+                    diff.in_sync += 1;
+                } else {
+                    diff.transfer.push((entry, Some(existing)));
+                }
+            }
+        }
+    }
+    for entry in dst_snapshot {
+        if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
+            continue;
+        }
+        if !source_map.contains_key(entry.rel_path.as_str()) {
+            diff.extras.push(entry);
+        }
+    }
+    diff
+}
+
+impl<'a> ManifestDiff<'a> {
+    /// The copy work list for a sync: everything in `transfer`, plus the
+    /// type-mismatched files/symlinks (their old destination entry is removed
+    /// first, so they copy with no delta basis). Directories are not copied —
+    /// they are created explicitly.
+    fn entries_to_copy(&self) -> Vec<(&'a SnapshotEntry, Option<&'a SnapshotEntry>)> {
+        self.transfer
+            .iter()
+            .copied()
+            .chain(
+                self.type_mismatch
+                    .iter()
+                    .filter(|entry| entry.file_type != "dir")
+                    .map(|entry| (*entry, None)),
+            )
+            .collect()
+    }
+
+    /// Mirror-delete candidates, deepest paths first.
+    fn extra_paths_deepest_first(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .extras
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .collect();
+        paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
+        paths
+    }
+}
+
 fn build_scan_report(
     source_id: &str,
     destination_id: &str,
@@ -466,16 +570,14 @@ fn build_scan_report(
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
 ) -> ScanReport {
-    // Reference maps: the snapshots can each hold hundreds of thousands of
-    // entries, and cloning both into owned maps doubles peak memory.
-    let source_map = map_entry_refs(source_snapshot);
-    let dst_map = map_entry_refs(dst_snapshot);
+    let diff = diff_manifests(source_snapshot, dst_snapshot, excludes, sync);
     let mut report = ScanReport {
         source_id: source_id.to_string(),
         destination_id: destination_id.to_string(),
         scanned_at: Utc::now().to_rfc3339(),
         source_entries: source_snapshot.len() as u64,
         dst_entries: dst_snapshot.len() as u64,
+        in_sync: diff.in_sync,
         ..Default::default()
     };
     let mut diffs: Vec<ScanDiffEntry> = Vec::new();
@@ -493,40 +595,27 @@ fn build_scan_report(
             });
         }
     };
-    for entry in source_snapshot {
-        if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
-            continue;
-        }
-        match dst_map.get(entry.rel_path.as_str()) {
-            None => {
-                report.to_add += 1;
-                push(&entry.rel_path, "add", &entry.file_type);
-            }
-            Some(existing) if existing.file_type != entry.file_type => {
-                report.type_mismatch += 1;
-                push(&entry.rel_path, "type_mismatch", &entry.file_type);
-            }
-            Some(existing) => {
-                // Directories only count as different on add/type-mismatch; an
-                // mtime-only touch is noise for a "what differs" report.
-                if entry.file_type == "dir" || entries_match(entry, existing, sync) {
-                    report.in_sync += 1;
-                } else {
-                    report.to_update += 1;
-                    push(&entry.rel_path, "update", &entry.file_type);
-                }
-            }
+    for (entry, existing) in &diff.transfer {
+        if existing.is_none() {
+            report.to_add += 1;
+            push(&entry.rel_path, "add", &entry.file_type);
+        } else {
+            report.to_update += 1;
+            push(&entry.rel_path, "update", &entry.file_type);
         }
     }
+    for entry in &diff.missing_dirs {
+        report.to_add += 1;
+        push(&entry.rel_path, "add", &entry.file_type);
+    }
+    for entry in &diff.type_mismatch {
+        report.type_mismatch += 1;
+        push(&entry.rel_path, "type_mismatch", &entry.file_type);
+    }
     if sync.mirror {
-        for entry in dst_snapshot {
-            if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
-                continue;
-            }
-            if !source_map.contains_key(entry.rel_path.as_str()) {
-                report.to_delete += 1;
-                push(&entry.rel_path, "delete", &entry.file_type);
-            }
+        for entry in &diff.extras {
+            report.to_delete += 1;
+            push(&entry.rel_path, "delete", &entry.file_type);
         }
     }
     drop(push);
@@ -1290,7 +1379,11 @@ fn finish_received_file(
         entry.mtime_ns / 1_000_000_000,
         (entry.mtime_ns % 1_000_000_000) as u32,
     );
-    set_file_mtime(tmp, mtime).ok();
+    if let Err(err) = set_file_mtime(tmp, mtime) {
+        // A file whose mtime cannot be recorded will compare as changed and
+        // re-transfer every cycle; make that visible instead of silent.
+        warn!(rel_path = entry.rel_path, error = %err, "failed to set received file mtime");
+    }
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1375,6 +1468,9 @@ fn send_file_tcp(
         }
         pos = chunk_end;
     }
+    // Catch torn streams: the hash covers what was read, not a consistent
+    // version — a same-size mutation mid-stream would otherwise pass.
+    ensure_source_stable(src, entry)?;
     let finish = TransferFinishFileRequest {
         root: destination_root.to_path_buf(),
         cycle_id,
@@ -1413,6 +1509,8 @@ fn send_put_file_tcp(
         );
         bail!("source changed while copying {}", entry.rel_path);
     }
+    // Catch same-size torn reads too (mutation mid-read keeps the length).
+    ensure_source_stable(src, entry)?;
     let _ = destination_id;
     let full_hash = blake3::hash(&bytes).to_hex().to_string();
     let path = put_file_api_path(destination_root, cycle_id, entry, &full_hash);
@@ -1472,6 +1570,8 @@ fn send_file_delta(
         );
         bail!("source changed while copying {}", entry.rel_path);
     }
+    // Catch same-size torn reads too (mutation mid-read keeps the length).
+    ensure_source_stable(src, entry)?;
     let delta_bytes = delta::build_delta(&new_data, &sums);
     // If the delta saves little, a plain chunked transfer avoids the basis read
     // on the destination; fall back unless we beat ~90% of the file size.
@@ -2844,7 +2944,6 @@ fn sync_directory_with_transfer(
 ) -> Result<()> {
     let timeout = transfer_timeout(sync);
     prepare_dir_on_machine(dst_machine_id, dst_machine, dst_root, None, None, timeout)?;
-    let source_map = map_entries(source_snapshot);
     // The caller usually prefetched the destination scan concurrently with the
     // source scan (a missing destination root scans as empty, so prefetching
     // before prepare-dir is safe); scan here only when it did not.
@@ -2861,17 +2960,14 @@ fn sync_directory_with_transfer(
             snapshot_timeout(sync),
         )?,
     };
-    let dst_map = map_entries(&dst_snapshot);
+    // Same compare implementation the Scan report uses.
+    let diff = diff_manifests(source_snapshot, &dst_snapshot, excludes, sync);
 
     // 1. Remove destination entries whose type no longer matches the source
     //    (e.g. a file that is now a directory). Deepest paths first.
-    let mut type_mismatch: Vec<String> = source_snapshot
+    let mut type_mismatch: Vec<String> = diff
+        .type_mismatch
         .iter()
-        .filter(|entry| {
-            dst_map
-                .get(&entry.rel_path)
-                .is_some_and(|existing| existing.file_type != entry.file_type)
-        })
         .map(|entry| entry.rel_path.clone())
         .collect();
     type_mismatch.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
@@ -2907,13 +3003,14 @@ fn sync_directory_with_transfer(
     // 3. Transfer changed/missing files and symlinks concurrently. A file that
     //    already exists on the destination (same type) is eligible for an
     //    rsync-style delta against the copy that is there.
-    let pending: Vec<(&SnapshotEntry, bool)> = source_snapshot
-        .iter()
-        .filter(|entry| entry.file_type == "file" || entry.file_type == "symlink")
-        .filter_map(|entry| match dst_map.get(&entry.rel_path) {
-            Some(existing) if entries_match(entry, existing, sync) => None,
-            Some(existing) => Some((entry, should_attempt_delta(entry, existing))),
-            None => Some((entry, false)),
+    let pending: Vec<(&SnapshotEntry, bool)> = diff
+        .entries_to_copy()
+        .into_iter()
+        .map(|(entry, existing)| {
+            (
+                entry,
+                existing.is_some_and(|existing| should_attempt_delta(entry, existing)),
+            )
         })
         .collect();
     let transfer_started = Instant::now();
@@ -2941,14 +3038,7 @@ fn sync_directory_with_transfer(
 
     // 4. Mirror: remove destination paths the source no longer has (deepest first).
     if sync.mirror {
-        let mut extra_paths: Vec<String> = dst_map
-            .keys()
-            .filter(|rel| {
-                !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
-            })
-            .cloned()
-            .collect();
-        extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
+        let extra_paths = diff.extra_paths_deepest_first();
         remove_paths_on_machine(
             dst_machine_id,
             dst_machine,
@@ -4634,10 +4724,10 @@ fn sync_destination(
         )
     })?;
     let result = (|| {
-        let source_map = map_entries(source_snapshot);
         let dst_snapshot =
             take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
-        let dst_map = map_entries(&dst_snapshot);
+        // Same compare implementation the Scan report uses.
+        let diff = diff_manifests(source_snapshot, &dst_snapshot, excludes, sync);
 
         for entry in source_snapshot.iter().filter(|e| e.file_type == "dir") {
             let target = dst_root.join(&entry.rel_path);
@@ -4650,13 +4740,10 @@ fn sync_destination(
             // read-only source dir does not block writing its children.
         }
 
-        let to_copy: Vec<&SnapshotEntry> = source_snapshot
-            .iter()
-            .filter(|e| e.file_type == "file" || e.file_type == "symlink")
-            .filter(|e| match dst_map.get(&e.rel_path) {
-                Some(existing) => !entries_match(e, existing, sync),
-                None => true,
-            })
+        let to_copy: Vec<&SnapshotEntry> = diff
+            .entries_to_copy()
+            .into_iter()
+            .map(|(entry, _)| entry)
             .collect();
         let total_bytes: u64 = to_copy
             .iter()
@@ -4675,15 +4762,7 @@ fn sync_destination(
         drop(transfer_guard);
 
         if sync.mirror {
-            let mut extra_paths: Vec<String> = dst_map
-                .keys()
-                .filter(|rel| {
-                    !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
-                })
-                .cloned()
-                .collect();
-            extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
-            for rel in extra_paths {
+            for rel in diff.extra_paths_deepest_first() {
                 move_to_trash(dst_root, &rel, cycle_id)
                     .with_context(|| format!("failed to remove extra destination path {rel}"))?;
             }
@@ -5594,6 +5673,12 @@ fn copy_file(
             bail!("source changed while copying {}", entry.rel_path);
         }
     }
+    // Catch torn copies: a same-size mutation mid-read is invisible to the
+    // size checks (and, without checksum mode, to any hash).
+    if let Err(err) = ensure_source_stable(src, entry) {
+        remove_any(&tmp).ok();
+        return Err(err);
+    }
     // fsync data before tightening mode (a read-only mode would block the
     // writable handle fsync needs on Windows).
     fsync_file(&tmp).with_context(|| format!("failed to fsync {}", entry.rel_path))?;
@@ -5602,7 +5687,11 @@ fn copy_file(
         entry.mtime_ns / 1_000_000_000,
         (entry.mtime_ns % 1_000_000_000) as u32,
     );
-    set_file_mtime(&tmp, mtime).ok();
+    if let Err(err) = set_file_mtime(&tmp, mtime) {
+        // A file whose mtime cannot be recorded will compare as changed and
+        // re-transfer every cycle; make that visible instead of silent.
+        warn!(rel_path = entry.rel_path, error = %err, "failed to set file mtime");
+    }
     replace_path(&tmp, final_path)?;
     fsync_parent(final_path).ok();
     Ok(())
@@ -5865,6 +5954,32 @@ fn should_attempt_delta(source: &SnapshotEntry, existing: &SnapshotEntry) -> boo
 fn mtimes_match(left_ns: i64, right_ns: i64, sync: &NativeSyncConfig) -> bool {
     let window_ns = (sync.modify_window_secs as i128) * 1_000_000_000;
     (left_ns as i128 - right_ns as i128).abs() <= window_ns
+}
+
+/// After reading a source file's content, confirm the file is still exactly
+/// the version its snapshot entry described (size AND mtime). A concurrent
+/// writer can mutate the file mid-read without changing its size, producing a
+/// TORN copy (half old, half new) whose own transfer hash still checks out —
+/// the hash covers what was read, not a consistent version. Reporting the
+/// canonical source-changing error makes the cycle record a yellow issue and
+/// re-copy the settled file next round. Snapshot read views (ZFS) are
+/// immutable, so there this is a cheap no-op lstat.
+fn ensure_source_stable(src: &Path, entry: &SnapshotEntry) -> Result<()> {
+    let metadata = fs::symlink_metadata(src)
+        .with_context(|| format!("failed to re-check source {}", src.display()))?;
+    let mtime_ns = metadata_mtime_ns(&metadata)?;
+    if metadata.len() as i64 != entry.size || mtime_ns != entry.mtime_ns {
+        warn!(
+            rel_path = entry.rel_path,
+            snapshot_size = entry.size,
+            live_size = metadata.len(),
+            snapshot_mtime_ns = entry.mtime_ns,
+            live_mtime_ns = mtime_ns,
+            "source changed while its content was being copied"
+        );
+        bail!("source changed while copying {}", entry.rel_path);
+    }
+    Ok(())
 }
 
 fn map_entries(entries: &[SnapshotEntry]) -> BTreeMap<String, SnapshotEntry> {
@@ -7514,6 +7629,93 @@ mod tests {
         let mut bigger = without_hash.clone();
         bigger.size += 1;
         assert!(snapshot_entry_changed(&without_hash, &bigger));
+    }
+
+    #[test]
+    fn ensure_source_stable_detects_same_size_mutation() -> Result<()> {
+        let temp = temp_dir("source_stable");
+        let path = temp.join("live.txt");
+        fs::write(&path, b"12345")?;
+        let entry = snapshot_entry(&path, "live.txt".to_string(), false)?;
+        ensure_source_stable(&path, &entry)?;
+
+        // Same size, different content: only the mtime betrays the change.
+        fs::write(&path, b"abcde")?;
+        filetime::set_file_mtime(
+            &path,
+            FileTime::from_unix_time(entry.mtime_ns / 1_000_000_000 + 5, 0),
+        )?;
+        let err = ensure_source_stable(&path, &entry).unwrap_err();
+        assert_eq!(source_changed_paths(&err), vec!["live.txt".to_string()]);
+        fs::remove_dir_all(&temp).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn diff_manifests_classifies_all_kinds() {
+        let dir_entry = |rel: &str| SnapshotEntry {
+            rel_path: rel.to_string(),
+            file_type: "dir".to_string(),
+            size: 0,
+            mtime_ns: 1,
+            mode: 0o755,
+            hash: None,
+        };
+        let source = vec![
+            test_file_entry("same.txt", 10),
+            test_file_entry("changed.txt", 20),
+            test_file_entry("new.txt", 5),
+            dir_entry("new_dir"),
+            dir_entry("same_dir"),
+            test_file_entry("was_dir_now_file", 3),
+            test_file_entry("excluded/skip.txt", 1),
+        ];
+        let dst = vec![
+            test_file_entry("same.txt", 10),
+            test_file_entry("changed.txt", 21),
+            dir_entry("same_dir"),
+            dir_entry("was_dir_now_file"),
+            test_file_entry("extra.txt", 7),
+        ];
+        let mut sync = NativeSyncConfig::default();
+        sync.mirror = true;
+        sync.checksum = false;
+        let excludes = vec![PathBuf::from("excluded")];
+        let diff = diff_manifests(&source, &dst, &excludes, &sync);
+
+        assert_eq!(
+            diff.transfer
+                .iter()
+                .map(|(e, existing)| (e.rel_path.as_str(), existing.is_some()))
+                .collect::<Vec<_>>(),
+            vec![("changed.txt", true), ("new.txt", false)]
+        );
+        assert_eq!(diff.missing_dirs.len(), 1);
+        assert_eq!(diff.missing_dirs[0].rel_path, "new_dir");
+        assert_eq!(diff.type_mismatch.len(), 1);
+        assert_eq!(diff.type_mismatch[0].rel_path, "was_dir_now_file");
+        assert_eq!(
+            diff.extras
+                .iter()
+                .map(|e| e.rel_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["extra.txt"]
+        );
+        assert_eq!(diff.in_sync, 2, "same.txt + same_dir");
+
+        // The sync work list re-copies type-flipped files with no delta basis.
+        let to_copy = diff.entries_to_copy();
+        assert_eq!(
+            to_copy
+                .iter()
+                .map(|(e, basis)| (e.rel_path.as_str(), basis.is_some()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("changed.txt", true),
+                ("new.txt", false),
+                ("was_dir_now_file", false)
+            ]
+        );
     }
 
     #[test]
