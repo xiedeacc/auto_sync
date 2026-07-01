@@ -406,7 +406,7 @@ Realtime + ZFS：
 - 对同一 source，如果多个 dst 在同一时间窗口需要同一个版本点，应复用同一个 cycle/snapshot。
 - `daily` schedule 以配置的本地时间每天触发。
 - `weekly` schedule 以配置的星期几和时间触发。
-- `realtime` schedule 使用 fanotify 尽快触发小批量同步，并按 source 的 `reconcile_interval` 定期创建 ZFS snapshot 兜底。
+- `realtime` schedule 使用 fanotify/USN 尽快触发小批量同步。不做后台周期性对账（用户明确决定，2026-07-02）：疑似丢事件（overflow、USN gap、启动 gap）会自动触发一次完整 reconcile 修复；除此之外的漂移由用户手动 `Scan`（对账不同步）检查、手动 `Full`（对账并同步差异）修复。`reconcile_interval` 配置保留但当前不驱动任何周期任务。
 - source group 不再依赖一个全局 daily/weekly schedule。
 
 流程：
@@ -414,7 +414,7 @@ Realtime + ZFS：
 1. daemon 启动后加载配置和状态库。
 2. 对每个 source group 恢复已存在的 cycle/snapshot 状态。
 3. 对 realtime source 启动 fanotify group，事件持续写入 `event_log`，作为触发提示。
-4. 当某个 dst schedule 到期，或 realtime reconcile interval 到期时，为 source 创建新的 cycle。
+4. 当某个 dst schedule 到期，或 realtime source 的 open cycle 有可执行事件时，为 source 创建新的 cycle。
 5. ZFS 后端对 cycle 创建 snapshot，并用上一个 retained snapshot 到当前 snapshot 的 `zfs diff` 生成同步计划。
 6. 将触发该 schedule 的 dst 的 `target_cycle_id` / `target_snapshot_name` 更新到该 cycle；同一 source 的其他 dst 只有在自己的 schedule 到期或需要 reconcile 时才更新 target。
 7. 为需要追赶该 cycle 的 enabled dst 生成 sync_task。
@@ -442,18 +442,18 @@ Realtime + ZFS：
 - 手动 Full 会先保存配置，然后调用 `sync_destination_now_with_mode(..., Full)`：关闭该 source 当前 open cycle，只把当前 destination 的 `target_cycle_id` 指向这个新 cycle，并把 cycle 标记为 `needs_full_rescan = 1`、`manual_full_rescan = 1`。
 - realtime destination 也允许手动 Full。`manual_full_rescan` 是 realtime 的显式例外：同步执行时会跳过 event-path realtime incremental 分支，进入完整 reconcile。fanotify overflow、USN gap 等自动产生的 `needs_full_rescan` 事件不会偷偷执行 Full；它们会让该 realtime cycle 标记为需要人工/完整处理，而不是自动全量扫描。
 - Full sync 不是“删除目标后全部重传”。它会对 source 做完整 snapshot/manifest 扫描，并对目标 destination root 做完整 snapshot/manifest 扫描，然后按相对路径比较两边状态。
-- 对目录 source，完整 reconcile 的执行顺序是：
+- 对目录 source，完整 reconcile（对账）的执行顺序是：
   1. 读取 source path 信息，确认 source 是目录或文件。
-  2. 对目录 source，生成完整 `source_snapshot`，并写入 `path_snapshot`。
-  3. 对当前 destination 生成完整 `dst_snapshot`。
-  4. 如果同一路径 source/dst 类型不同，先删除或替换目标端旧路径。
-  5. 批量创建 source 中存在的目录。
-  6. 对 source 中的文件和 symlink，只复制目标端缺失或 metadata/content 不匹配的条目；已匹配文件不会重传。
-  7. mirror 模式下，删除目标端存在但 source_snapshot 中不存在、且不在 exclude 规则内的额外路径。
-  8. 清理本 cycle 的临时传输目录。
-  9. 再次对目标端做 snapshot，并用 `verify_snapshot_entries` 校验目标端与 source_snapshot 一致。
+  2. **并行**生成完整 `source_snapshot` 和 `dst_snapshot`（两棵树相互独立，通常在不同机器上；并行扫描把对账阶段的耗时约减半）。source_snapshot 写入 `path_snapshot`。
+  3. 如果同一路径 source/dst 类型不同，先删除或替换目标端旧路径。
+  4. 批量创建 source 中存在的目录。
+  5. 对 source 中的文件和 symlink，只复制目标端缺失或 metadata/content 不匹配的条目；已匹配文件不会重传。大的已存在文件按 rsync 式 block delta 只传差异块。
+  6. mirror 模式下，删除目标端存在但 source_snapshot 中不存在、且不在 exclude 规则内的额外路径。
+  7. 清理本 cycle 的临时传输目录。
+  8. 校验**本轮写入的条目**（跨机路径每个文件在落盘前已做 blake3 端到端校验并确认，不再整树重扫；本地路径对写入的路径逐个 lstat/按需重哈希校验）。未改动的条目在步骤 2 的对比中已经确认一致，整树重扫只是重复劳动，在 TB 级树上会让每轮开销翻倍。
+- 复制过程中源文件发生变化（size/hash 校验不过）不会让 destination 变红：该路径记为 `source_changing` 黄色 issue，其余文件照常传输，下一轮自动收敛。单个文件的硬失败最多容忍 20 个（其余文件继续传），连接级失败才立即终止本轮。
 - 对文件 source，Full sync 只围绕该单个文件生成 source snapshot，并同步到目标文件或目标目录下的同名文件；不支持 `src dir -> dst file`。
-- 跨机器 Full sync 使用同一语义，但 source/destination snapshot、批量 mkdir、批量 remove 和文件推送通过 peer HTTP transfer API 执行。大文件传输仍会按差异策略决定是 delta 还是流式全量传输；这不改变 Full sync 的“完整扫描 + 只修复差异”语义。
+- 跨机器 Full sync 使用同一语义，但 source/destination snapshot、批量 mkdir、批量 remove 和文件推送通过 peer HTTP transfer API 执行。本机 ZFS source 会先创建 snapshot 只读视图供读取，且若 destination 存在已验证的基准 snapshot，会先尝试 `zfs diff` 增量而不是全树扫描。大文件传输仍会按差异策略决定是 delta 还是流式全量传输；这不改变 Full sync 的"完整对账 + 只修复差异"语义。
 - Full sync 成功后，目标 destination 的 `last_verified_cycle_id` 推进到该 cycle，并显示绿色。任何复制、删除或最终校验失败都不会推进 verified offset，目标保持红/黄状态并在下一轮继续处理。
 
 ## 9. 同步一致性设计
@@ -495,7 +495,7 @@ Realtime 快速同步语义：
 - 进程启动或 watcher 因配置变化重启时，会对本机 realtime source 做一次 mtime 补漏扫描：读取该 source 最近一次 `event_log.observed_at` 作为 cutoff，递归扫描 source 下文件和目录，mtime 晚于 cutoff 且 cutoff 之后没有同路径事件的条目会补写 `startup_mtime_scan` 增量事件。该机制只补 event-path 增量事件，不自动触发 Full sync。
 - `startup_mtime_scan` 事件只在其所在 cycle 被标记为 `verified` 后清理；多 dst 场景下，如果某个 dst 尚未完成该 cycle，这些补漏事件仍会保留。
 - realtime 快速同步完成只能说明“事件提示队列已处理”，不能证明 dst 与最新 snapshot 完全一致。
-- 只有 snapshot/diff reconcile 完成并校验通过后，才能推进 `last_verified_cycle_id` 并显示绿点。
+- 当前实现（用户接受的取舍，2026-07-02）：realtime event-path 同步成功后即推进 `last_verified_cycle_id` 并显示绿点——绿点语义是“事件都已应用”，不等于“整棵树已验证”。疑似丢事件（overflow、USN gap、启动 gap）的 cycle 会自动升级为完整 reconcile 并在运行期间标红 `event_loss_reconcile`；除此之外的漂移由用户手动 `Scan` 检查、`Full` 修复，不做后台周期对账。
 - 如果 realtime 写入与后续 snapshot diff 结果冲突，以 snapshot diff/reconcile 为准修正 dst。
 
 删除策略：
@@ -669,12 +669,11 @@ dst 离线：
 - 不推进 cycle offset。
 - 定期探测恢复；恢复后从最旧未 verified cycle 开始同步。
 
-fanotify overflow：
+fanotify overflow / USN gap（疑似丢事件）：
 
-- 写入 overflow 事件。
-- 仅对应 source group 标记 `needs_reconcile`。
-- ZFS source 在下一次 reconcile interval 或立即创建新 snapshot，通过 `zfs diff` 补齐事件丢失窗口。
-- 非 ZFS source 回退到 manifest 分片 reconcile。
+- 写入带 `rescan_required` 标记的事件，对应 cycle 标记 `needs_full_rescan`。
+- 下一轮该 cycle 自动升级为完整 reconcile（对账并修复一切差异，包括事件流漏掉的删除），运行期间 destination 标红 `event_loss_reconcile`，校验通过后恢复绿点。
+- ZFS source 若存在已验证基准 snapshot，可通过 `zfs diff` 补齐事件丢失窗口；否则做全树 manifest 对账。
 
 磁盘空间不足：
 

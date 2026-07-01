@@ -14,9 +14,14 @@ UDP `18766`; the Web API listens on the configured `port`, commonly
 port, and OS.
 
 Cross-machine sync uses the auto_sync Web API and a keep-alive TCP connection
-pool. Full sync and reconcile build source and destination snapshots, transfer
-only mismatched files and symlinks, optionally mirror-delete destination extras,
-and verify the destination after transfer.
+pool. Full sync is reconcile-then-transfer (对账后同步): it scans the source
+and destination trees concurrently, compares the two manifests, transfers only
+mismatched files and symlinks (rsync-style block deltas for large changed
+files, blake3 end-to-end verification per file), optionally mirror-deletes
+destination extras, and verifies what the cycle wrote. Scan (对账不同步) runs
+the same concurrent compare without changing anything and produces a
+difference report. On ZFS sources, cycles diff against the destination's last
+verified snapshot via `zfs diff` instead of re-walking the tree.
 
 Windows deployment can use the system OpenSSH Server optional feature when
 requested, but `auto_sync` is launched through a current-user Startup launcher
@@ -79,9 +84,11 @@ of installing it as a Windows service. OpenSSH setup is opt-in via
 NAS for deployments. `deploy_local.sh` installs missing Ubuntu/Debian build
 dependencies and Rust stable on first run, then skips setup on later runs. The
 Windows daemon uses the NTFS USN Journal for realtime local source change
-detection and keeps periodic full reconciliation as a fallback for journal
-gaps, journal resets, and first-run verification. The GUI and Web UI share this
-daemon-backed state instead of running separate watcher logic.
+detection; suspected event loss (journal gaps or resets) automatically
+triggers a full reconcile (对账) of the affected destinations, and drift can
+always be checked with Scan and repaired with a manual Full sync. The GUI and
+Web UI share this daemon-backed state instead of running separate watcher
+logic.
 `deploy_openwrt.sh` cross-compiles aarch64 OpenWrt binaries when needed,
 installs the `conf/auto_sync.procd` procd init script, and deploys to
 `/opt/auto_sync`.

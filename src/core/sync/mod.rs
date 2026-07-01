@@ -374,40 +374,56 @@ pub fn scan_destination_now(
     let dst_machine = machine_or_local(cfg, dst_machine_id)?;
     let dst_root = destination_root_for_source(source, &source_info, &dst.path, &dst_machine);
 
-    let mut source_snapshot = snapshot_on_machine(
-        source_machine_id,
-        &source_machine,
-        &source_info.base,
-        TransferSnapshotMode::Source,
-        &source.excludes,
-        sync.checksum,
-        timeout,
-    )?;
-    let mut dst_snapshot = if source_info.kind == "dir" {
-        snapshot_on_machine(
-            dst_machine_id,
-            &dst_machine,
-            &dst_root,
-            TransferSnapshotMode::Destination,
-            &[],
+    // Source and destination trees are independent: scan them concurrently
+    // (they usually live on different machines), halving the compare's scan
+    // phase versus scanning serially.
+    let in_compare = progress::in_compare_context();
+    let (source_result, dst_result) = thread::scope(|scope| {
+        let dst_handle = scope.spawn(|| {
+            let _compare = in_compare.then(progress::enter_compare_context);
+            if source_info.kind == "dir" {
+                snapshot_on_machine(
+                    dst_machine_id,
+                    &dst_machine,
+                    &dst_root,
+                    TransferSnapshotMode::Destination,
+                    &[],
+                    sync.checksum,
+                    timeout,
+                )
+            } else {
+                // A file source syncs exactly one destination path and never
+                // deletes anything else; snapshot just that path so mirror mode
+                // does not report the destination directory's other files as
+                // pending deletions.
+                snapshot_paths_on_machine(
+                    dst_machine_id,
+                    &dst_machine,
+                    &dst_root,
+                    std::slice::from_ref(&source_info.name),
+                    TransferSnapshotMode::Destination,
+                    &[],
+                    sync.checksum,
+                    timeout,
+                )
+            }
+        });
+        let source_result = snapshot_on_machine(
+            source_machine_id,
+            &source_machine,
+            &source_info.base,
+            TransferSnapshotMode::Source,
+            &source.excludes,
             sync.checksum,
             timeout,
-        )?
-    } else {
-        // A file source syncs exactly one destination path and never deletes
-        // anything else; snapshot just that path so mirror mode does not report
-        // the destination directory's other files as pending deletions.
-        snapshot_paths_on_machine(
-            dst_machine_id,
-            &dst_machine,
-            &dst_root,
-            std::slice::from_ref(&source_info.name),
-            TransferSnapshotMode::Destination,
-            &[],
-            sync.checksum,
-            timeout,
-        )?
-    };
+        );
+        let dst_result = dst_handle
+            .join()
+            .expect("destination scan thread panicked");
+        (source_result, dst_result)
+    });
+    let mut source_snapshot = source_result?;
+    let mut dst_snapshot = dst_result?;
     if source_info.kind != "dir" {
         source_snapshot.retain(|entry| entry.rel_path == source_info.name);
         dst_snapshot.retain(|entry| entry.rel_path == source_info.name);
@@ -2660,19 +2676,51 @@ fn sync_cycle_with_transfer(
         } else {
             Some(set_sync_kind("full"))
         };
+        // The source and destination trees are independent (usually on
+        // different machines): scan them CONCURRENTLY instead of serially,
+        // roughly halving the reconcile's compare phase. The destination
+        // prescan is skipped for Changed Since (it syncs via per-path
+        // snapshots) and when the source snapshot is already cached (nothing
+        // left to overlap with).
+        let mut prefetched_dst: Option<Vec<SnapshotEntry>> = None;
         let source_snapshot = if let Some(snapshot) = full_source_snapshot.as_ref() {
             snapshot
         } else {
-            let snapshot = snapshot_on_machine(
-                source_machine_id,
-                &source_machine,
-                &read_root,
-                TransferSnapshotMode::Source,
-                &source.excludes,
-                source_checksum,
-                source_timeout,
-            )
-            .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
+            let prescan_dst = !cycle.manual_changed_since_rescan;
+            let (source_result, dst_result) = thread::scope(|scope| {
+                let dst_handle = prescan_dst.then(|| {
+                    scope.spawn(|| {
+                        snapshot_on_machine(
+                            dst_machine_id,
+                            &dst_machine,
+                            &dst_root,
+                            TransferSnapshotMode::Destination,
+                            &[],
+                            sync.checksum,
+                            snapshot_timeout(&sync),
+                        )
+                    })
+                });
+                let source_result = snapshot_on_machine(
+                    source_machine_id,
+                    &source_machine,
+                    &read_root,
+                    TransferSnapshotMode::Source,
+                    &source.excludes,
+                    source_checksum,
+                    source_timeout,
+                );
+                let dst_result = dst_handle
+                    .map(|handle| handle.join().expect("destination scan thread panicked"));
+                (source_result, dst_result)
+            });
+            let snapshot = source_result
+                .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
+            if let Some(dst_result) = dst_result {
+                prefetched_dst = Some(dst_result.with_context(|| {
+                    format!("failed to snapshot destination {}", dst_root.display())
+                })?);
+            }
             state.replace_snapshot(cycle.id, &source.id, &snapshot)?;
             full_source_snapshot = Some(snapshot);
             full_source_snapshot
@@ -2721,6 +2769,7 @@ fn sync_cycle_with_transfer(
                 &dst.id,
                 cycle.id,
                 source_snapshot,
+                prefetched_dst.take(),
                 &source.excludes,
                 &sync,
             )
@@ -2778,6 +2827,7 @@ fn sync_cycle_with_transfer(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_directory_with_transfer(
     source_machine_id: &str,
     source_machine: &crate::core::config::MachineConfig,
@@ -2788,22 +2838,29 @@ fn sync_directory_with_transfer(
     destination_id: &str,
     cycle_id: i64,
     source_snapshot: &[SnapshotEntry],
+    prefetched_dst_snapshot: Option<Vec<SnapshotEntry>>,
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
 ) -> Result<()> {
     let timeout = transfer_timeout(sync);
     prepare_dir_on_machine(dst_machine_id, dst_machine, dst_root, None, None, timeout)?;
     let source_map = map_entries(source_snapshot);
-    let dst_snapshot = snapshot_on_machine(
-        dst_machine_id,
-        dst_machine,
-        dst_root,
-        TransferSnapshotMode::Destination,
-        &[],
-        sync.checksum,
-        // Whole-tree walk on the peer: the per-file timeout is far too small.
-        snapshot_timeout(sync),
-    )?;
+    // The caller usually prefetched the destination scan concurrently with the
+    // source scan (a missing destination root scans as empty, so prefetching
+    // before prepare-dir is safe); scan here only when it did not.
+    let dst_snapshot = match prefetched_dst_snapshot {
+        Some(snapshot) => snapshot,
+        None => snapshot_on_machine(
+            dst_machine_id,
+            dst_machine,
+            dst_root,
+            TransferSnapshotMode::Destination,
+            &[],
+            sync.checksum,
+            // Whole-tree walk on the peer: the per-file timeout is far too small.
+            snapshot_timeout(sync),
+        )?,
+    };
     let dst_map = map_entries(&dst_snapshot);
 
     // 1. Remove destination entries whose type no longer matches the source

@@ -6,6 +6,30 @@
 
 ---
 
+## 0'. 状态更新（2026-07-02，四轮 review 后）
+
+本文最初的行号和部分结论已过时。当天完成了 Full / Compare / Changed-Since / Incremental 四轮 review 并落地修复（commits `ffdc323` → `7a23723`），各编号问题现状：
+
+| # | 原结论 | 现状 |
+|---|--------|------|
+| F1 | `reconcile_interval` 未接线，realtime 无兜底 | **部分解决 + 用户决策**：疑似丢事件（overflow/USN gap/启动 gap）已自动触发完整 reconcile（红色 `event_loss_reconcile`，修复含删除在内的一切差异）；周期性对账实现后按用户明确要求移除（7a23723）——漂移由手动 `Scan` 检查、`Full` 修复。realtime 绿点语义 = "事件已应用"，为用户接受的取舍。另修复计划顺序 bug：被标记 rescan 但无可执行事件的 cycle 不再空计划盖绿章。 |
+| F2 | overflow 卡黄无自愈 | **已修复**：rescan 事件自动升级完整 reconcile。 |
+| F3 | USN 启动 gap 不置 rescan | **已修复**（2026-06-30 起 needs_full_rescan 接线）。 |
+| F4 | fsync 默认关闭 | **未变**（用户曾搁置该决策，改动前需再确认）。 |
+| F5 | put-file/chunk 只校验 size | **已修复**：所有跨机传输路径均带 blake3 全文件端到端校验（put-file、chunked finish、delta）。 |
+| F6 | peer API 无鉴权 + body 无上限 | **未变**（内网部署，用户接受；改动前需确认）。 |
+| F7 | 整文件入内存 × 并发 | **部分修复**：delta 发送端接入全局 1 GiB 内存预算（`acquire_transfer_memory`）；chunked 路径本就流式。接收端 body 缓冲未变。 |
+| F8/F9 | watcher 单错误死亡 / handle_paths 泄漏 | **未变**。 |
+| §1.4 | fast-missing-dirs 标绿不校验 | **已修复**：改为对本轮写入条目逐路径校验（含批量复制的子树）。 |
+| §2.1 | 单文件失败废弃整轮、无重试分类 | **已修复**：source_changing 容忍（黄）、单文件失败容忍至 20 个、连接级错误即断、终态错误不重试；错误正文跨 HTTP 边界传递。 |
+| §4 | 长事务锁竞争 | **已缓解**：path_snapshot 批量写/删分块（20K 行/事务）；event_log、path_snapshot 均有修剪；空闲时零 DB 写入（配置指纹门控）；watcher 事件即时唤醒调度器。 |
+
+其余新增能力：跨机 cycle 的 ZFS snapshot 只读视图 + `zfs diff` 快路径、Full/Compare 两端并行扫描、Compare 失败可见（错误报告落库）、全树 snapshot 请求超时下限（1h/6h）、Changed-Since 基线回退与 hash 存在性容忍、SnapshotEntry 空 hash 不上线。
+
+以下原文保留作历史评审记录。
+
+---
+
 ## 0. 结论速览
 
 整体架构是合理的：snapshot 提供稳定读视图、临时文件 + 原子 rename、per-dst offset、WAL + `synchronous=FULL` 的状态库、watcher 分 source 隔离——这些都符合“最终一致 + 不轻易标绿”的设计意图。
