@@ -55,6 +55,10 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/sync-source-now", post(api_sync_source_now))
         .route("/api/sync-destination-now", post(api_sync_destination_now))
         .route("/api/cancel-activity", post(api_cancel_activity))
+        .route(
+            "/api/notify-status-changed",
+            post(api_notify_status_changed),
+        )
         .route("/api/scan-destination-now", post(api_scan_destination_now))
         .route("/api/scan-report", get(api_scan_report))
         .route("/api/transfer/snapshot", post(api_transfer_snapshot))
@@ -295,6 +299,14 @@ async fn api_sync_destination_now(
         )?))
     })
     .await
+}
+
+async fn api_notify_status_changed() -> Json<serde_json::Value> {
+    // A peer's sync state changed: bump the epoch so the local UI re-fetches
+    // statuses on its next (1s) runtime poll instead of waiting for the
+    // slower status poll. Never re-pushed — see peer_notify.
+    crate::core::peer_notify::note_remote_change();
+    Json(serde_json::json!({ "ok": true }))
 }
 
 async fn api_cancel_activity(

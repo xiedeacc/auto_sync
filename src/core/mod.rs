@@ -3,6 +3,7 @@ pub mod cancel;
 pub mod config;
 pub mod logging;
 pub mod machines;
+pub mod peer_notify;
 pub mod progress;
 pub mod scheduler;
 pub mod signal;

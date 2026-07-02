@@ -169,6 +169,7 @@ impl Backend {
             scan: current_scan_progress(),
             build: BuildInfo::current(),
             config_errors: current_config_warnings(),
+            status_epoch: crate::core::peer_notify::status_epoch(),
         }
     }
 
@@ -890,6 +891,10 @@ pub struct RuntimeStatus {
     pub build: BuildInfo,
     #[serde(default)]
     pub config_errors: Vec<String>,
+    /// Bumps whenever this machine's sync state changes or a peer pushes a
+    /// status notification; the UI re-fetches statuses when it moves.
+    #[serde(default)]
+    pub status_epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

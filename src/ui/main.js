@@ -270,6 +270,12 @@ async function refreshStatusOnly() {
   }
 }
 
+// Last status_epoch seen on the 1s runtime poll. The epoch bumps when local
+// sync state changes or a peer pushes a status notification; a change means
+// destination statuses moved, so refresh them immediately instead of waiting
+// out the slower status poll.
+let lastStatusEpoch = null;
+
 async function refreshRuntimeStatusOnly() {
   if (runtimeStatusPolling) {
     return;
@@ -279,6 +285,14 @@ async function refreshRuntimeStatusOnly() {
     await loadRuntimeStatus();
     if (dstLogViewer && el.dstLogModal && !el.dstLogModal.hidden) {
       await loadSyncActivity();
+    }
+    const epoch = runtimeStatus && runtimeStatus.status_epoch;
+    if (typeof epoch === "number" && epoch !== lastStatusEpoch) {
+      const first = lastStatusEpoch === null;
+      lastStatusEpoch = epoch;
+      if (!first) {
+        refreshStatusOnly().catch(() => {});
+      }
     }
   } catch (_) {
     runtimeStatus = null;
@@ -1655,7 +1669,13 @@ function weekdayAbbrev(value) {
 }
 
 function cycleDisplay(status) {
-  return `${valueOr(status && status.last_verified_cycle_id, "-")} / ${valueOr(status && status.target_cycle_id, "-")}`;
+  // verified / latest: how far this destination lags behind the source's
+  // newest closed cycle (a scheduled destination catches up at its schedule).
+  const latest = valueOr(
+    status && status.latest_closed_cycle_id,
+    valueOr(status && status.target_cycle_id, "-"),
+  );
+  return `${valueOr(status && status.last_verified_cycle_id, "-")} / ${latest}`;
 }
 
 function statusClass(status) {

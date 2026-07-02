@@ -113,6 +113,10 @@ fn main() -> Result<()> {
         .context("failed to install Ctrl-C handler")?;
     }
 
+    // Push local status changes (cycle advances, verify results) to peer
+    // machines so their UIs update within ~2s instead of a full poll cycle.
+    auto_sync::core::peer_notify::spawn_notifier(config_path.clone(), shutdown.clone());
+
     // Scheduler + watcher always run, on a background thread.
     let scheduler = {
         let cfg = cfg.clone();
