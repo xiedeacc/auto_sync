@@ -692,8 +692,9 @@ fanotify overflow / USN gap（疑似丢事件）：
 手动取消（sync / compare）：
 
 - 长时间运行的同步与 compare 支持协作式取消：所有目录遍历（每目录 + 每条目轮询）、并行传输 worker（每文件）、分块大文件发送（每 16MiB 块）都设有取消检查点，几十万条目的 HDD 扫描也能在中途秒级停止。
-- 入口：HTTP `POST /api/cancel-activity`（body `{scope?: "sync"|"compare", propagate?: bool}`）、UI 状态栏 Cancel 按钮、`auto_syncctl cancel [--scope sync|compare] [--local-only]`、桌面端 Tauri command。
-- 跨机器传播：`propagate = true` 时把取消转发到所有已知 runtime 机器（转发请求带 `propagate = false` 防止风暴）。peer 为对端服务的整树扫描（`/api/transfer/snapshot*`）按请求方声明的 `purpose`（sync/compare）注册，因此取消 compare 不会误杀正在进行的 sync 扫描；peer 端扫描中止后返回 500，等待方随即解除阻塞。
+- 入口：HTTP `POST /api/cancel-activity`（body `{scope?: "sync"|"compare", source_id?, destination_id?, propagate?: bool}`）、UI 中 dst 行的停止按钮（该 dst 有任务运行时替换删除按钮，任务结束后恢复）、`auto_syncctl cancel [--scope sync|compare] [--source-id .. --destination-id ..] [--local-only]`、桌面端 Tauri command。
+- 按 destination 定位：每个可取消操作注册时携带 `source_id|destination_id` 目标（compare 一个；引擎的 cycle pass 列出该 source 的全部 destination——prefetch 与传输在 cycle 内共享，无法只停一个 dst）。带目标的取消请求严格匹配，绝不误杀本机或对端机器上其它 source 的 pass；不带目标则取消该 kind 的全部。进度视图（scan/transfer）也携带归属的 source/destination，UI 据此把停止按钮放到正确的行。
+- 跨机器传播：`propagate = true` 时把取消（含目标）转发到所有已知 runtime 机器（转发请求带 `propagate = false` 防止风暴）。peer 为对端服务的整树扫描（`/api/transfer/snapshot*`）按请求方声明的 `purpose`（sync/compare）与 `scope`（目标 destination）注册，因此取消 compare 不会误杀正在进行的 sync 扫描，按 dst 的取消也能停到对端；peer 端扫描中止后返回 500，等待方随即解除阻塞。
 - 取消后的状态：cycle 的手动 Full/Changed-Since 标记被清除，destination 的 in-flight target 被撤销（verified 基准保留），状态红点 `cancelled`——调度器不会在 5 秒后原样重启这次重活；destination 会在下一次 schedule、新事件或手动同步时重新拿到 target，最终一致性不受影响。事件丢失触发的 reconcile 需求不会丢：`rescan_required` 事件行仍在，下次拿到 target 时照常升级为完整对账。
 - 取消的错误以固定文案 `cancelled by user request` 贯穿错误链（含跨机 HTTP 错误体），传输重试逻辑对其不重试，worker pool 视其为致命错误立即整体停止。
 

@@ -49,7 +49,27 @@ async function checkPendingScans() {
       if (report && report.scanned_at && report.scanned_at !== info.prev) {
         scanReports[key] = report;
         delete scanPending[key];
+        // The "Compare running" notice must not outlive the compare: replace
+        // it with the outcome (auto-clearing) once the report lands.
+        if (statusMessage.startsWith("Compare running")) {
+          if (report.error) {
+            setTransientMessage(
+              `Compare ${info.sourceId} -> ${info.destinationId} failed: ${report.error}`,
+              15000,
+            );
+          } else {
+            const total = Number(report.to_add || 0) + Number(report.to_update || 0)
+              + Number(report.to_delete || 0) + Number(report.type_mismatch || 0);
+            setTransientMessage(
+              `Compare ${info.sourceId} -> ${info.destinationId} finished: `
+                + `${total} difference${total === 1 ? "" : "s"}`,
+              15000,
+            );
+          }
+        }
+        updateDstControls();
         renderDestinationLogModal();
+        refreshStatusOnly().catch(() => {});
       }
     }
   } finally {
@@ -69,7 +89,6 @@ const el = {
   config: document.getElementById("config"),
   statusConfig: document.getElementById("status-config"),
   statusText: document.getElementById("status-text"),
-  statusCancel: document.getElementById("status-cancel"),
   statusConfigError: document.getElementById("status-config-error"),
   statusBuild: document.getElementById("status-build"),
   refresh: document.getElementById("refresh"),
@@ -202,6 +221,7 @@ async function loadStatus() {
 async function loadRuntimeStatus() {
   runtimeStatus = await invoke("get_runtime_status");
   updateStatusBar();
+  updateDstControls();
   renderDestinationLogModal();
   checkPendingScans();
 }
@@ -373,6 +393,7 @@ function updateStatusUi() {
       }
     }
   }
+  updateDstControls();
 }
 
 function updateStatusBar() {
@@ -410,7 +431,6 @@ function updateStatusBar() {
     el.statusText.title = message;
   }
 
-  updateCancelButton();
   updateConfigErrorIndicator();
 
   const build = runtimeStatus && runtimeStatus.build;
@@ -443,62 +463,55 @@ function scanStatusLabel(scan) {
   return scan && scan.kind === "compare" ? "Comparing" : "Checking changes";
 }
 
-// What is cancellable right now, across the local runtime and every machine
-// in the activity poll: {any, scope} where scope is "sync", "compare", or
-// null (both kinds active -> cancel everything).
-function activeCancelScope() {
-  const runtimes = [runtimeStatus];
-  for (const machine of (syncActivity && syncActivity.machines) || []) {
-    if (machine && machine.runtime && !machine.local) {
-      runtimes.push(machine.runtime);
-    }
+// Activity attributable to one destination row: a compare pending from this
+// UI, or the scan/transfer running on the source's execution machine and
+// scoped to this destination. Drives the row's stop-button swap.
+function dstActivity(source, dst) {
+  if (!source || !dst) {
+    return { active: false, scope: null };
   }
-  let sync = false;
-  let compare = false;
-  for (const runtime of runtimes) {
-    if (!runtime) continue;
-    if (runtime.syncing || runtime.transfer) sync = true;
-    if (runtime.scan) {
-      if (runtime.scan.kind === "compare") compare = true;
-      else sync = true;
-    }
+  if (scanPending[scanReportKey(source.id, dst.id)]) {
+    return { active: true, scope: "compare" };
   }
-  if (sync && compare) return { any: true, scope: null };
-  if (compare) return { any: true, scope: "compare" };
-  if (sync) return { any: true, scope: "sync" };
-  return { any: false, scope: null };
+  const runtime = activityRuntime(activityForSource(source), source);
+  if (!runtime) {
+    return { active: false, scope: null };
+  }
+  const scan = runtime.scan;
+  if (scan && scan.source_id === source.id && scan.destination_id === dst.id) {
+    return { active: true, scope: scan.kind === "compare" ? "compare" : "sync" };
+  }
+  const transfer = runtime.transfer;
+  if (
+    transfer &&
+    transfer.destination_id === dst.id &&
+    (!transfer.source_id || transfer.source_id === source.id)
+  ) {
+    return { active: true, scope: "sync" };
+  }
+  return { active: false, scope: null };
 }
 
-function updateCancelButton() {
-  if (!el.statusCancel) return;
-  const cancel = activeCancelScope();
-  el.statusCancel.hidden = !cancel.any;
-  if (cancel.any) {
-    el.statusCancel.textContent =
-      cancel.scope === "compare" ? "Cancel compare" : "Cancel";
-  }
-}
-
-async function cancelActivity() {
-  const cancel = activeCancelScope();
-  if (!cancel.any || el.statusCancel.disabled) return;
-  el.statusCancel.disabled = true;
-  try {
-    const outcome = await invoke("cancel_activity", { scope: cancel.scope });
-    const remote = (outcome.machines || []).reduce(
-      (total, machine) => total + (machine.cancelled || 0),
-      0,
-    );
-    const total = (outcome.cancelled_local || 0) + remote;
-    setMessage(
-      total
-        ? `Cancel requested (${total} operation${total === 1 ? "" : "s"})`
-        : "Nothing to cancel",
-    );
-    await loadRuntimeStatus().catch(() => {});
-    updateStatusBar();
-  } finally {
-    el.statusCancel.disabled = false;
+// While a destination has a running task, its delete button gives way to a
+// stop button (and returns once the task ends).
+function updateDstControls() {
+  for (const row of el.sourcePanel.querySelectorAll(".destination-row")) {
+    const source = findSourceById(row.dataset.sourceId);
+    const dst = source
+      && (source.destinations || []).find((item) => item.id === row.dataset.destinationId);
+    const stopButton = row.querySelector('[data-action="stop-dst"]');
+    const removeButton = row.querySelector('[data-action="remove-dst"]');
+    if (!stopButton || !removeButton) {
+      continue;
+    }
+    const act = dstActivity(source, dst);
+    stopButton.hidden = !act.active;
+    removeButton.hidden = act.active;
+    if (act.active) {
+      const title = act.scope === "compare" ? "Stop compare" : "Stop sync";
+      stopButton.title = title;
+      stopButton.setAttribute("aria-label", title);
+    }
   }
 }
 
@@ -1000,6 +1013,7 @@ function renderSyncRows(source, group) {
           <option value="full">Full</option>
           <option value="scan">Compare</option>
         </select>
+        <button class="danger icon dst-stop-button" data-action="stop-dst" title="Stop running task" aria-label="Stop running task" hidden>&#9632;</button>
         <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
       </div>
     `;
@@ -1019,6 +1033,37 @@ function renderSyncRows(source, group) {
       source.destinations.splice(dstIndex, 1);
       await autoSaveConfig();
       renderSourcePanel();
+    };
+    row.querySelector('[data-action="stop-dst"]').onclick = async (event) => {
+      const button = event.currentTarget;
+      const act = dstActivity(source, dst);
+      if (!act.active || button.disabled) {
+        return;
+      }
+      button.disabled = true;
+      try {
+        const outcome = await invoke("cancel_activity", {
+          scope: act.scope,
+          sourceId: source.id,
+          destinationId: dst.id,
+        });
+        const remote = (outcome.machines || []).reduce(
+          (total, machine) => total + (machine.cancelled || 0),
+          0,
+        );
+        const total = (outcome.cancelled_local || 0) + remote;
+        setTransientMessage(
+          total
+            ? `Stop requested for ${source.id} -> ${dst.id}`
+            : "Nothing to stop",
+        );
+        await loadRuntimeStatus().catch(() => {});
+        updateDstControls();
+      } catch (error) {
+        setMessage(String(error));
+      } finally {
+        button.disabled = false;
+      }
     };
     row.querySelector('[data-action="edit-schedule"]').onclick = () => {
       openScheduleModal(dst.schedule, (schedule) => {
@@ -1041,7 +1086,10 @@ function renderSyncRows(source, group) {
       }
     };
     row.querySelector('[data-action="show-dst-log"]').onclick = () => {
-      openDestinationLogModal(source, dst);
+      // While a compare runs for this destination, the info icon shows the
+      // compare's live progress; otherwise the regular destination log.
+      const act = dstActivity(source, dst);
+      openDestinationLogModal(source, dst, act.scope === "compare" ? "scan" : "log");
     };
     row.querySelector('[data-action="repair-scan"]').onclick = () => {
       const latestStatus = statusFor(source.id, dst.id);
@@ -1085,10 +1133,10 @@ function renderSyncRows(source, group) {
       // the engine picks it up right after the current pass.
       if (mode === "scan") {
         // The scan runs in the background (it can take many minutes on a large
-        // tree and must not block the backup). Open the info panel so live
-        // progress shows, kick it off, and poll for the report when it lands.
+        // tree and must not block the backup). Kick it off and poll for the
+        // report; the info icon opens live progress on demand — no popup is
+        // forced on the user.
         const key = scanReportKey(source.id, dst.id);
-        openDestinationLogModal(source, dst, "scan");
         runBusy(`Starting compare ${source.id} -> ${dst.id}...`, async () => {
           await saveConfig();
           const previous = await invoke("scan_destination_now", {
@@ -1103,7 +1151,8 @@ function renderSyncRows(source, group) {
           if (previous) {
             scanReports[key] = previous;
           }
-          setMessage("Compare running — progress and result appear in the info panel.");
+          setMessage(`Compare running for ${source.id} -> ${dst.id} — click its info icon for progress.`);
+          updateDstControls();
           renderDestinationLogModal();
         }, { showMainMessage: false });
         return;
@@ -2628,6 +2677,22 @@ function setMessage(text) {
   updateStatusBar();
 }
 
+// Informational notices (stop requested, compare finished) must not sit in
+// the status bar forever: auto-clear unless something else replaced them.
+let transientMessageTimer = null;
+function setTransientMessage(text, ms = 10000) {
+  setMessage(text);
+  if (transientMessageTimer) {
+    clearTimeout(transientMessageTimer);
+  }
+  transientMessageTimer = setTimeout(() => {
+    transientMessageTimer = null;
+    if (statusMessage === text) {
+      setMessage("");
+    }
+  }, ms);
+}
+
 function destinationSyncStatusMessage(source, mode) {
   if (mode === "changed_since") {
     return "Scanning source changes...";
@@ -2831,7 +2896,6 @@ el.dstSyncReset.onclick = () => resetDestinationSync().catch((error) => setMessa
 el.machineClose.onclick = closeMachineModal;
 el.machineDiscover.onclick = () => discoverMachines().catch((error) => setMessage(String(error)));
 el.machineAdd.onclick = () => addMachine().catch((error) => setMessage(String(error)));
-el.statusCancel.onclick = () => cancelActivity().catch((error) => setMessage(String(error)));
 el.issueClose.onclick = closeIssueModal;
 el.dstLogClose.onclick = closeDestinationLogModal;
 el.scanDiffClose.onclick = closeScanDiffModal;
@@ -2912,6 +2976,8 @@ async function invokeWeb(command, payload = {}) {
     } else if (command === "cancel_activity") {
       options.body = JSON.stringify({
         scope: payload.scope || null,
+        source_id: payload.sourceId || payload.source_id || null,
+        destination_id: payload.destinationId || payload.destination_id || null,
         propagate: true,
       });
     } else if (command === "add_machine") {

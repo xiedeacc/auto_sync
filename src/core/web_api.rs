@@ -314,9 +314,15 @@ async fn api_cancel_activity(
     Json(req): Json<CancelActivityRequest>,
 ) -> Result<Json<CancelOutcome>, ApiError> {
     blocking(move || {
-        Ok(Json(
-            backend.cancel_activity(req.scope.as_deref(), req.propagate)?,
-        ))
+        let target = match (req.source_id.as_deref(), req.destination_id.as_deref()) {
+            (Some(source_id), Some(destination_id)) => Some((source_id, destination_id)),
+            _ => None,
+        };
+        Ok(Json(backend.cancel_activity(
+            req.scope.as_deref(),
+            target,
+            req.propagate,
+        )?))
     })
     .await
 }

@@ -18,6 +18,11 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferProgressView {
+    /// Source the transfer belongs to (from the enclosing cancel scope when
+    /// it names exactly one destination); empty when unattributable. Lets the
+    /// UI pin activity — and its stop control — to the right row.
+    #[serde(default)]
+    pub source_id: String,
     pub destination_id: String,
     pub destination_path: String,
     pub rel_path: String,
@@ -38,11 +43,17 @@ pub struct ScanProgressView {
     /// one shared progress display.
     #[serde(default)]
     pub kind: String,
+    /// See [`TransferProgressView::source_id`]; empty when unattributable.
+    #[serde(default)]
+    pub source_id: String,
+    #[serde(default)]
+    pub destination_id: String,
 }
 
 #[derive(Debug)]
 struct TransferProgressState {
     token: u64,
+    source_id: String,
     destination_id: String,
     destination_path: String,
     rel_path: String,
@@ -69,6 +80,22 @@ struct ScanProgressState {
     last_write_at: Instant,
     updated_at_ms: u128,
     kind: String,
+    source_id: String,
+    destination_id: String,
+}
+
+/// The (source_id, destination_id) the work on this thread is scoped to,
+/// read from the cancel token's target label ("source_id|destination_id").
+fn attribution() -> (String, String) {
+    match crate::core::cancel::current_target() {
+        Some(target) => match target.split_once('|') {
+            Some((source_id, destination_id)) => {
+                (source_id.to_string(), destination_id.to_string())
+            }
+            None => (String::new(), String::new()),
+        },
+        None => (String::new(), String::new()),
+    }
 }
 
 thread_local! {
@@ -208,6 +235,7 @@ pub fn start_transfer(
         .unwrap_or_else(|err| err.into_inner());
     *progress = Some(TransferProgressState {
         token,
+        source_id: attribution().0,
         destination_id: destination_id.to_string(),
         destination_path: destination_path.to_string_lossy().to_string(),
         rel_path: rel_path.to_string(),
@@ -234,6 +262,7 @@ pub fn start_scan(root_path: &Path) -> ScanProgressGuard {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     let root_path = root_path.to_string_lossy().to_string();
+    let (source_id, destination_id) = attribution();
     *progress = Some(ScanProgressState {
         token,
         root_path: root_path.clone(),
@@ -243,6 +272,8 @@ pub fn start_scan(root_path: &Path) -> ScanProgressGuard {
         last_write_at: now,
         updated_at_ms: now_ms(),
         kind: if in_compare_context() { "compare" } else { "sync" }.to_string(),
+        source_id,
+        destination_id,
     });
     if let Some(state) = progress.as_ref() {
         write_scan_progress_file(&state.view());
@@ -264,6 +295,7 @@ pub fn begin_transfer(
         .unwrap_or_else(|err| err.into_inner());
     *progress = Some(TransferProgressState {
         token,
+        source_id: attribution().0,
         destination_id: destination_id.to_string(),
         destination_path: destination_path.to_string_lossy().to_string(),
         rel_path: String::new(),
@@ -398,6 +430,7 @@ impl TransferProgressState {
             self.bytes_per_sec
         };
         TransferProgressView {
+            source_id: self.source_id.clone(),
             destination_id: self.destination_id.clone(),
             destination_path: self.destination_path.clone(),
             rel_path: self.rel_path.clone(),
@@ -417,6 +450,8 @@ impl ScanProgressState {
             entries_seen: self.entries_seen,
             updated_at_ms: self.updated_at_ms,
             kind: self.kind.clone(),
+            source_id: self.source_id.clone(),
+            destination_id: self.destination_id.clone(),
         }
     }
 }
@@ -537,6 +572,7 @@ mod tests {
         let now = std::time::Instant::now();
         let mut state = TransferProgressState {
             token: 1,
+            source_id: "s".to_string(),
             destination_id: "d".to_string(),
             destination_path: "p".to_string(),
             rel_path: "f".to_string(),
@@ -576,6 +612,7 @@ mod tests {
         let now = Instant::now();
         let mut state = TransferProgressState {
             token: 1,
+            source_id: "src".to_string(),
             destination_id: "dst".to_string(),
             destination_path: "/dst".to_string(),
             rel_path: "file.bin".to_string(),

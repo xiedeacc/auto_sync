@@ -854,9 +854,15 @@ async fn sync_now(backend: tauri::State<'_, Backend>) -> Result<Vec<DestinationV
 async fn cancel_activity(
     backend: tauri::State<'_, Backend>,
     scope: Option<String>,
+    source_id: Option<String>,
+    destination_id: Option<String>,
 ) -> Result<auto_sync::core::backend::CancelOutcome, String> {
+    let target = match (source_id.as_deref(), destination_id.as_deref()) {
+        (Some(source_id), Some(destination_id)) => Some((source_id, destination_id)),
+        _ => None,
+    };
     backend
-        .cancel_activity(scope.as_deref(), true)
+        .cancel_activity(scope.as_deref(), target, true)
         .map_err(error_text)
 }
 

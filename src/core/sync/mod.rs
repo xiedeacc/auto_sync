@@ -391,7 +391,10 @@ pub fn scan_destination_now(
         .try_lock()
         .map_err(|_| anyhow!("{SCAN_ALREADY_RUNNING}"))?;
     let _kind = set_sync_kind_if_empty("scan");
-    let _cancellable = cancel::begin(cancel::KIND_COMPARE);
+    let _cancellable = cancel::begin_target(
+        cancel::KIND_COMPARE,
+        Some(cancel::target_for(source_id, destination_id)),
+    );
     // Tag tree walks started here as compare progress so they do not fight a
     // concurrently running sync's scan for the UI progress display.
     let _compare = progress::enter_compare_context();
@@ -731,6 +734,13 @@ pub struct TransferSnapshotRequest {
     /// does not kill a sync's scan (and vice versa). Empty from old senders.
     #[serde(default)]
     pub purpose: String,
+    /// The destination the requester's operation is scoped to
+    /// ("source_id|destination_id", see [`crate::core::cancel::target_for`]):
+    /// the peer registers the served walk under the same target so a
+    /// destination-targeted cancel stops it too. Empty from old senders or
+    /// multi-destination passes; such walks need an untargeted cancel.
+    #[serde(default)]
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -745,6 +755,9 @@ pub struct TransferSnapshotPathsRequest {
     /// See [`TransferSnapshotRequest::purpose`].
     #[serde(default)]
     pub purpose: String,
+    /// See [`TransferSnapshotRequest::scope`].
+    #[serde(default)]
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -999,8 +1012,18 @@ fn snapshot_request_cancel_kind(purpose: &str) -> &str {
     }
 }
 
+/// The destination target a peer-served walk registers under: the requester's
+/// declared scope, or none for old senders (cancellable only untargeted).
+fn snapshot_request_cancel_target(scope: &str) -> Option<String> {
+    let scope = scope.trim();
+    (!scope.is_empty()).then(|| scope.to_string())
+}
+
 pub fn transfer_snapshot(req: TransferSnapshotRequest) -> Result<Vec<SnapshotEntry>> {
-    let _cancellable = cancel::begin(snapshot_request_cancel_kind(&req.purpose));
+    let _cancellable = cancel::begin_target(
+        snapshot_request_cancel_kind(&req.purpose),
+        snapshot_request_cancel_target(&req.scope),
+    );
     match req.mode {
         TransferSnapshotMode::Source => take_snapshot_with_excludes(
             &req.root,
@@ -1019,7 +1042,10 @@ pub fn transfer_snapshot(req: TransferSnapshotRequest) -> Result<Vec<SnapshotEnt
 }
 
 pub fn transfer_snapshot_paths(req: TransferSnapshotPathsRequest) -> Result<Vec<SnapshotEntry>> {
-    let _cancellable = cancel::begin(snapshot_request_cancel_kind(&req.purpose));
+    let _cancellable = cancel::begin_target(
+        snapshot_request_cancel_kind(&req.purpose),
+        snapshot_request_cancel_target(&req.scope),
+    );
     match req.mode {
         TransferSnapshotMode::Source => take_snapshot_paths_with_excludes(
             &req.root,
@@ -1816,6 +1842,19 @@ pub fn sync_cycle_for_source(
         cycle_id = cycle.id,
         needs_full_rescan = cycle.needs_full_rescan,
         "sync cycle started"
+    );
+    // Scope this cycle's work to the source's destinations: a stop request
+    // targeted at any of them cancels the pass (prefetch walks and transfers
+    // are shared across the cycle's destinations, so there is no smaller
+    // stoppable unit), while other sources' passes stay untouched.
+    let _cycle_scope = cancel::begin_targets(
+        cancel::KIND_SYNC,
+        source
+            .destinations
+            .iter()
+            .filter(|dst| dst.enabled)
+            .map(|dst| cancel::target_for(&source.id, &dst.id))
+            .collect(),
     );
 
     if cycle_has_remote_target(cfg, state, source, cycle)? {
@@ -3537,6 +3576,7 @@ fn snapshot_on_machine(
         excludes: excludes.to_vec(),
         checksum,
         purpose: snapshot_purpose().to_string(),
+        scope: cancel::current_target().unwrap_or_default(),
     };
     if machine_id == "local" {
         transfer_snapshot(req)
@@ -3572,6 +3612,7 @@ fn snapshot_paths_on_machine(
         excludes: excludes.to_vec(),
         checksum,
         purpose: snapshot_purpose().to_string(),
+        scope: cancel::current_target().unwrap_or_default(),
     };
     if machine_id == "local" {
         transfer_snapshot_paths(req)
@@ -6781,7 +6822,7 @@ mod tests {
         // Unique kind: the registry is process-global and tests run in
         // parallel — cancelling "sync"/"compare" could hit other tests' ops.
         let _op = cancel::begin("test-cancel-walk");
-        cancel::request(Some("test-cancel-walk"));
+        cancel::request(Some("test-cancel-walk"), None);
         let err =
             take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap_err();
         assert!(cancel::error_is_cancelled(&err), "got: {err:#}");

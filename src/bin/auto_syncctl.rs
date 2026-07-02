@@ -37,6 +37,12 @@ enum CommandKind {
         /// Limit to one kind: "sync" or "compare". Default cancels both.
         #[arg(long)]
         scope: Option<String>,
+        /// With --destination-id, limit the cancel to work scoped to that
+        /// destination of this source.
+        #[arg(long)]
+        source_id: Option<String>,
+        #[arg(long)]
+        destination_id: Option<String>,
         /// Do not forward the cancel to peer machines.
         #[arg(long)]
         local_only: bool,
@@ -85,7 +91,12 @@ fn main() -> Result<()> {
             }
             print_status(&state, &cfg)?;
         }
-        CommandKind::Cancel { scope, local_only } => {
+        CommandKind::Cancel {
+            scope,
+            source_id,
+            destination_id,
+            local_only,
+        } => {
             let cfg = load_config(&config_path)?;
             // The daemon binds its preferred LAN address (not loopback); use
             // the same resolution to reach it.
@@ -97,6 +108,8 @@ fn main() -> Result<()> {
             };
             let req = serde_json::json!({
                 "scope": scope,
+                "source_id": source_id,
+                "destination_id": destination_id,
                 "propagate": !local_only,
             });
             let outcome: auto_sync::core::backend::CancelOutcome =

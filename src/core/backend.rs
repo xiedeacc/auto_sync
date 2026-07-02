@@ -21,6 +21,7 @@ use crate::core::progress::{
     ScanProgressView, TransferProgressView, configure_progress_file, current_scan_progress,
     current_transfer_progress,
 };
+use crate::core::cancel;
 use crate::core::state::{DestinationView, ScanReport, State as DbState};
 use crate::core::sync::{SyncRequestMode, current_sync_kind, sync_is_running};
 
@@ -287,18 +288,29 @@ impl Backend {
 
     /// Cancel long-running activity (sync passes, compares, and the tree
     /// walks they run — including walks served for a peer). `scope` limits
-    /// the cancel to "sync" or "compare"; `None` cancels both. When
-    /// `propagate` is set the request is forwarded to every known runtime
-    /// machine (best effort), so the machine actually burning disk time stops
-    /// too; forwarded requests arrive with `propagate = false` and stay local.
-    pub fn cancel_activity(&self, scope: Option<&str>, propagate: bool) -> Result<CancelOutcome> {
-        let cancelled_local = crate::core::cancel::request(scope);
+    /// the cancel to "sync" or "compare"; `None` cancels both. `target`
+    /// (source_id + destination_id) limits it to work scoped to that
+    /// destination. When `propagate` is set the request is forwarded to every
+    /// known runtime machine (best effort), so the machine actually burning
+    /// disk time stops too; forwarded requests arrive with `propagate =
+    /// false` and stay local.
+    pub fn cancel_activity(
+        &self,
+        scope: Option<&str>,
+        target: Option<(&str, &str)>,
+        propagate: bool,
+    ) -> Result<CancelOutcome> {
+        let target_label =
+            target.map(|(source_id, destination_id)| cancel::target_for(source_id, destination_id));
+        let cancelled_local = cancel::request(scope, target_label.as_deref());
         let mut machines = Vec::new();
         if propagate {
             let cfg = load_config(&self.config_path)?;
             apply_runtime_config(&cfg);
             let req = CancelActivityRequest {
                 scope: scope.map(ToString::to_string),
+                source_id: target.map(|(source_id, _)| source_id.to_string()),
+                destination_id: target.map(|(_, destination_id)| destination_id.to_string()),
                 propagate: false,
             };
             for (machine_id, machine) in remote_runtime_machine_refs(&cfg) {
@@ -632,6 +644,12 @@ pub struct CancelActivityRequest {
     /// "sync", "compare", or absent for both.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Together with `destination_id`, limits the cancel to work scoped to
+    /// one destination; absent cancels regardless of destination.
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub destination_id: Option<String>,
     /// Forward the cancel to peer machines. Defaults to true for UI/API
     /// callers; propagated requests carry false to stop the fan-out.
     #[serde(default = "default_true")]

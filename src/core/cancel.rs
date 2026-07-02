@@ -31,36 +31,82 @@ static REGISTRY: Mutex<Vec<ActiveOp>> = Mutex::new(Vec::new());
 struct ActiveOp {
     id: u64,
     kind: String,
+    /// "source_id|destination_id" labels for work tied to specific
+    /// destinations (a compare has one; a source's cycle pass lists every
+    /// destination it may drive). Empty for unscoped work (legacy peers),
+    /// which only an untargeted request cancels.
+    targets: Vec<String>,
     flag: Arc<AtomicBool>,
 }
 
+/// Cancel token installed on a thread: the shared cancelled flag plus the
+/// destination target the work is for (carried so spawned workers and peer
+/// requests can attribute their work to the same destination).
+#[derive(Clone)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+    target: Option<Arc<str>>,
+}
+
 thread_local! {
-    static CURRENT: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    static CURRENT: RefCell<Option<CancelToken>> = const { RefCell::new(None) };
+}
+
+/// Composes the target label carried by scoped operations. Kept in one place
+/// so the UI request, the registry and peer request stamping all agree.
+pub fn target_for(source_id: &str, destination_id: &str) -> String {
+    format!("{source_id}|{destination_id}")
 }
 
 /// Registers a cancellable operation of the given kind and installs its token
 /// on this thread until the guard drops. Nested `begin`s on one thread stack:
 /// the inner operation gets its own token and the outer one is restored on
-/// drop (in practice entry points don't nest — local snapshot calls run under
-/// the enclosing sync/compare operation and must NOT call `begin` again).
+/// drop (the engine nests a per-destination scoped op inside the pass-level
+/// one so a targeted cancel stops just that destination).
 pub fn begin(kind: &str) -> OpGuard {
+    begin_targets(kind, Vec::new())
+}
+
+/// Like [`begin`], additionally scoping the operation to one destination
+/// (see [`target_for`]); a targeted cancel request only hits matching ops.
+pub fn begin_target(kind: &str, target: Option<String>) -> OpGuard {
+    begin_targets(kind, target.into_iter().collect())
+}
+
+/// Like [`begin`], scoping the operation to a set of destinations: a cancel
+/// request targeted at ANY of them stops the whole operation (a source's
+/// cycle pass serves all its destinations at once — prefetch walks and
+/// transfers are shared, so it cannot stop for just one).
+pub fn begin_targets(kind: &str, targets: Vec<String>) -> OpGuard {
     let id = NEXT_OP_ID.fetch_add(1, Ordering::Relaxed);
     let flag = Arc::new(AtomicBool::new(false));
+    // The thread-local token carries a single unambiguous target (used to
+    // stamp peer requests and progress attribution); a multi-destination op
+    // has no single answer, so it carries none.
+    let token_target: Option<Arc<str>> = match targets.as_slice() {
+        [only] => Some(Arc::from(only.as_str())),
+        _ => None,
+    };
     REGISTRY
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .push(ActiveOp {
             id,
             kind: kind.to_string(),
+            targets,
             flag: flag.clone(),
         });
-    let previous = CURRENT.with(|current| current.replace(Some(flag)));
+    let token = CancelToken {
+        flag,
+        target: token_target,
+    };
+    let previous = CURRENT.with(|current| current.replace(Some(token)));
     OpGuard { id, previous }
 }
 
 pub struct OpGuard {
     id: u64,
-    previous: Option<Arc<AtomicBool>>,
+    previous: Option<CancelToken>,
 }
 
 impl Drop for OpGuard {
@@ -75,18 +121,30 @@ impl Drop for OpGuard {
 
 /// The cancel token installed on this thread, if any. Capture it before
 /// spawning worker threads and re-install with [`enter`].
-pub fn current_token() -> Option<Arc<AtomicBool>> {
+pub fn current_token() -> Option<CancelToken> {
     CURRENT.with(|current| current.borrow().clone())
 }
 
+/// The destination target of the operation running on this thread, if it is
+/// scoped ("source_id|destination_id"). Used to stamp outgoing peer requests
+/// and progress views with the destination the work belongs to.
+pub fn current_target() -> Option<String> {
+    CURRENT.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .and_then(|token| token.target.as_ref().map(|target| target.to_string()))
+    })
+}
+
 /// Installs a captured token on this (worker) thread until the guard drops.
-pub fn enter(token: Option<Arc<AtomicBool>>) -> TokenGuard {
+pub fn enter(token: Option<CancelToken>) -> TokenGuard {
     let previous = CURRENT.with(|current| current.replace(token));
     TokenGuard { previous }
 }
 
 pub struct TokenGuard {
-    previous: Option<Arc<AtomicBool>>,
+    previous: Option<CancelToken>,
 }
 
 impl Drop for TokenGuard {
@@ -103,7 +161,7 @@ pub fn check() -> Result<()> {
         current
             .borrow()
             .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            .is_some_and(|token| token.flag.load(Ordering::Relaxed))
     });
     if cancelled {
         bail!("{CANCELLED_MESSAGE}");
@@ -111,15 +169,21 @@ pub fn check() -> Result<()> {
     Ok(())
 }
 
-/// Requests cancellation of active operations. `kind = None` cancels all;
-/// otherwise only operations registered under that kind. Returns how many
-/// operations were signalled. Idempotent; operations notice at their next
-/// [`check`] and unwind with [`CANCELLED_MESSAGE`].
-pub fn request(kind: Option<&str>) -> usize {
+/// Requests cancellation of active operations. `kind = None` cancels all
+/// kinds; `target = None` cancels regardless of destination. A targeted
+/// request hits ONLY operations scoped to that target (strict — it must
+/// never kill another source's pass on this or any propagated-to machine);
+/// legacy unscoped operations require an untargeted request. Returns how
+/// many operations were signalled. Idempotent; operations notice at their
+/// next [`check`] and unwind with [`CANCELLED_MESSAGE`].
+pub fn request(kind: Option<&str>, target: Option<&str>) -> usize {
     let registry = REGISTRY.lock().unwrap_or_else(|err| err.into_inner());
     let mut signalled = 0;
     for op in registry.iter() {
-        if kind.is_none_or(|kind| op.kind == kind) {
+        let kind_matches = kind.is_none_or(|kind| op.kind == kind);
+        let target_matches =
+            target.is_none_or(|target| op.targets.iter().any(|scoped| scoped == target));
+        if kind_matches && target_matches {
             op.flag.store(true, Ordering::Relaxed);
             signalled += 1;
         }
@@ -158,7 +222,7 @@ mod tests {
         assert!(check().is_ok());
         let guard = begin("test-kind-basic");
         assert!(check().is_ok());
-        assert_eq!(request(Some("test-kind-basic")), 1);
+        assert_eq!(request(Some("test-kind-basic"), None), 1);
         let err = check().unwrap_err();
         assert!(error_is_cancelled(&err));
         drop(guard);
@@ -170,20 +234,52 @@ mod tests {
         let _outer = begin("test-kind-outer");
         let inner_flag = {
             let _inner = begin("test-kind-inner");
-            current_token().unwrap()
+            current_token().unwrap().flag
         };
         // Inner guard dropped: its kind is no longer registered.
-        assert_eq!(request(Some("test-kind-inner")), 0);
+        assert_eq!(request(Some("test-kind-inner"), None), 0);
         assert!(!inner_flag.load(Ordering::Relaxed));
         assert!(check().is_ok(), "outer op untouched by other-kind cancel");
-        assert_eq!(request(Some("test-kind-outer")), 1);
+        assert_eq!(request(Some("test-kind-outer"), None), 1);
         assert!(check().is_err(), "outer token restored and cancelled");
+    }
+
+    #[test]
+    fn targeted_request_is_strict_and_multi_target_ops_match_any_of_theirs() {
+        let _scoped = begin_target("test-kind-target", Some(target_for("srcA", "dst1")));
+        assert_eq!(
+            current_target().as_deref(),
+            Some("srcA|dst1"),
+            "single-target op exposes its target on the thread"
+        );
+        // A different destination's targeted cancel must not touch it...
+        assert_eq!(
+            request(Some("test-kind-target"), Some("srcB|dst1")),
+            0,
+            "strict matching: other targets and unscoped-op fallbacks are out"
+        );
+        assert!(check().is_ok());
+        // ...while its own target does.
+        assert_eq!(request(Some("test-kind-target"), Some("srcA|dst1")), 1);
+        assert!(check().is_err());
+
+        let _pass = begin_targets(
+            "test-kind-multi",
+            vec![target_for("srcC", "dst1"), target_for("srcC", "dst2")],
+        );
+        assert_eq!(
+            current_target(),
+            None,
+            "multi-target op has no single attribution target"
+        );
+        assert_eq!(request(Some("test-kind-multi"), Some("srcC|dst2")), 1);
+        assert!(check().is_err(), "any listed target cancels the whole op");
     }
 
     #[test]
     fn worker_threads_see_cancellation_through_entered_token() {
         let _op = begin("test-kind-worker");
-        request(Some("test-kind-worker"));
+        request(Some("test-kind-worker"), None);
         let token = current_token();
         let cancelled = std::thread::spawn(move || {
             let _enter = enter(token);
