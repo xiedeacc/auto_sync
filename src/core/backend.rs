@@ -482,6 +482,29 @@ impl Backend {
         state_db.recent_tasks(limit)
     }
 
+    /// Long-poll a task until it leaves `running` (or `timeout_secs`
+    /// elapses): the response is the task's current row either way. Scripts
+    /// waiting on a sync/compare get sub-second completion detection instead
+    /// of polling /api/tasks on an interval.
+    pub fn wait_task(
+        &self,
+        task_id: i64,
+        timeout_secs: u64,
+    ) -> Result<Option<crate::core::state::TaskLogEntry>> {
+        let cfg = load_config(&self.config_path)?;
+        let state_db = DbState::open(&cfg.app.data_db)?;
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs.min(600));
+        loop {
+            let task = state_db.task_by_id(task_id)?;
+            match &task {
+                Some(entry) if entry.status == "running" && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                _ => return Ok(task),
+            }
+        }
+    }
+
     /// Task logs from this machine AND every managed runtime machine (tasks
     /// live where they execute; remote logs are fetched live, best effort).
     pub fn all_tasks(&self, limit: usize) -> Result<Vec<MachineTasksView>> {

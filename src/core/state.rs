@@ -1288,6 +1288,35 @@ impl State {
         Ok(changed)
     }
 
+    /// A single task row by id.
+    pub fn task_by_id(&self, task_id: i64) -> Result<Option<TaskLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, source_id, destination_id, started_at, ended_at, duration_ms,
+                    status, error, files_synced, differences, entries_scanned
+             FROM task_log WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![task_id], |row| {
+            Ok(TaskLogEntry {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                source_id: row.get(2)?,
+                destination_id: row.get(3)?,
+                started_at: row.get(4)?,
+                ended_at: row.get(5)?,
+                duration_ms: row.get(6)?,
+                status: row.get(7)?,
+                error: row.get(8)?,
+                files_synced: row.get::<_, i64>(9)? as u64,
+                differences: row.get::<_, i64>(10)? as u64,
+                entries_scanned: row.get::<_, i64>(11)? as u64,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     /// Newest-first task rows (running first by recency like the rest).
     pub fn recent_tasks(&self, limit: usize) -> Result<Vec<TaskLogEntry>> {
         let mut stmt = self.conn.prepare(

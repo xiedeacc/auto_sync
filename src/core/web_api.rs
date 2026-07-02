@@ -63,6 +63,7 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/scan-report", get(api_scan_report))
         .route("/api/tasks", get(api_tasks))
         .route("/api/all-tasks", get(api_all_tasks))
+        .route("/api/task-wait", get(api_task_wait))
         .route(
             "/api/dismiss-restart-notice",
             post(api_dismiss_restart_notice),
@@ -405,6 +406,26 @@ async fn api_all_tasks(
     blocking(move || {
         Ok(Json(
             backend.all_tasks(query.limit.unwrap_or(100).min(100))?,
+        ))
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskWaitQuery {
+    id: i64,
+    timeout_secs: Option<u64>,
+}
+
+/// Long poll: blocks until the task leaves `running` or the timeout elapses,
+/// returning the row's current state either way (null for an unknown id).
+async fn api_task_wait(
+    AxumState(backend): AxumState<Backend>,
+    Query(query): Query<TaskWaitQuery>,
+) -> Result<Json<Option<crate::core::state::TaskLogEntry>>, ApiError> {
+    blocking(move || {
+        Ok(Json(
+            backend.wait_task(query.id, query.timeout_secs.unwrap_or(120))?,
         ))
     })
     .await
