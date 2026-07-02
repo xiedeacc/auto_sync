@@ -3,8 +3,10 @@
 //! Polling alone leaves a remote controller up to its poll interval behind a
 //! cycle advance on the source machine. Instead, any local status-affecting
 //! change (cycle closed, destination status/target updated) records the
-//! affected source; a notifier loop pushes at most once every
-//! [`PUSH_INTERVAL`] — and ONLY to the controller that created/manages that
+//! affected source and wakes the notifier immediately; [`PUSH_INTERVAL`] is a
+//! rate limit (minimum spacing between pushes), not a fixed cadence — an
+//! isolated change is pushed right away, a burst is batched into one push per
+//! interval. Pushes go ONLY to the controller that created/manages that
 //! source (`source_group.managed_by`), never to unrelated machines. A source
 //! with no remote controller (created locally) is nobody else's to display,
 //! so nothing is pushed for it.
@@ -22,9 +24,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
@@ -33,21 +35,25 @@ use crate::core::config::{
 };
 use crate::core::machines::{machine_matches_discovery_id, remote_post_json};
 
-/// Minimum spacing between outgoing pushes (user-facing latency budget).
+/// Minimum spacing between outgoing pushes (rate limit, not a cadence: an
+/// isolated change is pushed immediately).
 const PUSH_INTERVAL: Duration = Duration::from_secs(2);
 
 static CHANGED_SOURCES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+static CHANGED_WAKE: Condvar = Condvar::new();
 static STATUS_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Record that this machine's own sync state for `source_id` changed (cycle
 /// closed, status or target updated). Cheap; call freely from state-mutation
-/// paths.
+/// paths. Wakes the notifier so an isolated change is pushed without waiting
+/// out a poll tick.
 pub fn mark_local_change(source_id: &str) {
     CHANGED_SOURCES
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .insert(source_id.to_string());
     STATUS_EPOCH.fetch_add(1, Ordering::Relaxed);
+    CHANGED_WAKE.notify_all();
 }
 
 /// Record an incoming peer notification: the UI should re-fetch statuses,
@@ -72,16 +78,41 @@ struct NotifyAck {
     ok: bool,
 }
 
-/// Start the notifier loop: every [`PUSH_INTERVAL`], drain the changed
-/// sources and notify each one's managing controller (best effort — an
-/// unreachable controller just misses the hint and falls back to its own
-/// polling).
+/// Start the notifier loop: sleep until a change arrives (condvar wake from
+/// [`mark_local_change`]), enforce [`PUSH_INTERVAL`] spacing since the last
+/// push, then drain the changed sources and notify each one's managing
+/// controller (best effort — an unreachable controller just misses the hint
+/// and falls back to its own polling).
 pub fn spawn_notifier(config_path: std::path::PathBuf, shutdown: Arc<AtomicBool>) {
     let result = thread::Builder::new()
         .name("auto_sync_peer_notify".to_string())
         .spawn(move || {
+            let mut last_push: Option<Instant> = None;
             while !shutdown.load(Ordering::SeqCst) {
-                thread::sleep(PUSH_INTERVAL);
+                // Block until something is pending; the timeout only bounds
+                // how long a shutdown request can go unnoticed.
+                {
+                    let mut changed = CHANGED_SOURCES
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner());
+                    while changed.is_empty() {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        changed = CHANGED_WAKE
+                            .wait_timeout(changed, Duration::from_millis(500))
+                            .unwrap_or_else(|err| err.into_inner())
+                            .0;
+                    }
+                }
+                // Rate limit: changes arriving during this wait batch into
+                // the same push.
+                if let Some(at) = last_push {
+                    let since = at.elapsed();
+                    if since < PUSH_INTERVAL {
+                        thread::sleep(PUSH_INTERVAL - since);
+                    }
+                }
                 let changed: BTreeSet<String> = std::mem::take(
                     &mut *CHANGED_SOURCES
                         .lock()
@@ -91,6 +122,7 @@ pub fn spawn_notifier(config_path: std::path::PathBuf, shutdown: Arc<AtomicBool>
                     continue;
                 }
                 push_to_controllers(&config_path, &changed);
+                last_push = Some(Instant::now());
             }
         });
     if let Err(err) = result {
