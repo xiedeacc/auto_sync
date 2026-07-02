@@ -1057,6 +1057,10 @@ pub struct TransferReceiveSymlinkRequest {
     pub mode: u32,
     pub hash: Option<String>,
     pub target: String,
+    /// Raw target bytes from a Unix sender (targets are not required to be
+    /// UTF-8 there); a Unix receiver prefers these over the lossy string.
+    #[serde(default)]
+    pub target_bytes: Option<Vec<u8>>,
     /// Whether the link points to a directory (decided by the sender). Needed so
     /// a Linux directory-symlink is recreated as a directory-symlink on Windows.
     #[serde(default)]
@@ -1632,7 +1636,17 @@ pub fn transfer_receive_symlink(req: TransferReceiveSymlinkRequest) -> Result<Tr
         mode: req.mode,
         hash: req.hash,
     };
-    receive_symlink_target(&req.root, req.cycle_id, &entry, &req.target, req.is_dir)?;
+    // Unix receivers prefer the sender's raw bytes (byte-faithful for
+    // non-UTF-8 targets); everyone else uses the wire string, converting the
+    // separators to the local convention so relative targets still resolve.
+    #[cfg(unix)]
+    let target: PathBuf = match req.target_bytes {
+        Some(bytes) => std::os::unix::ffi::OsStringExt::from_vec(bytes).into(),
+        None => PathBuf::from(&req.target),
+    };
+    #[cfg(not(unix))]
+    let target: PathBuf = PathBuf::from(req.target.replace('/', "\\"));
+    receive_symlink_target(&req.root, req.cycle_id, &entry, &target, req.is_dir)?;
     Ok(transfer_ack())
 }
 
@@ -1692,12 +1706,21 @@ fn receive_symlink_target(
     dst_root: &Path,
     cycle_id: i64,
     entry: &SnapshotEntry,
-    target: &str,
+    target: &Path,
     is_dir: bool,
 ) -> Result<()> {
     reject_dangerous_destination(dst_root)?;
     if entry.file_type != "symlink" {
         bail!("receive_symlink_target requires a symlink entry");
+    }
+    if target.is_absolute() {
+        // Copied verbatim for backup fidelity, but it points wherever the
+        // DESTINATION machine has that path — usually nowhere.
+        warn!(
+            rel_path = entry.rel_path,
+            target = %target.display(),
+            "symlink has an absolute target; it will not resolve portably on this machine"
+        );
     }
     let final_path = safe_join_rel(dst_root, &entry.rel_path)?;
     let tmp = tmp_path(dst_root, cycle_id, &entry.rel_path);
@@ -1707,7 +1730,7 @@ fn receive_symlink_target(
     if tmp.exists() || fs::symlink_metadata(&tmp).is_ok() {
         remove_any(&tmp)?;
     }
-    create_symlink_kind(Path::new(target), &tmp, is_dir)
+    create_symlink_kind(target, &tmp, is_dir)
         .with_context(|| format!("failed to create symlink {}", tmp.display()))?;
     if Some(hash_symlink(&tmp)?) != entry.hash {
         remove_any(&tmp).ok();
@@ -2004,10 +2027,15 @@ fn send_symlink_tcp(
     src: &Path,
     timeout: Duration,
 ) -> Result<()> {
-    let target = fs::read_link(src)
-        .with_context(|| format!("failed to read symlink {}", src.display()))?
-        .to_string_lossy()
-        .to_string();
+    let raw_target = fs::read_link(src)
+        .with_context(|| format!("failed to read symlink {}", src.display()))?;
+    // The link changed between the scan and this push: report the canonical
+    // source-changing wording so the pass records a yellow retryable issue —
+    // the receiver-side hash mismatch used to burn 3 retries and count as a
+    // hard failure instead.
+    if Some(hash_symlink_target(&raw_target)) != entry.hash {
+        bail!("source changed while copying {}", entry.rel_path);
+    }
     let req = TransferReceiveSymlinkRequest {
         root: destination_root.to_path_buf(),
         rel_path: entry.rel_path.clone(),
@@ -2015,7 +2043,13 @@ fn send_symlink_tcp(
         mtime_ns: entry.mtime_ns,
         mode: entry.mode,
         hash: entry.hash.clone(),
-        target,
+        target: symlink_target_for_wire(&raw_target),
+        // Unix-to-Unix keeps the exact bytes (a target is not required to be
+        // UTF-8 there); the string field stays for Windows and old peers.
+        #[cfg(unix)]
+        target_bytes: Some(std::os::unix::ffi::OsStrExt::as_bytes(raw_target.as_os_str()).to_vec()),
+        #[cfg(not(unix))]
+        target_bytes: None,
         is_dir: symlink_points_to_dir(src),
     };
     let ack: TransferAck =
@@ -2024,6 +2058,21 @@ fn send_symlink_tcp(
         bail!("peer rejected symlink transfer");
     }
     Ok(())
+}
+
+/// Wire form of a symlink target: Windows senders normalize `\` to `/` so a
+/// RELATIVE target resolves on a Unix destination (and [`hash_symlink`]
+/// normalizes the same way, keeping both sides' fingerprints equal). Unix
+/// targets pass through untouched — `\` is a legal filename byte there.
+fn symlink_target_for_wire(target: &Path) -> String {
+    #[cfg(windows)]
+    {
+        target.to_string_lossy().replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        target.to_string_lossy().to_string()
+    }
 }
 
 fn throttle_after_transfer(bytes: usize, bwlimit_kbps: u64) {
@@ -5481,6 +5530,17 @@ impl SourceEndpoint {
                 add_directory: source.add_directory,
             });
         }
+        if metadata.file_type().is_symlink() && fs::metadata(&source.src).is_ok_and(|m| m.is_dir())
+        {
+            // Deliberate lstat semantics, but surprising enough to say out
+            // loud: the LINK syncs as a single file, not the tree behind it.
+            warn!(
+                source = source.id,
+                path = %source.src.display(),
+                "source root is a symlink to a directory; syncing the link itself, \
+                 not the directory tree (point src at the real path to sync the tree)"
+            );
+        }
         if metadata.is_file() || metadata.file_type().is_symlink() {
             return Ok(Self::File {
                 path: source.src.clone(),
@@ -5522,16 +5582,29 @@ impl DestinationEndpoint {
                 if dst.path.exists() && !dst.path.is_dir() {
                     bail!("directory source cannot sync to non-directory destination");
                 }
-                if !add_directory {
-                    return Ok(Self::Dir {
-                        root: dst.path.clone(),
-                    });
+                let effective_root = if *add_directory {
+                    let dir_name = src_root.file_name().ok_or_else(|| {
+                        anyhow::anyhow!("source directory has no name: {}", src_root.display())
+                    })?;
+                    dst.path.join(dir_name)
+                } else {
+                    dst.path.clone()
+                };
+                // The scanners use lstat and read a symlink root as an EMPTY
+                // tree: every pass would re-copy everything through the link
+                // while mirror deletion never ran — permanently green and
+                // permanently wrong. Refuse it loudly instead.
+                if fs::symlink_metadata(&effective_root)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    bail!(
+                        "destination root {} is a symlink; point the destination at the real path",
+                        effective_root.display()
+                    );
                 }
-                let dir_name = src_root.file_name().ok_or_else(|| {
-                    anyhow::anyhow!("source directory has no name: {}", src_root.display())
-                })?;
                 Ok(Self::Dir {
-                    root: dst.path.join(dir_name),
+                    root: effective_root,
                 })
             }
             SourceEndpoint::File { .. } => {
@@ -7281,7 +7354,21 @@ fn hash_file(path: &Path) -> Result<String> {
 
 fn hash_symlink(path: &Path) -> Result<String> {
     let target = fs::read_link(path)?;
-    Ok(format!("symlink:{}", target.to_string_lossy()))
+    Ok(hash_symlink_target(&target))
+}
+
+/// Symlink fingerprint. Windows normalizes separators to `/` so a relative
+/// target compares equal to the Unix copy the wire conversion produces; Unix
+/// keeps the raw (lossy) string — `\` is a legal target byte there.
+fn hash_symlink_target(target: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!("symlink:{}", target.to_string_lossy().replace('\\', "/"))
+    }
+    #[cfg(not(windows))]
+    {
+        format!("symlink:{}", target.to_string_lossy())
+    }
 }
 
 fn tmp_path(dst_root: &Path, cycle_id: i64, rel: &str) -> PathBuf {
@@ -7309,7 +7396,19 @@ fn path_blocks_directory(path: &Path) -> bool {
 
 fn remove_any(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
-    if meta.is_dir() && !meta.file_type().is_symlink() {
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        // Windows directory symlinks/junctions are directory handles:
+        // remove_file returns ACCESS_DENIED for them and they need
+        // RemoveDirectory. Never remove_dir_all here — that would recurse
+        // into the link target.
+        if fs::remove_file(path).is_err() {
+            fs::remove_dir(path)
+                .with_context(|| format!("failed to remove symlink {}", path.display()))?;
+        }
+        return Ok(());
+    }
+    if meta.is_dir() {
         fs::remove_dir_all(path)?;
     } else {
         fs::remove_file(path)?;

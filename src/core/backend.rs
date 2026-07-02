@@ -1328,11 +1328,21 @@ fn browse_paths_inner(requested: PathBuf) -> Result<BrowseResponse> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&path)? {
         let entry = entry?;
+        // DirEntry::metadata is lstat: symlinks used to fall through the
+        // dir/file split and silently vanish from the picker. Classify them
+        // by their target so a symlinked directory is at least visible
+        // (entering it resolves to the real path via canonicalize).
         let metadata = entry.metadata()?;
         let kind = if metadata.is_dir() {
             "dir"
         } else if metadata.is_file() {
             "file"
+        } else if metadata.file_type().is_symlink() {
+            match std::fs::metadata(entry.path()) {
+                Ok(target) if target.is_dir() => "dir",
+                Ok(_) => "file",
+                Err(_) => continue, // dangling
+            }
         } else {
             continue;
         };
