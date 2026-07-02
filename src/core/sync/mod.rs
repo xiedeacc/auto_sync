@@ -32,6 +32,7 @@ use crate::core::machines::{
 use crate::core::progress;
 use crate::core::state::{Cycle, CycleEvent, ScanDiffEntry, ScanReport, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
+use crate::core::storage;
 
 pub mod delta;
 
@@ -52,6 +53,10 @@ const DELTA_MAX_SIZE: u64 = 512 * 1024 * 1024;
 /// worker over budget waits until others release; a single request larger than
 /// the whole budget is still allowed to run alone so it cannot deadlock.
 const TRANSFER_MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
+/// When the destination is flash, wholesale subtree copies queue file entries
+/// and flush them through the parallel pool in batches of this size; the batch
+/// bounds memory while keeping the pool saturated between flush barriers.
+const WHOLESALE_PARALLEL_BATCH: usize = 1024;
 
 /// Serializes every run of the sync engine within a process. With the daemon,
 /// web server and (optional) desktop UI now sharing one process, the scheduled
@@ -5513,6 +5518,11 @@ fn copy_missing_directory_tree(
     copied_paths: &mut BTreeSet<String>,
     changing_paths: &mut BTreeSet<String>,
 ) -> Result<()> {
+    // Flash destinations take the parallel copy pool; rotational and
+    // undetectable media keep the sequential path (parallel small-file writes
+    // thrash HDD heads, and unknown must not regress the proven default).
+    let parallel_files = storage::path_is_rotational(dst_root) == Some(false);
+    let mut pending: Vec<SnapshotEntry> = Vec::new();
     let mut dir_specs = Vec::new();
     let mut queue = VecDeque::from([subtree_root.to_path_buf()]);
     while let Some(dir) = queue.pop_front() {
@@ -5563,6 +5573,25 @@ fn copy_missing_directory_tree(
             let Some(entry) = snapshot_entry_if_supported(&child, rel_path, sync.checksum)? else {
                 continue;
             };
+            if parallel_files {
+                // Parents already exist: the BFS creates each directory when
+                // it is popped, before its children are enqueued.
+                copied_paths.insert(entry.rel_path.clone());
+                pending.push(entry);
+                if pending.len() >= WHOLESALE_PARALLEL_BATCH {
+                    flush_wholesale_copies(
+                        src_root,
+                        dst_root,
+                        destination_id,
+                        cycle_id,
+                        &mut pending,
+                        source_snapshot,
+                        changing_paths,
+                        sync,
+                    )?;
+                }
+                continue;
+            }
             if let Err(err) = copy_entry(src_root, dst_root, destination_id, cycle_id, &entry)
                 .with_context(|| format!("failed to copy {}", entry.rel_path))
             {
@@ -5571,13 +5600,56 @@ fn copy_missing_directory_tree(
                     return Err(err);
                 }
                 changing_paths.extend(paths);
+            } else {
+                cancel::add_synced_files(1);
             }
             copied_paths.insert(entry.rel_path.clone());
             source_snapshot.push(entry);
         }
     }
+    flush_wholesale_copies(
+        src_root,
+        dst_root,
+        destination_id,
+        cycle_id,
+        &mut pending,
+        source_snapshot,
+        changing_paths,
+        sync,
+    )?;
     set_dir_mtimes(dst_root, &dir_specs)
         .with_context(|| format!("failed to set directory mtimes for {subtree_rel}"))?;
+    Ok(())
+}
+
+/// Drains the wholesale-copy batch through the parallel pool. Source-changing
+/// entries are tolerated (collected for the caller, like the sequential path);
+/// any hard failure aborts the subtree copy, matching the sequential path's
+/// fail-fast contract.
+#[allow(clippy::too_many_arguments)]
+fn flush_wholesale_copies(
+    src_root: &Path,
+    dst_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    pending: &mut Vec<SnapshotEntry>,
+    source_snapshot: &mut Vec<SnapshotEntry>,
+    changing_paths: &mut BTreeSet<String>,
+    sync: &NativeSyncConfig,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<&SnapshotEntry> = pending.iter().collect();
+    let outcome = copy_entries_parallel(src_root, dst_root, destination_id, cycle_id, &refs, sync)?;
+    changing_paths.extend(outcome.changing);
+    let failed_count = outcome.failed.len();
+    if let Some((path, err)) = outcome.failed.into_iter().next() {
+        return Err(err.context(format!(
+            "{failed_count} wholesale file copy(s) failed (first: {path})"
+        )));
+    }
+    source_snapshot.append(pending);
     Ok(())
 }
 
