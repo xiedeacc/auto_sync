@@ -15,6 +15,7 @@
 | 每目的地暂停/继续 | **新功能**:`DestinationConfig.paused`(配置字段,随委托推送同步到源机)。暂停=取消当前任务+调度器不再派发(pending target 保留,黄色 reason=paused);继续=从暂停处自动接续。UI:info 按钮左侧新增 ⏸/▶ 切换钮(替代原与删除按钮合并的 stop 钮;任务运行时删除钮改为禁用);手动 Sync 对暂停目的地明确拒绝。修复了"新增 src group 首次全量点停止后自动重启"的问题。 |
 | 测试补盲(§8 五) | **已补**:scheduler.rs 0→6 个(daily/weekly 边界、severity 回退、weekday 解析;本地时区无关写法);machines.rs `read_http_response`/`read_chunked_body` 泛型化到 `Read` 并补 5 个线格式测试;worker pool 容错语义 2 个(≤20 失败聚合、达上限熔断);批量/流式端点 3 个单测 + e2e 升级(200 小文件走批量端点、20MiB 大文件走流式端点,真实 HTTP)。 |
 | E10(kind 标签全局共享) | **核实为仅外观**:引擎 pass 由 SYNC_GATE 串行,重叠只可能让 task_log 的 kind 标签在 sync/compare 并存窗口内偏差,数据通路无影响;不改。 |
+| 删除双向传播 | **新功能(用户 2026-07-03 提出)**:此前只有控制机→执行机方向的删除生效;执行机(如 NAS UI)删除 `managed_by` 条目会被控制机的下一次委托推送**静默复活**。现在执行机删除前先调用控制机 `/api/config/remove-delegated-entry`(用执行机的 live health id 验证请求者身份;控制机删副本后自身推送让两边收敛;控制机不可达则拒绝本地删除并明确报错)。端点纳入 peer_token 鉴权面。 |
 | mod.rs 拆分 | **唯一未做的遗留**(纯代码组织,P3):~10K 行拆 6 个子模块是大型机械重构,不应与本轮大量行为变更混在同一个变更集里部署;建议下一轮单独提交。 |
 
 ---

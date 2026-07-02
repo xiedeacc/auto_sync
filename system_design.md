@@ -200,6 +200,7 @@ install_dir = "/opt/auto_sync"
 - `dst` 可以离线；离线不删除状态，只标记红点并在下一次在线时从落后周期补齐。
 - 每个 `dst` 独立配置 `schedule`。`schedule.mode = "realtime"` 表示 fanotify 触发近实时同步，同时由 source snapshot backend 定期 reconcile。
 - 如果 source 选择的是远程机器，控制机保存配置后会把该 source group 下发到 source 所在机器，并由 source 机器的 daemon 真正执行。下发后的 group 会把该 source 机器自身重写为 `local`，同机 destination 也重写为 `local`；远端会把该 delegated group 持久化到自己的 `conf/auto_sync.toml`，并用 `managed_by` 标记控制机；控制机只保留完整配置用于 UI，并通过网络读取执行机器的最新状态。手动触发远程 sync 前，控制机会先查询远端 `/api/runtime-status`，若远端已有 sync 占用则拒绝新请求，行为与本机 sync gate 一致。
+- 删除双向传播（2026-07-03 晚）：控制机删除委托 source/destination 时，其推送的（可能为空的）委托集合让执行机同步删除；反方向，执行机删除带 `managed_by` 的条目时会**先**调用控制机的 `/api/config/remove-delegated-entry`（控制机用执行机的 live health id 验证请求者身份后删除自己的副本并再次推送收敛），控制机不可达则本地保存直接失败并明确报错——否则控制机的下一次推送会静默复活已删条目。该端点纳入 `peer_token` 鉴权面。
 - `schedule` 是用户可见的触发策略；`cycle` 是后端生成的 source 版本点，两者不能混用命名。
 - ZFS snapshot 是 dataset 级别，不是任意目录级别。若 `src` 是 dataset 的子目录，配置需要记录 `dataset` 和 `path_in_dataset`。
 - 路径类型规则：`src` 可以是文件或目录；`dst` 可以是目录，且当 `src` 是文件并且 `dst` 路径已经存在为文件时，允许 `src file -> dst file`。如果 `src` 是文件而 `dst` 路径不存在，则按 `src file -> dst dir` 处理；不支持 `src dir -> dst file`。

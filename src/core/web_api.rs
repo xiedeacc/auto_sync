@@ -44,7 +44,9 @@ use crate::core::sync::{
 /// `app.peer_token` set (same value on every machine) they require the
 /// matching header; empty keeps the open LAN-trust behavior.
 fn path_requires_peer_token(path: &str) -> bool {
-    path.starts_with("/api/transfer/") || path == "/api/config/delegated-source-groups"
+    path.starts_with("/api/transfer/")
+        || path == "/api/config/delegated-source-groups"
+        || path == "/api/config/remove-delegated-entry"
 }
 
 async fn require_peer_token(req: Request<axum::body::Body>, next: Next) -> Response {
@@ -71,6 +73,10 @@ pub fn router(backend: Backend) -> Router {
         .route(
             "/api/config/delegated-source-groups",
             post(api_delegated_source_groups),
+        )
+        .route(
+            "/api/config/remove-delegated-entry",
+            post(api_remove_delegated_entry),
         )
         .route("/api/health", get(api_health))
         .route("/api/machines", get(api_machines).post(api_add_machine))
@@ -261,6 +267,13 @@ async fn api_delegated_source_groups(
     Json(req): Json<DelegatedSourceGroupsRequest>,
 ) -> Result<Json<AppConfig>, ApiError> {
     blocking(move || Ok(Json(backend.apply_delegated_source_groups(req)?))).await
+}
+
+async fn api_remove_delegated_entry(
+    AxumState(backend): AxumState<Backend>,
+    Json(req): Json<crate::core::backend::RemoveDelegatedEntryRequest>,
+) -> Result<Json<AppConfig>, ApiError> {
+    blocking(move || Ok(Json(backend.remove_delegated_entry(req)?))).await
 }
 
 async fn api_health(

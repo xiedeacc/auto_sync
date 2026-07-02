@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::core::cancel;
 use crate::core::config::{
@@ -96,6 +96,18 @@ impl Backend {
     }
 
     pub fn save_config(&self, cfg: &AppConfig) -> Result<AppConfig> {
+        // Reverse delegation: deleting a source/destination that a REMOTE
+        // controller manages must reach that controller BEFORE the local
+        // write — its next delegation push would otherwise silently
+        // resurrect the entry. An unreachable controller therefore fails the
+        // save loudly (nothing changed anywhere) instead of leaving the two
+        // configs to fight.
+        if let Some(current) = load_config(&self.config_path)
+            .ok()
+            .map(|current| clean_config_for_save(&current))
+        {
+            self.notify_controllers_of_removed_entries(&current, &clean_config_for_save(cfg))?;
+        }
         let (cfg, current) = {
             let _rmw = crate::core::config::config_write_lock();
             let current = load_config(&self.config_path)
@@ -145,6 +157,103 @@ impl Backend {
         state_db.ensure_config(&cfg)?;
         self.clear_machine_cache();
         Ok(cfg)
+    }
+
+    /// Controller-side handler for [`RemoveDelegatedEntryRequest`]: verify the
+    /// reporter really is the source's executing machine (live health id),
+    /// drop the source/destination from OUR config, and save — the save's own
+    /// delegation push then converges the executing machine as well.
+    pub fn remove_delegated_entry(&self, req: RemoveDelegatedEntryRequest) -> Result<AppConfig> {
+        let cfg = load_or_create_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
+        let Some(index) = cfg.source_groups.iter().position(|source| {
+            source.id == req.source_id && machine_id_or_local(&source.machine_id) != "local"
+        }) else {
+            // Already gone — idempotent (repeated deletes, races with our
+            // own delegation push).
+            return Ok(cfg);
+        };
+        let machine_ref = machine_id_or_local(&cfg.source_groups[index].machine_id).to_string();
+        let machine = find_machine(&cfg, &machine_ref)
+            .ok_or_else(|| anyhow::anyhow!("unknown source machine: {machine_ref}"))?;
+        let health =
+            remote_get_json::<MachineHealth>(&machine, "/api/health", Duration::from_secs(3))
+                .with_context(|| format!("failed to verify the reporter of {}", req.source_id))?;
+        if health.id != req.reporter_id {
+            anyhow::bail!(
+                "removal of {} was not requested by its executing machine",
+                req.source_id
+            );
+        }
+        let mut next = cfg.clone();
+        match &req.destination_id {
+            Some(destination_id) => {
+                let source = &mut next.source_groups[index];
+                let before = source.destinations.len();
+                source.destinations.retain(|dst| dst.id != *destination_id);
+                if source.destinations.len() == before {
+                    return Ok(next); // destination already gone — idempotent
+                }
+            }
+            None => {
+                next.source_groups.remove(index);
+            }
+        }
+        info!(
+            source = req.source_id,
+            destination = ?req.destination_id,
+            "removing delegated entry at its executing machine's request"
+        );
+        self.save_config(&next)
+    }
+
+    /// See [`RemoveDelegatedEntryRequest`]: called before a local save that
+    /// deletes managed entries. Fails (aborting the save) when a managing
+    /// controller cannot be reached or refuses.
+    fn notify_controllers_of_removed_entries(
+        &self,
+        current: &AppConfig,
+        next: &AppConfig,
+    ) -> Result<()> {
+        let removed = removed_managed_entries(current, next);
+        if removed.is_empty() {
+            return Ok(());
+        }
+        let reporter_id = local_health(current, self.port).id;
+        for entry in removed {
+            let target = match &entry.destination_id {
+                Some(dst) => format!("{}:{}", entry.source_id, dst),
+                None => entry.source_id.clone(),
+            };
+            let controller = resolve_machine_by_health_id(current, &entry.controller_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot delete {target}: the controller managing it ({}) is not \
+                         reachable — delete it there instead, or retry when it is online",
+                        entry.controller_id
+                    )
+                })?;
+            let req = RemoveDelegatedEntryRequest {
+                reporter_id: reporter_id.clone(),
+                source_id: entry.source_id.clone(),
+                destination_id: entry.destination_id.clone(),
+            };
+            let _: AppConfig = remote_post_json(
+                &controller,
+                "/api/config/remove-delegated-entry",
+                &req,
+                Duration::from_secs(15),
+            )
+            .with_context(|| {
+                format!("cannot delete {target}: its managing controller rejected the removal")
+            })?;
+            info!(
+                target = target,
+                controller = %controller.host,
+                "managed entry removal propagated to its controller"
+            );
+        }
+        Ok(())
     }
 
     pub fn health(&self) -> Result<MachineHealth> {
@@ -883,6 +992,89 @@ pub struct DelegatedSourceGroupsRequest {
     pub controller_id: String,
     pub machines: Vec<MachineConfig>,
     pub source_groups: Vec<crate::core::config::SourceGroupConfig>,
+}
+
+/// Reverse-delegation removal: the EXECUTING machine of a delegated source
+/// asks the controller that manages it to delete the source (or one of its
+/// destinations) from the controller's config too — without this, the
+/// controller's next delegation push would silently resurrect an entry the
+/// user deleted on the executing machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveDelegatedEntryRequest {
+    /// Discovery/health id of the machine reporting the removal; the
+    /// controller verifies it against the source's executing machine before
+    /// honoring a config-mutating peer request.
+    pub reporter_id: String,
+    pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_id: Option<String>,
+}
+
+/// A managed (delegated) entry a pending local save would delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemovedManagedEntry {
+    controller_id: String,
+    source_id: String,
+    destination_id: Option<String>,
+}
+
+/// Diff the current config against the pending one and list every deletion
+/// of a source (or destination) that a remote controller manages.
+fn removed_managed_entries(current: &AppConfig, next: &AppConfig) -> Vec<RemovedManagedEntry> {
+    let mut removed = Vec::new();
+    for source in &current.source_groups {
+        if source.managed_by.trim().is_empty() {
+            continue;
+        }
+        match next
+            .source_groups
+            .iter()
+            .find(|candidate| candidate.id == source.id)
+        {
+            None => removed.push(RemovedManagedEntry {
+                controller_id: source.managed_by.clone(),
+                source_id: source.id.clone(),
+                destination_id: None,
+            }),
+            Some(next_source) => {
+                for dst in &source.destinations {
+                    if !next_source
+                        .destinations
+                        .iter()
+                        .any(|candidate| candidate.id == dst.id)
+                    {
+                        removed.push(RemovedManagedEntry {
+                            controller_id: source.managed_by.clone(),
+                            source_id: source.id.clone(),
+                            destination_id: Some(dst.id.clone()),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// Find the configured machine whose LIVE health id matches `health_id`.
+/// Delegation records controllers by discovery id (host+port+exe hash), which
+/// is not a configured machine id/alias, so the only reliable resolution is
+/// asking the machines who they are.
+fn resolve_machine_by_health_id(cfg: &AppConfig, health_id: &str) -> Option<MachineConfig> {
+    for machine in cfg
+        .machines
+        .iter()
+        .filter(|machine| machine.enabled && machine.id != "local")
+    {
+        if let Ok(health) =
+            remote_get_json::<MachineHealth>(machine, "/api/health", Duration::from_secs(2))
+        {
+            if health.id == health_id {
+                return Some(machine.clone());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Serialize)]
@@ -1889,6 +2081,251 @@ mod tests {
         assert_eq!(offset.last_verified_cycle_id, None);
         assert_eq!(offset.status, "red");
         assert_eq!(offset.status_reason, "destination_path_changed");
+    }
+
+    fn managed_source(id: &str, managed_by: &str) -> crate::core::config::SourceGroupConfig {
+        crate::core::config::SourceGroupConfig {
+            id: id.to_string(),
+            machine_id: "local".to_string(),
+            src: PathBuf::from("/zfs"),
+            add_directory: false,
+            managed_by: managed_by.to_string(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: crate::core::config::SyncMode::Mirror,
+            snapshot: crate::core::config::SnapshotConfig::default(),
+            destinations: vec![
+                crate::core::config::DestinationConfig {
+                    id: "dst_1".to_string(),
+                    machine_id: "local".to_string(),
+                    path: PathBuf::from("/zfs_pool"),
+                    enabled: true,
+                    paused: false,
+                    schedule: crate::core::config::ScheduleConfig::default(),
+                    sync: None,
+                },
+                crate::core::config::DestinationConfig {
+                    id: "dst_2".to_string(),
+                    machine_id: "local".to_string(),
+                    path: PathBuf::from("/zfs_pool2"),
+                    enabled: true,
+                    paused: false,
+                    schedule: crate::core::config::ScheduleConfig::default(),
+                    sync: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn removed_managed_entries_reports_only_managed_deletions() {
+        let mut current = AppConfig::default();
+        current.source_groups.push(managed_source("src_m", "ctl-1"));
+        current.source_groups.push(managed_source("src_free", ""));
+
+        // Deleting a destination of the managed source is reported; deleting
+        // the whole UNmanaged source is not (nobody else holds a copy).
+        let mut next = current.clone();
+        next.source_groups[0].destinations.retain(|d| d.id != "dst_2");
+        next.source_groups.retain(|s| s.id != "src_free");
+        let removed = removed_managed_entries(&current, &next);
+        assert_eq!(
+            removed,
+            vec![RemovedManagedEntry {
+                controller_id: "ctl-1".to_string(),
+                source_id: "src_m".to_string(),
+                destination_id: Some("dst_2".to_string()),
+            }]
+        );
+
+        // Deleting the managed source itself is reported as one whole-source
+        // removal (not per destination).
+        let mut next = current.clone();
+        next.source_groups.retain(|s| s.id != "src_m");
+        let removed = removed_managed_entries(&current, &next);
+        assert_eq!(
+            removed,
+            vec![RemovedManagedEntry {
+                controller_id: "ctl-1".to_string(),
+                source_id: "src_m".to_string(),
+                destination_id: None,
+            }]
+        );
+
+        // No deletions → nothing to notify.
+        assert!(removed_managed_entries(&current, &current).is_empty());
+    }
+
+    /// Minimal HTTP peer: answers /api/health with the given id and every
+    /// other request with an empty (default) AppConfig JSON. Records request
+    /// lines for assertions.
+    fn spawn_mock_peer(health_id: &str) -> (u16, std::sync::Arc<Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        // 127.0.0.2: reachable loopback that machine_is_self() does NOT treat
+        // as this host (127.0.0.1 would make normalize rewrite machine ids).
+        let listener = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: std::sync::Arc<Mutex<Vec<String>>> = Default::default();
+        let seen_writer = seen.clone();
+        let health_id = health_id.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut raw = Vec::new();
+                let mut buf = [0_u8; 4096];
+                let head_end = loop {
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break 0,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                };
+                if head_end == 0 {
+                    continue;
+                }
+                let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                while raw.len() < head_end + content_length {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let request_line = head.lines().next().unwrap_or("").to_string();
+                seen_writer
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .push(request_line.clone());
+                let body = if request_line.contains("/api/health") {
+                    format!(
+                        r#"{{"id":"{health_id}","name":"mock","host":"127.0.0.1","port":1,"os":"linux","version":"0.0.0"}}"#
+                    )
+                } else {
+                    "{}".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
+    #[test]
+    fn remove_delegated_entry_verifies_reporter_then_removes() {
+        let temp = temp_dir("backend_remove_delegated");
+        let config_path = temp.join("auto_sync.toml");
+        let (port, _seen) = spawn_mock_peer("reporter-1");
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = temp.join("state").join("auto_sync.sqlite");
+        cfg.app.log_dir = temp.join("logs");
+        cfg.machines.push(MachineConfig {
+            id: "nas".to_string(),
+            host: "127.0.0.2".to_string(),
+            port,
+            enabled: true,
+            ..MachineConfig::default()
+        });
+        let mut source = managed_source("src_m", "");
+        source.machine_id = "nas".to_string();
+        cfg.source_groups.push(source);
+        crate::core::config::save_config(&config_path, &cfg).unwrap();
+        let backend = Backend::new(config_path.clone(), 18765);
+
+        // A reporter that is not the executing machine is refused.
+        let err = backend
+            .remove_delegated_entry(RemoveDelegatedEntryRequest {
+                reporter_id: "impostor".to_string(),
+                source_id: "src_m".to_string(),
+                destination_id: None,
+            })
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not requested"), "{err:#}");
+
+        // Destination removal by the true executing machine.
+        backend
+            .remove_delegated_entry(RemoveDelegatedEntryRequest {
+                reporter_id: "reporter-1".to_string(),
+                source_id: "src_m".to_string(),
+                destination_id: Some("dst_2".to_string()),
+            })
+            .unwrap();
+        let cfg = load_config(&config_path).unwrap();
+        let dst_ids: Vec<&str> = cfg.source_groups[0]
+            .destinations
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(dst_ids, vec!["dst_1"]);
+
+        // Whole-source removal, then an idempotent repeat.
+        backend
+            .remove_delegated_entry(RemoveDelegatedEntryRequest {
+                reporter_id: "reporter-1".to_string(),
+                source_id: "src_m".to_string(),
+                destination_id: None,
+            })
+            .unwrap();
+        assert!(load_config(&config_path).unwrap().source_groups.is_empty());
+        backend
+            .remove_delegated_entry(RemoveDelegatedEntryRequest {
+                reporter_id: "reporter-1".to_string(),
+                source_id: "src_m".to_string(),
+                destination_id: None,
+            })
+            .unwrap();
+
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn saving_away_a_managed_source_notifies_its_controller_first() {
+        let temp = temp_dir("backend_reverse_delete");
+        let config_path = temp.join("auto_sync.toml");
+        let (port, seen) = spawn_mock_peer("ctl-health-1");
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = temp.join("state").join("auto_sync.sqlite");
+        cfg.app.log_dir = temp.join("logs");
+        cfg.machines.push(MachineConfig {
+            id: "controller".to_string(),
+            host: "127.0.0.2".to_string(),
+            port,
+            enabled: true,
+            ..MachineConfig::default()
+        });
+        cfg.source_groups.push(managed_source("src_m", "ctl-health-1"));
+        crate::core::config::save_config(&config_path, &cfg).unwrap();
+        let backend = Backend::new(config_path.clone(), 18765);
+
+        let mut next = cfg.clone();
+        next.source_groups.clear();
+        backend.save_config(&next).unwrap();
+
+        let requests = seen.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.contains("/api/config/remove-delegated-entry")),
+            "controller was not notified: {requests:?}"
+        );
+        assert!(load_config(&config_path).unwrap().source_groups.is_empty());
+
+        std::fs::remove_dir_all(temp).ok();
     }
 
     fn temp_dir(name: &str) -> PathBuf {
