@@ -312,7 +312,38 @@ th {
 }
 
 .destination-right {
-  grid-template-columns: 34px 100px 100px 34px 104px 34px;
+  grid-template-columns: auto 100px 100px 34px 104px 34px;
+}
+
+/* Info cell: the repair icon (visible only when the last Compare found
+   differences) sits left of the info button in the same grid cell. */
+.dst-info-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  min-width: 34px;
+}
+
+.repair-scan-button {
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #b45309;
+  border-radius: 6px;
+  background: rgba(180, 83, 9, 0.1);
+  color: #b45309;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.repair-scan-button:hover {
+  background: rgba(180, 83, 9, 0.2);
 }
 
 .actions-label {

@@ -776,6 +776,8 @@ fn offline_views_for_source(source: &SourceGroupConfig, reason: &str) -> Vec<Des
             status_reason: reason.to_string(),
             updated_at: None,
             issues: Vec::new(),
+            scan_differences: None,
+            scan_at: None,
         })
         .collect()
 }
@@ -848,6 +850,7 @@ fn sync_request_mode_wire_value(mode: SyncRequestMode) -> &'static str {
         SyncRequestMode::Incremental => "incremental",
         SyncRequestMode::Full => "full",
         SyncRequestMode::ChangedSince => "changed_since",
+        SyncRequestMode::RepairScan => "repair_scan",
     }
 }
 

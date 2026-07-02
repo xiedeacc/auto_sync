@@ -70,6 +70,14 @@ pub struct DestinationView {
     pub status_reason: String,
     pub updated_at: Option<String>,
     pub issues: Vec<DestinationIssueView>,
+    /// Differences the last successful Compare found (add+update+delete+
+    /// type-mismatch); None when no report is stored or the compare failed.
+    /// Drives the UI's repair affordance.
+    #[serde(default)]
+    pub scan_differences: Option<u64>,
+    /// When the report behind `scan_differences` was taken.
+    #[serde(default)]
+    pub scan_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1050,6 +1058,14 @@ impl State {
         Ok(())
     }
 
+    pub fn delete_scan_report(&self, source_id: &str, destination_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM scan_report WHERE source_id=?1 AND destination_id=?2",
+            params![source_id, destination_id],
+        )?;
+        Ok(())
+    }
+
     pub fn get_scan_report(
         &self,
         source_id: &str,
@@ -1204,6 +1220,19 @@ impl State {
                 } else {
                     offset.status_reason
                 };
+                let (scan_differences, scan_at) =
+                    match self.get_scan_report(&source.id, &dst.id) {
+                        Ok(Some(report)) if report.error.is_empty() => (
+                            Some(
+                                report.to_add
+                                    + report.to_update
+                                    + report.to_delete
+                                    + report.type_mismatch,
+                            ),
+                            Some(report.scanned_at),
+                        ),
+                        _ => (None, None),
+                    };
                 views.push(DestinationView {
                     source_id: source.id.clone(),
                     destination_id: dst.id.clone(),
@@ -1217,6 +1246,8 @@ impl State {
                     status_reason: computed_reason,
                     updated_at: Some(offset.updated_at),
                     issues: self.destination_issues(&source.id, &dst.id)?,
+                    scan_differences,
+                    scan_at,
                 });
             }
         }

@@ -361,6 +361,17 @@ function updateStatusUi() {
       logButton.title = iconState.title;
       logButton.setAttribute("aria-label", iconState.title);
     }
+    const repairButton = row.querySelector('[data-action="repair-scan"]');
+    if (repairButton) {
+      const diffs = Number(status && status.scan_differences) || 0;
+      repairButton.hidden = diffs === 0;
+      if (diffs > 0) {
+        const when = (status && status.scan_at) || "";
+        repairButton.title =
+          `Compare found ${diffs} difference${diffs === 1 ? "" : "s"}` +
+          `${when ? ` (${when})` : ""} — click to sync just these paths`;
+      }
+    }
   }
 }
 
@@ -975,7 +986,10 @@ function renderSyncRows(source, group) {
         <label>Cycle</label>
         <span aria-hidden="true"></span>
         <label class="actions-label">Sync</label>
-        <button class="destination-log-button icon destination-log-${escapeAttr(logIconState.kind)}" data-action="show-dst-log" title="${escapeAttr(logIconState.title)}" aria-label="${escapeAttr(logIconState.title)}"><span class="destination-log-icon" aria-hidden="true">i</span></button>
+        <span class="dst-info-cell">
+          <button class="repair-scan-button icon" data-action="repair-scan" title="" aria-label="Sync compare differences" hidden>&#8646;</button>
+          <button class="destination-log-button icon destination-log-${escapeAttr(logIconState.kind)}" data-action="show-dst-log" title="${escapeAttr(logIconState.title)}" aria-label="${escapeAttr(logIconState.title)}"><span class="destination-log-icon" aria-hidden="true">i</span></button>
+        </span>
         <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
         <input class="destination-readonly destination-cycle" value="${escapeAttr(cycleDisplay(status))}" readonly>
         <button class="sync-config-button icon" data-action="edit-dst-sync" title="${escapeAttr(destinationSyncTitle(dst))}">&#9881;</button>
@@ -1028,6 +1042,27 @@ function renderSyncRows(source, group) {
     };
     row.querySelector('[data-action="show-dst-log"]').onclick = () => {
       openDestinationLogModal(source, dst);
+    };
+    row.querySelector('[data-action="repair-scan"]').onclick = () => {
+      const latestStatus = statusFor(source.id, dst.id);
+      const diffs = Number(latestStatus && latestStatus.scan_differences) || 0;
+      if (!diffs) {
+        return;
+      }
+      if (isDestinationUnavailable(latestStatus)) {
+        setMessage(unavailableLabel(latestStatus));
+        return;
+      }
+      runBusy(`Syncing ${diffs} compare difference${diffs === 1 ? "" : "s"} for ${dst.id}...`, async () => {
+        await saveConfig();
+        statuses = await invoke("sync_destination_now", {
+          sourceId: source.id,
+          destinationId: dst.id,
+          mode: "repair_scan",
+        });
+        setMessage("");
+        render();
+      }, { showMainMessage: false });
     };
     row.querySelector('[data-action="sync-dst"]').onchange = (event) => {
       const mode = event.currentTarget.value;

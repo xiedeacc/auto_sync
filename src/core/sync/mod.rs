@@ -180,6 +180,9 @@ pub fn queue_destination_sync(
     destination_id: &str,
     mode: SyncRequestMode,
 ) -> Result<()> {
+    if matches!(mode, SyncRequestMode::RepairScan) {
+        return queue_scan_repair(cfg, state, source_id, destination_id);
+    }
     if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
         match mode {
             SyncRequestMode::Incremental => {}
@@ -187,8 +190,63 @@ pub fn queue_destination_sync(
             SyncRequestMode::ChangedSince => {
                 state.mark_cycle_manual_changed_since_rescan(cycle.id)?
             }
+            SyncRequestMode::RepairScan => unreachable!("handled above"),
         }
     }
+    Ok(())
+}
+
+/// Queue a repair of exactly the differences the last Compare reported:
+/// inject the report's paths as synthetic events and target the destination
+/// with a plain incremental, which applies precisely those paths (copying
+/// only entries that actually differ, mirror-deleting destination extras).
+/// When the stored report is a truncated sample — it cannot name every
+/// difference — escalate to a full reconcile instead. The consumed report is
+/// deleted either way so the UI's repair affordance clears; a fresh Compare
+/// re-establishes it.
+fn queue_scan_repair(
+    cfg: &AppConfig,
+    state: &State,
+    source_id: &str,
+    destination_id: &str,
+) -> Result<()> {
+    let Some(report) = state.get_scan_report(source_id, destination_id)? else {
+        bail!("no compare report stored; run Compare first");
+    };
+    if !report.error.is_empty() {
+        bail!("last compare failed ({}); run Compare again", report.error);
+    }
+    let total = report.to_add + report.to_update + report.to_delete + report.type_mismatch;
+    if total == 0 {
+        return Ok(());
+    }
+    let sample_is_complete =
+        !report.truncated && report.differences.len() as u64 >= total;
+    if sample_is_complete {
+        for diff in &report.differences {
+            state.record_event(source_id, 0, "scan_repair", Some(&diff.rel_path), false)?;
+        }
+        state.force_target_destination(cfg, source_id, destination_id)?;
+        info!(
+            source = source_id,
+            destination = destination_id,
+            paths = report.differences.len(),
+            "queued scan repair for reported differences"
+        );
+    } else {
+        // The report only holds a sample of the differences: repairing just
+        // the sample would leave the rest untouched, so reconcile fully.
+        if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
+            state.mark_cycle_manual_full_rescan(cycle.id)?;
+        }
+        info!(
+            source = source_id,
+            destination = destination_id,
+            total,
+            "scan report is a truncated sample; repairing via full reconcile"
+        );
+    }
+    state.delete_scan_report(source_id, destination_id)?;
     Ok(())
 }
 
@@ -310,15 +368,7 @@ pub fn sync_destination_now_with_mode(
     mode: SyncRequestMode,
 ) -> Result<()> {
     let _kind = set_sync_kind(sync_request_mode_wire_value(mode));
-    if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
-        match mode {
-            SyncRequestMode::Incremental => {}
-            SyncRequestMode::Full => state.mark_cycle_manual_full_rescan(cycle.id)?,
-            SyncRequestMode::ChangedSince => {
-                state.mark_cycle_manual_changed_since_rescan(cycle.id)?
-            }
-        }
-    }
+    queue_destination_sync(cfg, state, source_id, destination_id, mode)?;
     sync_all_pending(cfg, state)
 }
 
@@ -631,6 +681,9 @@ pub enum SyncRequestMode {
     Incremental,
     Full,
     ChangedSince,
+    /// Repair exactly the differences the last Compare reported (falls back
+    /// to a full reconcile when the stored report is a truncated sample).
+    RepairScan,
 }
 
 fn sync_request_mode_wire_value(mode: SyncRequestMode) -> &'static str {
@@ -638,6 +691,7 @@ fn sync_request_mode_wire_value(mode: SyncRequestMode) -> &'static str {
         SyncRequestMode::Incremental => "incremental",
         SyncRequestMode::Full => "full",
         SyncRequestMode::ChangedSince => "changed_since",
+        SyncRequestMode::RepairScan => "repair_scan",
     }
 }
 
@@ -651,6 +705,7 @@ impl FromStr for SyncRequestMode {
             "changed_since" | "changed-since" | "since" | "since-last-verified" => {
                 Ok(Self::ChangedSince)
             }
+            "repair_scan" | "repair-scan" | "repair" => Ok(Self::RepairScan),
             other => bail!("unsupported sync mode: {other}"),
         }
     }
@@ -7321,6 +7376,69 @@ mod tests {
         assert_eq!(
             fs::read(effective_dst.join("destination-only.txt")).unwrap(),
             b"extra"
+        );
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn repair_scan_syncs_only_reported_differences_and_consumes_the_report() {
+        let temp = temp_dir("repair_scan_targets_report_paths");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("hello.txt"), b"hello").unwrap();
+        fs::write(src.join("untouched.txt"), b"untouched").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            add_directory: true,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+                sync: None,
+            }],
+        });
+
+        let mut state = State::open(&db).unwrap();
+        sync_all_now(&cfg, &mut state).unwrap();
+
+        // Introduce destination drift the event stream never saw.
+        let effective_dst = dst.join("src");
+        fs::write(effective_dst.join("hello.txt"), b"corrupted").unwrap();
+        fs::remove_file(effective_dst.join("untouched.txt")).unwrap();
+
+        let report = scan_destination_now(&cfg, &state, "src_1", "dst_1").unwrap();
+        assert_eq!(report.to_update, 1, "hello.txt differs");
+        assert_eq!(report.to_add, 1, "untouched.txt missing");
+
+        queue_destination_sync(&cfg, &state, "src_1", "dst_1", SyncRequestMode::RepairScan)
+            .unwrap();
+        // The consumed report is gone: the UI repair affordance clears.
+        assert!(state.get_scan_report("src_1", "dst_1").unwrap().is_none());
+        sync_all_pending(&cfg, &mut state).unwrap();
+
+        assert_eq!(fs::read(effective_dst.join("hello.txt")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read(effective_dst.join("untouched.txt")).unwrap(),
+            b"untouched"
         );
 
         fs::remove_dir_all(temp).ok();
