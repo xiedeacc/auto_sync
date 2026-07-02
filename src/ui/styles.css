@@ -406,6 +406,72 @@ th {
   display: none;
 }
 
+.tasks-modal-panel {
+  width: min(980px, 94vw);
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.tasks-list {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.tasks-machine {
+  margin-bottom: 14px;
+}
+
+.tasks-machine-title {
+  font-weight: 700;
+  padding: 6px 2px;
+  border-bottom: 1px solid var(--line);
+}
+
+.task-row {
+  display: grid;
+  grid-template-columns: 88px 110px minmax(140px, 1fr) 150px 90px minmax(160px, 1.4fr);
+  gap: 8px;
+  padding: 5px 2px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  align-items: center;
+}
+
+.task-row-head {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.task-target,
+.task-result {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-status {
+  font-weight: 650;
+}
+
+.task-status-running {
+  color: #2563eb;
+}
+
+.task-status-success {
+  color: var(--accent);
+}
+
+.task-status-failed,
+.task-status-aborted {
+  color: var(--red);
+}
+
+.task-status-cancelled {
+  color: #b45309;
+}
+
 .actions-label {
   grid-column: span 2;
 }

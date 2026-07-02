@@ -482,6 +482,68 @@ impl Backend {
         state_db.recent_tasks(limit)
     }
 
+    /// Task logs from this machine AND every managed runtime machine (tasks
+    /// live where they execute; remote logs are fetched live, best effort).
+    pub fn all_tasks(&self, limit: usize) -> Result<Vec<MachineTasksView>> {
+        let cfg = load_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
+        let mut machines = vec![match self.recent_tasks(limit) {
+            Ok(tasks) => MachineTasksView {
+                machine_id: "local".to_string(),
+                label: "local".to_string(),
+                local: true,
+                tasks,
+                error: None,
+            },
+            Err(err) => MachineTasksView {
+                machine_id: "local".to_string(),
+                label: "local".to_string(),
+                local: true,
+                tasks: Vec::new(),
+                error: Some(err.to_string()),
+            },
+        }];
+        let remotes = remote_runtime_machine_refs(&cfg);
+        // Parallel: one offline machine's connect timeout must not delay the
+        // rest of the list.
+        let fetched: Vec<MachineTasksView> = thread::scope(|scope| {
+            let handles: Vec<_> = remotes
+                .into_iter()
+                .map(|(machine_id, machine)| {
+                    scope.spawn(move || {
+                        let path = format!("/api/tasks?limit={limit}");
+                        match remote_get_json::<Vec<crate::core::state::TaskLogEntry>>(
+                            &machine,
+                            &path,
+                            Duration::from_secs(5),
+                        ) {
+                            Ok(tasks) => MachineTasksView {
+                                machine_id,
+                                label: machine_label(&machine),
+                                local: false,
+                                tasks,
+                                error: None,
+                            },
+                            Err(err) => MachineTasksView {
+                                machine_id,
+                                label: machine_label(&machine),
+                                local: false,
+                                tasks: Vec::new(),
+                                error: Some(err.to_string()),
+                            },
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("task fetch thread panicked"))
+                .collect()
+        });
+        machines.extend(fetched);
+        Ok(machines)
+    }
+
     /// The most recent stored Scan report for a destination, if any.
     pub fn scan_report(&self, source_id: &str, destination_id: &str) -> Result<Option<ScanReport>> {
         let cfg = load_config(&self.config_path)?;
@@ -713,6 +775,20 @@ struct ScanDestinationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DismissRestartNoticeRequest {
     pub source_id: String,
+}
+
+/// One machine's task log (`local = true` for this machine; `error` set when
+/// a remote machine could not be reached).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineTasksView {
+    pub machine_id: String,
+    pub label: String,
+    #[serde(default)]
+    pub local: bool,
+    #[serde(default)]
+    pub tasks: Vec<crate::core::state::TaskLogEntry>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

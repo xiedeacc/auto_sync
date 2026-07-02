@@ -116,7 +116,11 @@ const el = {
   statusText: document.getElementById("status-text"),
   statusConfigError: document.getElementById("status-config-error"),
   statusBuild: document.getElementById("status-build"),
-  refresh: document.getElementById("refresh"),
+  tasks: document.getElementById("tasks"),
+  tasksModal: document.getElementById("tasks-modal"),
+  tasksClose: document.getElementById("tasks-close"),
+  tasksSummary: document.getElementById("tasks-summary"),
+  tasksList: document.getElementById("tasks-list"),
   machineStatus: document.getElementById("machine-status"),
   folderModal: document.getElementById("folder-modal"),
   folderMachine: document.getElementById("folder-machine"),
@@ -2106,6 +2110,149 @@ function closeDestinationLogModal() {
   dstLogViewer = null;
 }
 
+// ---------------------------------------------------------------------------
+// Tasks modal: running and recent tasks from this machine and every managed
+// runtime machine (each machine stores its own task log; remote logs are
+// fetched live from the remote).
+// ---------------------------------------------------------------------------
+
+let tasksPollTimer = null;
+
+function openTasksModal() {
+  el.tasksModal.hidden = false;
+  el.tasksSummary.textContent = "Loading tasks...";
+  el.tasksList.innerHTML = "";
+  refreshTasksModal();
+  if (!tasksPollTimer) {
+    tasksPollTimer = setInterval(refreshTasksModal, 3000);
+  }
+}
+
+function closeTasksModal() {
+  el.tasksModal.hidden = true;
+  if (tasksPollTimer) {
+    clearInterval(tasksPollTimer);
+    tasksPollTimer = null;
+  }
+}
+
+async function refreshTasksModal() {
+  if (!el.tasksModal || el.tasksModal.hidden) {
+    return;
+  }
+  let machines;
+  try {
+    machines = await invoke("get_all_tasks", { limit: 100 });
+  } catch (error) {
+    el.tasksSummary.textContent = String(error);
+    return;
+  }
+  if (el.tasksModal.hidden) {
+    return;
+  }
+  const running = machines.reduce(
+    (total, machine) =>
+      total + (machine.tasks || []).filter((task) => task.status === "running").length,
+    0,
+  );
+  el.tasksSummary.textContent =
+    `${running} running · newest first · each machine keeps its last 100 finished tasks`;
+  el.tasksList.innerHTML = machines.map(renderMachineTasks).join("");
+}
+
+function renderMachineTasks(machine) {
+  const label = machine.local ? "local" : (machine.label || machine.machine_id);
+  const title = `<div class="tasks-machine-title">${escapeHtml(label)}</div>`;
+  if (machine.error) {
+    return `<div class="tasks-machine">${title}<div class="empty">${escapeHtml(machine.error)}</div></div>`;
+  }
+  const tasks = machine.tasks || [];
+  if (!tasks.length) {
+    return `<div class="tasks-machine">${title}<div class="empty">No recorded tasks</div></div>`;
+  }
+  return `
+    <div class="tasks-machine">
+      ${title}
+      <div class="task-row task-row-head">
+        <span>Status</span><span>Kind</span><span>Task</span><span>Started</span><span>Duration</span><span>Result</span>
+      </div>
+      ${tasks.map(renderTaskRow).join("")}
+    </div>`;
+}
+
+function renderTaskRow(task) {
+  const target = task.destination_id
+    ? `${task.source_id} -> ${task.destination_id}`
+    : task.source_id;
+  const result = taskResultLabel(task);
+  return `
+    <div class="task-row">
+      <span class="task-status task-status-${escapeAttr(task.status)}">${escapeHtml(task.status)}</span>
+      <span>${escapeHtml(taskKindLabel(task.kind))}</span>
+      <span class="task-target" title="${escapeAttr(target)}">${escapeHtml(target)}</span>
+      <span>${escapeHtml(formatScanTime(task.started_at))}</span>
+      <span>${escapeHtml(taskDurationLabel(task))}</span>
+      <span class="task-result" title="${escapeAttr(result)}">${escapeHtml(result)}</span>
+    </div>`;
+}
+
+function taskKindLabel(kind) {
+  switch (String(kind || "").trim()) {
+    case "compare": return "Compare";
+    case "incremental":
+    case "automatic":
+    case "sync": return "Incremental";
+    case "full": return "Full";
+    case "changed_since": return "Changed Since";
+    case "repair_scan": return "Repair";
+    case "startup_scan": return "Startup Scan";
+    default: return kind || "-";
+  }
+}
+
+function taskDurationLabel(task) {
+  if (task.status === "running") {
+    const started = Date.parse(task.started_at);
+    return Number.isFinite(started)
+      ? `${formatDurationMs(Date.now() - started)}…`
+      : "running";
+  }
+  return task.duration_ms === null || task.duration_ms === undefined
+    ? "-"
+    : formatDurationMs(task.duration_ms);
+}
+
+function formatDurationMs(ms) {
+  const secs = Math.max(0, Math.round(Number(ms) / 1000));
+  if (secs < 60) {
+    return `${secs}s`;
+  }
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) {
+    return `${mins}m ${secs % 60}s`;
+  }
+  return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+}
+
+function taskResultLabel(task) {
+  const parts = [];
+  if (task.kind === "compare") {
+    const diffs = Number(task.differences || 0);
+    if (task.status === "success") {
+      parts.push(`${diffs} difference${diffs === 1 ? "" : "s"}`);
+    }
+    if (Number(task.entries_scanned || 0) > 0) {
+      parts.push(`${task.entries_scanned} entries`);
+    }
+  } else if (Number(task.files_synced || 0) > 0) {
+    parts.push(`${task.files_synced} file${task.files_synced === 1 ? "" : "s"}`);
+  }
+  if (task.error) {
+    parts.push(task.error);
+  }
+  return parts.join(" · ") || "-";
+}
+
 function renderDestinationLogModal() {
   if (!dstLogViewer || !el.dstLogModal || el.dstLogModal.hidden) {
     return;
@@ -2775,7 +2922,6 @@ function setBusy(nextBusy) {
   el.config.disabled = busy;
   el.statusConfig.disabled = busy;
   el.settingsSave.disabled = busy;
-  el.refresh.disabled = busy;
   updateStatusUi();
 }
 
@@ -2957,7 +3103,8 @@ function bindButtonClick(button, handler) {
 bindButtonClick(el.readme, openReadmeModal);
 bindButtonClick(el.config, openConfigModal);
 bindButtonClick(el.statusConfig, openSettingsModal);
-bindButtonClick(el.refresh, () => runBusy("", loadAll));
+bindButtonClick(el.tasks, openTasksModal);
+el.tasksClose.onclick = closeTasksModal;
 bindButtonClick(el.machineStatus, openMachineModal);
 window.autoSyncOpenMachines = openMachineModal;
 window.autoSyncCloseMachines = (event) => {
@@ -3043,6 +3190,7 @@ async function invokeWeb(command, payload = {}) {
     scan_destination_now: ["POST", "/api/scan-destination-now"],
     cancel_activity: ["POST", "/api/cancel-activity"],
     dismiss_restart_notice: ["POST", "/api/dismiss-restart-notice"],
+    get_all_tasks: ["GET", "/api/all-tasks"],
     scan_report: ["GET", "/api/scan-report"],
     browse_paths: ["GET", "/api/browse-paths"],
   };
@@ -3061,6 +3209,8 @@ async function invokeWeb(command, payload = {}) {
     const sourceId = payload.sourceId || payload.source_id;
     const destinationId = payload.destinationId || payload.destination_id;
     url = `${path}?source_id=${encodeURIComponent(sourceId)}&destination_id=${encodeURIComponent(destinationId)}`;
+  } else if (command === "get_all_tasks") {
+    url = `${path}?limit=${encodeURIComponent(payload.limit || 100)}`;
   } else if (command === "remove_machine") {
     const machineId = payload.machineId || payload.machine_id;
     url = `${path}/${encodeURIComponent(machineId || "")}`;

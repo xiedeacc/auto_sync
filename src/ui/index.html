@@ -16,7 +16,7 @@
     <div class="toolbar">
       <button id="readme" type="button" title="Sync mode behavior">Readme</button>
       <button id="config" type="button" title="Show current configuration">Config</button>
-      <button id="refresh" type="button" title="Refresh status">Refresh</button>
+      <button id="tasks" type="button" title="Running and recent tasks on every machine">Tasks</button>
     </div>
   </header>
 
@@ -271,6 +271,17 @@
       </div>
       <div id="dst-log-summary" class="issue-summary"></div>
       <div id="dst-log-list" class="dst-log-list"></div>
+    </div>
+  </div>
+
+  <div id="tasks-modal" class="modal" hidden>
+    <div class="modal-panel tasks-modal-panel">
+      <div class="modal-head">
+        <h2>Tasks</h2>
+        <button id="tasks-close" class="icon" title="Close">x</button>
+      </div>
+      <div id="tasks-summary" class="issue-summary"></div>
+      <div id="tasks-list" class="tasks-list"></div>
     </div>
   </div>
 

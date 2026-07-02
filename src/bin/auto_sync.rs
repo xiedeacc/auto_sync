@@ -634,6 +634,7 @@ fn run_with_desktop(backend: Backend, port: u16, start_hidden: bool) {
             scan_destination_now,
             scan_report,
             dismiss_restart_notice,
+            get_all_tasks,
             browse_paths
         ])
         .run(tauri::generate_context!());
@@ -908,6 +909,17 @@ async fn dismiss_restart_notice(
 ) -> Result<(), String> {
     backend
         .dismiss_restart_notice(&source_id)
+        .map_err(error_text)
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn get_all_tasks(
+    backend: tauri::State<'_, Backend>,
+    limit: Option<usize>,
+) -> Result<Vec<auto_sync::core::backend::MachineTasksView>, String> {
+    backend
+        .all_tasks(limit.unwrap_or(100).min(100))
         .map_err(error_text)
 }
 

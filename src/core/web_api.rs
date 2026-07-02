@@ -62,6 +62,7 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/scan-destination-now", post(api_scan_destination_now))
         .route("/api/scan-report", get(api_scan_report))
         .route("/api/tasks", get(api_tasks))
+        .route("/api/all-tasks", get(api_all_tasks))
         .route(
             "/api/dismiss-restart-notice",
             post(api_dismiss_restart_notice),
@@ -392,6 +393,18 @@ async fn api_tasks(
     blocking(move || {
         Ok(Json(
             backend.recent_tasks(query.limit.unwrap_or(100).min(100))?,
+        ))
+    })
+    .await
+}
+
+async fn api_all_tasks(
+    AxumState(backend): AxumState<Backend>,
+    Query(query): Query<TasksQuery>,
+) -> Result<Json<Vec<crate::core::backend::MachineTasksView>>, ApiError> {
+    blocking(move || {
+        Ok(Json(
+            backend.all_tasks(query.limit.unwrap_or(100).min(100))?,
         ))
     })
     .await
