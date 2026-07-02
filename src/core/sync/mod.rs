@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use filetime::{FileTime, set_file_mtime};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::core::cancel;
 use crate::core::config::{
@@ -427,6 +427,30 @@ pub fn scan_destination_now(
     let dst_machine = machine_or_local(cfg, dst_machine_id)?;
     let dst_root = destination_root_for_source(source, &source_info, &dst.path, &dst_machine);
 
+    // Fast path: when BOTH sides live on local ZFS datasets with verified
+    // baseline snapshots, diff each side against its base and examine only
+    // the union of changed paths — everything else was verified in sync at
+    // the baselines and untouched since. Any missing precondition or zfs
+    // failure falls back to the full two-tree walk below.
+    if source_info.kind == "dir" {
+        match zfs_diff_compare(state, source, destination_id, &dst_root, &sync) {
+            Ok(Some(report)) => {
+                state.put_scan_report(&report)?;
+                return Ok(report);
+            }
+            Ok(None) => {}
+            Err(err) if cancel::error_is_cancelled(&err) => return Err(err),
+            Err(err) => {
+                warn!(
+                    source = source_id,
+                    destination = destination_id,
+                    error = %err,
+                    "zfs diff compare failed; falling back to full compare"
+                );
+            }
+        }
+    }
+
     // Source and destination trees are independent: scan them concurrently
     // (they usually live on different machines), halving the compare's scan
     // phase versus scanning serially.
@@ -492,6 +516,92 @@ pub fn scan_destination_now(
     );
     state.put_scan_report(&report)?;
     Ok(report)
+}
+
+/// Compare both trees via `zfs diff` against their verified baseline
+/// snapshots (see [`record_destination_verified_baselines`]): only the union
+/// of paths either side changed since its base needs examining — at the
+/// baselines the two sides were verified identical. Returns `Ok(None)` when
+/// the fast path does not apply (either side not ZFS-local, no baselines,
+/// dataset mismatch, or zfs failed) so the caller runs the full walk.
+fn zfs_diff_compare(
+    state: &State,
+    source: &SourceGroupConfig,
+    destination_id: &str,
+    dst_root: &Path,
+    sync: &NativeSyncConfig,
+) -> Result<Option<ScanReport>> {
+    let Some(src_base) = state.destination_verified_snapshot(&source.id, destination_id)? else {
+        return Ok(None);
+    };
+    let Some(dst_base) = state.destination_verified_dst_snapshot(&source.id, destination_id)?
+    else {
+        return Ok(None);
+    };
+    // Both roots must resolve to local ZFS datasets matching the recorded
+    // bases: never trust "no diff" as "unchanged" for the wrong dataset.
+    let Ok(src_dataset) = resolve_zfs_dataset(source) else {
+        return Ok(None);
+    };
+    let Ok(dst_dataset) = resolve_dataset_for_path(dst_root) else {
+        return Ok(None);
+    };
+    if src_base.split('@').next() != Some(src_dataset.name.as_str())
+        || dst_base.split('@').next() != Some(dst_dataset.name.as_str())
+    {
+        return Ok(None);
+    }
+    let src_live_root = if src_dataset.path_in_dataset.as_os_str().is_empty() {
+        src_dataset.mountpoint.clone()
+    } else {
+        src_dataset.mountpoint.join(&src_dataset.path_in_dataset)
+    };
+    let Ok(dst_live_root) = dst_root.canonicalize() else {
+        return Ok(None);
+    };
+    let Some(src_changed) = zfs_diff_changed_paths_live(&src_base, &src_live_root) else {
+        return Ok(None);
+    };
+    let Some(dst_changed) = zfs_diff_changed_paths_live(&dst_base, &dst_live_root) else {
+        return Ok(None);
+    };
+    let mut union: BTreeSet<String> = src_changed.into_iter().collect();
+    union.extend(dst_changed);
+    let paths: Vec<String> = union.into_iter().collect();
+    info!(
+        source = source.id,
+        destination = destination_id,
+        src_base,
+        dst_base,
+        changed = paths.len(),
+        "compare served by zfs diff against verified baselines"
+    );
+    cancel::check()?;
+    let source_snapshot = take_snapshot_paths_with_excludes(
+        &src_live_root,
+        &paths,
+        SnapshotMode::Source,
+        &source.excludes,
+        sync.checksum,
+    )?;
+    reject_dangerous_destination(&dst_live_root)?;
+    let dst_snapshot = take_snapshot_paths_with_excludes(
+        &dst_live_root,
+        &paths,
+        SnapshotMode::Destination,
+        &[],
+        sync.checksum,
+    )?;
+    let mut report = build_scan_report(
+        &source.id,
+        destination_id,
+        &source_snapshot,
+        &dst_snapshot,
+        &source.excludes,
+        sync,
+    );
+    report.method = "zfs_diff".to_string();
+    Ok(Some(report))
 }
 
 fn machine_or_local(
@@ -2193,10 +2303,13 @@ fn sync_cycle_for_source_inner(
                                             "green",
                                             "verified",
                                         )?;
-                                        state.set_destination_verified_snapshot(
-                                            &source.id,
+                                        record_destination_verified_baselines(
+                                            state,
+                                            source,
                                             &dst.id,
                                             Some(&zfs.full_name),
+                                            Some(dst_root),
+                                            cycle.id,
                                         )?;
                                         continue;
                                     }
@@ -2242,15 +2355,18 @@ fn sync_cycle_for_source_inner(
                             "green",
                             "verified",
                         )?;
-                        // Record the base snapshot for the next zfs diff (or
-                        // clear it for non-ZFS sources so no stale base lingers).
-                        state.set_destination_verified_snapshot(
-                            &source.id,
+                        // Record the base snapshots for the next zfs diff (or
+                        // clear them for non-ZFS sources so no stale base lingers).
+                        record_destination_verified_baselines(
+                            state,
+                            source,
                             &dst.id,
                             source_view
                                 .zfs_snapshot
                                 .as_ref()
                                 .map(|z| z.full_name.as_str()),
+                            Some(dst_root),
+                            cycle.id,
                         )?;
                         info!(
                             source = source.id,
@@ -2330,15 +2446,21 @@ fn sync_cycle_for_source_inner(
                     "green",
                     "verified",
                 )?;
-                // Advance (or clear) the zfs diff base like the other success
+                // Advance (or clear) the zfs diff bases like the other success
                 // paths do; leaving a stale base forces redundant re-syncs.
-                state.set_destination_verified_snapshot(
-                    &source.id,
+                record_destination_verified_baselines(
+                    state,
+                    source,
                     &dst.id,
                     source_view
                         .zfs_snapshot
                         .as_ref()
                         .map(|z| z.full_name.as_str()),
+                    match &dst_endpoint {
+                        DestinationEndpoint::Dir { root } => Some(root.as_path()),
+                        _ => None,
+                    },
+                    cycle.id,
                 )?;
                 info!(
                     source = source.id,
@@ -2966,10 +3088,15 @@ fn sync_cycle_with_transfer(
                                     "green",
                                     "verified",
                                 )?;
-                                state.set_destination_verified_snapshot(
-                                    &source.id,
+                                // Remote destination: no local dst dataset to
+                                // baseline, so only the source base is kept.
+                                record_destination_verified_baselines(
+                                    state,
+                                    source,
                                     &dst.id,
                                     Some(&zfs.full_name),
+                                    None,
+                                    cycle.id,
                                 )?;
                                 continue;
                             }
@@ -3108,11 +3235,15 @@ fn sync_cycle_with_transfer(
                     "verified",
                 )?;
                 // Record the base snapshot for the next zfs diff (or clear it
-                // for non-ZFS sources so no stale base lingers).
-                state.set_destination_verified_snapshot(
-                    &source.id,
+                // for non-ZFS sources so no stale base lingers). The
+                // destination is remote here: no local dst baseline.
+                record_destination_verified_baselines(
+                    state,
+                    source,
                     &dst.id,
                     zfs_snapshot.map(|zfs| zfs.full_name.as_str()),
+                    None,
+                    cycle.id,
                 )?;
             }
             Err(err) => {
@@ -4759,6 +4890,168 @@ fn cleanup_zfs_snapshots(
         }
     }
     Ok(())
+}
+
+/// Relative paths (under `live_root`) changed between a snapshot and the
+/// LIVE filesystem (`zfs diff -H <snapshot>` with no second argument diffs
+/// against the current state). Same contract as [`zfs_diff_changed_paths`]:
+/// `None` means "no reliable diff — fall back".
+fn zfs_diff_changed_paths_live(base_full_name: &str, live_root: &Path) -> Option<Vec<String>> {
+    let base_exists = Command::new("zfs")
+        .args(["list", "-H", "-t", "snapshot", base_full_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !base_exists {
+        return None;
+    }
+    let output = Command::new("zfs")
+        .args(["diff", "-H", base_full_name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(parse_zfs_diff(&text, live_root))
+}
+
+/// The ZFS dataset an arbitrary local path lives on (deepest mountpoint that
+/// contains it). Errors when the path is not on a mounted ZFS dataset.
+fn resolve_dataset_for_path(path: &Path) -> Result<ZfsDataset> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+    let mut best: Option<(String, PathBuf)> = None;
+    for (name, mountpoint) in zfs_filesystems()? {
+        if canonical.starts_with(&mountpoint) {
+            let replace = best
+                .as_ref()
+                .map(|(_, current)| mountpoint.components().count() > current.components().count())
+                .unwrap_or(true);
+            if replace {
+                best = Some((name, mountpoint));
+            }
+        }
+    }
+    let Some((name, mountpoint)) = best else {
+        bail!("path is not on a zfs dataset: {}", canonical.display());
+    };
+    let path_in_dataset = path_in_dataset(&canonical, &mountpoint)?;
+    Ok(ZfsDataset {
+        name,
+        mountpoint,
+        path_in_dataset,
+    })
+}
+
+/// Snapshot-name prefix for one (source, destination) pair's dst-side
+/// verified baselines, used both to name new ones and to sweep stale ones.
+fn dst_baseline_prefix(source: &SourceGroupConfig, destination_id: &str) -> String {
+    format!(
+        "{}_dstbase_{}_{}",
+        source.snapshot.prefix,
+        sanitize_snapshot_component(&source.id),
+        sanitize_snapshot_component(destination_id)
+    )
+}
+
+/// Record BOTH verified baselines for a destination: the source-side ZFS
+/// snapshot (diff base for incremental syncs) and — when the source base
+/// exists and the destination root is a local ZFS path — a destination-side
+/// snapshot taken now, while dst content equals the source base. With both
+/// bases Compare can `zfs diff` each side against its base and examine only
+/// the changed paths instead of walking two whole trees. Baseline failures
+/// never fail the sync: the dst base is cleared and Compare falls back to
+/// the full walk.
+fn record_destination_verified_baselines(
+    state: &State,
+    source: &SourceGroupConfig,
+    destination_id: &str,
+    src_snapshot_name: Option<&str>,
+    local_dst_root: Option<&Path>,
+    cycle_id: i64,
+) -> Result<()> {
+    state.set_destination_verified_snapshot(&source.id, destination_id, src_snapshot_name)?;
+    let previous = state
+        .destination_verified_dst_snapshot(&source.id, destination_id)
+        .unwrap_or(None);
+    let dst_base = match (src_snapshot_name, local_dst_root) {
+        (Some(_), Some(dst_root)) => {
+            match create_dst_baseline_snapshot(source, destination_id, dst_root, cycle_id) {
+                Ok(name) => Some(name),
+                Err(err) => {
+                    debug!(
+                        source = source.id,
+                        destination = destination_id,
+                        error = %err,
+                        "no destination-side baseline snapshot (compare falls back to full walk)"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    state.set_destination_verified_dst_snapshot(&source.id, destination_id, dst_base.as_deref())?;
+    cleanup_dst_baseline_snapshots(
+        source,
+        destination_id,
+        dst_base.as_deref(),
+        previous.as_deref(),
+    );
+    Ok(())
+}
+
+fn create_dst_baseline_snapshot(
+    source: &SourceGroupConfig,
+    destination_id: &str,
+    dst_root: &Path,
+    cycle_id: i64,
+) -> Result<String> {
+    let dataset = resolve_dataset_for_path(dst_root)?;
+    let full_name = format!(
+        "{}@{}_{:012}",
+        dataset.name,
+        dst_baseline_prefix(source, destination_id),
+        cycle_id
+    );
+    ensure_zfs_snapshot(&full_name)?;
+    Ok(full_name)
+}
+
+/// Best-effort sweep of this pair's superseded dst baselines: everything
+/// with the pair's prefix except the current one (only the latest base is
+/// ever diffed against).
+fn cleanup_dst_baseline_snapshots(
+    source: &SourceGroupConfig,
+    destination_id: &str,
+    current: Option<&str>,
+    previous: Option<&str>,
+) {
+    let Some(dataset) = current
+        .or(previous)
+        .and_then(|name| name.split('@').next())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let prefix = format!("{dataset}@{}", dst_baseline_prefix(source, destination_id));
+    let Ok(output) = command_stdout(
+        Command::new("zfs").args(["list", "-H", "-t", "snapshot", "-o", "name", "-r", &dataset]),
+    ) else {
+        return;
+    };
+    for snapshot in output.lines().filter(|name| name.starts_with(&prefix)) {
+        if Some(snapshot) == current {
+            continue;
+        }
+        if let Err(err) = Command::new("zfs").args(["destroy", snapshot]).status() {
+            debug!(snapshot, error = %err, "failed to destroy superseded dst baseline snapshot");
+        }
+    }
 }
 
 fn command_stdout(command: &mut Command) -> Result<String> {
@@ -6918,6 +7211,39 @@ mod tests {
         cancel::request(Some("test-cancel-walk"), None);
         let err = take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap_err();
         assert!(cancel::error_is_cancelled(&err), "got: {err:#}");
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn zfs_diff_compare_requires_both_baselines() {
+        let temp = temp_dir("zfs_compare_fallback");
+        let db = temp.join("state.sqlite");
+        let src = temp.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let state = State::open(&db).unwrap();
+        let source = SourceGroupConfig {
+            id: "zc_src".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            add_directory: true,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
+            destinations: Vec::new(),
+        };
+        // No baselines recorded -> the fast path declines (caller runs the
+        // full walk) instead of erroring.
+        let outcome = zfs_diff_compare(
+            &state,
+            &source,
+            "zc_dst",
+            &temp.join("dst"),
+            &NativeSyncConfig::default(),
+        )
+        .unwrap();
+        assert!(outcome.is_none());
         fs::remove_dir_all(temp).ok();
     }
 

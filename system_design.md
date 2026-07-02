@@ -706,6 +706,12 @@ fanotify overflow / USN gap（疑似丢事件）：
 - 每个 sync cycle pass（按 source，dst 列全部启用目标）和每次 compare 在执行机器的 SQLite `task_log` 表记录一行：kind、source_id、destination_id、启动/结束时间、duration_ms、status（running/success/failed/cancelled/aborted）、error、files_synced（挂在取消 token 上的计数器，两个传输 worker pool 汇报）、differences 与 entries_scanned（compare 报告）。运行中的任务 `ended_at IS NULL`，随时可查（`GET /api/tasks?limit=`，或 sqlite3 直查）。
 - 惰性保留：插入新行时删除最新 100 条之外的**已结束**行；running 行不会被清。没有产生任何传输且未推进的 pass 直接丢弃行，避免调度心跳刷屏。守护进程重启时把遗留的 running 行标记为 aborted。
 
+Compare 的 zfs diff 快路径：
+
+- 引擎在本地 Dir→Dir 的验证成功点（zfs-diff 增量、全量 reconcile、changed-since/generic 成功路径）除了记录源侧基准快照（`last_verified_snapshot_name`）外，若 dst 根也在本机 ZFS 数据集上，同时给 dst 数据集打基准快照（`<prefix>_dstbase_<src>_<dst>_<cycle>`，存 `destination_offset.last_verified_dst_snapshot_name`；旧基准即时清理，只保留当前一个）。此刻 dst 内容等于源基准内容，两个基准对应同一份已验证状态。
+- Compare 时若两个基准都在且各自数据集与实际路径匹配：`zfs diff -H <base>`（对活文件系统）分别取两侧自基准以来的变化路径，对并集做按路径快照（目录递归）再走常规清单对比——并集之外的路径在基准点已验证一致且此后未动，视为 in-sync。报告带 `method: "zfs_diff"`，entry 计数只覆盖被检查的路径。
+- 任一条件不满足（任一侧非 ZFS/非本机、缺基准、数据集不匹配、zfs 命令失败）自动回退全树扫描。远端 dst（跨机传输路径）不打 dst 基准，天然回退。
+
 sync 与 compare 的并发约束：
 
 - 跨机器完全并发（每个 source 在其所在机器执行）；同一台机器上同时最多一个 compare（scan gate）与一个 sync pass（sync gate），二者原则上可并存。

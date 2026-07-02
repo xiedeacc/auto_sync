@@ -150,6 +150,12 @@ pub struct ScanReport {
     pub truncated: bool,
     #[serde(default)]
     pub error: String,
+    /// How the compare was produced: "" for a full two-tree walk, "zfs_diff"
+    /// when both sides were diffed against their verified base snapshots and
+    /// only the changed paths were examined (entry counts then cover just
+    /// those paths, not the whole tree).
+    #[serde(default)]
+    pub method: String,
 }
 
 pub struct State {
@@ -315,6 +321,11 @@ impl State {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         self.ensure_column("destination_offset", "last_verified_snapshot_name", "TEXT")?;
+        self.ensure_column(
+            "destination_offset",
+            "last_verified_dst_snapshot_name",
+            "TEXT",
+        )?;
         // Per-source scalars that must survive event_log pruning.
         self.conn.execute_batch(
             r#"
@@ -1030,6 +1041,39 @@ impl State {
         Ok(())
     }
 
+    /// The DESTINATION-side ZFS snapshot taken at the destination's last
+    /// verify (its content then equalled the source base). Together with
+    /// [`Self::destination_verified_snapshot`] it lets Compare diff each side
+    /// against its base instead of walking both trees.
+    pub fn destination_verified_dst_snapshot(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT last_verified_dst_snapshot_name FROM destination_offset WHERE source_id=?1 AND destination_id=?2",
+                params![source_id, destination_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+            .map_err(Into::into)
+    }
+
+    pub fn set_destination_verified_dst_snapshot(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        snapshot_name: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE destination_offset SET last_verified_dst_snapshot_name=?3, updated_at=?4 WHERE source_id=?1 AND destination_id=?2",
+            params![source_id, destination_id, snapshot_name, now_string()],
+        )?;
+        Ok(())
+    }
+
     /// Snapshot names still referenced as a diff base by any destination of this
     /// source. The snapshot cleaner must retain these.
     pub fn source_referenced_snapshots(&self, source_id: &str) -> Result<Vec<String>> {
@@ -1374,6 +1418,7 @@ impl State {
                 last_completed_cycle_id=NULL,
                 last_verified_cycle_id=NULL,
                 last_verified_snapshot_name=NULL,
+                last_verified_dst_snapshot_name=NULL,
                 status='red',
                 status_reason=excluded.status_reason,
                 updated_at=excluded.updated_at

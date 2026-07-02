@@ -120,7 +120,7 @@
           <p><strong>Incremental</strong> 会关闭当前 source cycle，并且只同步当前选中的 destination。对 Realtime 目标它应用积压的事件路径；ZFS 源上如果有已验证的基准快照，会走 <code>zfs diff</code> 快路径只同步差异。</p>
           <p><strong>Changed Since</strong> 会关闭当前 source cycle，完整扫描 source，并与上次该 destination 验证过的基线快照对比，只同步从那之后变化过的相对路径（比 Full 快得多，但不检查 destination 侧的漂移）。</p>
           <p><strong>Full</strong> 是完整对账加同步：源端和目标端<em>并行</em>扫描整棵树，对比两份清单，然后只传输缺失或不一致的文件——不会盲目全量重传。开启 Mirror 时会删除 source 不存在的多余路径，完成后校验本轮写入的内容。怀疑目标不完整时用它修复。</p>
-          <p><strong>Scan</strong>（对账不同步）：只做两端并行扫描和清单对比，生成差异报告（新增/更新/删除/类型变化），不改动任何文件。想先看差异再决定是否同步时用它。</p>
+          <p><strong>Scan</strong>（对账不同步）：只做两端并行扫描和清单对比，生成差异报告（新增/更新/删除/类型变化），不改动任何文件。想先看差异再决定是否同步时用它。当 src 和 dst 都在本机 ZFS 数据集上且存在已验证的基准快照（由成功的 Full / Changed Since / zfs-diff 增量同步建立）时，Scan 走 <code>zfs diff</code> 快路径：两侧各自与基准快照做 diff，只比对变化过的路径，秒级完成；任一侧不满足则自动回退为全树扫描。</p>
         </section>
         <section>
           <h3>可靠性行为</h3>
