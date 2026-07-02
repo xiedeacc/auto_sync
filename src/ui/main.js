@@ -347,12 +347,33 @@ async function refreshRuntimeStatusOnly() {
   }
 }
 
+function sourceRestartNotice(sourceId) {
+  const view = (statuses || []).find(
+    (status) => status.source_id === sourceId && status.restart_notice_at,
+  );
+  return view
+    ? { at: view.restart_notice_at, gapStart: view.restart_gap_started || null }
+    : null;
+}
+
 function updateStatusUi() {
   for (const group of el.sourcePanel.querySelectorAll(".source-group")) {
     const sourceId = group.dataset.sourceId;
     const latest = group.querySelector(".source-latest-cycle");
     if (latest) {
       latest.value = sourceLatestCycle(sourceId);
+    }
+    const restartButton = group.querySelector('[data-action="restart-notice"]');
+    if (restartButton) {
+      const notice = sourceRestartNotice(sourceId);
+      restartButton.hidden = !notice;
+      if (notice) {
+        restartButton.title =
+          `auto_sync on this source's machine restarted at ${formatScanTime(notice.at)}` +
+          `${notice.gapStart ? `; changes since ${formatScanTime(notice.gapStart)}` : "; changes made while it was down"}` +
+          " may be unrecorded. Run Compare, Full or Changed Since on this source to verify" +
+          " — or click to dismiss this notice.";
+      }
     }
     const sourceSync = group.querySelector('[data-action="sync-source"]');
     if (sourceSync) {
@@ -835,7 +856,10 @@ function renderSourcePanel() {
           <span></span>
           <span></span>
           <span></span>
-          <input class="source-latest-cycle" value="${escapeAttr(sourceLatestCycle(source.id))}" readonly>
+          <span class="source-cycle-cell">
+            <button class="restart-notice-button icon" data-action="restart-notice" title="" aria-label="Daemon restart notice" hidden>&#9888;</button>
+            <input class="source-latest-cycle" value="${escapeAttr(sourceLatestCycle(source.id))}" readonly>
+          </span>
           <button class="exclude-button" data-action="edit-excludes">Excluded ${excludeCountLabel(source)}</button>
           <button class="source-sync-button" data-action="sync-source" title="Sync source">Sync</button>
           <button class="danger icon" data-action="remove-source" title="Remove source">x</button>
@@ -992,6 +1016,33 @@ function bindSourceControls(source, sourceIndex, group) {
   };
   group.querySelector('[data-action="edit-excludes"]').onclick = () => {
     openExcludeModal(source);
+  };
+  group.querySelector('[data-action="restart-notice"]').onclick = async (event) => {
+    const button = event.currentTarget;
+    const notice = sourceRestartNotice(source.id);
+    if (!notice || button.disabled) {
+      return;
+    }
+    const dismiss = window.confirm(
+      `The sync daemon for ${source.id} restarted at ${formatScanTime(notice.at)}; `
+        + "changes made while it was down may be unrecorded.\n\n"
+        + "OK = dismiss this notice (accept the risk).\n"
+        + "Cancel = keep it; run Compare, Full or Changed Since to verify instead.",
+    );
+    if (!dismiss) {
+      return;
+    }
+    button.disabled = true;
+    try {
+      await invoke("dismiss_restart_notice", { sourceId: source.id });
+      button.hidden = true;
+      setTransientMessage(`Restart notice for ${source.id} dismissed`);
+      refreshStatusOnly().catch(() => {});
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      button.disabled = false;
+    }
   };
   group.querySelector('[data-action="sync-source"]').onclick = () => {
     if (sourceHasUnavailableDestination(source.id)) {
@@ -2991,6 +3042,7 @@ async function invokeWeb(command, payload = {}) {
     sync_destination_now: ["POST", "/api/sync-destination-now"],
     scan_destination_now: ["POST", "/api/scan-destination-now"],
     cancel_activity: ["POST", "/api/cancel-activity"],
+    dismiss_restart_notice: ["POST", "/api/dismiss-restart-notice"],
     scan_report: ["GET", "/api/scan-report"],
     browse_paths: ["GET", "/api/browse-paths"],
   };
@@ -3035,6 +3087,10 @@ async function invokeWeb(command, payload = {}) {
         source_id: payload.sourceId || payload.source_id || null,
         destination_id: payload.destinationId || payload.destination_id || null,
         propagate: true,
+      });
+    } else if (command === "dismiss_restart_notice") {
+      options.body = JSON.stringify({
+        source_id: payload.sourceId || payload.source_id,
       });
     } else if (command === "add_machine") {
       options.body = JSON.stringify(payload.machine);

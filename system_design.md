@@ -309,7 +309,9 @@ Linux 后台进程对 `schedule.mode = "realtime"` 的 source 使用 fanotify。
 - 若 filesystem/mount mark 不可用，会回退到对 src 目录树逐目录注册 inode mark。
 - 无法解析路径的 FID/name 附属记录不会把 realtime cycle 标记为 Full/rescan；realtime 自动同步仍只按已解析的 event path 做增量同步。queue overflow 仍会写入需要 reconcile 的事件。
 - 删除、rename 和部分元数据变化不依赖事件流保证最终正确性，而是由周期关闭时的源目录快照和 dst 校验/reconcile 兜底。
-- 启动顺序（防事件丢失窗口）：调度器先启动 watcher 并等待其上报 armed（fanotify 在 mark 安装完成后、USN 在 reader 线程就位后通过 `signal::mark_watcher_armed` 通知；每个 source 各自计数，全部就绪才放行，最长等 15 分钟后放行并告警），然后才执行启动 mtime 变更扫描。若先扫描后装 mark，大树扫描的几分钟里"扫描器已经走过该目录、mark 还没生效"期间新建的文件会被两边同时漏掉；先装 mark 则两个机制重叠覆盖，重复记录同一路径无害。配置变更重启 watcher 走同样的顺序。
+- 启动语义（停机窗口）：不再在每次重启时自动做全树 mtime 扫描（90 万条 HDD 树一次要 10 分钟以上的随机读）。调度器启动 watcher 并等待其上报 armed（`signal::mark_watcher_armed`，fanotify 按 source 计数、全部 mark 就位才放行，上限 15 分钟）之后：
+  - Windows（USN）：持久 journal 覆盖停机期间的变化（游标断档自动记 `rescan_required`），无须任何提示。
+  - Linux（fanotify，无 journal）：为每个本机 watch 的 source 升起**重启提醒**（`source_meta.restart_notice_at/gap_started`，gap 起点取上一进程最后观测到的事件时间）。提醒持久存在并随 destination 状态下发到 UI（source 行 Latest Cycle 旁的 ⚠ 图标），直到：用户对该 source 成功完成一次**在提醒之后发起的** Compare / Full / Changed Since（时间戳比较防止把重启前就在跑的动作误当覆盖），或用户点击 ⚠ 手动忽略（`POST /api/dismiss-restart-notice`，远程 source 自动委派到执行机器）。重复重启不会刷新已有提醒（gap 只增不减）。普通 incremental 只重放已记录事件，不清除提醒。
 
 建议 fanotify 策略：
 

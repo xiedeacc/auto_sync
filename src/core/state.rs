@@ -99,6 +99,16 @@ pub struct DestinationView {
     /// When the report behind `scan_differences` was taken.
     #[serde(default)]
     pub scan_at: Option<String>,
+    /// Source-level restart notice (duplicated onto each of the source's
+    /// destination views): the daemon restarted at this time on a machine
+    /// whose watcher cannot see downtime changes. Persists until a covering
+    /// manual action or a user dismissal.
+    #[serde(default)]
+    pub restart_notice_at: Option<String>,
+    /// Start of the potentially unobserved window (the last event the
+    /// previous run saw); None when unknown.
+    #[serde(default)]
+    pub restart_gap_started: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +324,11 @@ impl State {
             );
             "#,
         )?;
+        // Restart notice: raised when the daemon starts on a platform whose
+        // watcher cannot observe downtime changes; persists until a covering
+        // manual action (compare / full / changed-since) or a user dismissal.
+        self.ensure_column("source_meta", "restart_notice_at", "TEXT")?;
+        self.ensure_column("source_meta", "restart_gap_started", "TEXT")?;
         Ok(())
     }
 
@@ -1102,6 +1117,68 @@ impl State {
         Ok(())
     }
 
+    /// Raise the restart notice for a source: the daemon just started and its
+    /// watcher cannot know what changed while it was down. Keeps an existing
+    /// (undismissed) notice untouched so the reported gap never shrinks; the
+    /// gap start defaults to the last event the previous run observed.
+    pub fn raise_restart_notice(&self, source_id: &str) -> Result<bool> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO source_meta (source_id) VALUES (?1)",
+            params![source_id],
+        )?;
+        let changed = self.conn.execute(
+            "UPDATE source_meta
+             SET restart_notice_at = ?2,
+                 restart_gap_started = last_event_observed_at
+             WHERE source_id = ?1 AND restart_notice_at IS NULL",
+            params![source_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Clear the restart notice ONLY when a covering action began after the
+    /// notice was raised — an action already underway during the restart read
+    /// the tree too early to vouch for the gap.
+    pub fn clear_restart_notice_if_covered(
+        &self,
+        source_id: &str,
+        action_started_at: &str,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE source_meta
+             SET restart_notice_at = NULL, restart_gap_started = NULL
+             WHERE source_id = ?1
+               AND restart_notice_at IS NOT NULL
+               AND restart_notice_at <= ?2",
+            params![source_id, action_started_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Unconditional clear: the user chose to ignore the notice.
+    pub fn dismiss_restart_notice(&self, source_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE source_meta
+             SET restart_notice_at = NULL, restart_gap_started = NULL
+             WHERE source_id = ?1",
+            params![source_id],
+        )?;
+        Ok(())
+    }
+
+    /// (noticed_at, gap_started) when the source has an active restart notice.
+    pub fn restart_notice(&self, source_id: &str) -> Result<Option<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT restart_notice_at, restart_gap_started
+             FROM source_meta WHERE source_id = ?1 AND restart_notice_at IS NOT NULL",
+        )?;
+        let mut rows = stmt.query(params![source_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+            None => Ok(None),
+        }
+    }
+
     /// Open a task-log row for a starting sync/compare (`status = running`,
     /// no end time yet — a running task is queryable at any moment). Lazy
     /// retention: inserting prunes finished rows beyond the newest
@@ -1340,6 +1417,10 @@ impl State {
         let mut views = Vec::new();
         for source in &cfg.source_groups {
             let latest = self.latest_closed_cycle_id(&source.id)?;
+            let (restart_notice_at, restart_gap_started) = match self.restart_notice(&source.id)? {
+                Some((at, gap)) => (Some(at), gap),
+                None => (None, None),
+            };
             for dst in &source.destinations {
                 let offset = self.destination_offset(&source.id, &dst.id)?;
                 let target = offset.target_cycle_id;
@@ -1390,6 +1471,8 @@ impl State {
                     issues: self.destination_issues(&source.id, &dst.id)?,
                     scan_differences,
                     scan_at,
+                    restart_notice_at: restart_notice_at.clone(),
+                    restart_gap_started: restart_gap_started.clone(),
                 });
             }
         }
@@ -1820,6 +1903,46 @@ mod tests {
         AppConfig, DestinationConfig, ScheduleConfig, SnapshotConfig, SourceGroupConfig, SyncMode,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn restart_notice_persists_until_covered_or_dismissed() {
+        let temp = temp_dir("state_restart_notice");
+        let state = State::open(&temp.join("state.sqlite")).unwrap();
+
+        // An action that STARTED BEFORE the notice cannot vouch for the gap.
+        let before_notice = Utc::now().to_rfc3339();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(state.raise_restart_notice("src_n").unwrap());
+        let (noticed_at, _gap) = state.restart_notice("src_n").unwrap().unwrap();
+        assert!(
+            !state
+                .clear_restart_notice_if_covered("src_n", &before_notice)
+                .unwrap(),
+            "pre-notice action must not clear the notice"
+        );
+
+        // Raising again keeps the original notice (gap never shrinks).
+        assert!(!state.raise_restart_notice("src_n").unwrap());
+        let (still_at, _) = state.restart_notice("src_n").unwrap().unwrap();
+        assert_eq!(still_at, noticed_at);
+
+        // An action started after the notice clears it.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let after_notice = Utc::now().to_rfc3339();
+        assert!(
+            state
+                .clear_restart_notice_if_covered("src_n", &after_notice)
+                .unwrap()
+        );
+        assert!(state.restart_notice("src_n").unwrap().is_none());
+
+        // Manual dismissal clears unconditionally.
+        assert!(state.raise_restart_notice("src_n").unwrap());
+        state.dismiss_restart_notice("src_n").unwrap();
+        assert!(state.restart_notice("src_n").unwrap().is_none());
+
+        std::fs::remove_dir_all(temp).ok();
+    }
 
     #[test]
     fn task_log_tracks_running_tasks_and_prunes_finished_ones_lazily() {

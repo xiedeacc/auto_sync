@@ -18,7 +18,9 @@ use auto_sync::core::config::{AppConfig, load_config, load_or_create_config};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::state::State;
 use auto_sync::core::sync::sync_all_pending;
-use auto_sync::core::watcher::{record_startup_mtime_events, spawn_source_watcher_thread};
+use auto_sync::core::watcher::{
+    source_is_watched_here, spawn_source_watcher_thread, watcher_covers_downtime,
+};
 use auto_sync::core::web_api;
 use clap::Parser;
 use tracing::{error, info, warn};
@@ -631,6 +633,7 @@ fn run_with_desktop(backend: Backend, port: u16, start_hidden: bool) {
             cancel_activity,
             scan_destination_now,
             scan_report,
+            dismiss_restart_notice,
             browse_paths
         ])
         .run(tauri::generate_context!());
@@ -663,14 +666,14 @@ fn run_scheduler(
         Err(err) => warn!(error = %err, "failed to sweep stale running tasks"),
     }
 
-    // Watcher FIRST, startup scan second: the scan can take minutes on a big
-    // tree, and a file created after the scanner passed its directory but
-    // before the watcher's marks existed would be missed by both. With the
-    // watcher armed before the scan starts, the two overlap instead of
-    // leaving a gap (duplicate coverage of one path is harmless).
+    // Start the watcher and wait for its marks to be live, then raise the
+    // restart notice: on platforms without a persistent journal (fanotify)
+    // whatever changed while the process was down is unobservable, and the
+    // user decides how to reconcile (Compare / Full / Changed Since) instead
+    // of paying an automatic full-tree scan on every restart.
     let mut watcher_state = start_watcher(&cfg);
     wait_for_watcher_armed(&shutdown);
-    record_startup_changes(&cfg, &state);
+    raise_restart_notices(&cfg, &state);
 
     let mut watcher_signature = config_signature(&cfg);
     let mut last_status_log =
@@ -685,7 +688,6 @@ fn run_scheduler(
                     stop_watcher(&mut watcher_state);
                     watcher_state = start_watcher(&new_cfg);
                     wait_for_watcher_armed(&shutdown);
-                    record_startup_changes(&new_cfg, &state);
                     watcher_signature = signature;
                 }
                 cfg = new_cfg;
@@ -727,13 +729,28 @@ fn run_scheduler(
     Ok(())
 }
 
-fn record_startup_changes(cfg: &AppConfig, state: &State) {
-    match record_startup_mtime_events(cfg, state) {
-        Ok(recorded) if recorded > 0 => {
-            info!(recorded, "startup mtime scan recorded realtime events");
+/// On platforms whose watcher cannot see downtime changes (fanotify), raise
+/// a persistent per-source notice: the user reconciles manually (Compare /
+/// Full / Changed Since) or dismisses it. Windows USN replays its persistent
+/// journal across restarts, so nothing was missed and no notice is raised.
+fn raise_restart_notices(cfg: &AppConfig, state: &State) {
+    if watcher_covers_downtime() {
+        return;
+    }
+    for source in cfg
+        .source_groups
+        .iter()
+        .filter(|source| source_is_watched_here(source))
+    {
+        match state.raise_restart_notice(&source.id) {
+            Ok(true) => info!(
+                source = source.id,
+                "daemon restarted: changes made while it was down may be unrecorded; \
+                 run Compare/Full/Changed Since or dismiss the notice"
+            ),
+            Ok(false) => {}
+            Err(err) => warn!(source = source.id, error = %err, "failed to raise restart notice"),
         }
-        Ok(_) => {}
-        Err(err) => warn!(error = %err, "startup mtime scan failed"),
     }
 }
 
@@ -881,6 +898,17 @@ fn get_sync_activity(backend: tauri::State<'_, Backend>) -> Result<SyncActivityS
 #[tauri::command]
 async fn sync_now(backend: tauri::State<'_, Backend>) -> Result<Vec<DestinationView>, String> {
     backend.sync_now().map_err(error_text)
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn dismiss_restart_notice(
+    backend: tauri::State<'_, Backend>,
+    source_id: String,
+) -> Result<(), String> {
+    backend
+        .dismiss_restart_notice(&source_id)
+        .map_err(error_text)
 }
 
 #[cfg(feature = "gui")]

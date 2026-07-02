@@ -375,6 +375,7 @@ impl Backend {
         let destination_id = destination_id.to_string();
         std::thread::spawn(move || match DbState::open(&cfg.app.data_db) {
             Ok(state) => {
+                let action_started_at = chrono::Utc::now().to_rfc3339();
                 let task_id = state
                     .task_start("compare", &source_id, &destination_id)
                     .ok();
@@ -384,6 +385,16 @@ impl Backend {
                     &source_id,
                     &destination_id,
                 );
+                // A compare that STARTED after the restart notice was raised
+                // read the post-gap tree: whatever the gap changed shows up
+                // in its report, so the notice has served its purpose.
+                if result.is_ok() {
+                    if let Err(err) =
+                        state.clear_restart_notice_if_covered(&source_id, &action_started_at)
+                    {
+                        tracing::warn!(error = %err, "failed to clear restart notice");
+                    }
+                }
                 if let Some(task_id) = task_id {
                     let record = match &result {
                         Ok(report) => {
@@ -438,6 +449,28 @@ impl Backend {
             Err(err) => tracing::warn!(error = %err, "scan could not open state db"),
         });
         Ok(previous)
+    }
+
+    /// Dismiss the restart notice for a source (the user chose to ignore the
+    /// possible gap). Delegated to the source's machine — the notice lives in
+    /// its state db.
+    pub fn dismiss_restart_notice(&self, source_id: &str) -> Result<()> {
+        let cfg = load_config(&self.config_path)?;
+        apply_runtime_config(&cfg);
+        if let Some(machine) = source_execution_machine(&cfg, source_id)? {
+            let _: serde_json::Value = remote_post_json(
+                &machine,
+                "/api/dismiss-restart-notice",
+                &DismissRestartNoticeRequest {
+                    source_id: source_id.to_string(),
+                },
+                Duration::from_secs(10),
+            )?;
+            return Ok(());
+        }
+        let state_db = DbState::open(&cfg.app.data_db)?;
+        state_db.ensure_config(&cfg)?;
+        state_db.dismiss_restart_notice(source_id)
     }
 
     /// Recent task-log rows (running first by recency). Tasks are recorded on
@@ -677,6 +710,11 @@ struct ScanDestinationRequest {
     destination_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DismissRestartNoticeRequest {
+    pub source_id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct EmptyRequest {}
 
@@ -837,6 +875,8 @@ fn offline_views_for_source(source: &SourceGroupConfig, reason: &str) -> Vec<Des
             issues: Vec::new(),
             scan_differences: None,
             scan_at: None,
+            restart_notice_at: None,
+            restart_gap_started: None,
         })
         .collect()
 }

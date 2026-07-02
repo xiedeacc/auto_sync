@@ -1867,7 +1867,17 @@ pub fn sync_cycle_for_source(
         .collect::<Vec<_>>()
         .join(",");
     let task_id = state.task_start(&kind, &source.id, &destination_ids).ok();
+    let action_started_at = chrono::Utc::now().to_rfc3339();
     let result = sync_cycle_for_source_inner(cfg, state, source, cycle);
+    // A manual Full or Changed Since pass that began after a restart notice
+    // re-reads the source tree, covering whatever the daemon's downtime may
+    // have missed; a plain incremental replays only recorded events and
+    // vouches for nothing.
+    if result.is_ok() && matches!(kind.as_str(), "full" | "changed_since") {
+        if let Err(err) = state.clear_restart_notice_if_covered(&source.id, &action_started_at) {
+            warn!(source = source.id, error = %err, "failed to clear restart notice");
+        }
+    }
     if let Some(task_id) = task_id {
         let files = cancel::synced_files();
         let record = match &result {

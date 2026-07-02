@@ -62,6 +62,10 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/scan-destination-now", post(api_scan_destination_now))
         .route("/api/scan-report", get(api_scan_report))
         .route("/api/tasks", get(api_tasks))
+        .route(
+            "/api/dismiss-restart-notice",
+            post(api_dismiss_restart_notice),
+        )
         .route("/api/transfer/snapshot", post(api_transfer_snapshot))
         .route(
             "/api/transfer/snapshot-paths",
@@ -361,6 +365,17 @@ async fn api_scan_report(
         Ok(Json(
             backend.scan_report(&query.source_id, &query.destination_id)?,
         ))
+    })
+    .await
+}
+
+async fn api_dismiss_restart_notice(
+    AxumState(backend): AxumState<Backend>,
+    Json(req): Json<crate::core::backend::DismissRestartNoticeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    blocking(move || {
+        backend.dismiss_restart_notice(&req.source_id)?;
+        Ok(Json(serde_json::json!({ "ok": true })))
     })
     .await
 }

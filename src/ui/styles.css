@@ -375,6 +375,37 @@ th {
   display: none;
 }
 
+/* Latest Cycle cell hosts the restart-notice warning without adding a grid
+   column; hidden keeps the input full width. */
+.source-cycle-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.source-cycle-cell .source-latest-cycle {
+  flex: 1;
+  min-width: 0;
+}
+
+.restart-notice-button {
+  width: 30px;
+  min-width: 30px;
+  border-color: #b45309;
+  background: rgba(180, 83, 9, 0.12);
+  color: #b45309;
+  font-size: 14px;
+}
+
+.restart-notice-button:hover {
+  background: rgba(180, 83, 9, 0.22);
+}
+
+.restart-notice-button[hidden] {
+  display: none;
+}
+
 .actions-label {
   grid-column: span 2;
 }
