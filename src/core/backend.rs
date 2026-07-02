@@ -1022,7 +1022,6 @@ fn sync_request_mode_wire_value(mode: SyncRequestMode) -> &'static str {
     match mode {
         SyncRequestMode::Incremental => "incremental",
         SyncRequestMode::Full => "full",
-        SyncRequestMode::ChangedSince => "changed_since",
         SyncRequestMode::RepairScan => "repair_scan",
     }
 }

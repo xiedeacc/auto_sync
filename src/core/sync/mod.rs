@@ -185,9 +185,6 @@ pub fn queue_destination_sync(
         match mode {
             SyncRequestMode::Incremental => {}
             SyncRequestMode::Full => state.mark_cycle_manual_full_rescan(cycle.id)?,
-            SyncRequestMode::ChangedSince => {
-                state.mark_cycle_manual_changed_since_rescan(cycle.id)?
-            }
             SyncRequestMode::RepairScan => unreachable!("handled above"),
         }
     }
@@ -531,6 +528,9 @@ fn zfs_diff_compare(
     dst_root: &Path,
     sync: &NativeSyncConfig,
 ) -> Result<Option<ScanReport>> {
+    if !sync.zfs_diff {
+        return Ok(None);
+    }
     let Some(src_base) = state.destination_verified_snapshot(&source.id, destination_id)? else {
         return Ok(None);
     };
@@ -794,7 +794,6 @@ pub enum SyncRequestMode {
     #[default]
     Incremental,
     Full,
-    ChangedSince,
     /// Repair exactly the differences the last Compare reported (falls back
     /// to a full reconcile when the stored report is a truncated sample).
     RepairScan,
@@ -804,7 +803,6 @@ fn sync_request_mode_wire_value(mode: SyncRequestMode) -> &'static str {
     match mode {
         SyncRequestMode::Incremental => "incremental",
         SyncRequestMode::Full => "full",
-        SyncRequestMode::ChangedSince => "changed_since",
         SyncRequestMode::RepairScan => "repair_scan",
     }
 }
@@ -816,9 +814,6 @@ impl FromStr for SyncRequestMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "incremental" => Ok(Self::Incremental),
             "full" => Ok(Self::Full),
-            "changed_since" | "changed-since" | "since" | "since-last-verified" => {
-                Ok(Self::ChangedSince)
-            }
             "repair_scan" | "repair-scan" | "repair" => Ok(Self::RepairScan),
             other => bail!("unsupported sync mode: {other}"),
         }
@@ -1979,11 +1974,11 @@ pub fn sync_cycle_for_source(
     let task_id = state.task_start(&kind, &source.id, &destination_ids).ok();
     let action_started_at = chrono::Utc::now().to_rfc3339();
     let result = sync_cycle_for_source_inner(cfg, state, source, cycle);
-    // A manual Full or Changed Since pass that began after a restart notice
-    // re-reads the source tree, covering whatever the daemon's downtime may
-    // have missed; a plain incremental replays only recorded events and
+    // A manual Full pass that began after a restart notice re-reads (or
+    // zfs-diffs) the source tree, covering whatever the daemon's downtime
+    // may have missed; a plain incremental replays only recorded events and
     // vouches for nothing.
-    if result.is_ok() && matches!(kind.as_str(), "full" | "changed_since") {
+    if result.is_ok() && kind == "full" {
         if let Err(err) = state.clear_restart_notice_if_covered(&source.id, &action_started_at) {
             warn!(source = source.id, error = %err, "failed to clear restart notice");
         }
@@ -2210,8 +2205,7 @@ fn sync_cycle_for_source_inner(
     // USN/journal gap, startup gap) rather than a user action. Mark the affected
     // destinations red and identify the reason while the reconcile runs; each one
     // returns to green only after its full re-scan verifies.
-    let is_event_loss_reconcile =
-        cycle.needs_full_rescan && !cycle.manual_full_rescan && !cycle.manual_changed_since_rescan;
+    let is_event_loss_reconcile = cycle.needs_full_rescan && !cycle.manual_full_rescan;
     if is_event_loss_reconcile {
         warn!(
             source = source.id,
@@ -2261,14 +2255,14 @@ fn sync_cycle_for_source_inner(
             DestinationEndpoint::Dir { root: dst_root },
         ) = (&source_endpoint, &dst_endpoint)
         {
-            if !cycle.manual_changed_since_rescan {
+            {
                 // ZFS diff incremental: when this is a ZFS source and the
                 // destination still has its retained base snapshot, sync only
                 // the paths `zfs diff` reports instead of re-scanning the tree.
-                // Skipped for event-loss and manual Full reconciles, which must
-                // re-verify the whole destination (incl. dst-side drift). Falls
-                // back to a full reconcile on any failure.
-                if !is_event_loss_reconcile && !cycle.manual_full_rescan {
+                // Skipped for event-loss reconciles, which must re-verify the
+                // whole destination. Falls back to a full reconcile on any
+                // failure.
+                if sync.zfs_diff && !is_event_loss_reconcile && !cycle.manual_full_rescan {
                     if let Some(zfs) = source_view.zfs_snapshot.as_ref() {
                         if let Some(base) =
                             state.destination_verified_snapshot(&source.id, &dst.id)?
@@ -2326,6 +2320,65 @@ fn sync_cycle_for_source_inner(
                         }
                     }
                 }
+                // Manual Full via dual-side zfs diff: with BOTH verified
+                // baselines, the union of each side's changes since its base
+                // is the complete set of paths that can differ now (dst-side
+                // drift included) — everything else was verified identical at
+                // the baselines and untouched since. Reconciling just the
+                // union equals a full pass at a fraction of the IO.
+                if sync.zfs_diff && cycle.manual_full_rescan {
+                    if let Some(zfs) = source_view.zfs_snapshot.as_ref() {
+                        if let Some(rel_paths) =
+                            full_zfs_diff_paths(state, source, &dst.id, zfs, dst_root)?
+                        {
+                            info!(
+                                source = source.id,
+                                destination = dst.id,
+                                cycle_id = cycle.id,
+                                changed = rel_paths.len(),
+                                "manual Full served by dual-side zfs diff"
+                            );
+                            match sync_endpoint_event_paths(
+                                &source_endpoint,
+                                &dst_endpoint,
+                                &dst.id,
+                                cycle.id,
+                                &rel_paths,
+                                &source.excludes,
+                                &sync,
+                            ) {
+                                Ok(()) => {
+                                    progressed |= !rel_paths.is_empty();
+                                    state.clear_destination_issues(&source.id, &dst.id)?;
+                                    state.upsert_destination_status(
+                                        &source.id,
+                                        &dst.id,
+                                        Some(cycle.id),
+                                        "green",
+                                        "verified",
+                                    )?;
+                                    record_destination_verified_baselines(
+                                        state,
+                                        source,
+                                        &dst.id,
+                                        Some(&zfs.full_name),
+                                        Some(dst_root),
+                                        cycle.id,
+                                    )?;
+                                    continue;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        source = source.id,
+                                        destination = dst.id,
+                                        error = %err,
+                                        "zfs diff Full failed; falling back to walk-based full reconcile"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 // Reaching here means no zfs diff base was usable, so this is a
                 // full source+dst reconcile; reflect that in the status type.
                 let _kind = set_sync_kind("full");
@@ -2365,7 +2418,7 @@ fn sync_cycle_for_source_inner(
                                 .zfs_snapshot
                                 .as_ref()
                                 .map(|z| z.full_name.as_str()),
-                            Some(dst_root),
+                            if sync.zfs_diff { Some(dst_root) } else { None },
                             cycle.id,
                         )?;
                         info!(
@@ -2401,43 +2454,18 @@ fn sync_cycle_for_source_inner(
             shared_source_snapshot = Some(snapshot);
             shared_source_snapshot.as_ref().unwrap()
         };
-        let changed_since_paths = if cycle.manual_changed_since_rescan {
-            changed_since_scan_paths(
-                state,
-                &source.id,
-                &dst.id,
-                &source_snapshot,
-                &source.excludes,
-            )?
-        } else {
-            None
-        };
-        let sync_result = if let Some(rel_paths) = changed_since_paths.as_ref() {
-            sync_endpoint_event_paths(
-                &source_endpoint,
-                &dst_endpoint,
-                &dst.id,
-                cycle.id,
-                rel_paths,
-                &source.excludes,
-                &sync,
-            )
-        } else {
-            sync_endpoint(
-                &source_endpoint,
-                &dst_endpoint,
-                &dst.id,
-                cycle.id,
-                &source_snapshot,
-                &source.excludes,
-                &sync,
-            )
-        };
+        let sync_result = sync_endpoint(
+            &source_endpoint,
+            &dst_endpoint,
+            &dst.id,
+            cycle.id,
+            source_snapshot,
+            &source.excludes,
+            &sync,
+        );
         match sync_result {
             Ok(()) => {
-                progressed |= changed_since_paths
-                    .as_ref()
-                    .is_none_or(|paths| !paths.is_empty());
+                progressed = true;
                 state.clear_destination_issues(&source.id, &dst.id)?;
                 state.upsert_destination_status(
                     &source.id,
@@ -2457,7 +2485,7 @@ fn sync_cycle_for_source_inner(
                         .as_ref()
                         .map(|z| z.full_name.as_str()),
                     match &dst_endpoint {
-                        DestinationEndpoint::Dir { root } => Some(root.as_path()),
+                        DestinationEndpoint::Dir { root } if sync.zfs_diff => Some(root.as_path()),
                         _ => None,
                     },
                     cycle.id,
@@ -2580,9 +2608,6 @@ fn event_incremental_plan(
     if cycle.manual_full_rescan {
         return Ok(None);
     }
-    if cycle.manual_changed_since_rescan {
-        return Ok(None);
-    }
     if cycle.needs_full_rescan {
         // A possible-event-loss signal (queue overflow, USN gap). Fall through
         // to a full reconcile that re-scans source+dst and repairs every
@@ -2622,110 +2647,49 @@ fn event_incremental_plan(
     Ok(Some(RealtimeIncrementalPlan::Apply(plans)))
 }
 
-/// Compute the source paths that changed since the destination's last verified
-/// baseline. Returns `None` when no usable baseline exists — the caller then
-/// runs a full sync instead (safe, just not the cheap mode the user asked for),
-/// so every degradation is logged with its reason.
-fn changed_since_scan_paths(
+/// The union of paths either side changed since its verified baseline
+/// snapshot — the complete set of paths a manual Full needs to reconcile
+/// (source side diffed snapshot-to-snapshot against the cycle's stable read
+/// view, destination side diffed base-to-live). `Ok(None)` when a
+/// precondition is missing (no baselines, dataset mismatch, dst not local
+/// ZFS, zfs failure): the caller runs the walk-based full reconcile.
+fn full_zfs_diff_paths(
     state: &State,
-    source_id: &str,
+    source: &SourceGroupConfig,
     destination_id: &str,
-    source_snapshot: &[SnapshotEntry],
-    excludes: &[PathBuf],
+    zfs: &ZfsSnapshot,
+    dst_root: &Path,
 ) -> Result<Option<Vec<String>>> {
-    let Some(last_verified) = state.destination_last_verified(source_id, destination_id)? else {
-        info!(
-            source = source_id,
-            destination = destination_id,
-            "changed-since: destination never verified; running full sync instead"
-        );
+    let Some(src_base) = state.destination_verified_snapshot(&source.id, destination_id)? else {
         return Ok(None);
     };
-    // Event and zfs-diff cycles verify without storing a snapshot, so the
-    // exact last-verified cycle often has none. Any OLDER stored snapshot is a
-    // safe baseline — it only widens the changed-path set.
-    let Some(base_cycle_id) = state.latest_snapshot_cycle_at_or_before(source_id, last_verified)?
+    let Some(dst_base) = state.destination_verified_dst_snapshot(&source.id, destination_id)?
     else {
-        info!(
-            source = source_id,
-            destination = destination_id,
-            last_verified,
-            "changed-since: no stored baseline snapshot; running full sync instead"
-        );
         return Ok(None);
     };
-    let Some(base_cycle) = state.cycle_by_id(source_id, base_cycle_id)? else {
-        info!(
-            source = source_id,
-            destination = destination_id,
-            base_cycle_id,
-            "changed-since: baseline cycle record missing; running full sync instead"
-        );
-        return Ok(None);
-    };
-    let baseline = state.snapshot_entries(base_cycle_id, source_id)?;
-    if baseline.is_empty() {
+    if src_base.split('@').next() != Some(zfs.dataset.as_str()) {
         return Ok(None);
     }
-    if base_cycle_id != last_verified {
-        info!(
-            source = source_id,
-            destination = destination_id,
-            last_verified,
-            base_cycle_id,
-            "changed-since: using older stored snapshot as baseline"
-        );
-    }
-    let cutoff_ns = cycle_cutoff_mtime_ns(&base_cycle);
-    let baseline_map = map_entry_refs(&baseline);
-    let source_map = map_entry_refs(source_snapshot);
-    let mut paths = BTreeSet::new();
-
-    for entry in source_snapshot {
-        if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
-            continue;
-        }
-        let differs_from_baseline = baseline_map
-            .get(entry.rel_path.as_str())
-            .is_none_or(|base| snapshot_entry_changed(base, entry));
-        if entry.mtime_ns > cutoff_ns || differs_from_baseline {
-            paths.insert(entry.rel_path.clone());
-        }
-    }
-
-    for entry in &baseline {
-        if source_map.contains_key(entry.rel_path.as_str())
-            || is_rel_excluded(Path::new(&entry.rel_path), excludes)
-        {
-            continue;
-        }
-        paths.insert(entry.rel_path.clone());
-    }
-
-    Ok(Some(paths.into_iter().collect()))
-}
-
-fn cycle_cutoff_mtime_ns(cycle: &Cycle) -> i64 {
-    let value = cycle.ends_at.as_ref().unwrap_or(&cycle.starts_at);
-    value
-        .timestamp()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(value.timestamp_subsec_nanos() as i64)
-}
-
-fn snapshot_entry_changed(left: &SnapshotEntry, right: &SnapshotEntry) -> bool {
-    // Hashes participate only when BOTH sides have one: the baseline and the
-    // current snapshot may have been taken under different checksum settings,
-    // and a bare presence difference would mark every file as changed.
-    let hash_changed = match (&left.hash, &right.hash) {
-        (Some(left), Some(right)) => left != right,
-        _ => false,
+    let Ok(dst_dataset) = resolve_dataset_for_path(dst_root) else {
+        return Ok(None);
     };
-    left.file_type != right.file_type
-        || left.size != right.size
-        || left.mtime_ns != right.mtime_ns
-        || left.mode != right.mode
-        || hash_changed
+    if dst_base.split('@').next() != Some(dst_dataset.name.as_str()) {
+        return Ok(None);
+    }
+    let Ok(dst_live_root) = dst_root.canonicalize() else {
+        return Ok(None);
+    };
+    let Some(src_changed) =
+        zfs_diff_changed_paths(&src_base, &zfs.full_name, &zfs.source_live_root)
+    else {
+        return Ok(None);
+    };
+    let Some(dst_changed) = zfs_diff_changed_paths_live(&dst_base, &dst_live_root) else {
+        return Ok(None);
+    };
+    let mut union: BTreeSet<String> = src_changed.into_iter().collect();
+    union.extend(dst_changed);
+    Ok(Some(union.into_iter().collect()))
 }
 
 fn cycle_has_remote_target(
@@ -2970,8 +2934,7 @@ fn sync_cycle_with_transfer(
     // Possible-event-loss reconcile (overflow / journal gap / startup gap):
     // mark destinations red and identify the reason while the cross-machine
     // re-scan runs; each returns to green only after it verifies.
-    let is_event_loss_reconcile =
-        cycle.needs_full_rescan && !cycle.manual_full_rescan && !cycle.manual_changed_since_rescan;
+    let is_event_loss_reconcile = cycle.needs_full_rescan && !cycle.manual_full_rescan;
     if is_event_loss_reconcile {
         warn!(
             source = source.id,
@@ -3048,10 +3011,7 @@ fn sync_cycle_with_transfer(
         // Skipped for event-loss and manual Full reconciles, which must
         // re-verify the whole destination; falls back to a full transfer on
         // any failure.
-        if !cycle.manual_changed_since_rescan
-            && !is_event_loss_reconcile
-            && !cycle.manual_full_rescan
-        {
+        if sync.zfs_diff && !is_event_loss_reconcile && !cycle.manual_full_rescan {
             if let Some(zfs) = zfs_snapshot {
                 if let Some(base) = state.destination_verified_snapshot(&source.id, &dst.id)? {
                     if let Some(rel_paths) =
@@ -3114,27 +3074,20 @@ fn sync_cycle_with_transfer(
             }
         }
 
-        // Full source+dst transfer pass; reflect that in the status type,
-        // unless this is a manual Changed Since.
-        let _kind = if cycle.manual_changed_since_rescan {
-            None
-        } else {
-            Some(set_sync_kind("full"))
-        };
+        // Full source+dst transfer pass; reflect that in the status type.
+        let _kind = set_sync_kind("full");
         // The source and destination trees are independent (usually on
         // different machines): scan them CONCURRENTLY instead of serially,
         // roughly halving the reconcile's compare phase. The destination
-        // prescan is skipped for Changed Since (it syncs via per-path
-        // snapshots) and when the source snapshot is already cached (nothing
-        // left to overlap with).
+        // prescan is skipped when the source snapshot is already cached
+        // (nothing left to overlap with).
         let mut prefetched_dst: Option<Vec<SnapshotEntry>> = None;
         let source_snapshot = if let Some(snapshot) = full_source_snapshot.as_ref() {
             snapshot
         } else {
-            let prescan_dst = !cycle.manual_changed_since_rescan;
             let cancel_token = cancel::current_token();
             let (source_result, dst_result) = thread::scope(|scope| {
-                let dst_handle = prescan_dst.then(|| {
+                let dst_handle = Some({
                     scope.spawn(|| {
                         let _cancel = cancel::enter(cancel_token.clone());
                         snapshot_on_machine(
@@ -3180,52 +3133,23 @@ fn sync_cycle_with_transfer(
             cycle_id = cycle.id,
             "syncing destination with TCP incremental transfer"
         );
-        let changed_since_paths = if cycle.manual_changed_since_rescan {
-            changed_since_scan_paths(
-                state,
-                &source.id,
-                &dst.id,
-                source_snapshot,
-                &source.excludes,
-            )?
-        } else {
-            None
-        };
-        let sync_result = if let Some(rel_paths) = changed_since_paths.as_ref() {
-            sync_directory_event_paths_with_transfer(
-                source_machine_id,
-                &source_machine,
-                &read_root,
-                dst_machine_id,
-                &dst_machine,
-                &dst_root,
-                &dst.id,
-                cycle.id,
-                rel_paths,
-                &source.excludes,
-                &sync,
-            )
-        } else {
-            sync_directory_with_transfer(
-                source_machine_id,
-                &source_machine,
-                &read_root,
-                dst_machine_id,
-                &dst_machine,
-                &dst_root,
-                &dst.id,
-                cycle.id,
-                source_snapshot,
-                prefetched_dst.take(),
-                &source.excludes,
-                &sync,
-            )
-        };
+        let sync_result = sync_directory_with_transfer(
+            source_machine_id,
+            &source_machine,
+            &read_root,
+            dst_machine_id,
+            &dst_machine,
+            &dst_root,
+            &dst.id,
+            cycle.id,
+            source_snapshot,
+            prefetched_dst.take(),
+            &source.excludes,
+            &sync,
+        );
         match sync_result {
             Ok(()) => {
-                progressed |= changed_since_paths
-                    .as_ref()
-                    .is_none_or(|paths| !paths.is_empty());
+                progressed = true;
                 state.clear_destination_issues(&source.id, &dst.id)?;
                 state.upsert_destination_status(
                     &source.id,
@@ -6960,14 +6884,8 @@ mod tests {
             "full".parse::<SyncRequestMode>().unwrap(),
             SyncRequestMode::Full
         );
-        assert_eq!(
-            "changed_since".parse::<SyncRequestMode>().unwrap(),
-            SyncRequestMode::ChangedSince
-        );
-        assert_eq!(
-            "since-last-verified".parse::<SyncRequestMode>().unwrap(),
-            SyncRequestMode::ChangedSince
-        );
+        // Changed Since was removed: its wire values are now rejected.
+        assert!("changed_since".parse::<SyncRequestMode>().is_err());
         assert!("other".parse::<SyncRequestMode>().is_err());
     }
 
@@ -7686,97 +7604,6 @@ mod tests {
     }
 
     #[test]
-    fn changed_since_destination_sync_updates_only_paths_changed_since_last_verified_cycle() {
-        let temp = temp_dir("changed_since_sync");
-        let src = temp.join("src");
-        let dst = temp.join("dst");
-        let db = temp.join("state.sqlite");
-        fs::create_dir_all(&src).unwrap();
-        fs::create_dir_all(&dst).unwrap();
-        fs::write(src.join("changed.txt"), b"old").unwrap();
-        fs::write(src.join("removed.txt"), b"remove me").unwrap();
-        fs::write(src.join("untouched.txt"), b"untouched").unwrap();
-
-        let mut cfg = AppConfig::default();
-        cfg.app.data_db = db.clone();
-        cfg.source_groups.push(SourceGroupConfig {
-            id: "src_1".to_string(),
-            machine_id: "local".to_string(),
-            src: src.clone(),
-            add_directory: true,
-            managed_by: String::new(),
-            excludes: Vec::new(),
-            enabled: true,
-            mode: SyncMode::Mirror,
-            snapshot: SnapshotConfig {
-                backend: SnapshotBackend::Manifest,
-                ..SnapshotConfig::default()
-            },
-            destinations: vec![DestinationConfig {
-                id: "dst_1".to_string(),
-                machine_id: "local".to_string(),
-                path: dst.clone(),
-                enabled: true,
-                schedule: ScheduleConfig::default(),
-                sync: None,
-            }],
-        });
-
-        let mut state = State::open(&db).unwrap();
-        sync_all_now(&cfg, &mut state).unwrap();
-        let effective_dst = dst.join("src");
-        let base_cycle_id = state
-            .destination_last_verified("src_1", "dst_1")
-            .unwrap()
-            .unwrap();
-        assert!(state.snapshot_count(base_cycle_id, "src_1").unwrap() > 0);
-
-        fs::write(src.join("changed.txt"), b"new").unwrap();
-        let future_mtime = FileTime::from_unix_time(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                + 60,
-            0,
-        );
-        set_file_mtime(src.join("changed.txt"), future_mtime).unwrap();
-        fs::remove_file(src.join("removed.txt")).unwrap();
-        fs::write(effective_dst.join("destination-only.txt"), b"extra").unwrap();
-
-        sync_destination_now_with_mode(
-            &cfg,
-            &mut state,
-            "src_1",
-            "dst_1",
-            SyncRequestMode::ChangedSince,
-        )
-        .unwrap();
-
-        assert_eq!(fs::read(effective_dst.join("changed.txt")).unwrap(), b"new");
-        assert!(!effective_dst.join("removed.txt").exists());
-        assert_eq!(
-            fs::read(effective_dst.join("untouched.txt")).unwrap(),
-            b"untouched"
-        );
-        assert_eq!(
-            fs::read(effective_dst.join("destination-only.txt")).unwrap(),
-            b"extra"
-        );
-
-        let view = state
-            .destination_views(&cfg)
-            .unwrap()
-            .into_iter()
-            .find(|view| view.destination_id == "dst_1")
-            .unwrap();
-        assert_eq!(view.status, "green");
-        assert!(view.last_verified_cycle_id > Some(base_cycle_id));
-
-        fs::remove_dir_all(temp).ok();
-    }
-
-    #[test]
     fn realtime_event_incremental_syncs_only_event_paths() {
         let temp = temp_dir("realtime_event_paths_only");
         let src = temp.join("src");
@@ -8385,26 +8212,6 @@ mod tests {
         sync.mirror = false;
         let report = build_scan_report("s", "d", &source, &dst, &[], &sync);
         assert_eq!(report.to_delete, 0);
-    }
-
-    #[test]
-    fn changed_since_hash_presence_mismatch_is_not_a_change() {
-        // Baseline recorded under checksum mode, current snapshot without (or
-        // vice versa): the bare presence difference must not mark the file as
-        // changed — that would silently turn Changed Since into a full sync.
-        let mut with_hash = test_file_entry("a.txt", 5);
-        with_hash.hash = Some("abc".to_string());
-        let without_hash = test_file_entry("a.txt", 5);
-        assert!(!snapshot_entry_changed(&with_hash, &without_hash));
-        assert!(!snapshot_entry_changed(&without_hash, &with_hash));
-
-        let mut other_hash = with_hash.clone();
-        other_hash.hash = Some("def".to_string());
-        assert!(snapshot_entry_changed(&with_hash, &other_hash));
-
-        let mut bigger = without_hash.clone();
-        bigger.size += 1;
-        assert!(snapshot_entry_changed(&without_hash, &bigger));
     }
 
     #[test]

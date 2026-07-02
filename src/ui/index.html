@@ -118,9 +118,8 @@
         <section>
           <h3>Destination Sync</h3>
           <p><strong>Incremental</strong> 会关闭当前 source cycle，并且只同步当前选中的 destination。对 Realtime 目标它应用积压的事件路径；ZFS 源上如果有已验证的基准快照，会走 <code>zfs diff</code> 快路径只同步差异。</p>
-          <p><strong>Changed Since</strong> 会关闭当前 source cycle，完整扫描 source，并与上次该 destination 验证过的基线快照对比，只同步从那之后变化过的相对路径（比 Full 快得多，但不检查 destination 侧的漂移）。</p>
-          <p><strong>Full</strong> 是完整对账加同步：源端和目标端<em>并行</em>扫描整棵树，对比两份清单，然后只传输缺失或不一致的文件——不会盲目全量重传。开启 Mirror 时会删除 source 不存在的多余路径，完成后校验本轮写入的内容。怀疑目标不完整时用它修复。</p>
-          <p><strong>Scan</strong>（对账不同步）：只做两端并行扫描和清单对比，生成差异报告（新增/更新/删除/类型变化），不改动任何文件。想先看差异再决定是否同步时用它。当 src 和 dst 都在本机 ZFS 数据集上且存在已验证的基准快照（由成功的 Full / Changed Since / zfs-diff 增量同步建立）时，Scan 走 <code>zfs diff</code> 快路径：两侧各自与基准快照做 diff，只比对变化过的路径，秒级完成；任一侧不满足则自动回退为全树扫描。</p>
+          <p><strong>Full</strong> 是完整对账加同步，修复包括目标侧漂移在内的所有差异；开启 Mirror 时删除 source 不存在的多余路径。有两个实现，按 ZFS diff 配置（Settings 或每个 destination 的 ⚙ 中可开关）自动选择：<em>zfs diff 版</em>——src 和 dst 都在本机 ZFS 且有已验证基准快照时，两侧各自与基准做 diff，只对账变化过的路径，秒级完成；<em>对比版</em>——源端和目标端<em>并行</em>扫描整棵树、对比清单、只传输缺失或不一致的文件。任一前提不满足自动落到对比版。</p>
+          <p><strong>Scan</strong>（对账不同步）：生成差异报告（新增/更新/删除/类型变化），不改动任何文件。与 Full 相同的双版本策略：ZFS diff 可用时秒级，只比对两侧基准以来变化的路径；否则两端并行全树扫描。</p>
         </section>
         <section>
           <h3>可靠性行为</h3>
@@ -135,7 +134,7 @@
         <section>
           <h3>Example</h3>
           <p>对于 <code>\\?\C:\Users\tiger\Documents\xwechat_files</code> 到 <code>nas:/opt</code>，实际 destination root 通常是 <code>/opt/xwechat_files</code>。</p>
-          <p>如果重启前已经同步了一部分，Incremental 会继续补齐缺口并修复不一致；Changed Since 会完整扫描 source 但只处理上次验证基线之后变化的路径；Full 会并行扫描两端、对账、修复差异，并在 Mirror 开启时删除额外文件。</p>
+          <p>如果重启前已经同步了一部分，Incremental 会继续补齐缺口并修复不一致；Full 会对账并修复所有差异（ZFS diff 可用时秒级，否则并行扫描两端），并在 Mirror 开启时删除额外文件。</p>
         </section>
       </div>
     </div>
@@ -152,6 +151,7 @@
           <h3>Sync</h3>
           <label class="check-row"><input id="settings-sync-mirror" type="checkbox"> Mirror</label>
           <label class="check-row"><input id="settings-sync-checksum" type="checkbox"> Checksum</label>
+          <label class="check-row" title="Use zfs diff against verified baseline snapshots for Full/Compare when both sides are local ZFS; falls back to full tree walks otherwise"><input id="settings-sync-zfsdiff" type="checkbox"> ZFS diff</label>
           <label class="check-row"><input id="settings-sync-debug" type="checkbox"> Debug logs</label>
         </div>
         <div class="settings-section">
@@ -186,6 +186,7 @@
           <h3>Sync</h3>
           <label class="check-row"><input id="dst-sync-mirror" type="checkbox"> Mirror</label>
           <label class="check-row"><input id="dst-sync-checksum" type="checkbox"> Checksum</label>
+          <label class="check-row" title="Use zfs diff against verified baseline snapshots for Full/Compare when both sides are local ZFS; falls back to full tree walks otherwise"><input id="dst-sync-zfsdiff" type="checkbox"> ZFS diff</label>
           <label class="check-row"><input id="dst-sync-debug" type="checkbox"> Debug logs</label>
         </div>
         <div class="settings-section">

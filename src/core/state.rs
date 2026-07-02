@@ -337,7 +337,7 @@ impl State {
         )?;
         // Restart notice: raised when the daemon starts on a platform whose
         // watcher cannot observe downtime changes; persists until a covering
-        // manual action (compare / full / changed-since) or a user dismissal.
+        // manual action (compare / full) or a user dismissal.
         self.ensure_column("source_meta", "restart_notice_at", "TEXT")?;
         self.ensure_column("source_meta", "restart_gap_started", "TEXT")?;
         Ok(())
@@ -887,18 +887,6 @@ impl State {
             r#"
             UPDATE sync_cycle
             SET needs_full_rescan=1, manual_full_rescan=1, updated_at=?1
-            WHERE id=?2
-            "#,
-            params![now_string(), cycle_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn mark_cycle_manual_changed_since_rescan(&self, cycle_id: i64) -> Result<()> {
-        self.conn.execute(
-            r#"
-            UPDATE sync_cycle
-            SET manual_changed_since_rescan=1, updated_at=?1
             WHERE id=?2
             "#,
             params![now_string(), cycle_id],

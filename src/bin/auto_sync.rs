@@ -670,7 +670,7 @@ fn run_scheduler(
     // Start the watcher and wait for its marks to be live, then raise the
     // restart notice: on platforms without a persistent journal (fanotify)
     // whatever changed while the process was down is unobservable, and the
-    // user decides how to reconcile (Compare / Full / Changed Since) instead
+    // user decides how to reconcile (Compare / Full) instead
     // of paying an automatic full-tree scan on every restart.
     let mut watcher_state = start_watcher(&cfg);
     wait_for_watcher_armed(&shutdown);
@@ -732,7 +732,7 @@ fn run_scheduler(
 
 /// On platforms whose watcher cannot see downtime changes (fanotify), raise
 /// a persistent per-source notice: the user reconciles manually (Compare /
-/// Full / Changed Since) or dismisses it. Windows USN replays its persistent
+/// Full) or dismisses it. Windows USN replays its persistent
 /// journal across restarts, so nothing was missed and no notice is raised.
 fn raise_restart_notices(cfg: &AppConfig, state: &State) {
     if watcher_covers_downtime() {
@@ -747,7 +747,7 @@ fn raise_restart_notices(cfg: &AppConfig, state: &State) {
             Ok(true) => info!(
                 source = source.id,
                 "daemon restarted: changes made while it was down may be unrecorded; \
-                 run Compare/Full/Changed Since or dismiss the notice"
+                 run Compare/Full or dismiss the notice"
             ),
             Ok(false) => {}
             Err(err) => warn!(source = source.id, error = %err, "failed to raise restart notice"),

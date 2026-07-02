@@ -147,6 +147,7 @@ const el = {
   settingsSave: document.getElementById("settings-save"),
   settingsSyncMirror: document.getElementById("settings-sync-mirror"),
   settingsSyncChecksum: document.getElementById("settings-sync-checksum"),
+  settingsSyncZfsDiff: document.getElementById("settings-sync-zfsdiff"),
   settingsSyncDebug: document.getElementById("settings-sync-debug"),
   settingsAutostart: document.getElementById("settings-autostart"),
   settingsCloseToTray: document.getElementById("settings-close-to-tray"),
@@ -159,6 +160,7 @@ const el = {
   dstSyncReset: document.getElementById("dst-sync-reset"),
   dstSyncMirror: document.getElementById("dst-sync-mirror"),
   dstSyncChecksum: document.getElementById("dst-sync-checksum"),
+  dstSyncZfsDiff: document.getElementById("dst-sync-zfsdiff"),
   dstSyncDebug: document.getElementById("dst-sync-debug"),
   dstSyncTimeout: document.getElementById("dst-sync-timeout"),
   dstSyncBwlimit: document.getElementById("dst-sync-bwlimit"),
@@ -375,7 +377,7 @@ function updateStatusUi() {
         restartButton.title =
           `auto_sync on this source's machine restarted at ${formatScanTime(notice.at)}` +
           `${notice.gapStart ? `; changes since ${formatScanTime(notice.gapStart)}` : "; changes made while it was down"}` +
-          " may be unrecorded. Run Compare, Full or Changed Since on this source to verify" +
+          " may be unrecorded. Run Compare or Full on this source to verify" +
           " — or click to dismiss this notice.";
       }
     }
@@ -1031,7 +1033,7 @@ function bindSourceControls(source, sourceIndex, group) {
       `The sync daemon for ${source.id} restarted at ${formatScanTime(notice.at)}; `
         + "changes made while it was down may be unrecorded.\n\n"
         + "OK = dismiss this notice (accept the risk).\n"
-        + "Cancel = keep it; run Compare, Full or Changed Since to verify instead.",
+        + "Cancel = keep it; run Compare or Full to verify instead.",
     );
     if (!dismiss) {
       return;
@@ -1114,7 +1116,6 @@ function renderSyncRows(source, group) {
         <select class="destination-sync-select" data-action="sync-dst" title="Sync">
           <option value="">Sync</option>
           <option value="incremental">Incremental</option>
-          <option value="changed_since">Changed Since</option>
           <option value="full">Full</option>
           <option value="scan">Compare</option>
         </select>
@@ -1419,6 +1420,7 @@ function normalizeNativeSyncConfig(sync) {
     bwlimit_kbps: Number(sync.bwlimit_kbps || 0),
     max_parallel_transfers: Number(sync.max_parallel_transfers ?? 16),
     modify_window_secs: Number(sync.modify_window_secs ?? 1),
+    zfs_diff: sync.zfs_diff !== false,
     fsync: sync.fsync === true,
   };
 }
@@ -1964,6 +1966,7 @@ function openSettingsModal(event) {
   const sync = cfg.app.sync;
   el.settingsSyncMirror.checked = sync.mirror;
   el.settingsSyncChecksum.checked = sync.checksum;
+  el.settingsSyncZfsDiff.checked = sync.zfs_diff !== false;
   el.settingsSyncDebug.checked = sync.debug_logs;
   el.settingsSyncTimeout.value = String(sync.transfer_timeout_secs || 120);
   el.settingsSyncBwlimit.value = String(sync.bwlimit_kbps || 0);
@@ -1988,6 +1991,7 @@ async function saveSettings() {
     ...baseSync,
     mirror: el.settingsSyncMirror.checked,
     checksum: el.settingsSyncChecksum.checked,
+    zfs_diff: el.settingsSyncZfsDiff.checked,
     debug_logs: el.settingsSyncDebug.checked,
     transfer_timeout_secs: clampInteger(el.settingsSyncTimeout.value, 1, 86400),
     bwlimit_kbps: clampInteger(el.settingsSyncBwlimit.value, 0, 10_000_000),
@@ -2004,6 +2008,7 @@ function openDestinationSyncModal(dst, onApply) {
   dstSyncEditor = { dst, onApply, baseSync: sync };
   el.dstSyncMirror.checked = sync.mirror;
   el.dstSyncChecksum.checked = sync.checksum;
+  el.dstSyncZfsDiff.checked = sync.zfs_diff !== false;
   el.dstSyncDebug.checked = sync.debug_logs;
   el.dstSyncTimeout.value = String(sync.transfer_timeout_secs || 120);
   el.dstSyncBwlimit.value = String(sync.bwlimit_kbps || 0);
@@ -2026,6 +2031,7 @@ async function saveDestinationSync() {
     ...baseSync,
     mirror: el.dstSyncMirror.checked,
     checksum: el.dstSyncChecksum.checked,
+    zfs_diff: el.dstSyncZfsDiff.checked,
     debug_logs: el.dstSyncDebug.checked,
     transfer_timeout_secs: clampInteger(el.dstSyncTimeout.value, 1, 86400),
     bwlimit_kbps: clampInteger(el.dstSyncBwlimit.value, 0, 10_000_000),
@@ -2947,9 +2953,6 @@ function setTransientMessage(text, ms = 10000) {
 }
 
 function destinationSyncStatusMessage(source, mode) {
-  if (mode === "changed_since") {
-    return "Scanning source changes...";
-  }
   if (mode !== "full") {
     return "Checking changes...";
   }

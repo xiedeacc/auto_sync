@@ -311,7 +311,7 @@ Linux 后台进程对 `schedule.mode = "realtime"` 的 source 使用 fanotify。
 - 删除、rename 和部分元数据变化不依赖事件流保证最终正确性，而是由周期关闭时的源目录快照和 dst 校验/reconcile 兜底。
 - 启动语义（停机窗口）：不再在每次重启时自动做全树 mtime 扫描（90 万条 HDD 树一次要 10 分钟以上的随机读）。调度器启动 watcher 并等待其上报 armed（`signal::mark_watcher_armed`，fanotify 按 source 计数、全部 mark 就位才放行，上限 15 分钟）之后：
   - Windows（USN）：持久 journal 覆盖停机期间的变化（游标断档自动记 `rescan_required`），无须任何提示。
-  - Linux（fanotify，无 journal）：为每个本机 watch 的 source 升起**重启提醒**（`source_meta.restart_notice_at/gap_started`，gap 起点取上一进程最后观测到的事件时间）。提醒持久存在并随 destination 状态下发到 UI（source 行 Latest Cycle 旁的 ⚠ 图标），直到：用户对该 source 成功完成一次**在提醒之后发起的** Compare / Full / Changed Since（时间戳比较防止把重启前就在跑的动作误当覆盖），或用户点击 ⚠ 手动忽略（`POST /api/dismiss-restart-notice`，远程 source 自动委派到执行机器）。重复重启不会刷新已有提醒（gap 只增不减）。普通 incremental 只重放已记录事件，不清除提醒。
+  - Linux（fanotify，无 journal）：为每个本机 watch 的 source 升起**重启提醒**（`source_meta.restart_notice_at/gap_started`，gap 起点取上一进程最后观测到的事件时间）。提醒持久存在并随 destination 状态下发到 UI（source 行 Latest Cycle 旁的 ⚠ 图标），直到：用户对该 source 成功完成一次**在提醒之后发起的** Compare / Full（时间戳比较防止把重启前就在跑的动作误当覆盖），或用户点击 ⚠ 手动忽略（`POST /api/dismiss-restart-notice`，远程 source 自动委派到执行机器）。重复重启不会刷新已有提醒（gap 只增不减）。普通 incremental 只重放已记录事件，不清除提醒。
 
 建议 fanotify 策略：
 
@@ -433,16 +433,13 @@ Realtime + ZFS：
 - 手动同步会为全部 source 或选定 source 关闭当前 open cycle，创建新的 target cycle，并让 enabled dst 追赶该 cycle。
 - 若目标离线或校验失败，不推进 `last_verified_cycle_id`，下一轮会继续重试该 target cycle。
 
-当前实现的 Changed Since sync：
-
-- Changed Since sync 只由用户在单个 destination 的 `Sync... -> Changed Since` 手动触发。它适合 source 已推进到较新的 cycle，而该 destination 还停在较旧 verified cycle，只想追赶旧 cycle 之后变化路径的场景。
-- 手动 Changed Since 会关闭该 source 当前 open cycle，只把当前 destination 的 `target_cycle_id` 指向这个新 cycle，并把 cycle 标记为 `manual_changed_since_rescan = 1`。它不会设置 `needs_full_rescan`，因此语义上不是 Full。
-- 执行时先对 source 做完整 snapshot/manifest 扫描，并将当前完整 `source_snapshot` 写入 `path_snapshot`。随后读取该 destination 的 `last_verified_cycle_id`，找到对应 source cycle 的时间点；时间取该 source cycle 的 `ends_at`，如果没有则回退到 `starts_at`，并转换成 Unix epoch nanoseconds。这个时间来自 source cycle，而不是当前机器执行同步时的 wall-clock。
-- 路径计划由当前完整 `source_snapshot` 和 last verified cycle 的历史 `path_snapshot` 生成：当前条目的 mtime 晚于上述 cycle 时间、当前条目相对历史 snapshot 有 metadata/content 变化、新增路径、以及历史 snapshot 中存在但当前 source 已不存在的路径，都会加入待同步相对路径集合。
-- 对待同步路径集合执行局部 source/destination snapshot、复制、类型替换、mirror 删除和局部校验。没有出现在该集合中的 destination-only 文件不会被扫描或删除；需要验证整棵目标树时使用 Full。
-- 如果 destination 从未 verified、找不到它的基线 source cycle，或基线 `path_snapshot` 没有可用条目，Changed Since 没有可靠的时间锚点，会降级为完整 reconcile。
+Changed Since 模式已移除（2026-07-02）：它的"只追赶源侧基线之后的变化"语义被 zfs diff 增量与 Full 的 zfs diff 版覆盖；非 ZFS 场景由 Full（并行双树扫描）承担。API 收到 `changed_since` 会返回错误；历史 task_log 行的标签仍可展示。
 
 当前实现的 Full sync：
+
+- Full 有两个实现，由 `sync.zfs_diff` 配置（全局默认 true，每个 destination 的 sync 覆盖可关）自动选择：
+  - **zfs diff 版**：src 与 dst 都在本机 ZFS 且两侧已验证基准快照都在（见 Compare 的 zfs diff 快路径一节）时，`zfs diff` 各取两侧自基准以来的变化路径，对并集执行按路径同步（复制差异、mirror 删除多余、类型替换），并集之外的路径基线时一致且未动过，无须触碰。秒级到差异量级。
+  - **对比版**：任一前提不满足（配置关闭、任一侧非本机 ZFS、缺基准、zfs 失败）时回退——双树并行扫描 + 清单对账,行为同下文。
 
 - Full sync 只由用户在单个 destination 的 `Sync... -> Full` 手动触发。`Sync All`、source 级 `Sync`、destination 级 `Incremental`、以及 realtime watcher 自动触发都按 incremental 处理。
 - 手动 Full 会先保存配置，然后调用 `sync_destination_now_with_mode(..., Full)`：关闭该 source 当前 open cycle，只把当前 destination 的 `target_cycle_id` 指向这个新 cycle，并把 cycle 标记为 `needs_full_rescan = 1`、`manual_full_rescan = 1`。
@@ -708,7 +705,7 @@ fanotify overflow / USN gap（疑似丢事件）：
 
 Compare 的 zfs diff 快路径：
 
-- 引擎在本地 Dir→Dir 的验证成功点（zfs-diff 增量、全量 reconcile、changed-since/generic 成功路径）除了记录源侧基准快照（`last_verified_snapshot_name`）外，若 dst 根也在本机 ZFS 数据集上，同时给 dst 数据集打基准快照（`<prefix>_dstbase_<src>_<dst>_<cycle>`，存 `destination_offset.last_verified_dst_snapshot_name`；旧基准即时清理，只保留当前一个）。此刻 dst 内容等于源基准内容，两个基准对应同一份已验证状态。
+- 引擎在本地 Dir→Dir 的验证成功点（zfs-diff 增量、全量 reconcile、generic 成功路径）除了记录源侧基准快照（`last_verified_snapshot_name`）外，若 dst 根也在本机 ZFS 数据集上，同时给 dst 数据集打基准快照（`<prefix>_dstbase_<src>_<dst>_<cycle>`，存 `destination_offset.last_verified_dst_snapshot_name`；旧基准即时清理，只保留当前一个）。此刻 dst 内容等于源基准内容，两个基准对应同一份已验证状态。
 - Compare 时若两个基准都在且各自数据集与实际路径匹配：`zfs diff -H <base>`（对活文件系统）分别取两侧自基准以来的变化路径，对并集做按路径快照（目录递归）再走常规清单对比——并集之外的路径在基准点已验证一致且此后未动，视为 in-sync。报告带 `method: "zfs_diff"`，entry 计数只覆盖被检查的路径。
 - 任一条件不满足（任一侧非 ZFS/非本机、缺基准、数据集不匹配、zfs 命令失败）自动回退全树扫描。远端 dst（跨机传输路径）不打 dst 基准，天然回退。
 
