@@ -698,6 +698,16 @@ fanotify overflow / USN gap（疑似丢事件）：
 - 取消后的状态：cycle 的手动 Full/Changed-Since 标记被清除，destination 的 in-flight target 被撤销（verified 基准保留），状态红点 `cancelled`——调度器不会在 5 秒后原样重启这次重活；destination 会在下一次 schedule、新事件或手动同步时重新拿到 target，最终一致性不受影响。事件丢失触发的 reconcile 需求不会丢：`rescan_required` 事件行仍在，下次拿到 target 时照常升级为完整对账。
 - 取消的错误以固定文案 `cancelled by user request` 贯穿错误链（含跨机 HTTP 错误体），传输重试逻辑对其不重试，worker pool 视其为致命错误立即整体停止。
 
+任务历史（task_log）：
+
+- 每个 sync cycle pass（按 source，dst 列全部启用目标）和每次 compare 在执行机器的 SQLite `task_log` 表记录一行：kind、source_id、destination_id、启动/结束时间、duration_ms、status（running/success/failed/cancelled/aborted）、error、files_synced（挂在取消 token 上的计数器，两个传输 worker pool 汇报）、differences 与 entries_scanned（compare 报告）。运行中的任务 `ended_at IS NULL`，随时可查（`GET /api/tasks?limit=`，或 sqlite3 直查）。
+- 惰性保留：插入新行时删除最新 100 条之外的**已结束**行；running 行不会被清。没有产生任何传输且未推进的 pass 直接丢弃行，避免调度心跳刷屏。守护进程重启时把遗留的 running 行标记为 aborted。
+
+sync 与 compare 的并发约束：
+
+- 跨机器完全并发（每个 source 在其所在机器执行）；同一台机器上同时最多一个 compare（scan gate）与一个 sync pass（sync gate），二者原则上可并存。
+- 例外：某 destination 的 compare 正在运行时，引擎不驱动该 destination 的 sync（realtime 新事件照常积累进下一个 cycle），状态显示黄色 `waiting_for_compare`，target 保留，compare 结束后下一个调度 tick 自动补上——避免 compare 读树的同时被 sync 改写导致报告失真。
+
 ## 14. 安全设计
 
 - SSH 部署优先使用密钥认证，不在配置文件保存明文密码。

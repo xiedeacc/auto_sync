@@ -61,6 +61,7 @@ pub fn router(backend: Backend) -> Router {
         )
         .route("/api/scan-destination-now", post(api_scan_destination_now))
         .route("/api/scan-report", get(api_scan_report))
+        .route("/api/tasks", get(api_tasks))
         .route("/api/transfer/snapshot", post(api_transfer_snapshot))
         .route(
             "/api/transfer/snapshot-paths",
@@ -361,6 +362,18 @@ async fn api_scan_report(
         ))
     })
     .await
+}
+
+#[derive(Debug, Deserialize)]
+struct TasksQuery {
+    limit: Option<usize>,
+}
+
+async fn api_tasks(
+    AxumState(backend): AxumState<Backend>,
+    Query(query): Query<TasksQuery>,
+) -> Result<Json<Vec<crate::core::state::TaskLogEntry>>, ApiError> {
+    blocking(move || Ok(Json(backend.recent_tasks(query.limit.unwrap_or(100).min(100))?))).await
 }
 
 async fn api_transfer_snapshot(

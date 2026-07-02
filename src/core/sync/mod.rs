@@ -1856,7 +1856,42 @@ pub fn sync_cycle_for_source(
             .map(|dst| cancel::target_for(&source.id, &dst.id))
             .collect(),
     );
+    // Task log: one row per cycle pass, opened while running (queryable
+    // live), closed with the outcome; a pass that moved nothing is dropped
+    // so the log holds real work, not scheduler heartbeats.
+    let kind = current_sync_kind().unwrap_or_else(|| "sync".to_string());
+    let destination_ids = source
+        .destinations
+        .iter()
+        .filter(|dst| dst.enabled)
+        .map(|dst| dst.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let task_id = state.task_start(&kind, &source.id, &destination_ids).ok();
+    let result = sync_cycle_for_source_inner(cfg, state, source, cycle);
+    if let Some(task_id) = task_id {
+        let files = cancel::synced_files();
+        let record = match &result {
+            Ok(outcome) if files == 0 && !outcome.progressed => state.task_discard(task_id),
+            Ok(_) => state.task_finish(task_id, "success", "", files, 0, 0),
+            Err(err) if cancel::error_is_cancelled(err) => {
+                state.task_finish(task_id, "cancelled", cancel::CANCELLED_MESSAGE, files, 0, 0)
+            }
+            Err(err) => state.task_finish(task_id, "failed", &format!("{err:#}"), files, 0, 0),
+        };
+        if let Err(err) = record {
+            warn!(source = source.id, error = %err, "failed to record task log entry");
+        }
+    }
+    result
+}
 
+fn sync_cycle_for_source_inner(
+    cfg: &AppConfig,
+    state: &mut State,
+    source: &SourceGroupConfig,
+    cycle: &Cycle,
+) -> Result<SyncCycleOutcome> {
     if cycle_has_remote_target(cfg, state, source, cycle)? {
         return sync_cycle_with_transfer(cfg, state, source, cycle);
     }
@@ -1903,6 +1938,25 @@ pub fn sync_cycle_for_source(
                 Some(cycle.id),
                 "green",
                 "verified",
+            )?;
+            continue;
+        }
+
+        // A compare for this destination is running: syncing changes under it
+        // would skew its report, so hold the sync until it finishes (the
+        // target stays; the next scheduler tick retries).
+        if cancel::kind_target_active(
+            cancel::KIND_COMPARE,
+            &cancel::target_for(&source.id, &dst.id),
+        ) {
+            all_verified = false;
+            blocked_count += 1;
+            state.upsert_destination_status(
+                &source.id,
+                &dst.id,
+                None,
+                "yellow",
+                "waiting_for_compare",
             )?;
             continue;
         }
@@ -2612,6 +2666,24 @@ fn sync_cycle_with_transfer(
                 Some(cycle.id),
                 "green",
                 "verified",
+            )?;
+            continue;
+        }
+        // A compare for this destination is running: syncing changes under it
+        // would skew its report, so hold the sync until it finishes (the
+        // target stays; the next scheduler tick retries).
+        if cancel::kind_target_active(
+            cancel::KIND_COMPARE,
+            &cancel::target_for(&source.id, &dst.id),
+        ) {
+            all_verified = false;
+            blocked_count += 1;
+            state.upsert_destination_status(
+                &source.id,
+                &dst.id,
+                None,
+                "yellow",
+                "waiting_for_compare",
             )?;
             continue;
         }
@@ -4099,8 +4171,10 @@ fn push_entries_parallel(
     {
         return Err(err);
     }
+    let transferred = done.load(Ordering::Relaxed) as usize;
+    cancel::add_synced_files(transferred as u64);
     Ok(TransferOutcome {
-        transferred: done.load(Ordering::Relaxed) as usize,
+        transferred,
         changing: changing.into_inner().unwrap_or_else(|err| err.into_inner()),
         failed: failed.into_inner().unwrap_or_else(|err| err.into_inner()),
     })
@@ -4207,8 +4281,10 @@ fn copy_entries_parallel(
     {
         return Err(err);
     }
+    let transferred = done.load(Ordering::Relaxed) as usize;
+    cancel::add_synced_files(transferred as u64);
     Ok(TransferOutcome {
-        transferred: done.load(Ordering::Relaxed) as usize,
+        transferred,
         changing: changing.into_inner().unwrap_or_else(|err| err.into_inner()),
         failed: failed.into_inner().unwrap_or_else(|err| err.into_inner()),
     })
@@ -7423,6 +7499,78 @@ mod tests {
     }
 
     #[test]
+    fn sync_defers_while_a_compare_runs_for_the_same_destination() {
+        let temp = temp_dir("sync_defers_during_compare");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("hello.txt"), b"hello").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "defer_src".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            add_directory: true,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "defer_dst".to_string(),
+                machine_id: "local".to_string(),
+                path: dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+                sync: None,
+            }],
+        });
+
+        let mut state = State::open(&db).unwrap();
+        // Simulate a running compare for this destination on another thread:
+        // register its scoped op the way scan_destination_now does. It must
+        // live on a separate thread so this thread's sync does not inherit
+        // the compare token.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let compare_thread = std::thread::spawn(move || {
+            let _op = cancel::begin_target(
+                cancel::KIND_COMPARE,
+                Some(cancel::target_for("defer_src", "defer_dst")),
+            );
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+
+        sync_all_now(&cfg, &mut state).unwrap();
+        let effective_dst = dst.join("src");
+        assert!(
+            !effective_dst.join("hello.txt").exists(),
+            "sync must wait for the running compare"
+        );
+        let views = state.destination_views(&cfg).unwrap();
+        assert_eq!(views[0].status_reason, "waiting_for_compare");
+
+        // Compare finished: the still-pending target syncs on the next pass.
+        release_tx.send(()).unwrap();
+        compare_thread.join().unwrap();
+        sync_all_pending(&cfg, &mut state).unwrap();
+        assert_eq!(fs::read(effective_dst.join("hello.txt")).unwrap(), b"hello");
+        let views = state.destination_views(&cfg).unwrap();
+        assert_eq!(views[0].status_reason, "verified");
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
     fn repair_scan_syncs_only_reported_differences_and_consumes_the_report() {
         let temp = temp_dir("repair_scan_targets_report_paths");
         let src = temp.join("src");
@@ -7436,7 +7584,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.app.data_db = db.clone();
         cfg.source_groups.push(SourceGroupConfig {
-            id: "src_1".to_string(),
+            id: "scan_repair_src".to_string(),
             machine_id: "local".to_string(),
             src: src.clone(),
             add_directory: true,
@@ -7449,7 +7597,7 @@ mod tests {
                 ..SnapshotConfig::default()
             },
             destinations: vec![DestinationConfig {
-                id: "dst_1".to_string(),
+                id: "scan_repair_dst".to_string(),
                 machine_id: "local".to_string(),
                 path: dst.clone(),
                 enabled: true,
@@ -7466,14 +7614,14 @@ mod tests {
         fs::write(effective_dst.join("hello.txt"), b"corrupted").unwrap();
         fs::remove_file(effective_dst.join("untouched.txt")).unwrap();
 
-        let report = scan_destination_now(&cfg, &state, "src_1", "dst_1").unwrap();
+        let report = scan_destination_now(&cfg, &state, "scan_repair_src", "scan_repair_dst").unwrap();
         assert_eq!(report.to_update, 1, "hello.txt differs");
         assert_eq!(report.to_add, 1, "untouched.txt missing");
 
-        queue_destination_sync(&cfg, &state, "src_1", "dst_1", SyncRequestMode::RepairScan)
+        queue_destination_sync(&cfg, &state, "scan_repair_src", "scan_repair_dst", SyncRequestMode::RepairScan)
             .unwrap();
         // The consumed report is gone: the UI repair affordance clears.
-        assert!(state.get_scan_report("src_1", "dst_1").unwrap().is_none());
+        assert!(state.get_scan_report("scan_repair_src", "scan_repair_dst").unwrap().is_none());
         sync_all_pending(&cfg, &mut state).unwrap();
 
         assert_eq!(fs::read(effective_dst.join("hello.txt")).unwrap(), b"hello");

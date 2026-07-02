@@ -56,6 +56,27 @@ pub struct SnapshotEntry {
     pub hash: Option<String>,
 }
 
+/// Lazy retention cap for the task log: inserts prune finished rows beyond
+/// the newest this-many (running rows are exempt).
+const TASK_LOG_KEEP: i64 = 100;
+
+/// One recorded sync/compare task (running rows have no `ended_at` yet).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskLogEntry {
+    pub id: i64,
+    pub kind: String,
+    pub source_id: String,
+    pub destination_id: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub status: String,
+    pub error: String,
+    pub files_synced: u64,
+    pub differences: u64,
+    pub entries_scanned: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DestinationView {
     pub source_id: String,
@@ -253,6 +274,21 @@ impl State {
                 scanned_at TEXT NOT NULL,
                 report_json TEXT NOT NULL,
                 PRIMARY KEY (source_id, destination_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS task_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                destination_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                duration_ms INTEGER,
+                status TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                files_synced INTEGER NOT NULL DEFAULT 0,
+                differences INTEGER NOT NULL DEFAULT 0,
+                entries_scanned INTEGER NOT NULL DEFAULT 0
             );
             "#,
         )?;
@@ -1066,6 +1102,113 @@ impl State {
         Ok(())
     }
 
+    /// Open a task-log row for a starting sync/compare (`status = running`,
+    /// no end time yet — a running task is queryable at any moment). Lazy
+    /// retention: inserting prunes finished rows beyond the newest
+    /// [`TASK_LOG_KEEP`]; running rows are never pruned.
+    pub fn task_start(&self, kind: &str, source_id: &str, destination_id: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO task_log (kind, source_id, destination_id, started_at, status)
+             VALUES (?1, ?2, ?3, ?4, 'running')",
+            params![kind, source_id, destination_id, Utc::now().to_rfc3339()],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "DELETE FROM task_log
+             WHERE ended_at IS NOT NULL
+               AND id NOT IN (SELECT id FROM task_log ORDER BY id DESC LIMIT ?1)",
+            params![TASK_LOG_KEEP],
+        )?;
+        Ok(id)
+    }
+
+    /// Close a task-log row with its outcome and counters.
+    pub fn task_finish(
+        &self,
+        task_id: i64,
+        status: &str,
+        error: &str,
+        files_synced: u64,
+        differences: u64,
+        entries_scanned: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE task_log
+             SET ended_at = ?2,
+                 duration_ms = CAST((julianday(?2) - julianday(started_at)) * 86400000 AS INTEGER),
+                 status = ?3,
+                 error = ?4,
+                 files_synced = ?5,
+                 differences = ?6,
+                 entries_scanned = ?7
+             WHERE id = ?1",
+            params![
+                task_id,
+                Utc::now().to_rfc3339(),
+                status,
+                error,
+                files_synced as i64,
+                differences as i64,
+                entries_scanned as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a task row that turned out to be a no-op (nothing targeted or
+    /// transferred) so the log holds real work, not scheduler heartbeats.
+    pub fn task_discard(&self, task_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM task_log WHERE id = ?1", params![task_id])?;
+        Ok(())
+    }
+
+    /// A daemon restart orphans `running` rows (the work died with the
+    /// process); mark them so they don't read as live forever.
+    pub fn abort_stale_running_tasks(&self) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        let changed = self.conn.execute(
+            "UPDATE task_log
+             SET ended_at = ?1,
+                 duration_ms = CAST((julianday(?1) - julianday(started_at)) * 86400000 AS INTEGER),
+                 status = 'aborted',
+                 error = 'daemon restarted while the task was running'
+             WHERE status = 'running'",
+            params![now],
+        )?;
+        Ok(changed)
+    }
+
+    /// Newest-first task rows (running first by recency like the rest).
+    pub fn recent_tasks(&self, limit: usize) -> Result<Vec<TaskLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, source_id, destination_id, started_at, ended_at, duration_ms,
+                    status, error, files_synced, differences, entries_scanned
+             FROM task_log ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(TaskLogEntry {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                source_id: row.get(2)?,
+                destination_id: row.get(3)?,
+                started_at: row.get(4)?,
+                ended_at: row.get(5)?,
+                duration_ms: row.get(6)?,
+                status: row.get(7)?,
+                error: row.get(8)?,
+                files_synced: row.get::<_, i64>(9)? as u64,
+                differences: row.get::<_, i64>(10)? as u64,
+                entries_scanned: row.get::<_, i64>(11)? as u64,
+            })
+        })?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row?);
+        }
+        Ok(tasks)
+    }
+
     pub fn get_scan_report(
         &self,
         source_id: &str,
@@ -1680,6 +1823,64 @@ mod tests {
         AppConfig, DestinationConfig, ScheduleConfig, SnapshotConfig, SourceGroupConfig, SyncMode,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn task_log_tracks_running_tasks_and_prunes_finished_ones_lazily() {
+        let temp = temp_dir("state_task_log");
+        let state = State::open(&temp.join("state.sqlite")).unwrap();
+
+        let running = state.task_start("compare", "src_a", "dst_a").unwrap();
+        let tasks = state.recent_tasks(10).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, "running");
+        assert!(tasks[0].ended_at.is_none(), "running task queryable live");
+
+        state
+            .task_finish(running, "success", "", 12, 3, 4000)
+            .unwrap();
+        let tasks = state.recent_tasks(10).unwrap();
+        assert_eq!(tasks[0].status, "success");
+        assert_eq!(tasks[0].files_synced, 12);
+        assert_eq!(tasks[0].differences, 3);
+        assert_eq!(tasks[0].entries_scanned, 4000);
+        assert!(tasks[0].ended_at.is_some());
+        assert!(tasks[0].duration_ms.is_some());
+
+        // Lazy retention: a long-running task survives the prune even while
+        // finished rows beyond the newest 100 are dropped at insert time.
+        let long_running = state.task_start("sync", "src_a", "dst_a").unwrap();
+        for i in 0..120 {
+            let id = state.task_start("sync", "src_a", "dst_a").unwrap();
+            state
+                .task_finish(id, "success", "", i, 0, 0)
+                .unwrap();
+        }
+        let tasks = state.recent_tasks(200).unwrap();
+        assert!(tasks.len() <= 101, "finished rows capped at 100 + running");
+        assert!(
+            tasks.iter().any(|task| task.id == long_running),
+            "running row never pruned"
+        );
+
+        // A restart sweep closes orphaned running rows.
+        assert_eq!(state.abort_stale_running_tasks().unwrap(), 1);
+        let tasks = state.recent_tasks(200).unwrap();
+        let orphan = tasks.iter().find(|task| task.id == long_running).unwrap();
+        assert_eq!(orphan.status, "aborted");
+
+        // A no-op row can be discarded entirely.
+        let noop = state.task_start("sync", "src_a", "dst_a").unwrap();
+        state.task_discard(noop).unwrap();
+        assert!(
+            !state
+                .recent_tasks(200)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == noop)
+        );
+
+        std::fs::remove_dir_all(temp).ok();
+    }
 
     #[test]
     fn realtime_does_not_advance_only_because_reconcile_interval_elapsed() {

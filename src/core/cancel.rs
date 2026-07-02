@@ -41,11 +41,13 @@ struct ActiveOp {
 
 /// Cancel token installed on a thread: the shared cancelled flag plus the
 /// destination target the work is for (carried so spawned workers and peer
-/// requests can attribute their work to the same destination).
+/// requests can attribute their work to the same destination) and a shared
+/// files-transferred counter the task log reads.
 #[derive(Clone)]
 pub struct CancelToken {
     flag: Arc<AtomicBool>,
     target: Option<Arc<str>>,
+    files: Arc<AtomicU64>,
 }
 
 thread_local! {
@@ -99,9 +101,43 @@ pub fn begin_targets(kind: &str, targets: Vec<String>) -> OpGuard {
     let token = CancelToken {
         flag,
         target: token_target,
+        files: Arc::new(AtomicU64::new(0)),
     };
     let previous = CURRENT.with(|current| current.replace(Some(token)));
     OpGuard { id, previous }
+}
+
+/// Credit `count` transferred files to the operation running on this thread
+/// (workers share the coordinator's token, so their transfers accumulate on
+/// the same counter). No-op outside an operation.
+pub fn add_synced_files(count: u64) {
+    CURRENT.with(|current| {
+        if let Some(token) = current.borrow().as_ref() {
+            token.files.fetch_add(count, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Files transferred so far by the operation running on this thread.
+pub fn synced_files() -> u64 {
+    CURRENT.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .map_or(0, |token| token.files.load(Ordering::Relaxed))
+    })
+}
+
+/// True while any registered operation of `kind` is scoped to `target`; lets
+/// the engine defer a destination's sync until its running compare finishes
+/// (both always execute on the source's machine, so the local registry is
+/// authoritative).
+pub fn kind_target_active(kind: &str, target: &str) -> bool {
+    REGISTRY
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .any(|op| op.kind == kind && op.targets.iter().any(|scoped| scoped == target))
 }
 
 pub struct OpGuard {

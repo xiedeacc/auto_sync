@@ -654,6 +654,13 @@ fn run_scheduler(
     let mut state = State::open(&cfg.app.data_db)?;
     state.ensure_config(&cfg)?;
     state.ensure_open_cycles(&cfg)?;
+    match state.abort_stale_running_tasks() {
+        Ok(aborted) if aborted > 0 => {
+            info!(aborted, "marked task-log rows orphaned by the previous run as aborted");
+        }
+        Ok(_) => {}
+        Err(err) => warn!(error = %err, "failed to sweep stale running tasks"),
+    }
     record_startup_changes(&cfg, &state);
 
     let mut watcher_state = start_watcher(&cfg);

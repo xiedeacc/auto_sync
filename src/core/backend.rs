@@ -375,12 +375,40 @@ impl Backend {
         let destination_id = destination_id.to_string();
         std::thread::spawn(move || match DbState::open(&cfg.app.data_db) {
             Ok(state) => {
-                if let Err(err) = crate::core::sync::scan_destination_now(
+                let task_id = state.task_start("compare", &source_id, &destination_id).ok();
+                let result = crate::core::sync::scan_destination_now(
                     &cfg,
                     &state,
                     &source_id,
                     &destination_id,
-                ) {
+                );
+                if let Some(task_id) = task_id {
+                    let record = match &result {
+                        Ok(report) => {
+                            let differences = report.to_add
+                                + report.to_update
+                                + report.to_delete
+                                + report.type_mismatch;
+                            let entries = report.source_entries + report.dst_entries;
+                            state.task_finish(task_id, "success", "", 0, differences, entries)
+                        }
+                        // The scan never ran (another one holds the gate):
+                        // nothing worth a history row.
+                        Err(err) if crate::core::sync::scan_error_is_already_running(err) => {
+                            state.task_discard(task_id)
+                        }
+                        Err(err) if cancel::error_is_cancelled(err) => {
+                            state.task_finish(task_id, "cancelled", cancel::CANCELLED_MESSAGE, 0, 0, 0)
+                        }
+                        Err(err) => {
+                            state.task_finish(task_id, "failed", &format!("{err:#}"), 0, 0, 0)
+                        }
+                    };
+                    if let Err(err) = record {
+                        tracing::warn!(error = %err, "failed to record compare task log entry");
+                    }
+                }
+                if let Err(err) = result {
                     tracing::warn!(error = %err, source = source_id, destination = destination_id, "scan failed");
                     // Persist the failure (with a fresh scanned_at) so the UI's
                     // report poll terminates and surfaces the error instead of
@@ -403,6 +431,15 @@ impl Backend {
             Err(err) => tracing::warn!(error = %err, "scan could not open state db"),
         });
         Ok(previous)
+    }
+
+    /// Recent task-log rows (running first by recency). Tasks are recorded on
+    /// the machine that executes them — query each machine for its own log.
+    pub fn recent_tasks(&self, limit: usize) -> Result<Vec<crate::core::state::TaskLogEntry>> {
+        let cfg = load_config(&self.config_path)?;
+        let state_db = DbState::open(&cfg.app.data_db)?;
+        state_db.ensure_config(&cfg)?;
+        state_db.recent_tasks(limit)
     }
 
     /// The most recent stored Scan report for a destination, if any.
