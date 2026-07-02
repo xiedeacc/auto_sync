@@ -346,6 +346,12 @@ th {
   background: rgba(180, 83, 9, 0.2);
 }
 
+/* display:inline-flex above would override the UA's [hidden] rule and keep
+   the button visible with zero differences; restore hidden semantics. */
+.repair-scan-button[hidden] {
+  display: none;
+}
+
 .actions-label {
   grid-column: span 2;
 }
