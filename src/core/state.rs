@@ -574,7 +574,7 @@ impl State {
         let mut closed_cycle = cycle;
         closed_cycle.status = "closed".to_string();
         closed_cycle.ends_at = Some(now);
-        crate::core::peer_notify::mark_local_change();
+        crate::core::peer_notify::mark_local_change(source_id);
         Ok(Some(closed_cycle))
     }
 
@@ -935,7 +935,7 @@ impl State {
                 now_string()
             ],
         )?;
-        crate::core::peer_notify::mark_local_change();
+        crate::core::peer_notify::mark_local_change(source_id);
         Ok(())
     }
 
@@ -1092,7 +1092,7 @@ impl State {
             "#,
             params![source_id, destination_id, target_cycle_id, now_string()],
         )?;
-        crate::core::peer_notify::mark_local_change();
+        crate::core::peer_notify::mark_local_change(source_id);
         Ok(())
     }
 
@@ -1116,7 +1116,7 @@ impl State {
             "#,
             params![source_id, destination_id, reason, now_string()],
         )?;
-        crate::core::peer_notify::mark_local_change();
+        crate::core::peer_notify::mark_local_change(source_id);
         Ok(())
     }
 

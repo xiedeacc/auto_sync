@@ -435,6 +435,18 @@ fn discovered_machine_name(health: &MachineHealth) -> String {
     }
 }
 
+/// Whether `value` is a discovery id (`lan_<sanitized-host>_<port>_<hash>`,
+/// see [`discovery_machine_id`]) referring to this machine entry. Used to
+/// resolve `source_group.managed_by` — which stores the controller's
+/// discovery id — back to a configured machine.
+pub fn machine_matches_discovery_id(machine: &MachineConfig, value: &str) -> bool {
+    let host = clean_machine_id(&machine.host);
+    if host.is_empty() {
+        return false;
+    }
+    value.starts_with(&format!("lan_{host}_{}_", machine.port))
+}
+
 fn discovery_machine_id(host: &str, port: u16) -> String {
     let host = clean_machine_id(host);
     let path_hash = current_exe_path_hash();
