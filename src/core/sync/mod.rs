@@ -268,6 +268,16 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
     configure_fsync(cfg.app.sync.fsync);
     progress::configure_progress_file(&cfg.app.data_db);
     state.ensure_config(cfg)?;
+    // Rows for deleted (source, destination) pairs pinned their snapshots
+    // forever; drop them and best-effort reclaim their dstbase snapshots.
+    match state.prune_removed_destination_offsets(cfg) {
+        Ok(orphans) => {
+            for snapshot in orphans {
+                Command::new("zfs").args(["destroy", &snapshot]).status().ok();
+            }
+        }
+        Err(err) => warn!(error = %err, "failed to prune removed destination offsets"),
+    }
     loop {
         let mut progressed = false;
         let mut blocked = false;
@@ -2048,7 +2058,14 @@ fn safe_join_rel(root: &Path, rel_path: &str) -> Result<PathBuf> {
 }
 
 fn normalize_rel_path(rel_path: &str) -> Result<PathBuf> {
+    // All internal producers join components with '/'. Treat '\' as a
+    // separator only where the OS does: on Linux it is a legal filename byte
+    // (rewriting it silently redirected "a\b" to a nested a/b path — wrong
+    // copies, phantom deletes under mirror).
+    #[cfg(windows)]
     let normalized = rel_path.replace('\\', "/");
+    #[cfg(not(windows))]
+    let normalized = rel_path.to_string();
     let rel = Path::new(&normalized);
     if rel.is_absolute() {
         bail!("relative path is absolute: {rel_path}");
@@ -2512,12 +2529,17 @@ fn sync_cycle_for_source_inner(
                                         "green",
                                         "verified",
                                     )?;
+                                    let touched: BTreeSet<String> =
+                                        rel_paths.iter().cloned().collect();
                                     record_destination_verified_baselines(
                                         state,
                                         source,
                                         &dst.id,
                                         Some(&zfs.full_name),
-                                        DstBaselineAction::Refresh(dst_root),
+                                        DstBaselineAction::Refresh {
+                                            dst_root,
+                                            touched: Some(&touched),
+                                        },
                                         cycle.id,
                                     )?;
                                     continue;
@@ -2552,7 +2574,7 @@ fn sync_cycle_for_source_inner(
                     &sync,
                 );
                 match sync_result {
-                    Ok(source_snapshot) => {
+                    Ok((source_snapshot, touched)) => {
                         state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
                         progressed = true;
                         state.clear_destination_issues(&source.id, &dst.id)?;
@@ -2574,7 +2596,10 @@ fn sync_cycle_for_source_inner(
                                 .as_ref()
                                 .map(|z| z.full_name.as_str()),
                             if sync.zfs_diff {
-                                DstBaselineAction::Refresh(dst_root)
+                                DstBaselineAction::Refresh {
+                                    dst_root,
+                                    touched: Some(&touched),
+                                }
                             } else {
                                 DstBaselineAction::Clear
                             },
@@ -3351,7 +3376,12 @@ fn sync_cycle_with_transfer(
                     &dst.id,
                     zfs_snapshot.map(|zfs| zfs.full_name.as_str()),
                     if dst_machine_id == "local" && sync.zfs_diff {
-                        DstBaselineAction::Refresh(&dst_root)
+                        // No touched set threaded out of the transfer pass
+                        // yet: the refresh proceeds unchecked here.
+                        DstBaselineAction::Refresh {
+                            dst_root: &dst_root,
+                            touched: None,
+                        }
                     } else {
                         DstBaselineAction::Clear
                     },
@@ -5192,8 +5222,18 @@ fn dst_baseline_prefix(source: &SourceGroupConfig, destination_id: &str) -> Stri
 enum DstBaselineAction<'a> {
     /// This pass made dst equal the source base across the whole tree
     /// (walk-based full reconcile, full manifest sync, dual-side zfs Full):
-    /// snapshot the dst dataset now as the new baseline.
-    Refresh(&'a Path),
+    /// snapshot the dst dataset now as the new baseline. `touched` is the set
+    /// of relative paths this pass itself wrote/removed; when provided (and a
+    /// previous baseline exists) the refresh is cross-checked with
+    /// `zfs diff old-base new-base` — any non-directory change OUTSIDE the
+    /// set means an external writer hit the destination between the
+    /// comparison and the snapshot, and its drift would be baked into the new
+    /// baseline (invisible to every future diff-based Compare/Full). The
+    /// refresh then downgrades to Retain.
+    Refresh {
+        dst_root: &'a Path,
+        touched: Option<&'a BTreeSet<String>>,
+    },
     /// This pass only applied source-side changes (zfs-diff incremental):
     /// keep the previous dst baseline — it still describes the last
     /// whole-tree verified state. Compare's dst diff just grows until the
@@ -5218,12 +5258,12 @@ fn record_destination_verified_baselines(
     cycle_id: i64,
 ) -> Result<()> {
     state.set_destination_verified_snapshot(&source.id, destination_id, src_snapshot_name)?;
-    let dst_root = match action {
+    let (dst_root, touched) = match action {
         DstBaselineAction::Retain => return Ok(()),
-        DstBaselineAction::Clear => None,
+        DstBaselineAction::Clear => (None, None),
         // A dst baseline without a paired source base is meaningless.
-        DstBaselineAction::Refresh(_) if src_snapshot_name.is_none() => None,
-        DstBaselineAction::Refresh(dst_root) => Some(dst_root),
+        DstBaselineAction::Refresh { .. } if src_snapshot_name.is_none() => (None, None),
+        DstBaselineAction::Refresh { dst_root, touched } => (Some(dst_root), touched),
     };
     let previous = state
         .destination_verified_dst_snapshot(&source.id, destination_id)
@@ -5231,7 +5271,32 @@ fn record_destination_verified_baselines(
     let dst_base = match dst_root {
         Some(dst_root) => {
             match create_dst_baseline_snapshot(source, destination_id, dst_root, cycle_id) {
-                Ok(name) => Some(name),
+                Ok(name) => {
+                    match baseline_refresh_contaminated(
+                        previous.as_deref(),
+                        &name,
+                        dst_root,
+                        touched,
+                    ) {
+                        Some(outside) => {
+                            // External write during the pass: baking it into
+                            // the baseline would hide it from every future
+                            // diff-based Compare/Full. Keep the old baseline
+                            // (Retain semantics — the drift stays visible in
+                            // the dst-side diff until repaired).
+                            warn!(
+                                source = source.id,
+                                destination = destination_id,
+                                path = outside,
+                                "destination changed outside this pass during the refresh window; \
+                                 keeping the previous baseline"
+                            );
+                            Command::new("zfs").args(["destroy", &name]).status().ok();
+                            return Ok(());
+                        }
+                        None => Some(name),
+                    }
+                }
                 Err(err) => {
                     debug!(
                         source = source.id,
@@ -5253,6 +5318,66 @@ fn record_destination_verified_baselines(
         previous.as_deref(),
     );
     Ok(())
+}
+
+/// Cross-check a baseline refresh: any non-directory path in
+/// `zfs diff -HF <previous> <new>` that this pass did not itself touch is
+/// evidence of an external writer during the pass window. Returns the first
+/// such path. `None` when clean or when the check cannot run (no previous
+/// baseline / different dataset / no touched set supplied) — refreshes then
+/// proceed as before.
+fn baseline_refresh_contaminated(
+    previous: Option<&str>,
+    new_base: &str,
+    dst_root: &Path,
+    touched: Option<&BTreeSet<String>>,
+) -> Option<String> {
+    let touched = touched?;
+    let previous = previous?;
+    if previous.split('@').next() != new_base.split('@').next() {
+        return None;
+    }
+    let live_root = dst_root.canonicalize().ok()?;
+    let output = command_stdout(Command::new("zfs").args(["diff", "-HF", previous, new_base]))
+        .map_err(|err| {
+            debug!(error = %err, "baseline refresh cross-check diff failed; accepting refresh");
+            err
+        })
+        .ok()?;
+    for line in output.lines() {
+        let mut fields = line.split('\t');
+        let Some(change) = fields.next() else {
+            continue;
+        };
+        if !matches!(change, "-" | "+" | "M" | "R") {
+            continue;
+        }
+        let Some(file_type) = fields.next() else {
+            continue;
+        };
+        // Directory rows are noise: the pass legitimately touches every
+        // directory (mtime/mode stamping) without that being drift.
+        if file_type == "/" {
+            continue;
+        }
+        for raw in fields {
+            let abs = unescape_zfs_path(raw);
+            let Ok(rel) = Path::new(&abs).strip_prefix(&live_root) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let Ok(rel_str) = rel_to_string(rel) else {
+                continue;
+            };
+            if rel_str_is_internal(&rel_str) || touched.contains(&rel_str) {
+                continue;
+            }
+            return Some(rel_str);
+        }
+    }
+    None
 }
 
 fn create_dst_baseline_snapshot(
@@ -5601,6 +5726,10 @@ fn sync_destination(
     result
 }
 
+/// Returns the source manifest plus the set of relative paths this pass
+/// itself wrote, removed or chmod'd — the baseline refresh cross-checks it
+/// against `zfs diff` to detect external writers (see
+/// [`baseline_refresh_contaminated`]).
 fn sync_destination_fast_missing_dirs(
     src_root: &Path,
     dst_root: &Path,
@@ -5608,7 +5737,7 @@ fn sync_destination_fast_missing_dirs(
     cycle_id: i64,
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
-) -> Result<Vec<SnapshotEntry>> {
+) -> Result<(Vec<SnapshotEntry>, BTreeSet<String>)> {
     fs::create_dir_all(dst_root).with_context(|| {
         format!(
             "failed to create destination directory: {}",
@@ -5684,6 +5813,7 @@ fn sync_destination_fast_missing_dirs(
         drop(transfer_guard);
 
         // Content-equal files whose permission bits drifted: chmod in place.
+        let mut mode_fixed: Vec<String> = Vec::new();
         for entry in source_snapshot
             .iter()
             .filter(|e| e.file_type == "file")
@@ -5694,10 +5824,12 @@ fn sync_destination_fast_missing_dirs(
                     let path = safe_join_rel(dst_root, &entry.rel_path)?;
                     set_mode(&path, entry.mode)
                         .with_context(|| format!("failed to set mode on {}", entry.rel_path))?;
+                    mode_fixed.push(entry.rel_path.clone());
                 }
             }
         }
 
+        let mut trashed: Vec<String> = Vec::new();
         if sync.mirror {
             let mut extra_paths: Vec<String> = dst_map
                 .keys()
@@ -5710,6 +5842,7 @@ fn sync_destination_fast_missing_dirs(
             for rel in extra_paths {
                 move_to_trash(dst_root, &rel, cycle_id)
                     .with_context(|| format!("failed to remove extra destination path {rel}"))?;
+                trashed.push(rel);
             }
         }
 
@@ -5746,7 +5879,13 @@ fn sync_destination_fast_missing_dirs(
         if !changing_paths.is_empty() {
             return Err(source_changing_error(&changing_paths));
         }
-        Ok(source_snapshot)
+        // Everything this pass wrote/removed/chmod'd, for the baseline
+        // refresh cross-check.
+        let mut touched = copied_paths;
+        touched.extend(to_copy.iter().map(|e| e.rel_path.clone()));
+        touched.extend(mode_fixed);
+        touched.extend(trashed);
+        Ok((source_snapshot, touched))
     })();
     cleanup_tmp_cycle(dst_root, cycle_id);
     cleanup_expired_trash(dst_root, sync.trash_keep_days);
@@ -5779,7 +5918,10 @@ fn collect_source_snapshot_copying_missing_dirs(
             let rel = child
                 .strip_prefix(src_root)
                 .with_context(|| format!("failed to strip root from {}", child.display()))?;
-            let rel_path = rel_to_string(rel)?;
+            let Ok(rel_path) = rel_to_string(rel) else {
+                warn!(path = %child.display(), "skipping entry with non-UTF-8 name");
+                continue;
+            };
             entries_seen += 1;
             let metadata = fs::symlink_metadata(&child)
                 .with_context(|| format!("failed to read metadata {}", child.display()))?;
@@ -5898,7 +6040,10 @@ fn copy_missing_directory_tree(
             let rel = child
                 .strip_prefix(src_root)
                 .with_context(|| format!("failed to strip root from {}", child.display()))?;
-            let rel_path = rel_to_string(rel)?;
+            let Ok(rel_path) = rel_to_string(rel) else {
+                warn!(path = %child.display(), "skipping entry with non-UTF-8 name");
+                continue;
+            };
             let Some(entry) = snapshot_entry_if_supported(&child, rel_path, sync.checksum)? else {
                 continue;
             };
@@ -6450,7 +6595,10 @@ fn collect_snapshot_path(
             let rel = item_path
                 .strip_prefix(root)
                 .with_context(|| format!("failed to strip root from {}", item_path.display()))?;
-            let rel_path = rel_to_string(rel)?;
+            let Ok(rel_path) = rel_to_string(rel) else {
+                warn!(path = %item_path.display(), "skipping entry with non-UTF-8 name");
+                return Ok(());
+            };
             if let Some(entry) = snapshot_entry_if_supported(item_path, rel_path, checksum)? {
                 entries.insert(entry.rel_path.clone(), entry);
             }
@@ -6462,7 +6610,10 @@ fn collect_snapshot_path(
     let rel = path
         .strip_prefix(root)
         .with_context(|| format!("failed to strip root from {}", path.display()))?;
-    let rel_path = rel_to_string(rel)?;
+    let Ok(rel_path) = rel_to_string(rel) else {
+        warn!(path = %path.display(), "skipping entry with non-UTF-8 name");
+        return Ok(());
+    };
     if let Some(entry) = snapshot_entry_if_supported(path, rel_path, checksum)? {
         entries.insert(entry.rel_path.clone(), entry);
     }
@@ -7300,7 +7451,17 @@ fn rel_to_string(path: &Path) -> Result<String> {
     let mut parts = Vec::new();
     for component in path.components() {
         match component {
-            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::Normal(part) => match part.to_str() {
+                Some(value) => parts.push(value.to_string()),
+                // A lossy conversion would sync (and verify against) a
+                // DIFFERENT name than the file actually has — silently wrong
+                // both ways. Callers that walk trees skip such entries with a
+                // warning instead.
+                None => bail!(
+                    "path component is not valid UTF-8: {}",
+                    path.to_string_lossy()
+                ),
+            },
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 bail!("invalid relative path: {}", path.display());
@@ -7870,7 +8031,7 @@ mod tests {
         fs::create_dir_all(&dst).unwrap();
         fs::write(src.join("top").join("nested").join("file.txt"), b"hello").unwrap();
 
-        let snapshot = sync_destination_fast_missing_dirs(
+        let (snapshot, touched) = sync_destination_fast_missing_dirs(
             &src,
             &dst,
             "dst_1",
@@ -7884,6 +8045,8 @@ mod tests {
         assert!(paths.contains("top"));
         assert!(paths.contains("top/nested"));
         assert!(paths.contains("top/nested/file.txt"));
+        // The wholesale-copied subtree counts as touched (baseline cross-check).
+        assert!(touched.contains("top/nested/file.txt"));
         assert_eq!(
             fs::read(dst.join("top").join("nested").join("file.txt")).unwrap(),
             b"hello"

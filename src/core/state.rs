@@ -1039,6 +1039,51 @@ impl State {
         Ok(())
     }
 
+    /// Delete destination_offset rows for (source, destination) pairs that no
+    /// longer exist in the config at all (disabled pairs keep their row so
+    /// re-enabling resumes where it left off). Returns the removed rows'
+    /// recorded dst baseline snapshot names for best-effort destruction: a
+    /// deleted row otherwise pinned its source snapshot forever through
+    /// `source_referenced_snapshots`, and its dstbase snapshot leaked on disk.
+    pub fn prune_removed_destination_offsets(&self, cfg: &AppConfig) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_id, destination_id, last_verified_dst_snapshot_name
+             FROM destination_offset",
+        )?;
+        let rows: Vec<(String, String, Option<String>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        let mut orphan_snapshots = Vec::new();
+        let mut removed = Vec::new();
+        for (source_id, destination_id, dst_snapshot) in rows {
+            let known = cfg.source_groups.iter().any(|source| {
+                source.id == source_id
+                    && source
+                        .destinations
+                        .iter()
+                        .any(|dst| dst.id == destination_id)
+            });
+            if known {
+                continue;
+            }
+            removed.push((source_id, destination_id));
+            if let Some(name) = dst_snapshot {
+                orphan_snapshots.push(name);
+            }
+        }
+        if !removed.is_empty() {
+            let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            for (source_id, destination_id) in &removed {
+                self.conn.execute(
+                    "DELETE FROM destination_offset WHERE source_id = ?1 AND destination_id = ?2",
+                    params![source_id, destination_id],
+                )?;
+            }
+        }
+        Ok(orphan_snapshots)
+    }
+
     pub fn upsert_destination_status(
         &self,
         source_id: &str,
