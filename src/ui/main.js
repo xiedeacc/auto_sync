@@ -581,8 +581,11 @@ function configDestination(sourceId, destinationId) {
   return source && (source.destinations || []).find((item) => item.id === destinationId);
 }
 
-// While a destination has a running task, deleting it is blocked (pause the
-// task first via the pause button next to the info icon).
+// The pause/resume button is a control over an in-progress sync, not a
+// standing config toggle: it appears only while a sync for this destination
+// is actually running (as a pause ⏸), or while the destination is paused (as
+// a resume ▶, the only way back). Idle-and-not-paused shows nothing — there
+// is no sync to pause. Deleting is blocked while a task runs.
 function updateDstControls() {
   for (const row of el.sourcePanel.querySelectorAll(".destination-row")) {
     const source = findSourceById(row.dataset.sourceId);
@@ -593,9 +596,18 @@ function updateDstControls() {
       continue;
     }
     const act = dstActivity(source, dst);
+    const syncActive = act.active && act.scope !== "compare";
+    const pauseButton = row.querySelector('[data-action="pause-dst"]');
+    if (pauseButton) {
+      // The button's icon/style already reflect dst.paused from the last
+      // render; here we only decide whether it is shown at all.
+      pauseButton.hidden = !((dst && dst.paused) || syncActive);
+    }
     removeButton.disabled = act.active;
     removeButton.title = act.active
-      ? "A task is running — pause it first"
+      ? (act.scope === "compare"
+        ? "A compare is running — wait for it to finish"
+        : "A sync is running — pause it first")
       : "Remove destination";
   }
 }
@@ -1116,7 +1128,7 @@ function renderSyncRows(source, group) {
         <label class="actions-label">Sync</label>
         <span class="dst-info-cell">
           <button class="repair-scan-button icon" data-action="repair-scan" title="" aria-label="Sync compare differences" hidden>&#8646;</button>
-          <button class="pause-dst-button icon ${dst.paused ? "paused" : ""}" data-action="pause-dst" title="${dst.paused ? "Resume automatic sync" : "Pause sync (stops the running task and holds new ones)"}" aria-label="${dst.paused ? "Resume automatic sync" : "Pause sync"}">${dst.paused ? "&#9654;" : "&#9208;"}</button>
+          <button class="pause-dst-button icon ${dst.paused ? "paused" : ""}" data-action="pause-dst" title="${dst.paused ? "Resume automatic sync" : "Pause sync (stops the running task and holds new ones)"}" aria-label="${dst.paused ? "Resume automatic sync" : "Pause sync"}" hidden>${dst.paused ? "&#9654;" : "&#9208;"}</button>
           <button class="destination-log-button icon destination-log-${escapeAttr(logIconState.kind)}" data-action="show-dst-log" title="${escapeAttr(logIconState.title)}" aria-label="${escapeAttr(logIconState.title)}"><span class="destination-log-icon" aria-hidden="true">i</span></button>
         </span>
         <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
