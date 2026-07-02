@@ -1730,7 +1730,10 @@ pub fn transfer_receive_symlink(req: TransferReceiveSymlinkRequest) -> Result<Tr
     // separators to the local convention so relative targets still resolve.
     #[cfg(unix)]
     let target: PathBuf = match req.target_bytes {
-        Some(bytes) => std::os::unix::ffi::OsStringExt::from_vec(bytes).into(),
+        Some(bytes) => {
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from(std::ffi::OsString::from_vec(bytes))
+        }
         None => PathBuf::from(&req.target),
     };
     #[cfg(not(unix))]
