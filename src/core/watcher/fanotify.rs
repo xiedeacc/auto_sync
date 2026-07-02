@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
 
 use crate::core::config::{AppConfig, SourceGroupConfig, machine_id_or_local};
-use crate::core::state::State;
+use crate::core::state::{State, WatcherEvent};
 
 const FAN_CLOEXEC: u32 = 0x0000_0001;
 const FAN_NONBLOCK: u32 = 0x0000_0002;
@@ -23,7 +23,6 @@ const FAN_CLASS_NOTIF: u32 = 0x0000_0000;
 const FAN_REPORT_FID: u32 = 0x0000_0200;
 const FAN_REPORT_DIR_FID: u32 = 0x0000_0400;
 const FAN_REPORT_NAME: u32 = 0x0000_0800;
-const FAN_REPORT_TARGET_FID: u32 = 0x0000_1000;
 const FAN_MARK_ADD: u32 = 0x0000_0001;
 const FAN_MARK_ONLYDIR: u32 = 0x0000_0008;
 const FAN_MARK_MOUNT: u32 = 0x0000_0010;
@@ -160,6 +159,23 @@ pub fn spawn_fanotify_thread(
                             // startup scan forever.
                             note_armed();
                             error!(error = %err, "fanotify source watcher stopped; restarting after backoff");
+                            // The kernel queue died with the fd: events between
+                            // now and the re-arm are unobservable. Mark the gap
+                            // so the next pass reconciles instead of trusting
+                            // an incomplete event stream.
+                            if let Ok(state) = State::open(&db_path) {
+                                for source in &source_cfg.source_groups {
+                                    state
+                                        .record_event(
+                                            &source.id,
+                                            0,
+                                            "watcher_restart_gap",
+                                            None,
+                                            true,
+                                        )
+                                        .ok();
+                                }
+                            }
                             for _ in 0..50 {
                                 if shutdown.load(Ordering::SeqCst) {
                                     break;
@@ -236,10 +252,20 @@ fn run_fanotify_loop(
             (fd, FanotifyMode::FidName, fid_mask)
         }
         Err(err) => {
-            warn!(
+            // fd-path mode sees only MODIFY/CLOSE_WRITE: deletes, renames and
+            // mkdirs produce NO events, so mirror syncing from the event
+            // stream alone would silently diverge. Make the degradation loud
+            // and force a reconcile (re-recorded on every watcher start).
+            error!(
                 error = %err,
-                "fanotify FID/name watcher unavailable; falling back to fd path watcher"
+                "fanotify degraded to fd-path mode: deletes/renames are invisible \
+                 to the event stream; forcing a reconcile"
             );
+            for source in &sources {
+                state
+                    .record_event(&source.id, 0, "watcher_degraded", None, true)
+                    .ok();
+            }
             let fd = setup_fd_path_fanotify(&sources)?;
             (fd, FanotifyMode::FdPath, FAN_MODIFY | FAN_CLOSE_WRITE)
         }
@@ -249,6 +275,10 @@ fn run_fanotify_loop(
     // safely begin (anything it misses from now on, the watcher records).
     on_armed();
 
+    let mut ctx = WatchCtx {
+        sticky_rescan: false,
+        last_eager_rebuild: None,
+    };
     let mut buf = vec![0_u8; 1024 * 64];
     while !shutdown.load(Ordering::SeqCst) {
         let n = unsafe {
@@ -270,21 +300,61 @@ fn run_fanotify_loop(
             thread::sleep(Duration::from_millis(200));
             continue;
         }
-        parse_events(&state, &mut sources, fd, mode, mask, &buf[..n as usize])?;
+        parse_events(&state, &mut sources, fd, mode, mask, &buf[..n as usize], &mut ctx)?;
     }
     Ok(())
 }
 
+/// Per-loop state threaded through event parsing.
+struct WatchCtx {
+    /// A previous batch failed to persist (events lost): the next successful
+    /// write is prefixed with a rescan_required marker so the loss triggers a
+    /// reconcile instead of silently vanishing — including when the lost event
+    /// was the queue_overflow marker itself.
+    sticky_rescan: bool,
+    /// Throttle for eager-mode handle-map rebuilds after an overflow.
+    last_eager_rebuild: Option<std::time::Instant>,
+}
+
 fn setup_fid_name_fanotify(sources: &mut [SourceRoot], mask: u64) -> Result<RawFd> {
-    let fd = fanotify_init(
-        FAN_REPORT_DIR_FID | FAN_REPORT_NAME | FAN_REPORT_FID | FAN_REPORT_TARGET_FID,
-    )
-    .context("fanotify_init FID/name mode failed")?;
-    if let Err(err) = mark_sources_fid(fd, sources, mask) {
-        close_event_fd(fd);
-        return Err(err);
+    // Tiered init. FAN_REPORT_TARGET_FID is deliberately absent: the parser
+    // never needed it (DIR_FID+NAME resolves dirent events, FID resolves
+    // modifies), it doubled the info records per event (two event_log rows),
+    // and it required kernel 5.17+ — pushing 5.9-5.16 kernels (Ubuntu 22.04,
+    // Debian 11, RHEL 9) into the crippled fd-path fallback for nothing.
+    // The FID-only tier (5.1+) resolves dirent events to the parent
+    // directory: coarser (the sync recurses that directory) but complete.
+    let tiers: [(&str, u32); 2] = [
+        (
+            "dir_fid+name+fid",
+            FAN_REPORT_DIR_FID | FAN_REPORT_NAME | FAN_REPORT_FID,
+        ),
+        ("fid", FAN_REPORT_FID),
+    ];
+    let mut last_err: Option<anyhow::Error> = None;
+    for (index, (label, flags)) in tiers.iter().enumerate() {
+        match fanotify_init(*flags) {
+            Ok(fd) => {
+                if let Err(err) = mark_sources_fid(fd, sources, mask) {
+                    close_event_fd(fd);
+                    return Err(err);
+                }
+                if index > 0 {
+                    warn!(
+                        tier = label,
+                        "fanotify running in a reduced FID tier (older kernel); \
+                         dirent events resolve to their parent directory"
+                    );
+                }
+                return Ok(fd);
+            }
+            Err(err) => {
+                warn!(tier = label, error = %err, "fanotify FID tier unavailable");
+                last_err = Some(err);
+            }
+        }
     }
-    Ok(fd)
+    Err(last_err.expect("at least one tier attempted")).context("fanotify_init FID modes failed")
 }
 
 fn setup_fd_path_fanotify(sources: &[SourceRoot]) -> Result<RawFd> {
@@ -422,6 +492,7 @@ fn mark_directory_tree(fd: RawFd, root: &Path, mask: u64) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_events(
     state: &State,
     sources: &mut [SourceRoot],
@@ -429,7 +500,9 @@ fn parse_events(
     mode: FanotifyMode,
     mark_mask: u64,
     mut bytes: &[u8],
+    ctx: &mut WatchCtx,
 ) -> Result<()> {
+    let mut batch: Vec<WatcherEvent> = Vec::new();
     let min_len = mem::size_of::<FanotifyEventMetadata>();
     while bytes.len() >= min_len {
         let meta = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<FanotifyEventMetadata>()) };
@@ -450,67 +523,133 @@ fn parse_events(
             break;
         }
 
-        // Persist failures (e.g. a transient SQLite lock) must not kill the
-        // watcher thread; log and continue so realtime watching survives.
-        let result = if meta.mask & FAN_Q_OVERFLOW != 0 {
+        if meta.mask & FAN_Q_OVERFLOW != 0 {
             warn!("fanotify queue overflow; recording realtime source events");
-            (|| -> Result<()> {
-                for source in &mut *sources {
-                    state.record_event(&source.id, meta.mask, "queue_overflow", None, true)?;
+            for source in &mut *sources {
+                batch.push(pending_event(&source.id, meta.mask, "queue_overflow", None, true));
+                // Eager handle maps (no open_by_handle_at) go permanently
+                // blind for directories whose create events the overflow ate:
+                // rebuild the map (throttled — a walk of a large tree).
+                if source.mount_fd.is_none() && !source.is_file {
+                    let rebuild_due = ctx
+                        .last_eager_rebuild
+                        .is_none_or(|at| at.elapsed() > Duration::from_secs(600));
+                    if rebuild_due {
+                        ctx.last_eager_rebuild = Some(std::time::Instant::now());
+                        match build_handle_path_map(&source.root, source.is_file) {
+                            Ok(map) => source.handle_paths = map,
+                            Err(err) => warn!(
+                                source = source.id,
+                                error = %err,
+                                "failed to rebuild handle map after overflow"
+                            ),
+                        }
+                    }
                 }
-                Ok(())
-            })()
+            }
         } else {
             let event = &bytes[..meta.event_len as usize];
-            match mode {
+            let collected = match mode {
                 FanotifyMode::FidName => {
-                    persist_fid_name_event(state, sources, fanotify_fd, mark_mask, &meta, event)
+                    collect_fid_name_event(sources, fanotify_fd, mark_mask, &meta, event, &mut batch)
                 }
-                FanotifyMode::FdPath => persist_fd_path_event(state, sources, &meta),
+                FanotifyMode::FdPath => collect_fd_path_event(sources, &meta, &mut batch),
+            };
+            if let Err(err) = collected {
+                warn!(error = %err, "failed to parse fanotify event; skipping");
             }
-        };
-        if let Err(err) = result {
-            warn!(error = %err, "failed to persist fanotify event; skipping");
         }
 
         bytes = &bytes[meta.event_len as usize..];
     }
+
+    // Same (source, kind, path) rows within one read() batch are redundant.
+    let mut seen: HashSet<(String, String, Option<String>)> = HashSet::new();
+    batch.retain(|event| {
+        seen.insert((
+            event.source_id.clone(),
+            event.event_kind.clone(),
+            event.rel_path.clone(),
+        ))
+    });
+    if ctx.sticky_rescan && !batch.is_empty() {
+        // A previous batch was lost (persist failure): mark the gap before the
+        // new events so the loss forces a reconcile.
+        for source in &*sources {
+            batch.insert(0, pending_event(&source.id, 0, "event_persist_gap", None, true));
+        }
+    }
+    // One transaction (one fsync) for the whole batch. Persist failures must
+    // not kill the watcher thread; the sticky flag keeps the loss visible.
+    match state.record_events_batch(&batch) {
+        Ok(()) => {
+            if !batch.is_empty() {
+                ctx.sticky_rescan = false;
+            }
+        }
+        Err(err) => {
+            warn!(error = %err, "failed to persist fanotify event batch");
+            ctx.sticky_rescan = true;
+        }
+    }
     Ok(())
 }
 
-fn persist_fd_path_event(
-    state: &State,
+fn pending_event(
+    source_id: &str,
+    raw_mask: u64,
+    kind: &str,
+    rel_path: Option<String>,
+    rescan_required: bool,
+) -> WatcherEvent {
+    WatcherEvent {
+        source_id: source_id.to_string(),
+        raw_mask,
+        event_kind: kind.to_string(),
+        rel_path,
+        rescan_required,
+    }
+}
+
+fn collect_fd_path_event(
     sources: &[SourceRoot],
     meta: &FanotifyEventMetadata,
+    batch: &mut Vec<WatcherEvent>,
 ) -> Result<()> {
     let Some(path) = event_path(meta.fd) else {
         for source in sources {
-            state.record_event(&source.id, meta.mask, mask_to_kind(meta.mask), None, true)?;
+            batch.push(pending_event(
+                &source.id,
+                meta.mask,
+                mask_to_kind(meta.mask),
+                None,
+                true,
+            ));
         }
         return Ok(());
     };
 
     for source in sources {
         if let Some(rel) = source_relative_event_path(source, &path) {
-            state.record_event(
+            batch.push(pending_event(
                 &source.id,
                 meta.mask,
                 mask_to_kind(meta.mask),
-                Some(rel.as_str()),
+                Some(rel),
                 false,
-            )?;
+            ));
         }
     }
     Ok(())
 }
 
-fn persist_fid_name_event(
-    state: &State,
+fn collect_fid_name_event(
     sources: &mut [SourceRoot],
     fanotify_fd: RawFd,
     mark_mask: u64,
     meta: &FanotifyEventMetadata,
     event: &[u8],
+    batch: &mut Vec<WatcherEvent>,
 ) -> Result<()> {
     let records = fid_records(event)?;
     // Deletes/moves-away invalidate the cached handle→path entry for the gone
@@ -518,7 +657,7 @@ fn persist_fid_name_event(
     // reuse, resolve a future event to the wrong path.
     let is_removal =
         meta.mask & (FAN_DELETE | FAN_MOVED_FROM | FAN_DELETE_SELF | FAN_MOVE_SELF) != 0;
-    let mut recorded = false;
+    let mut resolved = false;
     for source in &mut *sources {
         for record in &records {
             let Some(path) = fid_record_path(source, record)? else {
@@ -527,22 +666,25 @@ fn persist_fid_name_event(
             let Some(rel) = source_relative_event_path(source, &path) else {
                 continue;
             };
-            state.record_event(
+            batch.push(pending_event(
                 &source.id,
                 meta.mask,
                 mask_to_kind(meta.mask),
-                Some(rel.as_str()),
+                Some(rel),
                 false,
-            )?;
-            recorded = true;
+            ));
+            resolved = true;
             if is_removal {
                 remove_handle_paths_under(source, &path);
-            } else {
-                track_new_path_and_mark_directory(source, fanotify_fd, mark_mask, &path);
+            } else if !track_new_path_and_mark_directory(source, fanotify_fd, mark_mask, &path) {
+                // The new subtree could not be marked (per-directory fallback
+                // hitting max_user_marks): it is permanently unwatched, which
+                // must trigger a reconcile instead of a silent blind spot.
+                batch.push(pending_event(&source.id, 0, "watch_mark_failed", None, true));
             }
         }
     }
-    if !recorded {
+    if !resolved {
         debug!(
             mask = meta.mask,
             kind = mask_to_kind(meta.mask),
@@ -668,14 +810,17 @@ fn fid_record_path(source: &mut SourceRoot, record: &FidRecord) -> Result<Option
     }))
 }
 
+/// Returns `false` when a required watch mark could not be registered (the
+/// caller records a rescan marker: an unmarked new subtree is a permanent
+/// blind spot in per-directory fallback mode).
 fn track_new_path_and_mark_directory(
     source: &mut SourceRoot,
     fanotify_fd: RawFd,
     mark_mask: u64,
     path: &Path,
-) {
+) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
-        return;
+        return true;
     };
     // With lazy handle resolution the cache fills on demand; pre-inserting
     // here just saves the first open_by_handle_at for the new path.
@@ -687,19 +832,21 @@ fn track_new_path_and_mark_directory(
         Err(_) => true,
     };
     if !metadata.is_dir() {
-        return;
+        return true;
     }
     if !newly_tracked {
-        return;
+        return true;
     }
     // A filesystem-wide mark already covers new directories; only the
     // per-directory fallback must mark each created subtree explicitly.
     if !source.recursive_marks {
-        return;
+        return true;
     }
     if let Err(err) = mark_directory_tree(fanotify_fd, path, mark_mask | FAN_EVENT_ON_CHILD) {
         warn!(path = %path.display(), error = %err, "failed to mark new fanotify directory");
+        return false;
     }
+    true
 }
 
 fn event_path(fd: i32) -> Option<PathBuf> {

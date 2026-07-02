@@ -161,6 +161,16 @@ pub struct ScanReport {
     pub method: String,
 }
 
+/// One watcher event queued for [`State::record_events_batch`].
+#[derive(Debug, Clone)]
+pub struct WatcherEvent {
+    pub source_id: String,
+    pub raw_mask: u64,
+    pub event_kind: String,
+    pub rel_path: Option<String>,
+    pub rescan_required: bool,
+}
+
 pub struct State {
     conn: Connection,
     /// Fingerprint of the last config applied via [`Self::ensure_config`], so
@@ -964,6 +974,69 @@ impl State {
         // waiting out its polling interval.
         crate::core::signal::notify_scheduler();
         Ok(event_id)
+    }
+
+    /// Record a whole watcher read() batch in one transaction (one WAL fsync)
+    /// instead of 2-3 autocommits per event. With `synchronous=FULL` the
+    /// per-event fsyncs capped persistence at a few dozen events per second on
+    /// spinning disks — and a slow watcher is exactly what overflows the
+    /// kernel queue, whose penalty is a full-tree reconcile.
+    pub fn record_events_batch(&self, events: &[WatcherEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let now = now_string();
+        let tx = self.conn.unchecked_transaction()?;
+        let mut rescan_sources: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut cycles: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+        for event in events {
+            let cycle_id = match cycles.get(event.source_id.as_str()) {
+                Some(id) => *id,
+                None => {
+                    let id = self.ensure_open_cycle(&event.source_id, Utc::now())?;
+                    cycles.insert(event.source_id.as_str(), id);
+                    id
+                }
+            };
+            self.conn.execute(
+                r#"
+                INSERT INTO event_log
+                    (source_id, cycle_id, observed_at, raw_mask, event_kind, rel_path,
+                     rescan_required, persisted_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?3)
+                "#,
+                params![
+                    event.source_id,
+                    cycle_id,
+                    now,
+                    event.raw_mask as i64,
+                    event.event_kind,
+                    event.rel_path,
+                    bool_to_int(event.rescan_required)
+                ],
+            )?;
+            if event.rescan_required {
+                rescan_sources.insert(event.source_id.as_str());
+            }
+        }
+        for source_id in cycles.keys() {
+            self.conn.execute(
+                r#"
+                INSERT INTO source_meta (source_id, last_event_observed_at)
+                VALUES (?1, ?2)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    last_event_observed_at=MAX(COALESCE(last_event_observed_at, ''), excluded.last_event_observed_at)
+                "#,
+                params![source_id, now],
+            )?;
+        }
+        for source_id in &rescan_sources {
+            self.mark_open_cycle_needs_rescan(source_id)?;
+        }
+        tx.commit()?;
+        crate::core::signal::notify_scheduler();
+        Ok(())
     }
 
     pub fn upsert_destination_status(

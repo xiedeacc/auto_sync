@@ -685,11 +685,28 @@ fn run_scheduler(
             Ok(new_cfg) => {
                 let signature = config_signature(&new_cfg);
                 if signature != watcher_signature {
-                    info!("config changed; restarting source watcher");
+                    info!("source config changed; restarting source watcher");
                     stop_watcher(&mut watcher_state);
                     watcher_state = start_watcher(&new_cfg);
                     wait_for_watcher_armed(&shutdown);
                     watcher_signature = signature;
+                    // fanotify has no persistent journal: events during the
+                    // stop→re-arm window are unobservable. Mark the gap so the
+                    // next pass reconciles instead of trusting the stream.
+                    if !watcher_covers_downtime() {
+                        for source in new_cfg
+                            .source_groups
+                            .iter()
+                            .filter(|s| s.enabled && source_is_watched_here(s))
+                        {
+                            if let Err(err) =
+                                state.record_event(&source.id, 0, "watcher_restart_gap", None, true)
+                            {
+                                warn!(source = source.id, error = %err,
+                                    "failed to record watcher restart gap");
+                            }
+                        }
+                    }
                 }
                 cfg = new_cfg;
             }
@@ -816,8 +833,28 @@ fn stop_watcher(state: &mut WatcherState) {
     }
 }
 
+/// Only the fields the watcher actually depends on. Hashing the whole config
+/// restarted the watcher (losing the fanotify queue) on every unrelated save:
+/// discovery-thread machine metadata refreshes, UI preferences, aliases.
 fn config_signature(cfg: &AppConfig) -> String {
-    toml::to_string(cfg).unwrap_or_default()
+    let mut parts = vec![cfg.app.data_db.display().to_string()];
+    for source in &cfg.source_groups {
+        parts.push(format!(
+            "{}|{}|{}|{}|{}|{}",
+            source.id,
+            source.machine_id,
+            source.src.display(),
+            source.enabled,
+            source.add_directory,
+            source
+                .destinations
+                .iter()
+                .map(|dst| format!("{}:{}", dst.id, dst.enabled))
+                .collect::<Vec<_>>()
+                .join(","),
+        ));
+    }
+    parts.join("\n")
 }
 
 // ---------------------------------------------------------------------------

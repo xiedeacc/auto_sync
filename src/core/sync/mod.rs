@@ -280,9 +280,27 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
             for cycle in cycles {
                 cancel::check()?;
                 if state.source_has_target_cycle(&source.id, cycle.id)? {
-                    let outcome = sync_cycle_for_source(cfg, state, source, &cycle)?;
-                    progressed |= outcome.progressed;
-                    blocked |= outcome.blocked;
+                    // Per-source isolation: a persistently failing source
+                    // (unplugged disk, poisoned event row) must not starve
+                    // every source after it in the config order — only
+                    // cancellation stops the pass. The failing source itself
+                    // already recorded a red destination status.
+                    match sync_cycle_for_source(cfg, state, source, &cycle) {
+                        Ok(outcome) => {
+                            progressed |= outcome.progressed;
+                            blocked |= outcome.blocked;
+                        }
+                        Err(err) if cancel::error_is_cancelled(&err) => return Err(err),
+                        Err(err) => {
+                            error!(
+                                source = source.id,
+                                cycle_id = cycle.id,
+                                error = %err,
+                                "sync cycle failed; continuing with remaining sources"
+                            );
+                            break; // next cycles of this source would hit the same error
+                        }
+                    }
                 } else if cycle.status == "closed" {
                     state.mark_cycle_status(cycle.id, "verified")?;
                 }
@@ -1102,6 +1120,9 @@ pub struct TransferRemovePathsRequest {
 pub struct TransferCleanupTmpRequest {
     pub root: PathBuf,
     pub cycle_id: i64,
+    /// Trash retention window in days (None = receiver default of 30).
+    #[serde(default)]
+    pub trash_keep_days: Option<u64>,
 }
 
 /// Request the destination's per-block checksums for an existing file so the
@@ -1332,6 +1353,7 @@ pub fn transfer_remove_path(req: TransferRemovePathRequest) -> Result<TransferAc
 pub fn transfer_cleanup_tmp(req: TransferCleanupTmpRequest) -> Result<TransferAck> {
     reject_dangerous_destination(&req.root)?;
     cleanup_tmp_cycle(&req.root, req.cycle_id);
+    cleanup_expired_trash(&req.root, req.trash_keep_days.unwrap_or(30));
     Ok(transfer_ack())
 }
 
@@ -3473,7 +3495,7 @@ fn sync_directory_with_transfer(
     set_dir_mtimes_on_machine(dst_machine_id, dst_machine, dst_root, &dirs, timeout)
         .context("failed to set destination directory mtimes")?;
 
-    cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, timeout).ok();
+    cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, sync.trash_keep_days, timeout).ok();
 
     // No end-of-cycle destination re-scan: every transferred file was verified
     // end-to-end at receipt (blake3 full hash checked before the atomic rename,
@@ -3633,7 +3655,7 @@ fn sync_directory_event_paths_with_transfer(
     set_dir_mtimes_on_machine(dst_machine_id, dst_machine, dst_root, &dirs, timeout)
         .context("failed to set changed destination directory mtimes")?;
 
-    cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, timeout).ok();
+    cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, sync.trash_keep_days, timeout).ok();
     let actual = snapshot_paths_on_machine(
         dst_machine_id,
         dst_machine,
@@ -4135,11 +4157,13 @@ fn cleanup_tmp_on_machine(
     machine: &crate::core::config::MachineConfig,
     root: &Path,
     cycle_id: i64,
+    trash_keep_days: u64,
     timeout: Duration,
 ) -> Result<()> {
     let req = TransferCleanupTmpRequest {
         root: root.to_path_buf(),
         cycle_id,
+        trash_keep_days: Some(trash_keep_days),
     };
     if machine_id == "local" {
         transfer_cleanup_tmp(req)?;
@@ -5481,6 +5505,7 @@ fn sync_destination(
         outcome.into_result()
     })();
     cleanup_tmp_cycle(dst_root, cycle_id);
+    cleanup_expired_trash(dst_root, sync.trash_keep_days);
     result
 }
 
@@ -5627,6 +5652,7 @@ fn sync_destination_fast_missing_dirs(
         Ok(source_snapshot)
     })();
     cleanup_tmp_cycle(dst_root, cycle_id);
+    cleanup_expired_trash(dst_root, sync.trash_keep_days);
     result
 }
 
@@ -6006,6 +6032,7 @@ fn sync_destination_event_paths(
         Ok(())
     })();
     cleanup_tmp_cycle(dst_root, cycle_id);
+    cleanup_expired_trash(dst_root, sync.trash_keep_days);
     result
 }
 
@@ -6164,6 +6191,7 @@ fn sync_file_to_path(
         Ok(())
     })();
     cleanup_tmp_cycle(dst_root, cycle_id);
+    cleanup_expired_trash(dst_root, sync.trash_keep_days);
     result
 }
 
@@ -7254,13 +7282,56 @@ fn source_changing_error(paths: &BTreeSet<String>) -> anyhow::Error {
     )
 }
 
+/// Stale partial transfers from cycles whose target has moved on: kept this
+/// long to allow same-cycle resume across restarts, then reclaimed.
+const TMP_KEEP_DAYS: u64 = 7;
+
 fn cleanup_tmp_cycle(dst_root: &Path, cycle_id: i64) {
     let root = dst_root.join(INTERNAL_TMP);
     let path = root.join(cycle_id.to_string());
     if path.exists() {
         remove_any(&path).ok();
     }
+    // Other cycles' tmp dirs: needed only while their own cycle can still
+    // resume; once abandoned (cancel + new cycle, manual full) nothing ever
+    // cleaned them and multi-GB partial files accumulated forever. Age-based
+    // so a concurrent pass for another source on the same root is never hit.
+    sweep_aged_subdirs(&root, TMP_KEEP_DAYS, Some(cycle_id));
     fs::remove_dir(&root).ok();
+}
+
+/// Reclaim `.auto_sync_trash/<cycle>` folders whose last write is older than
+/// the retention window. 0 = keep forever.
+fn cleanup_expired_trash(dst_root: &Path, trash_keep_days: u64) {
+    if trash_keep_days == 0 {
+        return;
+    }
+    let root = dst_root.join(INTERNAL_TRASH);
+    sweep_aged_subdirs(&root, trash_keep_days, None);
+    fs::remove_dir(&root).ok();
+}
+
+fn sweep_aged_subdirs(root: &Path, keep_days: u64, keep_name: Option<i64>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(keep_days.saturating_mul(24 * 3600)))
+        .unwrap_or(UNIX_EPOCH);
+    for entry in entries.filter_map(|e| e.ok()) {
+        if let Some(keep) = keep_name {
+            if entry.file_name().to_string_lossy() == keep.to_string() {
+                continue;
+            }
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+        if modified < cutoff {
+            remove_any(&entry.path()).ok();
+        }
+    }
 }
 
 #[cfg(test)]

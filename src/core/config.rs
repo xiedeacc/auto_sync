@@ -87,6 +87,11 @@ pub struct NativeSyncConfig {
     /// fsync per file is costly; a backup re-verifies each cycle so the data is
     /// recoverable, but the published "verified" state would briefly be a lie.
     pub fsync: bool,
+    /// Days a mirror-deleted entry stays in the destination's
+    /// `.auto_sync_trash` before its per-cycle folder is reclaimed (age is
+    /// measured from the folder's last write). 0 keeps the trash forever —
+    /// note it then grows without bound, invisible to Compare.
+    pub trash_keep_days: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,6 +261,7 @@ impl Default for NativeSyncConfig {
             modify_window_secs: DEFAULT_MODIFY_WINDOW_SECS,
             zfs_diff: true,
             fsync: true,
+            trash_keep_days: 30,
         }
     }
 }
