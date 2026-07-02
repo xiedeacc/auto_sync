@@ -36,10 +36,7 @@ pub fn record_startup_mtime_events(cfg: &AppConfig, state: &State) -> Result<usi
 fn source_needs_startup_scan(source: &SourceGroupConfig) -> bool {
     source.enabled
         && machine_id_or_local(&source.machine_id) == "local"
-        && source
-            .destinations
-            .iter()
-            .any(|dst| dst.enabled)
+        && source.destinations.iter().any(|dst| dst.enabled)
 }
 
 fn record_source_startup_mtime_events(source: &SourceGroupConfig, state: &State) -> Result<usize> {
@@ -56,30 +53,58 @@ fn record_source_startup_mtime_events(source: &SourceGroupConfig, state: &State)
     }
     let mut recorded = 0_usize;
 
-    for entry in WalkDir::new(&root).follow_links(false) {
-        let entry = entry?;
-        let path = entry.path();
-        if path == root {
-            continue;
+    // On a large HDD tree this walk grinds the disk for minutes: surface it
+    // in the scan progress display and the task log so it never looks like
+    // "the disk is thrashing but nothing is running".
+    let scan_progress = crate::core::progress::start_scan(&root);
+    let task_id = state.task_start("startup_scan", &source.id, "").ok();
+    let mut entries_seen = 0_u64;
+    let result = (|| -> Result<usize> {
+        for entry in WalkDir::new(&root).follow_links(false) {
+            let entry = entry?;
+            let path = entry.path();
+            if path == root {
+                continue;
+            }
+            entries_seen += 1;
+            if entries_seen % 256 == 0 {
+                scan_progress.update(path, entries_seen);
+            }
+            if entry_is_excluded(&root, path, &source.excludes) {
+                continue;
+            }
+            let rel_path = path
+                .strip_prefix(&root)
+                .with_context(|| format!("failed to strip root from {}", path.display()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel_path.is_empty() || seen_paths.contains(&rel_path) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("failed to read metadata {}", path.display()))?;
+            if metadata_mtime_after(metadata.modified()?, cutoff) {
+                state.record_event(&source.id, 0, "startup_mtime_scan", Some(&rel_path), false)?;
+                recorded += 1;
+            }
         }
-        if entry_is_excluded(&root, path, &source.excludes) {
-            continue;
-        }
-        let rel_path = path
-            .strip_prefix(&root)
-            .with_context(|| format!("failed to strip root from {}", path.display()))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        if rel_path.is_empty() || seen_paths.contains(&rel_path) {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(path)
-            .with_context(|| format!("failed to read metadata {}", path.display()))?;
-        if metadata_mtime_after(metadata.modified()?, cutoff) {
-            state.record_event(&source.id, 0, "startup_mtime_scan", Some(&rel_path), false)?;
-            recorded += 1;
+        Ok(recorded)
+    })();
+    drop(scan_progress);
+    if let Some(task_id) = task_id {
+        let outcome = match &result {
+            Ok(recorded) => {
+                state.task_finish(task_id, "success", "", *recorded as u64, 0, entries_seen)
+            }
+            Err(err) => {
+                state.task_finish(task_id, "failed", &format!("{err:#}"), 0, 0, entries_seen)
+            }
+        };
+        if let Err(err) = outcome {
+            tracing::warn!(source = source.id, error = %err, "failed to record startup scan task");
         }
     }
+    let recorded = result?;
 
     if recorded > 0 {
         tracing::info!(

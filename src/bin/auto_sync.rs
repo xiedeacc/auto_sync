@@ -103,7 +103,6 @@ fn main() -> Result<()> {
     // pushes) honours it even though it never runs the scheduler loop.
     auto_sync::core::sync::configure_fsync(cfg.app.sync.fsync);
 
-
     let shutdown = Arc::new(AtomicBool::new(false));
     {
         let shutdown = shutdown.clone();
@@ -140,7 +139,6 @@ fn main() -> Result<()> {
     info!("auto_sync stopped");
     Ok(())
 }
-
 
 /// Holds the OS-level exclusive lock on the single-instance lock file for the
 /// life of the process. Dropping (or the process exiting, even via a kill)
@@ -656,7 +654,10 @@ fn run_scheduler(
     state.ensure_open_cycles(&cfg)?;
     match state.abort_stale_running_tasks() {
         Ok(aborted) if aborted > 0 => {
-            info!(aborted, "marked task-log rows orphaned by the previous run as aborted");
+            info!(
+                aborted,
+                "marked task-log rows orphaned by the previous run as aborted"
+            );
         }
         Ok(_) => {}
         Err(err) => warn!(error = %err, "failed to sweep stale running tasks"),

@@ -193,10 +193,7 @@ pub fn spawn_source_watcher_thread(
 fn source_needs_fanotify(source: &SourceGroupConfig) -> bool {
     source.enabled
         && machine_id_or_local(&source.machine_id) == "local"
-        && source
-            .destinations
-            .iter()
-            .any(|dst| dst.enabled)
+        && source.destinations.iter().any(|dst| dst.enabled)
 }
 
 fn run_fanotify_loop(
@@ -650,12 +647,13 @@ fn fid_record_path(source: &mut SourceRoot, record: &FidRecord) -> Result<Option
             // a filesystem-wide mark also reports sibling trees on the same
             // fs. A file source additionally needs its parent directory (the
             // DFID base of its own events).
-            let file_parent =
-                source.is_file && Some(path.as_path()) == source.root.parent();
+            let file_parent = source.is_file && Some(path.as_path()) == source.root.parent();
             if !path.starts_with(&source.root) && !file_parent {
                 return Ok(None);
             }
-            source.handle_paths.insert(record.handle.clone(), path.clone());
+            source
+                .handle_paths
+                .insert(record.handle.clone(), path.clone());
             path
         }
     };

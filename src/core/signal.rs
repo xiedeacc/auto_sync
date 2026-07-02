@@ -101,7 +101,10 @@ mod tests {
         mark_watcher_armed();
         let started = Instant::now();
         assert!(wait_watcher_armed(Duration::from_secs(5)));
-        assert!(started.elapsed() < Duration::from_secs(1), "returns immediately once armed");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "returns immediately once armed"
+        );
         // Leave the flag armed: other tests must not block on it.
         mark_watcher_armed();
     }

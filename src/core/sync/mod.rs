@@ -19,16 +19,16 @@ use filetime::{FileTime, set_file_mtime};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
+use crate::core::cancel;
 use crate::core::config::{
     AppConfig, DEFAULT_MAX_PARALLEL_TRANSFERS, DEFAULT_TRANSFER_TIMEOUT_SECS, DestinationConfig,
-    NativeSyncConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef,
-    machine_id_or_local, machine_is_local,
+    NativeSyncConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef, machine_id_or_local,
+    machine_is_local,
 };
 use crate::core::machines::{
     configure_tcp_connection_pool, encode_query_component, find_machine, remote_get_json,
     remote_post_bytes, remote_post_json,
 };
-use crate::core::cancel;
 use crate::core::progress;
 use crate::core::state::{Cycle, CycleEvent, ScanDiffEntry, ScanReport, SnapshotEntry, State};
 use crate::core::status::{check_destination_online, check_file_destination_online};
@@ -86,9 +86,7 @@ fn acquire_transfer_memory(bytes: u64) -> TransferMemoryPermit {
     let (used, available) = transfer_memory();
     let mut used = used.lock().unwrap_or_else(|err| err.into_inner());
     while *used > 0 && used.saturating_add(bytes) > TRANSFER_MEMORY_BUDGET {
-        used = available
-            .wait(used)
-            .unwrap_or_else(|err| err.into_inner());
+        used = available.wait(used).unwrap_or_else(|err| err.into_inner());
     }
     *used = used.saturating_add(bytes);
     TransferMemoryPermit { bytes }
@@ -220,8 +218,7 @@ fn queue_scan_repair(
     if total == 0 {
         return Ok(());
     }
-    let sample_is_complete =
-        !report.truncated && report.differences.len() as u64 >= total;
+    let sample_is_complete = !report.truncated && report.differences.len() as u64 >= total;
     if sample_is_complete {
         for diff in &report.differences {
             state.record_event(source_id, 0, "scan_repair", Some(&diff.rel_path), false)?;
@@ -289,7 +286,10 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
             // every full cycle's whole-tree snapshot accumulates forever.
             match state.prune_path_snapshots(&source.id) {
                 Ok(removed) if removed > 0 => {
-                    info!(source = source.id, removed, "pruned stored source snapshots");
+                    info!(
+                        source = source.id,
+                        removed, "pruned stored source snapshots"
+                    );
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -328,7 +328,10 @@ fn prune_verified_cycle_events(state: &State, source: &SourceGroupConfig) -> Res
     };
     let removed = state.prune_event_log(&source.id, keep_from)?;
     if removed > 0 {
-        info!(source = source.id, removed, keep_from, "pruned verified cycle events");
+        info!(
+            source = source.id,
+            removed, keep_from, "pruned verified cycle events"
+        );
     }
     Ok(())
 }
@@ -469,9 +472,7 @@ pub fn scan_destination_now(
             sync.checksum,
             timeout,
         );
-        let dst_result = dst_handle
-            .join()
-            .expect("destination scan thread panicked");
+        let dst_result = dst_handle.join().expect("destination scan thread panicked");
         (source_result, dst_result)
     });
     let mut source_snapshot = source_result?;
@@ -1474,8 +1475,7 @@ fn finish_received_file(
     }
     // Flush data before tightening mode and renaming: a swallowed fsync error
     // here could publish a zero-length/stale file as "verified" after a crash.
-    fsync_file(tmp)
-        .with_context(|| format!("failed to fsync received file {}", entry.rel_path))?;
+    fsync_file(tmp).with_context(|| format!("failed to fsync received file {}", entry.rel_path))?;
     set_mode(tmp, entry.mode).ok();
     let mtime = FileTime::from_unix_time(
         entry.mtime_ns / 1_000_000_000,
@@ -1562,8 +1562,7 @@ fn send_file_tcp(
             let skip = offset.saturating_sub(pos) as usize;
             let send_at = pos + skip as u64;
             let path = receive_file_chunk_api_path(destination_root, cycle_id, entry, send_at);
-            let ack: TransferAck =
-                remote_post_bytes(destination, &path, &buf[skip..n], timeout)?;
+            let ack: TransferAck = remote_post_bytes(destination, &path, &buf[skip..n], timeout)?;
             if !ack.ok {
                 bail!("peer rejected TCP file chunk");
             }
@@ -2068,9 +2067,7 @@ fn sync_cycle_for_source_inner(
                         Err(err) => {
                             all_verified = false;
                             had_unblocked_failure = true;
-                            record_destination_failure(
-                                state, &source.id, &dst.id, cycle.id, &err,
-                            )?;
+                            record_destination_failure(state, &source.id, &dst.id, cycle.id, &err)?;
                         }
                     }
                 }
@@ -2093,9 +2090,8 @@ fn sync_cycle_for_source_inner(
     // USN/journal gap, startup gap) rather than a user action. Mark the affected
     // destinations red and identify the reason while the reconcile runs; each one
     // returns to green only after its full re-scan verifies.
-    let is_event_loss_reconcile = cycle.needs_full_rescan
-        && !cycle.manual_full_rescan
-        && !cycle.manual_changed_since_rescan;
+    let is_event_loss_reconcile =
+        cycle.needs_full_rescan && !cycle.manual_full_rescan && !cycle.manual_changed_since_rescan;
     if is_event_loss_reconcile {
         warn!(
             source = source.id,
@@ -2117,15 +2113,29 @@ fn sync_cycle_for_source_inner(
     let source_view = SourceReadView::prepare(source, &live_source_endpoint, cycle.id)?;
     let source_endpoint = source_view.endpoint.clone();
 
-    info!(source = source.id, cycle_id = cycle.id, "reconcile: source view ready, marking cycle syncing");
+    info!(
+        source = source.id,
+        cycle_id = cycle.id,
+        "reconcile: source view ready, marking cycle syncing"
+    );
     state.mark_cycle_status(cycle.id, "planning")?;
     state.mark_cycle_status(cycle.id, "syncing")?;
-    info!(source = source.id, cycle_id = cycle.id, ready = ready_destinations.len(), "reconcile: entering destination loop");
+    info!(
+        source = source.id,
+        cycle_id = cycle.id,
+        ready = ready_destinations.len(),
+        "reconcile: entering destination loop"
+    );
     let mut shared_source_snapshot: Option<Vec<SnapshotEntry>> = None;
     for (dst_index, dst_endpoint) in ready_destinations {
         let dst = &source.destinations[dst_index];
         let sync = effective_sync_config(cfg, dst);
-        info!(source = source.id, destination = dst.id, cycle_id = cycle.id, "reconcile: processing destination");
+        info!(
+            source = source.id,
+            destination = dst.id,
+            cycle_id = cycle.id,
+            "reconcile: processing destination"
+        );
         if let (
             SourceEndpoint::Dir { root: src_root, .. },
             DestinationEndpoint::Dir { root: dst_root },
@@ -2143,11 +2153,9 @@ fn sync_cycle_for_source_inner(
                         if let Some(base) =
                             state.destination_verified_snapshot(&source.id, &dst.id)?
                         {
-                            if let Some(rel_paths) = zfs_diff_changed_paths(
-                                &base,
-                                &zfs.full_name,
-                                &zfs.source_live_root,
-                            ) {
+                            if let Some(rel_paths) =
+                                zfs_diff_changed_paths(&base, &zfs.full_name, &zfs.source_live_root)
+                            {
                                 info!(
                                     source = source.id,
                                     destination = dst.id,
@@ -2198,7 +2206,12 @@ fn sync_cycle_for_source_inner(
                 // Reaching here means no zfs diff base was usable, so this is a
                 // full source+dst reconcile; reflect that in the status type.
                 let _kind = set_sync_kind("full");
-                info!(source = source.id, destination = dst.id, cycle_id = cycle.id, "reconcile: starting full reconcile (fast_missing_dirs)");
+                info!(
+                    source = source.id,
+                    destination = dst.id,
+                    cycle_id = cycle.id,
+                    "reconcile: starting full reconcile (fast_missing_dirs)"
+                );
                 let sync_result = sync_destination_fast_missing_dirs(
                     src_root,
                     dst_root,
@@ -2224,7 +2237,10 @@ fn sync_cycle_for_source_inner(
                         state.set_destination_verified_snapshot(
                             &source.id,
                             &dst.id,
-                            source_view.zfs_snapshot.as_ref().map(|z| z.full_name.as_str()),
+                            source_view
+                                .zfs_snapshot
+                                .as_ref()
+                                .map(|z| z.full_name.as_str()),
                         )?;
                         info!(
                             source = source.id,
@@ -2309,7 +2325,10 @@ fn sync_cycle_for_source_inner(
                 state.set_destination_verified_snapshot(
                     &source.id,
                     &dst.id,
-                    source_view.zfs_snapshot.as_ref().map(|z| z.full_name.as_str()),
+                    source_view
+                        .zfs_snapshot
+                        .as_ref()
+                        .map(|z| z.full_name.as_str()),
                 )?;
                 info!(
                     source = source.id,
@@ -2462,12 +2481,8 @@ fn event_incremental_plan(
                     "realtime_event_path_unavailable",
                 )));
             };
-            let rel = normalize_rel_path(rel_path).with_context(|| {
-                format!(
-                    "invalid event path in cycle {}: {rel_path}",
-                    cycle.id
-                )
-            })?;
+            let rel = normalize_rel_path(rel_path)
+                .with_context(|| format!("invalid event path in cycle {}: {rel_path}", cycle.id))?;
             paths.insert(rel_to_string(&rel)?);
         }
         plans.push((dst_index, paths.into_iter().collect()));
@@ -2497,8 +2512,7 @@ fn changed_since_scan_paths(
     // Event and zfs-diff cycles verify without storing a snapshot, so the
     // exact last-verified cycle often has none. Any OLDER stored snapshot is a
     // safe baseline — it only widens the changed-path set.
-    let Some(base_cycle_id) =
-        state.latest_snapshot_cycle_at_or_before(source_id, last_verified)?
+    let Some(base_cycle_id) = state.latest_snapshot_cycle_at_or_before(source_id, last_verified)?
     else {
         info!(
             source = source_id,
@@ -2784,9 +2798,7 @@ fn sync_cycle_with_transfer(
                         Err(err) => {
                             all_verified = false;
                             had_unblocked_failure = true;
-                            record_destination_failure(
-                                state, &source.id, &dst.id, cycle.id, &err,
-                            )?;
+                            record_destination_failure(state, &source.id, &dst.id, cycle.id, &err)?;
                         }
                     }
                 }
@@ -2826,9 +2838,8 @@ fn sync_cycle_with_transfer(
     // Possible-event-loss reconcile (overflow / journal gap / startup gap):
     // mark destinations red and identify the reason while the cross-machine
     // re-scan runs; each returns to green only after it verifies.
-    let is_event_loss_reconcile = cycle.needs_full_rescan
-        && !cycle.manual_full_rescan
-        && !cycle.manual_changed_since_rescan;
+    let is_event_loss_reconcile =
+        cycle.needs_full_rescan && !cycle.manual_full_rescan && !cycle.manual_changed_since_rescan;
     if is_event_loss_reconcile {
         warn!(
             source = source.id,
@@ -2871,7 +2882,9 @@ fn sync_cycle_with_transfer(
         Some(SourceEndpoint::File { path }) => path.clone(),
         None => source_info.base.clone(),
     };
-    let zfs_snapshot = source_view.as_ref().and_then(|view| view.zfs_snapshot.as_ref());
+    let zfs_snapshot = source_view
+        .as_ref()
+        .and_then(|view| view.zfs_snapshot.as_ref());
 
     state.mark_cycle_status(cycle.id, "syncing")?;
     // The full source snapshot is taken lazily: when every destination syncs
@@ -4145,9 +4158,8 @@ fn push_entries_parallel(
                             let mut list = failed.lock().unwrap_or_else(|e| e.into_inner());
                             list.push((entry.rel_path.clone(), err));
                             if list.len() >= MAX_PER_FILE_TRANSFER_FAILURES {
-                                let (path, err) = list
-                                    .pop()
-                                    .expect("failure list cannot be empty at its cap");
+                                let (path, err) =
+                                    list.pop().expect("failure list cannot be empty at its cap");
                                 let mut slot =
                                     fatal_error.lock().unwrap_or_else(|e| e.into_inner());
                                 if slot.is_none() {
@@ -4255,9 +4267,8 @@ fn copy_entries_parallel(
                             let mut list = failed.lock().unwrap_or_else(|e| e.into_inner());
                             list.push((entry.rel_path.clone(), err));
                             if list.len() >= MAX_PER_FILE_TRANSFER_FAILURES {
-                                let (path, err) = list
-                                    .pop()
-                                    .expect("failure list cannot be empty at its cap");
+                                let (path, err) =
+                                    list.pop().expect("failure list cannot be empty at its cap");
                                 let mut slot =
                                     fatal_error.lock().unwrap_or_else(|e| e.into_inner());
                                 if slot.is_none() {
@@ -4559,9 +4570,8 @@ fn unescape_zfs_path(raw: &str) -> String {
             && (b'0'..=b'7').contains(&bytes[i + 2])
             && (b'0'..=b'7').contains(&bytes[i + 3])
         {
-            let value = (bytes[i + 1] - b'0') * 64
-                + (bytes[i + 2] - b'0') * 8
-                + (bytes[i + 3] - b'0');
+            let value =
+                (bytes[i + 1] - b'0') * 64 + (bytes[i + 2] - b'0') * 8 + (bytes[i + 3] - b'0');
             out.push(value);
             i += 4;
             continue;
@@ -4992,14 +5002,8 @@ fn sync_destination(
             .map(|e| e.size.max(0) as u64)
             .sum();
         let transfer_guard = progress::begin_transfer(destination_id, dst_root, total_bytes);
-        let outcome = copy_entries_parallel(
-            src_root,
-            dst_root,
-            destination_id,
-            cycle_id,
-            &to_copy,
-            sync,
-        )?;
+        let outcome =
+            copy_entries_parallel(src_root, dst_root, destination_id, cycle_id, &to_copy, sync)?;
         drop(transfer_guard);
 
         if sync.mirror {
@@ -5041,11 +5045,18 @@ fn sync_destination_fast_missing_dirs(
     let result = (|| {
         let mut changing_paths = BTreeSet::new();
         let mut copied_paths = BTreeSet::new();
-        info!(destination = destination_id, "reconcile: scanning destination tree");
+        info!(
+            destination = destination_id,
+            "reconcile: scanning destination tree"
+        );
         let dst_snapshot =
             take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
         let dst_map = map_entries(&dst_snapshot);
-        info!(destination = destination_id, dst_entries = dst_snapshot.len(), "reconcile: scanning source tree + copying missing dirs");
+        info!(
+            destination = destination_id,
+            dst_entries = dst_snapshot.len(),
+            "reconcile: scanning source tree + copying missing dirs"
+        );
         let mut source_snapshot = Vec::new();
         // Total is unknown up front (scan and copy interleave); the meter still
         // tracks throughput so the UI shows a live, non-zero transfer speed.
@@ -5087,15 +5098,14 @@ fn sync_destination_fast_missing_dirs(
                 None => true,
             })
             .collect();
-        info!(destination = destination_id, source_entries = source_snapshot.len(), to_copy = to_copy.len(), "reconcile: copying changed/missing files");
-        let outcome = copy_entries_parallel(
-            src_root,
-            dst_root,
-            destination_id,
-            cycle_id,
-            &to_copy,
-            sync,
-        )?;
+        info!(
+            destination = destination_id,
+            source_entries = source_snapshot.len(),
+            to_copy = to_copy.len(),
+            "reconcile: copying changed/missing files"
+        );
+        let outcome =
+            copy_entries_parallel(src_root, dst_root, destination_id, cycle_id, &to_copy, sync)?;
         drop(transfer_guard);
 
         if sync.mirror {
@@ -5114,7 +5124,10 @@ fn sync_destination_fast_missing_dirs(
         }
 
         set_snapshot_dir_mtimes(dst_root, &source_snapshot)?;
-        info!(destination = destination_id, "reconcile: verifying copied entries");
+        info!(
+            destination = destination_id,
+            "reconcile: verifying copied entries"
+        );
         // Verify everything this cycle wrote: the bulk-copied missing subtrees
         // and the changed-file batch. Untouched entries were compared against
         // the fresh destination scan above.
@@ -5474,14 +5487,8 @@ fn sync_changed_entries_local(
             None => true,
         })
         .collect();
-    let outcome = copy_entries_parallel(
-        src_root,
-        dst_root,
-        destination_id,
-        cycle_id,
-        &to_copy,
-        sync,
-    )?;
+    let outcome =
+        copy_entries_parallel(src_root, dst_root, destination_id, cycle_id, &to_copy, sync)?;
     changing_paths.extend(outcome.changing.iter().cloned());
     let failed_count = outcome.failed.len();
     if let Some((path, err)) = outcome.failed.into_iter().next() {
@@ -6899,15 +6906,17 @@ mod tests {
         // parallel — cancelling "sync"/"compare" could hit other tests' ops.
         let _op = cancel::begin("test-cancel-walk");
         cancel::request(Some("test-cancel-walk"), None);
-        let err =
-            take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap_err();
+        let err = take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap_err();
         assert!(cancel::error_is_cancelled(&err), "got: {err:#}");
         fs::remove_dir_all(temp).ok();
     }
 
     #[test]
     fn snapshot_purpose_maps_to_cancel_kinds() {
-        assert_eq!(snapshot_request_cancel_kind("compare"), cancel::KIND_COMPARE);
+        assert_eq!(
+            snapshot_request_cancel_kind("compare"),
+            cancel::KIND_COMPARE
+        );
         assert_eq!(snapshot_request_cancel_kind("sync"), cancel::KIND_SYNC);
         // Old senders carry no purpose: treated as sync work.
         assert_eq!(snapshot_request_cancel_kind(""), cancel::KIND_SYNC);
@@ -7614,14 +7623,26 @@ mod tests {
         fs::write(effective_dst.join("hello.txt"), b"corrupted").unwrap();
         fs::remove_file(effective_dst.join("untouched.txt")).unwrap();
 
-        let report = scan_destination_now(&cfg, &state, "scan_repair_src", "scan_repair_dst").unwrap();
+        let report =
+            scan_destination_now(&cfg, &state, "scan_repair_src", "scan_repair_dst").unwrap();
         assert_eq!(report.to_update, 1, "hello.txt differs");
         assert_eq!(report.to_add, 1, "untouched.txt missing");
 
-        queue_destination_sync(&cfg, &state, "scan_repair_src", "scan_repair_dst", SyncRequestMode::RepairScan)
-            .unwrap();
+        queue_destination_sync(
+            &cfg,
+            &state,
+            "scan_repair_src",
+            "scan_repair_dst",
+            SyncRequestMode::RepairScan,
+        )
+        .unwrap();
         // The consumed report is gone: the UI repair affordance clears.
-        assert!(state.get_scan_report("scan_repair_src", "scan_repair_dst").unwrap().is_none());
+        assert!(
+            state
+                .get_scan_report("scan_repair_src", "scan_repair_dst")
+                .unwrap()
+                .is_none()
+        );
         sync_all_pending(&cfg, &mut state).unwrap();
 
         assert_eq!(fs::read(effective_dst.join("hello.txt")).unwrap(), b"hello");
@@ -7731,10 +7752,7 @@ mod tests {
         assert!(!effective_dst.join("destination-only.txt").exists());
 
         let views = state.destination_views(&cfg).unwrap();
-        let view = views
-            .iter()
-            .find(|v| v.destination_id == "dst_1")
-            .unwrap();
+        let view = views.iter().find(|v| v.destination_id == "dst_1").unwrap();
         assert_eq!(view.status, "green");
         assert_eq!(view.target_cycle_id, view.last_verified_cycle_id);
 
@@ -8310,11 +8328,9 @@ mod tests {
         let per_file = anyhow!("peer returned non-200 response: HTTP/1.1 500: permission denied");
         assert!(!transfer_error_is_fatal(&per_file));
 
-        let not_found = anyhow::Error::from(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no such file",
-        ))
-        .context("failed to read source");
+        let not_found =
+            anyhow::Error::from(io::Error::new(io::ErrorKind::NotFound, "no such file"))
+                .context("failed to read source");
         assert!(!transfer_error_is_fatal(&not_found));
     }
 
@@ -8329,7 +8345,10 @@ mod tests {
         let ignored = outcome.unverifiable_paths();
         assert!(ignored.contains("a.txt") && ignored.contains("b.txt"));
         let err = outcome.into_result().unwrap_err();
-        assert!(source_changed_paths(&err).is_empty(), "failed beats changing: {err:#}");
+        assert!(
+            source_changed_paths(&err).is_empty(),
+            "failed beats changing: {err:#}"
+        );
 
         // ...tolerated source changes alone stay classifiable (yellow).
         let outcome = TransferOutcome {

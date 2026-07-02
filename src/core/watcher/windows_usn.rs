@@ -115,10 +115,7 @@ pub fn spawn_source_watcher_thread(
 fn source_needs_usn(source: &SourceGroupConfig) -> bool {
     source.enabled
         && machine_id_or_local(&source.machine_id) == "local"
-        && source
-            .destinations
-            .iter()
-            .any(|dst| dst.enabled)
+        && source.destinations.iter().any(|dst| dst.enabled)
 }
 
 fn check_source_usn_access(source: &SourceGroupConfig) -> Result<()> {

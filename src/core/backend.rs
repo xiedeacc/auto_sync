@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::core::cancel;
 use crate::core::config::{
     AppConfig, MachineConfig, SourceGroupConfig, clean_config_for_save, config_warnings,
     load_config, load_or_create_config, machine_id_or_local, machine_is_local, machine_is_self,
@@ -14,14 +15,13 @@ use crate::core::config::{
 };
 use crate::core::machines::{
     MachineHealth, MachineStatus, configure_tcp_connection_pool, discover_lan,
-    encode_query_component, find_machine, local_health, machine_id_from_path, machine_matches_health,
-    merge_discovered, remote_get_json, remote_post_json,
+    encode_query_component, find_machine, local_health, machine_id_from_path,
+    machine_matches_health, merge_discovered, remote_get_json, remote_post_json,
 };
 use crate::core::progress::{
     ScanProgressView, TransferProgressView, configure_progress_file, current_scan_progress,
     current_scan_progresses, current_transfer_progress,
 };
-use crate::core::cancel;
 use crate::core::state::{DestinationView, ScanReport, State as DbState};
 use crate::core::sync::{SyncRequestMode, current_sync_kind, sync_is_running};
 
@@ -375,7 +375,9 @@ impl Backend {
         let destination_id = destination_id.to_string();
         std::thread::spawn(move || match DbState::open(&cfg.app.data_db) {
             Ok(state) => {
-                let task_id = state.task_start("compare", &source_id, &destination_id).ok();
+                let task_id = state
+                    .task_start("compare", &source_id, &destination_id)
+                    .ok();
                 let result = crate::core::sync::scan_destination_now(
                     &cfg,
                     &state,
@@ -397,9 +399,14 @@ impl Backend {
                         Err(err) if crate::core::sync::scan_error_is_already_running(err) => {
                             state.task_discard(task_id)
                         }
-                        Err(err) if cancel::error_is_cancelled(err) => {
-                            state.task_finish(task_id, "cancelled", cancel::CANCELLED_MESSAGE, 0, 0, 0)
-                        }
+                        Err(err) if cancel::error_is_cancelled(err) => state.task_finish(
+                            task_id,
+                            "cancelled",
+                            cancel::CANCELLED_MESSAGE,
+                            0,
+                            0,
+                            0,
+                        ),
                         Err(err) => {
                             state.task_finish(task_id, "failed", &format!("{err:#}"), 0, 0, 0)
                         }
@@ -443,11 +450,7 @@ impl Backend {
     }
 
     /// The most recent stored Scan report for a destination, if any.
-    pub fn scan_report(
-        &self,
-        source_id: &str,
-        destination_id: &str,
-    ) -> Result<Option<ScanReport>> {
+    pub fn scan_report(&self, source_id: &str, destination_id: &str) -> Result<Option<ScanReport>> {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
         if let Some(machine) = source_execution_machine(&cfg, source_id)? {
@@ -873,9 +876,7 @@ fn normalize_local_machine_config(cfg: &mut AppConfig, reference_machines: &[Mac
     // our list (merge_delegated_machines drops it) yet a source/destination may
     // still reference it by that id.
     let mut snapshot = cfg.clone();
-    snapshot
-        .machines
-        .extend(reference_machines.iter().cloned());
+    snapshot.machines.extend(reference_machines.iter().cloned());
     let is_self_ref = |machine_id: &str| -> bool {
         if machine_is_local(&snapshot, machine_id) {
             return true;
@@ -1146,7 +1147,9 @@ static CONFIG_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 fn apply_runtime_config(cfg: &AppConfig) {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
     configure_progress_file(&cfg.app.data_db);
-    *CONFIG_WARNINGS.lock().unwrap_or_else(|err| err.into_inner()) = config_warnings(cfg);
+    *CONFIG_WARNINGS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = config_warnings(cfg);
 }
 
 fn current_config_warnings() -> Vec<String> {
@@ -1457,7 +1460,7 @@ mod tests {
         cfg.machines.push(MachineConfig {
             id: "nas".to_string(),
             alias_name: "nas".to_string(),
-            name: "tiger".to_string(),   // stale hostname from before a rename
+            name: "tiger".to_string(), // stale hostname from before a rename
             host: "192.168.2.247".to_string(),
             port: 18765,
             ssh_user: "olduser".to_string(), // stale; health advertises root

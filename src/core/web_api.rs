@@ -339,9 +339,10 @@ async fn api_scan_destination_now(
     Json(req): Json<ScanDestinationRequest>,
 ) -> Result<Json<Option<ScanReport>>, ApiError> {
     blocking(move || {
-        Ok(Json(
-            backend.scan_destination_now(&req.source_id, &req.destination_id)?,
-        ))
+        Ok(Json(backend.scan_destination_now(
+            &req.source_id,
+            &req.destination_id,
+        )?))
     })
     .await
 }
@@ -373,7 +374,12 @@ async fn api_tasks(
     AxumState(backend): AxumState<Backend>,
     Query(query): Query<TasksQuery>,
 ) -> Result<Json<Vec<crate::core::state::TaskLogEntry>>, ApiError> {
-    blocking(move || Ok(Json(backend.recent_tasks(query.limit.unwrap_or(100).min(100))?))).await
+    blocking(move || {
+        Ok(Json(
+            backend.recent_tasks(query.limit.unwrap_or(100).min(100))?,
+        ))
+    })
+    .await
 }
 
 async fn api_transfer_snapshot(

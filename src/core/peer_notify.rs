@@ -201,12 +201,7 @@ mod tests {
         let epoch_before = status_epoch();
         mark_local_change("src_test_notify");
         assert_eq!(status_epoch(), epoch_before + 1);
-        assert!(
-            CHANGED_SOURCES
-                .lock()
-                .unwrap()
-                .contains("src_test_notify")
-        );
+        assert!(CHANGED_SOURCES.lock().unwrap().contains("src_test_notify"));
 
         note_remote_change();
         assert_eq!(status_epoch(), epoch_before + 2);

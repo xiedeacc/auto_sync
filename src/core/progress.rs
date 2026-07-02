@@ -276,7 +276,12 @@ pub fn start_scan(root_path: &Path) -> ScanProgressGuard {
         updated_at: now,
         last_write_at: now,
         updated_at_ms: now_ms(),
-        kind: if in_compare_context() { "compare" } else { "sync" }.to_string(),
+        kind: if in_compare_context() {
+            "compare"
+        } else {
+            "sync"
+        }
+        .to_string(),
         source_id,
         destination_id,
     };

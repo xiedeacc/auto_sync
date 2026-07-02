@@ -1363,19 +1363,18 @@ impl State {
                 } else {
                     offset.status_reason
                 };
-                let (scan_differences, scan_at) =
-                    match self.get_scan_report(&source.id, &dst.id) {
-                        Ok(Some(report)) if report.error.is_empty() => (
-                            Some(
-                                report.to_add
-                                    + report.to_update
-                                    + report.to_delete
-                                    + report.type_mismatch,
-                            ),
-                            Some(report.scanned_at),
+                let (scan_differences, scan_at) = match self.get_scan_report(&source.id, &dst.id) {
+                    Ok(Some(report)) if report.error.is_empty() => (
+                        Some(
+                            report.to_add
+                                + report.to_update
+                                + report.to_delete
+                                + report.type_mismatch,
                         ),
-                        _ => (None, None),
-                    };
+                        Some(report.scanned_at),
+                    ),
+                    _ => (None, None),
+                };
                 views.push(DestinationView {
                     source_id: source.id.clone(),
                     destination_id: dst.id.clone(),
@@ -1521,10 +1520,7 @@ impl State {
                 "#,
             )?;
             let rows = stmt.query_map(params![source_id], |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                ))
+                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?))
             })?;
             for row in rows {
                 let (target, last_verified) = row?;
@@ -1576,7 +1572,8 @@ impl State {
         loop {
             let removed = {
                 let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-                self.conn.execute(&sql, params![source_id, keep_from_cycle])?
+                self.conn
+                    .execute(&sql, params![source_id, keep_from_cycle])?
             };
             total += removed;
             if removed < SNAPSHOT_WRITE_CHUNK {
@@ -1851,9 +1848,7 @@ mod tests {
         let long_running = state.task_start("sync", "src_a", "dst_a").unwrap();
         for i in 0..120 {
             let id = state.task_start("sync", "src_a", "dst_a").unwrap();
-            state
-                .task_finish(id, "success", "", i, 0, 0)
-                .unwrap();
+            state.task_finish(id, "success", "", i, 0, 0).unwrap();
         }
         let tasks = state.recent_tasks(200).unwrap();
         assert!(tasks.len() <= 101, "finished rows capped at 100 + running");
@@ -2146,7 +2141,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            state.latest_snapshot_cycle_at_or_before("src_1", 4).unwrap(),
+            state
+                .latest_snapshot_cycle_at_or_before("src_1", 4)
+                .unwrap(),
             Some(3)
         );
 
