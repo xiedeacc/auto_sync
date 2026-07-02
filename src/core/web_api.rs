@@ -7,7 +7,8 @@ use axum::extract::DefaultBodyLimit;
 use axum::extract::Path as AxumPath;
 use axum::extract::Query;
 use axum::extract::State as AxumState;
-use axum::http::{StatusCode, header};
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -34,6 +35,29 @@ use crate::core::sync::{
     transfer_remove_path, transfer_remove_paths, transfer_set_dir_mtimes, transfer_set_modes,
     transfer_snapshot, transfer_snapshot_paths,
 };
+
+/// Peer-only surface: these endpoints write/delete under destination roots
+/// or replace delegated config, and are never called by the browser UI. With
+/// `app.peer_token` set (same value on every machine) they require the
+/// matching header; empty keeps the open LAN-trust behavior.
+fn path_requires_peer_token(path: &str) -> bool {
+    path.starts_with("/api/transfer/") || path == "/api/config/delegated-source-groups"
+}
+
+async fn require_peer_token(req: Request<axum::body::Body>, next: Next) -> Response {
+    let expected = crate::core::machines::peer_token();
+    if !expected.is_empty() && path_requires_peer_token(req.uri().path()) {
+        let provided = req
+            .headers()
+            .get(crate::core::machines::PEER_TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if provided != expected {
+            return (StatusCode::UNAUTHORIZED, "peer token missing or wrong").into_response();
+        }
+    }
+    next.run(req).await
+}
 
 pub fn router(backend: Backend) -> Router {
     Router::new()
@@ -107,7 +131,10 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/transfer/push-file", post(api_transfer_push_file))
         .route("/api/browse-dirs", get(api_browse_paths))
         .route("/api/browse-paths", get(api_browse_paths))
-        .layer(DefaultBodyLimit::disable())
+        .layer(middleware::from_fn(require_peer_token))
+        // Bounded instead of disabled: the largest legitimate request bodies
+        // are 16MiB transfer chunks and (worst case) a whole-file delta.
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .with_state(backend)
 }
 

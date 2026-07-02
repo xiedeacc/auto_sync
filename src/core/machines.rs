@@ -688,6 +688,34 @@ pub fn configure_tcp_connection_pool(max_idle: usize) {
     }
 }
 
+/// Header carrying the shared peer secret on machine-to-machine calls.
+pub const PEER_TOKEN_HEADER: &str = "x-auto-sync-token";
+
+fn peer_token_slot() -> &'static std::sync::Mutex<String> {
+    static TOKEN: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| std::sync::Mutex::new(String::new()))
+}
+
+/// Shared secret for the peer/transfer APIs (`app.peer_token`). When set —
+/// the SAME value in every machine's config — outgoing peer calls carry it
+/// and this machine rejects transfer/delegation requests without it. Empty
+/// keeps the open LAN-trust behavior.
+pub fn configure_peer_token(token: &str) {
+    let mut slot = peer_token_slot()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if *slot != token {
+        *slot = token.to_string();
+    }
+}
+
+pub fn peer_token() -> String {
+    peer_token_slot()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
 pub fn find_machine(cfg: &AppConfig, machine_id: &str) -> Option<MachineConfig> {
     let machines = normalized_machines(cfg);
     resolve_machine(&machines, machine_id)
@@ -815,6 +843,10 @@ fn http_request_on_stream(
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\nAccept: application/json\r\n"
     );
+    let token = peer_token();
+    if !token.is_empty() {
+        request.push_str(&format!("{PEER_TOKEN_HEADER}: {token}\r\n"));
+    }
     if let Some(content_type) = content_type {
         request.push_str(&format!("Content-Type: {content_type}\r\n"));
     }
@@ -991,14 +1023,28 @@ fn take_tcp_connection(key: &TcpConnectionKey, timeout: Duration) -> Result<(Tcp
 }
 
 fn open_tcp_connection(key: &TcpConnectionKey, timeout: Duration) -> Result<TcpStream> {
-    let addr: SocketAddr = format!("{}:{}", key.host, key.port)
-        .parse()
-        .with_context(|| format!("invalid peer address {}:{}", key.host, key.port))?;
-    let stream = TcpStream::connect_timeout(&addr, timeout)
-        .with_context(|| format!("failed to connect to peer {}:{}", key.host, key.port))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    Ok(stream)
+    // to_socket_addrs resolves hostnames too (SocketAddr::parse accepted only
+    // IP literals, so a machine configured by name failed every peer call);
+    // try each resolved address until one connects.
+    let addrs: Vec<SocketAddr> = (key.host.as_str(), key.port)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve peer address {}:{}", key.host, key.port))?
+        .collect();
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => {
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
+                return Ok(stream);
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("peer address resolved to nothing")))
+    .with_context(|| format!("failed to connect to peer {}:{}", key.host, key.port))
 }
 
 fn return_tcp_connection(key: TcpConnectionKey, stream: TcpStream) {

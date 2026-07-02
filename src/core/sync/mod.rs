@@ -265,6 +265,7 @@ pub fn run_pending_with_kind(cfg: &AppConfig, state: &mut State, kind: &str) -> 
 
 fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
+    crate::core::machines::configure_peer_token(&cfg.app.peer_token);
     configure_fsync(cfg.app.sync.fsync);
     progress::configure_progress_file(&cfg.app.data_db);
     state.ensure_config(cfg)?;

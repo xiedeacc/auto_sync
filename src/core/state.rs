@@ -379,6 +379,21 @@ impl State {
         if self.applied_config_fingerprint.get() == Some(fingerprint) {
             return Ok(());
         }
+        // Web GET handlers open a FRESH State per request, so a per-instance
+        // cell alone never hits: every /api/status poll re-upserted every row
+        // (a real fsync each) on an idle system. The process-wide fingerprint
+        // makes those requests read-only after the first application.
+        {
+            use std::sync::{Mutex, OnceLock};
+            static APPLIED: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+            let applied = APPLIED.get_or_init(|| Mutex::new(None));
+            let mut guard = applied.lock().unwrap_or_else(|err| err.into_inner());
+            if *guard == Some(fingerprint) {
+                self.applied_config_fingerprint.set(Some(fingerprint));
+                return Ok(());
+            }
+            *guard = Some(fingerprint);
+        }
         let now = now_string();
         for source in &cfg.source_groups {
             self.conn.execute(
@@ -448,6 +463,11 @@ impl State {
     }
 
     pub fn ensure_open_cycle(&self, source_id: &str, starts_at: DateTime<Utc>) -> Result<i64> {
+        // check-then-insert must be atomic: scheduler, watcher and web
+        // requests each hold their own connection, and two concurrent misses
+        // used to insert two 'open' rows (the older one lingered forever).
+        // INSERT ... WHERE NOT EXISTS makes the recheck and the insert one
+        // statement; a racing insert between it and the reread just wins.
         if let Some(id) = self.current_open_cycle_id(source_id)? {
             return Ok(id);
         }
@@ -456,11 +476,15 @@ impl State {
             r#"
             INSERT INTO sync_cycle
                 (source_id, starts_at, status, needs_full_rescan, created_at, updated_at)
-            VALUES (?1, ?2, 'open', 0, ?2, ?2)
+            SELECT ?1, ?2, 'open', 0, ?2, ?2
+            WHERE NOT EXISTS (
+                SELECT 1 FROM sync_cycle WHERE source_id = ?1 AND status = 'open'
+            )
             "#,
             params![source_id, now],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        self.current_open_cycle_id(source_id)?
+            .ok_or_else(|| anyhow::anyhow!("failed to create open cycle for {source_id}"))
     }
 
     pub fn current_open_cycle_id(&self, source_id: &str) -> Result<Option<i64>> {
@@ -908,14 +932,16 @@ impl State {
     }
 
     pub fn clear_cycle_needs_rescan(&self, cycle_id: i64) -> Result<()> {
+        // Only the event-loss flag — and only when nothing manual arrived in
+        // the meantime. This used to zero manual_full_rescan too, based on a
+        // snapshot read before the cycle closed: a manual Full requested in
+        // that window was silently discarded.
         self.conn.execute(
             r#"
             UPDATE sync_cycle
             SET needs_full_rescan=0,
-                manual_full_rescan=0,
-                manual_changed_since_rescan=0,
                 updated_at=?1
-            WHERE id=?2
+            WHERE id=?2 AND manual_full_rescan=0
             "#,
             params![now_string(), cycle_id],
         )?;

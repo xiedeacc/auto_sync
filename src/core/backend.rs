@@ -41,6 +41,35 @@ struct MachineCache {
     refreshed_at: Option<Instant>,
 }
 
+/// Retry an incomplete delegation push in the background until every source
+/// machine has taken the current config (or the attempts run out). Only one
+/// repush loop runs at a time; a fresh save simply lets the loop pick up the
+/// newer file on its next attempt.
+fn spawn_delegation_repush(backend: Backend) {
+    static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ACTIVE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_secs(60));
+            let Ok(cfg) = load_config(&backend.config_path) else {
+                continue;
+            };
+            match backend.propagate_remote_source_groups(None, &cfg) {
+                Ok(()) => {
+                    tracing::info!("delegated source groups repushed successfully");
+                    break;
+                }
+                Err(err) => {
+                    warn!(error = %err, "delegation repush attempt failed; retrying");
+                }
+            }
+        }
+        ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
 impl Backend {
     pub fn new(config_path: PathBuf, port: u16) -> Self {
         let backend = Self {
@@ -67,21 +96,31 @@ impl Backend {
     }
 
     pub fn save_config(&self, cfg: &AppConfig) -> Result<AppConfig> {
-        let current = load_config(&self.config_path)
-            .ok()
-            .map(|cfg| clean_config_for_save(&cfg));
-        let mut cfg = preserve_current_machines(&self.config_path, cfg);
-        normalize_local_machine_config(&mut cfg, &[]);
-        reject_locked_source_path_changes(&self.config_path, &cfg)?;
+        let (cfg, current) = {
+            let _rmw = crate::core::config::config_write_lock();
+            let current = load_config(&self.config_path)
+                .ok()
+                .map(|cfg| clean_config_for_save(&cfg));
+            let mut cfg = preserve_current_machines(&self.config_path, cfg);
+            normalize_local_machine_config(&mut cfg, &[]);
+            reject_locked_source_path_changes(&self.config_path, &cfg)?;
+            (save_config(&self.config_path, &cfg)?, current)
+        };
         let next = clean_config_for_save(&cfg);
-        let cfg = save_config(&self.config_path, &cfg)?;
         apply_runtime_config(&cfg);
         let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         if let Some(current) = current.as_ref() {
             reset_changed_destination_offsets(&state_db, current, &next)?;
         }
-        self.propagate_remote_source_groups(current.as_ref(), &cfg)?;
+        // The save has already been applied locally; a failed delegation push
+        // must not report it as failed (the UI showed an error while the file
+        // HAD changed and the remote quietly kept the old config). Retry in
+        // the background until the source machine takes it.
+        if let Err(err) = self.propagate_remote_source_groups(current.as_ref(), &cfg) {
+            warn!(error = %err, "delegation push incomplete; retrying in the background");
+            spawn_delegation_repush(self.clone());
+        }
         self.clear_machine_cache();
         Ok(cfg)
     }
@@ -90,6 +129,7 @@ impl Backend {
         &self,
         req: DelegatedSourceGroupsRequest,
     ) -> Result<AppConfig> {
+        let _rmw = crate::core::config::config_write_lock();
         let mut cfg = load_or_create_config(&self.config_path)?;
         cfg.source_groups
             .retain(|source| source.managed_by != req.controller_id);
@@ -125,6 +165,7 @@ impl Backend {
     }
 
     pub fn add_machine(&self, machine: MachineConfig) -> Result<AppConfig> {
+        let _rmw = crate::core::config::config_write_lock();
         let mut cfg = load_or_create_config(&self.config_path)?;
         if let Some(existing) = cfg.machines.iter_mut().find(|item| {
             non_empty_machine_match(item, &machine.alias_name)
@@ -145,6 +186,7 @@ impl Backend {
         if machine_id == "local" {
             anyhow::bail!("local machine cannot be deleted");
         }
+        let _rmw = crate::core::config::config_write_lock();
         let mut cfg = load_or_create_config(&self.config_path)?;
         cfg.machines.retain(|machine| machine.id != machine_id);
         let cfg = save_config(&self.config_path, &cfg)?;
@@ -213,13 +255,17 @@ impl Backend {
     pub fn sync_now(&self) -> Result<Vec<DestinationView>> {
         let cfg = load_config(&self.config_path)?;
         apply_runtime_config(&cfg);
+        // Best-effort per machine: one offline remote must not veto syncing
+        // the local sources (its own status view already degrades to red).
         for machine in remote_source_machines(&cfg) {
-            let _: Vec<DestinationView> = remote_post_json(
+            if let Err(err) = remote_post_json::<_, Vec<DestinationView>>(
                 &machine,
                 "/api/sync-now",
                 &EmptyRequest {},
                 Duration::from_secs(30),
-            )?;
+            ) {
+                warn!(machine = machine.id, error = %err, "failed to trigger remote sync");
+            }
         }
         let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
@@ -637,9 +683,13 @@ impl Backend {
 
         // Discover without holding the cache lock (the sweep takes ~700ms, and
         // persisting a hostname fix below clears the cache -- same lock).
+        let discovered = discover_lan(Duration::from_millis(700))?;
+        // Serialize the read-modify-write against the other config writers:
+        // this thread's ~30s cadence made it the widest lost-update window
+        // (a UI save or a peer delegation landing mid-refresh was reverted).
+        let _rmw = crate::core::config::config_write_lock();
         let mut cfg = load_or_create_config(&self.config_path)?;
         apply_runtime_config(&cfg);
-        let discovered = discover_lan(Duration::from_millis(700))?;
         if refresh_machine_metadata_from_health(&mut cfg, &discovered) {
             // A machine reported different metadata (rename, moved endpoint, new
             // ssh port, ...); persist it. Use the plain config save, not the
@@ -693,27 +743,44 @@ impl Backend {
             }
         }
 
+        // Best-effort per machine: the first offline machine must not stop
+        // the push to the others (that left them on divergent configs with
+        // no record of it).
+        let mut failures: Vec<String> = Vec::new();
         for source_machine_id in source_machines {
-            let machine = find_machine(cfg, &source_machine_id)
-                .or_else(|| {
-                    previous.and_then(|previous| find_machine(previous, &source_machine_id))
-                })
-                .ok_or_else(|| anyhow::anyhow!("unknown source machine: {source_machine_id}"))?;
-            let groups = delegated_groups_for_machine(cfg, &source_machine_id, &controller_id)?;
-            let req = DelegatedSourceGroupsRequest {
-                controller_id: controller_id.clone(),
-                machines: cfg.machines.clone(),
-                source_groups: groups,
-            };
-            let _: AppConfig = remote_post_json(
-                &machine,
-                "/api/config/delegated-source-groups",
-                &req,
-                Duration::from_secs(5),
-            )
-            .with_context(|| format!("failed to push source groups to {source_machine_id}"))?;
+            let result = (|| -> Result<()> {
+                let machine = find_machine(cfg, &source_machine_id)
+                    .or_else(|| {
+                        previous.and_then(|previous| find_machine(previous, &source_machine_id))
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("unknown source machine: {source_machine_id}"))?;
+                let groups = delegated_groups_for_machine(cfg, &source_machine_id, &controller_id)?;
+                let req = DelegatedSourceGroupsRequest {
+                    controller_id: controller_id.clone(),
+                    machines: cfg.machines.clone(),
+                    source_groups: groups,
+                };
+                let _: AppConfig = remote_post_json(
+                    &machine,
+                    "/api/config/delegated-source-groups",
+                    &req,
+                    Duration::from_secs(5),
+                )?;
+                Ok(())
+            })();
+            if let Err(err) = result {
+                warn!(machine = source_machine_id, error = %err, "failed to push delegated source groups");
+                failures.push(format!("{source_machine_id}: {err:#}"));
+            }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "delegation push failed for {}",
+                failures.join("; ")
+            ))
+        }
     }
 
     fn merge_remote_source_statuses(
@@ -735,25 +802,59 @@ impl Backend {
             .into_iter()
             .filter(|view| !remote_source_ids.iter().any(|id| id == &view.source_id))
             .collect();
-        for source in cfg
+        // Concurrent fetch, deduped per machine: one offline machine's 3s
+        // connect timeout must not stack serially onto the others (the same
+        // fix all_tasks already has), and N source groups on one machine must
+        // not pay N timeouts.
+        let remote_sources: Vec<&crate::core::config::SourceGroupConfig> = cfg
             .source_groups
             .iter()
             .filter(|source| machine_id_or_local(&source.machine_id) != "local")
-        {
+            .collect();
+        let mut machine_ids: Vec<&str> = remote_sources
+            .iter()
+            .map(|source| machine_id_or_local(&source.machine_id))
+            .collect();
+        machine_ids.sort_unstable();
+        machine_ids.dedup();
+        let mut by_machine: std::collections::BTreeMap<
+            &str,
+            std::result::Result<Vec<DestinationView>, String>,
+        > = std::collections::BTreeMap::new();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = machine_ids
+                .iter()
+                .map(|machine_id| {
+                    let machine = find_machine(cfg, machine_id);
+                    (
+                        *machine_id,
+                        scope.spawn(move || match machine {
+                            Some(machine) => remote_get_json::<Vec<DestinationView>>(
+                                &machine,
+                                "/api/status",
+                                Duration::from_secs(3),
+                            )
+                            .map_err(|err| err.to_string()),
+                            None => Err("unknown_source_machine".to_string()),
+                        }),
+                    )
+                })
+                .collect();
+            for (machine_id, handle) in handles {
+                let result = handle
+                    .join()
+                    .unwrap_or_else(|_| Err("status fetch thread panicked".to_string()));
+                by_machine.insert(machine_id, result);
+            }
+        });
+        for source in remote_sources {
             let machine_id = machine_id_or_local(&source.machine_id);
-            let Some(machine) = find_machine(cfg, machine_id) else {
-                views.extend(offline_views_for_source(source, "unknown_source_machine"));
-                continue;
-            };
-            match remote_get_json::<Vec<DestinationView>>(
-                &machine,
-                "/api/status",
-                Duration::from_secs(3),
-            ) {
-                Ok(remote_views) => {
+            match by_machine.get(machine_id) {
+                Some(Ok(remote_views)) => {
                     let wanted: Vec<DestinationView> = remote_views
-                        .into_iter()
+                        .iter()
                         .filter(|view| view.source_id == source.id)
+                        .cloned()
                         .collect();
                     if wanted.is_empty() {
                         views.extend(offline_views_for_source(source, "remote_status_missing"));
@@ -761,8 +862,14 @@ impl Backend {
                         views.extend(wanted);
                     }
                 }
-                Err(err) => {
+                Some(Err(err)) if err == "unknown_source_machine" => {
+                    views.extend(offline_views_for_source(source, "unknown_source_machine"));
+                }
+                Some(Err(err)) => {
                     warn!(source = source.id, machine = machine_id, error = %err, "failed to fetch remote source status");
+                    views.extend(offline_views_for_source(source, "source_machine_offline"));
+                }
+                None => {
                     views.extend(offline_views_for_source(source, "source_machine_offline"));
                 }
             }
@@ -1215,6 +1322,24 @@ fn reset_changed_destination_offsets(
 /// advertisement (each machine detects its own sshd port and the account it runs
 /// as); only an empty user / zero port -- an advertisement carrying no info -- is
 /// ignored. Returns true if anything changed.
+/// TCP readback of a discovery claim: does `host:port` answer /api/health as
+/// the machine we would be rewriting? Both the id and the alias count as a
+/// match (aliases are how users identify machines across renames).
+fn confirm_machine_endpoint(host: &str, port: u16, machine_id: &str, alias: &str) -> bool {
+    let probe = MachineConfig {
+        id: machine_id.to_string(),
+        host: host.to_string(),
+        port,
+        ..Default::default()
+    };
+    match remote_get_json::<MachineHealth>(&probe, "/api/health", Duration::from_secs(2)) {
+        Ok(health) => {
+            health.id == machine_id || (!alias.is_empty() && health.alias_name == alias)
+        }
+        Err(_) => false,
+    }
+}
+
 fn refresh_machine_metadata_from_health(cfg: &mut AppConfig, discovered: &[MachineHealth]) -> bool {
     let mut changed = false;
     for machine in &mut cfg.machines {
@@ -1238,15 +1363,39 @@ fn refresh_machine_metadata_from_health(cfg: &mut AppConfig, discovered: &[Machi
             changed = true;
         }
 
+        // The discovery reply is an UNAUTHENTICATED UDP datagram: before an
+        // endpoint change is persisted (redirecting every future sync and
+        // control call), confirm over TCP that the claimed host:port really
+        // answers as this machine id. A forged broadcast fails the readback.
         let host = health.host.trim();
-        if !host.is_empty() && machine.host.trim() != host {
-            machine.host = host.to_string();
-            changed = true;
-        }
-
-        if health.port != 0 && machine.port != health.port {
-            machine.port = health.port;
-            changed = true;
+        let claimed_port = if health.port != 0 {
+            health.port
+        } else {
+            machine.port
+        };
+        let endpoint_changed =
+            (!host.is_empty() && machine.host.trim() != host) || machine.port != claimed_port;
+        if endpoint_changed && !host.is_empty() {
+            match confirm_machine_endpoint(host, claimed_port, &machine.id, &machine.alias_name) {
+                true => {
+                    if machine.host.trim() != host {
+                        machine.host = host.to_string();
+                        changed = true;
+                    }
+                    if machine.port != claimed_port {
+                        machine.port = claimed_port;
+                        changed = true;
+                    }
+                }
+                false => {
+                    warn!(
+                        machine = machine.id,
+                        host, claimed_port,
+                        "discovery reply advertises an endpoint that does not answer as this machine; ignoring"
+                    );
+                    continue;
+                }
+            }
         }
 
         let os = health.os.trim();
@@ -1285,6 +1434,8 @@ static CONFIG_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn apply_runtime_config(cfg: &AppConfig) {
     configure_tcp_connection_pool(cfg.app.tcp_connection_pool_size);
+    crate::core::machines::configure_peer_token(&cfg.app.peer_token);
+    crate::core::config::configure_preferred_subnet(&cfg.app.preferred_subnet);
     configure_progress_file(&cfg.app.data_db);
     *CONFIG_WARNINGS
         .lock()

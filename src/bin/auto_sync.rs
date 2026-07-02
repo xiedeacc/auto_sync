@@ -866,76 +866,104 @@ fn error_text(err: anyhow::Error) -> String {
     err.to_string()
 }
 
+/// Run blocking backend work off the webview/main thread. Non-async Tauri
+/// commands execute inline in the IPC callback: a peer with a 3-5s connect
+/// timeout froze the whole desktop window on every status poll.
 #[cfg(feature = "gui")]
-#[tauri::command]
-fn get_config(backend: tauri::State<'_, Backend>) -> Result<AppConfig, String> {
-    backend.get_config().map_err(error_text)
+async fn run_blocking<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(error_text)
 }
 
 #[cfg(feature = "gui")]
 #[tauri::command]
-fn save_config_command(
+async fn get_config(backend: tauri::State<'_, Backend>) -> Result<AppConfig, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.get_config()).await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn save_config_command(
     backend: tauri::State<'_, Backend>,
     cfg: AppConfig,
 ) -> Result<AppConfig, String> {
-    let saved = backend.save_config(&cfg).map_err(error_text)?;
+    let config_path = backend.config_path();
+    let backend = backend.inner().clone();
+    let saved = run_blocking(move || backend.save_config(&cfg)).await?;
     CLOSE_TO_TRAY.store(saved.app.close_to_tray, Ordering::Relaxed);
-    apply_autostart(saved.app.autostart, backend.config_path().as_path());
+    apply_autostart(saved.app.autostart, config_path.as_path());
     Ok(saved)
 }
 
 #[cfg(feature = "gui")]
 #[tauri::command]
-fn get_machines(backend: tauri::State<'_, Backend>) -> Result<MachineStatus, String> {
-    backend.machines().map_err(error_text)
+async fn get_machines(backend: tauri::State<'_, Backend>) -> Result<MachineStatus, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.machines()).await
 }
 
 #[cfg(feature = "gui")]
 #[tauri::command]
-fn discover_machines(backend: tauri::State<'_, Backend>) -> Result<MachineStatus, String> {
-    backend.discover_machines().map_err(error_text)
+async fn discover_machines(backend: tauri::State<'_, Backend>) -> Result<MachineStatus, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.discover_machines()).await
 }
 
 #[cfg(feature = "gui")]
 #[tauri::command]
-fn add_machine(
+async fn add_machine(
     backend: tauri::State<'_, Backend>,
     machine: MachineConfig,
 ) -> Result<AppConfig, String> {
-    backend.add_machine(machine).map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.add_machine(machine)).await
 }
 
 #[cfg(feature = "gui")]
 #[tauri::command]
-fn remove_machine(
+async fn remove_machine(
     backend: tauri::State<'_, Backend>,
     machine_id: String,
 ) -> Result<AppConfig, String> {
-    backend.remove_machine(&machine_id).map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.remove_machine(&machine_id)).await
 }
 
 #[cfg(feature = "gui")]
 #[tauri::command]
-fn get_status(backend: tauri::State<'_, Backend>) -> Result<Vec<DestinationView>, String> {
-    backend.status().map_err(error_text)
+async fn get_status(backend: tauri::State<'_, Backend>) -> Result<Vec<DestinationView>, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.status()).await
 }
 
 #[cfg(feature = "gui")]
 #[tauri::command]
 fn get_runtime_status(backend: tauri::State<'_, Backend>) -> Result<RuntimeStatus, String> {
+    // Pure in-memory read; safe to answer inline.
     Ok(backend.runtime_status())
 }
 
 #[cfg(feature = "gui")]
 #[tauri::command]
-fn get_sync_activity(backend: tauri::State<'_, Backend>) -> Result<SyncActivityStatus, String> {
-    backend.sync_activity().map_err(error_text)
+async fn get_sync_activity(
+    backend: tauri::State<'_, Backend>,
+) -> Result<SyncActivityStatus, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.sync_activity()).await
 }
 
 #[cfg(feature = "gui")]
 #[tauri::command]
 async fn sync_now(backend: tauri::State<'_, Backend>) -> Result<Vec<DestinationView>, String> {
-    backend.sync_now().map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.sync_now()).await
 }
 
 #[cfg(feature = "gui")]
@@ -944,9 +972,8 @@ async fn dismiss_restart_notice(
     backend: tauri::State<'_, Backend>,
     source_id: String,
 ) -> Result<(), String> {
-    backend
-        .dismiss_restart_notice(&source_id)
-        .map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.dismiss_restart_notice(&source_id)).await
 }
 
 #[cfg(feature = "gui")]
@@ -955,9 +982,8 @@ async fn get_all_tasks(
     backend: tauri::State<'_, Backend>,
     limit: Option<usize>,
 ) -> Result<Vec<auto_sync::core::backend::MachineTasksView>, String> {
-    backend
-        .all_tasks(limit.unwrap_or(100).min(100))
-        .map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.all_tasks(limit.unwrap_or(100).min(100))).await
 }
 
 #[cfg(feature = "gui")]
@@ -968,13 +994,15 @@ async fn cancel_activity(
     source_id: Option<String>,
     destination_id: Option<String>,
 ) -> Result<auto_sync::core::backend::CancelOutcome, String> {
-    let target = match (source_id.as_deref(), destination_id.as_deref()) {
-        (Some(source_id), Some(destination_id)) => Some((source_id, destination_id)),
-        _ => None,
-    };
-    backend
-        .cancel_activity(scope.as_deref(), target, true)
-        .map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || {
+        let target = match (source_id.as_deref(), destination_id.as_deref()) {
+            (Some(source_id), Some(destination_id)) => Some((source_id, destination_id)),
+            _ => None,
+        };
+        backend.cancel_activity(scope.as_deref(), target, true)
+    })
+    .await
 }
 
 #[cfg(feature = "gui")]
@@ -983,7 +1011,8 @@ async fn sync_source_now(
     backend: tauri::State<'_, Backend>,
     source_id: String,
 ) -> Result<Vec<DestinationView>, String> {
-    backend.sync_source_now(&source_id).map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.sync_source_now(&source_id)).await
 }
 
 #[cfg(feature = "gui")]
@@ -999,9 +1028,8 @@ async fn sync_destination_now(
         .unwrap_or("incremental")
         .parse::<SyncRequestMode>()
         .map_err(error_text)?;
-    backend
-        .sync_destination_now(&source_id, &destination_id, mode)
-        .map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.sync_destination_now(&source_id, &destination_id, mode)).await
 }
 
 #[cfg(feature = "gui")]
@@ -1011,9 +1039,8 @@ async fn scan_destination_now(
     source_id: String,
     destination_id: String,
 ) -> Result<Option<ScanReport>, String> {
-    backend
-        .scan_destination_now(&source_id, &destination_id)
-        .map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.scan_destination_now(&source_id, &destination_id)).await
 }
 
 #[cfg(feature = "gui")]
@@ -1023,17 +1050,17 @@ async fn scan_report(
     source_id: String,
     destination_id: String,
 ) -> Result<Option<ScanReport>, String> {
-    backend
-        .scan_report(&source_id, &destination_id)
-        .map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.scan_report(&source_id, &destination_id)).await
 }
 
 #[cfg(feature = "gui")]
 #[tauri::command]
-fn browse_paths(
+async fn browse_paths(
     backend: tauri::State<'_, Backend>,
     path: Option<PathBuf>,
     machine_id: Option<String>,
 ) -> Result<BrowseResponse, String> {
-    backend.browse_paths(path, machine_id).map_err(error_text)
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.browse_paths(path, machine_id)).await
 }

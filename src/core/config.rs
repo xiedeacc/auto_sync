@@ -41,6 +41,17 @@ pub struct AppSection {
     )]
     pub port: u16,
     pub tcp_connection_pool_size: usize,
+    /// Shared secret for the machine-to-machine APIs (/api/transfer/*,
+    /// delegated config pushes). Set the SAME value on every machine: peers
+    /// then send it as a header and each machine rejects peer requests
+    /// without it. Empty (the default) keeps the open LAN-trust behavior —
+    /// anyone who can reach the port can write/delete under destination
+    /// roots.
+    pub peer_token: String,
+    /// Preferred /24 prefix (with trailing dot, e.g. "192.168.2.") for the
+    /// LAN-facing address: web bind, discovery self-report, self detection.
+    /// Empty keeps the built-in default.
+    pub preferred_subnet: String,
     pub sync: NativeSyncConfig,
     /// Start auto_sync automatically when the user logs in (desktop only).
     #[serde(default = "default_true")]
@@ -242,6 +253,8 @@ impl Default for AppSection {
             status_log_interval_secs: 300,
             port: default_app_port(),
             tcp_connection_pool_size: DEFAULT_TCP_CONNECTION_POOL_SIZE,
+            peer_token: String::new(),
+            preferred_subnet: String::new(),
             sync: NativeSyncConfig::default(),
             autostart: true,
             close_to_tray: true,
@@ -420,6 +433,19 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
     Ok(cfg)
 }
 
+/// Serializes every load→mutate→save sequence in this process. Six writers
+/// (UI save, peer delegation push, machine add/remove, the discovery
+/// thread's metadata refresh) each read-modify-write the whole file; an
+/// unserialized interleave lets the later writer silently revert the earlier
+/// one's changes with its stale snapshot.
+pub fn config_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
 pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<AppConfig> {
     validate_unique_machine_ids(&cfg.machines)?;
     let cfg = clean_config_for_save(cfg);
@@ -429,7 +455,14 @@ pub fn save_config(path: &Path, cfg: &AppConfig) -> Result<AppConfig> {
             .with_context(|| format!("failed to create config dir {}", parent.display()))?;
     }
     let raw = toml::to_string_pretty(&cfg).context("failed to serialize config")?;
-    let tmp = path.with_extension("toml.tmp");
+    // Unique tmp name: concurrent writers sharing one fixed tmp path could
+    // rename each other's half-written file into place.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "toml.tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     fs::write(&tmp, raw).with_context(|| format!("failed to write {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| {
         format!(
@@ -970,11 +1003,37 @@ pub fn normalized_machines(cfg: &AppConfig) -> Vec<MachineConfig> {
     clean_machines(&cfg.machines)
 }
 
+/// Preferred /24 for the LAN-facing address (web bind, discovery self-report,
+/// machine_is_self). Configurable via `app.preferred_subnet` (e.g.
+/// "10.0.7."); the previous hard-coded 192.168.2. stays as the default so
+/// existing deployments behave identically.
+pub fn configure_preferred_subnet(subnet: &str) {
+    let subnet = subnet.trim();
+    if subnet.is_empty() {
+        return;
+    }
+    let mut slot = preferred_subnet_slot()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *slot = subnet.to_string();
+}
+
+fn preferred_subnet_slot() -> &'static std::sync::Mutex<String> {
+    static SUBNET: OnceLock<std::sync::Mutex<String>> = OnceLock::new();
+    SUBNET.get_or_init(|| std::sync::Mutex::new("192.168.2.".to_string()))
+}
+
 pub fn preferred_local_host() -> String {
-    if let Some(ip) = detect_local_ip_for(Ipv4Addr::new(192, 168, 2, 1))
-        .filter(|ip| ip.octets()[0..3] == [192, 168, 2])
-    {
-        return ip.to_string();
+    let subnet = preferred_subnet_slot()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    let probe: Option<Ipv4Addr> = format!("{subnet}1").parse().ok();
+    if let Some(probe) = probe {
+        if let Some(ip) = detect_local_ip_for(probe).filter(|ip| ip.to_string().starts_with(&subnet))
+        {
+            return ip.to_string();
+        }
     }
     if let Some(ip) = detect_local_ip_for(Ipv4Addr::new(8, 8, 8, 8)) {
         return ip.to_string();
