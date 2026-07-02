@@ -871,7 +871,7 @@ function renderSourcePanel() {
           <span></span>
           <span></span>
           <span class="source-cycle-cell">
-            <button class="restart-notice-button icon" data-action="restart-notice" title="" aria-label="Daemon restart notice" hidden>&#9888;</button>
+            <button class="restart-notice-button icon" data-action="restart-notice" title="" aria-label="Daemon restart notice" hidden><span class="destination-log-icon" aria-hidden="true">i</span></button>
             <input class="source-latest-cycle" value="${escapeAttr(sourceLatestCycle(source.id))}" readonly>
           </span>
           <button class="exclude-button" data-action="edit-excludes">Excluded ${excludeCountLabel(source)}</button>

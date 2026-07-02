@@ -326,9 +326,11 @@ th {
 }
 
 .repair-scan-button {
-  width: 26px;
-  height: 26px;
-  min-height: 26px;
+  /* Same 34px square as the delete/info buttons so the row reads as one
+     control strip. */
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
   padding: 0;
   display: inline-flex;
   align-items: center;
@@ -355,9 +357,9 @@ th {
 /* Pause/resume toggle left of the info button: pausing cancels the running
    task and holds pending/new ones; resuming lets the held work continue. */
 .pause-dst-button {
-  width: 26px;
-  height: 26px;
-  min-height: 26px;
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
   padding: 0;
   display: inline-flex;
   align-items: center;
@@ -409,10 +411,17 @@ th {
 }
 
 .restart-notice-button {
-  width: 30px;
-  min-width: 30px;
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border-color: #b45309;
   background: rgba(180, 83, 9, 0.12);
+  /* Amber circled-i: same glyph as the dst info button, notice coloring. */
   color: #b45309;
   font-size: 14px;
 }
