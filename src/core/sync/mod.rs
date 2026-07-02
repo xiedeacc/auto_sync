@@ -287,6 +287,7 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
             .iter()
             .filter(|s| s.enabled && machine_id_or_local(&s.machine_id) == "local")
         {
+            let mut source_progressed = false;
             let cycles = state.closed_cycles_for_source(&source.id)?;
             for cycle in cycles {
                 cancel::check()?;
@@ -299,6 +300,7 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
                     match sync_cycle_for_source(cfg, state, source, &cycle) {
                         Ok(outcome) => {
                             progressed |= outcome.progressed;
+                            source_progressed |= outcome.progressed;
                             blocked |= outcome.blocked;
                         }
                         Err(err) if cancel::error_is_cancelled(&err) => return Err(err),
@@ -319,6 +321,12 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
             // Drop stored snapshots no destination still needs (each keeps its
             // in-flight target and its Changed-Since baseline); without this
             // every full cycle's whole-tree snapshot accumulates forever.
+            // Only after a pass that did work: the prune probe scans the
+            // whole (potentially 600K-row) table, and running it every idle
+            // scheduler tick burned CPU and cache for nothing.
+            if !source_progressed {
+                continue;
+            }
             match state.prune_path_snapshots(&source.id) {
                 Ok(removed) if removed > 0 => {
                     info!(
@@ -6790,14 +6798,10 @@ fn sorted_read_dir(dir: &Path) -> Result<Vec<PathBuf>> {
             .with_context(|| format!("failed to read directory entry in {}", dir.display()))?;
         children.push(entry.path());
     }
-    children.sort_by(|left, right| file_name_sort_key(left).cmp(&file_name_sort_key(right)));
+    // OsStr comparison: the previous per-comparison String allocations cost
+    // O(n log n) heap traffic on large flat directories.
+    children.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
     Ok(children)
-}
-
-fn file_name_sort_key(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_default()
 }
 
 fn should_visit_path(root: &Path, path: &Path, mode: SnapshotMode, excludes: &[PathBuf]) -> bool {

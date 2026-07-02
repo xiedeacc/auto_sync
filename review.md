@@ -1,5 +1,37 @@
 # auto_sync 深度 Review(第五轮,2026-07-02)
 
+---
+
+## 0''. 修复状态(2026-07-03,第五轮修复后)
+
+本轮全部结论已按用户要求集中修复(commits `39deeed` → 修复完成),各编号现状:
+
+| 编号 | 现状 |
+|---|---|
+| R1/L1、L2 | **已修复**:三处目录挡路判断改 lstat(dst symlink 挡路进回收站,不再写穿);replace_path 类型翻转走回收站。 |
+| R2/S1 | **已修复**(即用户报告的 79640 假差异 bug):parse_zfs_diff / 按路径快照 / mirror 删除集三层过滤 `.auto_sync_*` 内部目录,带回归测试;实测同一比较 79640 → 15 个真实差异。 |
+| R3/C1 | **已修复**:事件/zfs diff 证据路径改精确 mtime 比较(容忍 100ns FILETIME 截断),verify 同步收紧;modify-window 仅保留给全树 quick-check。 |
+| R10/C2/盲区1/盲区2 | **已修复**:entries_match 双侧带 hash 时 hash 优先;dst 侧独有 diff 路径强制补哈希(Compare 与 zfs Full);权限漂移成为 metadata 差异类(Compare 报告 + chmod 原地修复,本地与远端 set-modes 端点);fanotify 订阅 FAN_ATTRIB。 |
+| R4/W1 | **已修复**:fanotify 分级初始化(去掉 TARGET_FID 硬前提,5.9+/5.1+ 两级 FID 后才 fd-path);fd-path 降级 error 级日志 + 每次启动记 rescan 事件强制对账。 |
+| R5/P1、W3 | **已修复**:config 变更与 supervisor 重启窗口都记 watcher_restart_gap(rescan);config_signature 只哈希 watcher 相关字段,无关保存不再重启 watcher。 |
+| R6/E1 | **已修复**:引擎 pass per-source 错误隔离,坏源不再饿死后续 source。 |
+| R7/S2、repair-3 | **已修复**:基线 Refresh 用 `zfs diff 旧基线→新基线` 对照本轮触碰集(walk Full 传全触碰集,zfs Full 传并集),发现外部写入降级 Retain。传输路径的本地 dst Refresh 暂无触碰集(不做核对)。 |
+| R8/S3 | **已修复**:混合 cycle 本地 ZFS dst 增量 Retain、全量 Refresh,仅真远程 Clear。 |
+| R9/S4 | **已修复**:清理匹配校验 `_<12位cycle>` 后缀,前缀关系 id 不再互删。 |
+| R11/W4、W5 | **已修复**:watcher 事件按 read() 批次单事务写入(每批一次 fsync)+ 同路径去重;持久化失败置 sticky,下次成功先补写 rescan 标记。 |
+| R12/E5 | **已修复**:trash 按 `sync.trash_keep_days`(默认 30 天)回收;tmp 非当前 cycle 7 天清扫;move_to_trash 失败不再静默硬删(EXDEV copy+delete,其余报错)。 |
+| R13/P2-P12 | **已修复**:配置 RMW 进程锁 + 唯一 tmp 名(P2);GET 轮询零写库(P3);Sync All 尽力而为(P4);UDP 发现改 TCP 回读确认后才落盘(P5);save_config 推送失败降级警告 + 后台重推(P6);peer 连接支持主机名(P7);Tauri 命令全部 spawn_blocking(P8);清 rescan 不再顺带清 manual 标志(P9);ensure_open_cycle 原子插入(P10);远端状态聚合并行 + 按机器去重(P11);首选网段可配置(P12)。 |
+| F6 | **已修复(机制)**:`app.peer_token` 鉴权 /api/transfer/* 与 delegated 推送(各机器配同一值;为空=旧行为);body 上限 1 GiB。需在两端 conf 设置 token 以启用。 |
+| E2 | **已修复**:`\`→`/` 重写仅限 Windows;非 UTF-8 文件名两侧跳过并告警(不再 lossy 错传)。 |
+| E3 | **已修复**:同名快照创建时间早于 cycle 开始即销毁重建;基线快照强制新鲜。 |
+| E4 | **已修复**(见 R12)。E6 批发拷贝失败容忍对齐 20 个契约;E7 tmp lstat 预清理;E8 介质检测只计数据 vdev;E9 zfs list 按 tab 解析。 |
+| S5 | **已修复**:删除的 (src,dst) 对的 offset 行修剪 + dstbase 快照回收(不再永久钉住 source 快照)。 |
+| S6/S7/S8 | **已修复**:文件 source 不打基线;Compare 对同 dst 活跃 sync 快速失败;destroy 退出码正确处理(单个 hold 不再阻塞清扫)。 |
+| L3-L9 | **已修复**:dst 根 symlink 拒绝(src 根警告);跨 OS target 分隔符归一 + hash 同步归一;Windows 目录链删除 RemoveDirectory 回退;Unix 间 target 原始字节传输;发送端 symlink 变化转黄;浏览器显示 symlink。L9 由失败容忍缓解(无专门降级)。 |
+| W6-W9 | W8 eager 溢出重建(10 分钟节流)、W9 mark 失败记 rescan **已修复**;W6(嵌套挂载点检测)**未做**——当前部署无嵌套 dataset,列为后续。 |
+| perf 一~四 | 部分完成:prune 空转门控(只在有进展的 pass 后跑)、sorted_read_dir 零分配排序已做;串行双树扫描、3×lstat、M 目录递归展开、map_entries 深拷贝、快照流式、delta 哈希、进度节流、统一介质并行度为**遗留优化项**(见 §8)。 |
+| C3 | **已修复(文档)**:system_design.md §9 如实记录事件路径读活树 + 守卫链语义、两档判等、回收站保留、基线交叉核对、peer_token。 |
+
 > 范围:全量源码 + `system_design.md`,基于 commit `d2f3688`。只评审,不改代码。
 > 方法:按 8 个维度(snapshot 机制 / fanotify / symlink / 引擎 / 状态与 API 层 / 写入中一致性 / 修复能力矩阵 / 性能)各由一个独立评审深读代码,产出的每条结论再由独立的"怀疑者"逐条对抗验证(读代码给行级证据),被证伪的结论已剔除或降级为其残余问题。共 68 条结论进入验证,3 条被证伪。
 > 行号基于评审时工作树。严重度:**Critical / High / Medium / Low**。
