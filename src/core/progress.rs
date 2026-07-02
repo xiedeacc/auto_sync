@@ -11,7 +11,11 @@ const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const EWMA_NEW_SAMPLE_PERCENT: u64 = 35;
 
 static TRANSFER_PROGRESS: OnceLock<Mutex<Option<TransferProgressState>>> = OnceLock::new();
-static SCAN_PROGRESS: OnceLock<Mutex<Option<ScanProgressState>>> = OnceLock::new();
+// Multiple tree walks can run at once on one machine (a local compare while a
+// peer-served walk or a sync's verify scan runs): each registers its own
+// entry instead of fighting over a single slot, so starting one walk cannot
+// blank another's progress display.
+static SCAN_PROGRESS: OnceLock<Mutex<Vec<ScanProgressState>>> = OnceLock::new();
 static PROGRESS_FILE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static SCAN_PROGRESS_FILE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -158,12 +162,9 @@ impl ScanProgressGuard {
         let mut progress = scan_progress_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        let Some(state) = progress.as_mut() else {
+        let Some(state) = progress.iter_mut().find(|state| state.token == self.token) else {
             return;
         };
-        if state.token != self.token {
-            return;
-        }
         state.current_path = current_path.to_string_lossy().to_string();
         state.entries_seen = entries_seen;
         let now = Instant::now();
@@ -196,14 +197,18 @@ impl Drop for ScanProgressGuard {
         let mut progress = scan_progress_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        if progress
-            .as_ref()
-            .is_some_and(|state| state.token == self.token)
-        {
-            *progress = None;
-            clear_scan_progress_file();
+        progress.retain(|state| state.token != self.token);
+        match latest_scan_state(&progress) {
+            Some(state) => write_scan_progress_file(&state.view()),
+            None => clear_scan_progress_file(),
         }
     }
+}
+
+/// The most recently updated of the registered walks (for the single-slot
+/// status-bar display and the progress file).
+fn latest_scan_state(progress: &[ScanProgressState]) -> Option<&ScanProgressState> {
+    progress.iter().max_by_key(|state| state.updated_at)
 }
 
 pub fn configure_progress_file(data_db: &Path) {
@@ -263,7 +268,7 @@ pub fn start_scan(root_path: &Path) -> ScanProgressGuard {
         .unwrap_or_else(|err| err.into_inner());
     let root_path = root_path.to_string_lossy().to_string();
     let (source_id, destination_id) = attribution();
-    *progress = Some(ScanProgressState {
+    let state = ScanProgressState {
         token,
         root_path: root_path.clone(),
         current_path: root_path,
@@ -274,10 +279,9 @@ pub fn start_scan(root_path: &Path) -> ScanProgressGuard {
         kind: if in_compare_context() { "compare" } else { "sync" }.to_string(),
         source_id,
         destination_id,
-    });
-    if let Some(state) = progress.as_ref() {
-        write_scan_progress_file(&state.view());
-    }
+    };
+    write_scan_progress_file(&state.view());
+    progress.push(state);
     ScanProgressGuard { token }
 }
 
@@ -364,23 +368,30 @@ pub fn current_scan_progress() -> Option<ScanProgressView> {
     let mut progress = scan_progress_lock()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    if let Some(state) = progress.as_ref() {
-        if state.updated_at.elapsed() > STALE_AFTER {
-            *progress = None;
-            clear_scan_progress_file();
-        } else {
-            return Some(state.view());
-        }
+    progress.retain(|state| state.updated_at.elapsed() <= STALE_AFTER);
+    if let Some(state) = latest_scan_state(&progress) {
+        return Some(state.view());
     }
     read_scan_progress_file()
+}
+
+/// Every live walk on this machine (compare, sync verify, peer-served), each
+/// attributed to its destination — the UI needs all of them, not just the
+/// most recent, to pin activity to the right rows.
+pub fn current_scan_progresses() -> Vec<ScanProgressView> {
+    let mut progress = scan_progress_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    progress.retain(|state| state.updated_at.elapsed() <= STALE_AFTER);
+    progress.iter().map(ScanProgressState::view).collect()
 }
 
 fn progress_lock() -> &'static Mutex<Option<TransferProgressState>> {
     TRANSFER_PROGRESS.get_or_init(|| Mutex::new(None))
 }
 
-fn scan_progress_lock() -> &'static Mutex<Option<ScanProgressState>> {
-    SCAN_PROGRESS.get_or_init(|| Mutex::new(None))
+fn scan_progress_lock() -> &'static Mutex<Vec<ScanProgressState>> {
+    SCAN_PROGRESS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn progress_file_lock() -> &'static Mutex<Option<PathBuf>> {

@@ -28,6 +28,11 @@ function scanReportKey(sourceId, destinationId) {
   return `${sourceId}|${destinationId}`;
 }
 
+// A pending compare whose report never arrives (consumed by a repair, or the
+// scan silently never started) must not pin the row's stop button forever:
+// once no compare walk has been visible for this long, give up on it.
+const SCAN_PENDING_GRACE_MS = 30000;
+
 // While a background scan is running, poll for its report (identified by a new
 // scanned_at) and surface it in the info panel when it completes.
 async function checkPendingScans() {
@@ -37,6 +42,12 @@ async function checkPendingScans() {
   checkingScans = true;
   try {
     for (const [key, info] of entries) {
+      const source = findSourceById(info.sourceId);
+      const dst = source
+        && (source.destinations || []).find((item) => item.id === info.destinationId);
+      if (source && dst && compareScanRunning(source, dst)) {
+        info.lastSeenRunning = Date.now();
+      }
       let report;
       try {
         report = await invoke("scan_report", {
@@ -44,6 +55,20 @@ async function checkPendingScans() {
           destinationId: info.destinationId,
         });
       } catch (_error) {
+        continue;
+      }
+      if (!report || !report.scanned_at || report.scanned_at === info.prev) {
+        const lastAlive = info.lastSeenRunning || info.startedAt || 0;
+        if (Date.now() - lastAlive > SCAN_PENDING_GRACE_MS) {
+          delete scanPending[key];
+          if (statusMessage.startsWith("Compare running")) {
+            setTransientMessage(
+              `Compare ${info.sourceId} -> ${info.destinationId} is no longer running`
+                + " (no new report was produced)",
+            );
+          }
+          updateDstControls();
+        }
         continue;
       }
       if (report && report.scanned_at && report.scanned_at !== info.prev) {
@@ -477,9 +502,10 @@ function dstActivity(source, dst) {
   if (!runtime) {
     return { active: false, scope: null };
   }
-  const scan = runtime.scan;
-  if (scan && scan.source_id === source.id && scan.destination_id === dst.id) {
-    return { active: true, scope: scan.kind === "compare" ? "compare" : "sync" };
+  for (const scan of runtimeScans(runtime)) {
+    if (scan.source_id === source.id && scan.destination_id === dst.id) {
+      return { active: true, scope: scan.kind === "compare" ? "compare" : "sync" };
+    }
   }
   const transfer = runtime.transfer;
   if (
@@ -490,6 +516,30 @@ function dstActivity(source, dst) {
     return { active: true, scope: "sync" };
   }
   return { active: false, scope: null };
+}
+
+// Every live walk on a runtime: newer daemons report all concurrent walks in
+// `scans`; fall back to the single `scan` slot for older peers.
+function runtimeScans(runtime) {
+  if (!runtime) {
+    return [];
+  }
+  if (Array.isArray(runtime.scans) && runtime.scans.length) {
+    return runtime.scans;
+  }
+  return runtime.scan ? [runtime.scan] : [];
+}
+
+// True while a compare walk for this destination is visible on the source's
+// execution machine (used to detect a pending compare that silently ended).
+function compareScanRunning(source, dst) {
+  const runtime = activityRuntime(activityForSource(source), source);
+  return runtimeScans(runtime).some(
+    (scan) =>
+      scan.kind === "compare"
+      && scan.source_id === source.id
+      && scan.destination_id === dst.id,
+  );
 }
 
 // While a destination has a running task, its delete button gives way to a
@@ -1147,6 +1197,8 @@ function renderSyncRows(source, group) {
             sourceId: source.id,
             destinationId: dst.id,
             prev: (previous && previous.scanned_at) || "",
+            startedAt: Date.now(),
+            lastSeenRunning: Date.now(),
           };
           if (previous) {
             scanReports[key] = previous;
@@ -2022,11 +2074,15 @@ function renderDestinationLogModal() {
   const activity = activityForSource(source);
   const runtime = activityRuntime(activity, source);
   const transfer = matchingTransfer(runtime, dst);
-  // Scan progress is tagged by kind; the Compare view (the only consumer of
-  // `scan` here) must not display a concurrent sync's tree walk. A missing
-  // kind (older peer build) keeps the legacy shared behavior.
-  const rawScan = runtime && runtime.scan;
-  const scan = rawScan && rawScan.kind === "sync" ? null : rawScan;
+  // Pick this destination's own compare walk from the live list; a walk
+  // without attribution (older peer build) is accepted as long as it is not
+  // tagged as a sync's tree walk.
+  const scan = runtimeScans(runtime).find(
+    (item) =>
+      item.kind !== "sync"
+      && (!item.source_id || item.source_id === source.id)
+      && (!item.destination_id || item.destination_id === dst.id),
+  ) || null;
   const rows = [
     ["Task", `${source.id} -> ${dst.id}`],
     ["Source Path", machinePathLabel(source.machine_id, source.src)],

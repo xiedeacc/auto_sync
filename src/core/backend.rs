@@ -19,7 +19,7 @@ use crate::core::machines::{
 };
 use crate::core::progress::{
     ScanProgressView, TransferProgressView, configure_progress_file, current_scan_progress,
-    current_transfer_progress,
+    current_scan_progresses, current_transfer_progress,
 };
 use crate::core::cancel;
 use crate::core::state::{DestinationView, ScanReport, State as DbState};
@@ -168,6 +168,7 @@ impl Backend {
             sync_kind: current_sync_kind(),
             transfer: current_transfer_progress(),
             scan: current_scan_progress(),
+            scans: current_scan_progresses(),
             build: BuildInfo::current(),
             config_errors: current_config_warnings(),
             status_epoch: crate::core::peer_notify::status_epoch(),
@@ -908,7 +909,12 @@ pub struct RuntimeStatus {
     #[serde(default)]
     pub sync_kind: Option<String>,
     pub transfer: Option<TransferProgressView>,
+    /// The most recently updated walk (single-slot status-bar display).
     pub scan: Option<ScanProgressView>,
+    /// Every live walk, each attributed to its destination — concurrent walks
+    /// (a compare while a peer-served or verify walk runs) all stay visible.
+    #[serde(default)]
+    pub scans: Vec<ScanProgressView>,
     pub build: BuildInfo,
     #[serde(default)]
     pub config_errors: Vec<String>,
