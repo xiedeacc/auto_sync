@@ -33,7 +33,7 @@ use crate::core::sync::{
     transfer_finish_file, transfer_path_info, transfer_prepare_dir, transfer_prepare_dirs,
     transfer_push_file, transfer_put_file, transfer_receive_file_chunk, transfer_receive_symlink,
     transfer_remove_path, transfer_remove_paths, transfer_set_dir_mtimes, transfer_set_modes,
-    transfer_snapshot, transfer_snapshot_paths,
+    transfer_snapshot, transfer_snapshot_paths, transfer_snapshot_stream,
 };
 
 /// Peer-only surface: these endpoints write/delete under destination roots
@@ -94,6 +94,10 @@ pub fn router(backend: Backend) -> Router {
             post(api_dismiss_restart_notice),
         )
         .route("/api/transfer/snapshot", post(api_transfer_snapshot))
+        .route(
+            "/api/transfer/snapshot-stream",
+            post(api_transfer_snapshot_stream),
+        )
         .route(
             "/api/transfer/snapshot-paths",
             post(api_transfer_snapshot_paths),
@@ -464,6 +468,35 @@ async fn api_transfer_snapshot(
     Json(req): Json<TransferSnapshotRequest>,
 ) -> Result<Json<Vec<SnapshotEntry>>, ApiError> {
     blocking(move || Ok(Json(transfer_snapshot(req)?))).await
+}
+
+/// Streaming variant of [`api_transfer_snapshot`]: NDJSON, one entry per
+/// line, produced while the walk runs — the server never buffers the whole
+/// manifest. The final line is a `__status__` marker; the requester must not
+/// trust the manifest without an ok (the 200 here predates the walk result).
+async fn api_transfer_snapshot_stream(Json(req): Json<TransferSnapshotRequest>) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::task::spawn_blocking(move || {
+        let data_tx = tx.clone();
+        let result = transfer_snapshot_stream(req, &mut move |buf: Vec<u8>| {
+            data_tx
+                .blocking_send(Ok(Bytes::from(buf)))
+                // A dropped receiver means the requester went away: abort the
+                // walk instead of scanning for nobody.
+                .map_err(|_| anyhow::anyhow!("snapshot stream requester disconnected"))
+        });
+        let status = crate::core::sync::SnapshotStreamStatus::from_result(&result);
+        let mut line = serde_json::to_vec(&status).unwrap_or_default();
+        line.push(b'\n');
+        let _ = tx.blocking_send(Ok(Bytes::from(line)));
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(axum::body::Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn api_transfer_snapshot_paths(

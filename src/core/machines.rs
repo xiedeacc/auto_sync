@@ -679,6 +679,311 @@ pub fn remote_post_bytes<T: DeserializeOwned>(
     serde_json::from_slice(&raw).context("failed to parse peer response")
 }
 
+/// POST a JSON request and stream the NDJSON response line by line through
+/// `on_line` (CR/LF stripped) instead of buffering the whole body. Whole-tree
+/// snapshot responses run to ~100MB of JSON — the buffered path holds all of
+/// it (plus the parsed value) in memory on the requesting side.
+pub fn remote_post_ndjson<B: Serialize>(
+    machine: &MachineConfig,
+    path: &str,
+    body: &B,
+    timeout: Duration,
+    on_line: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let body = serde_json::to_vec(body).context("failed to serialize peer request")?;
+    let key = TcpConnectionKey {
+        host: machine.host.trim().to_ascii_lowercase(),
+        port: machine.port,
+    };
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..2 {
+        let (mut stream, reused) = if attempt == 0 {
+            take_tcp_connection(&key, timeout)?
+        } else {
+            (open_tcp_connection(&key, timeout)?, false)
+        };
+        let mut delivered = false;
+        match ndjson_request_on_stream(
+            &mut stream,
+            &machine.host,
+            machine.port,
+            path,
+            &body,
+            &mut delivered,
+            on_line,
+        ) {
+            Ok(reusable) => {
+                if reusable {
+                    return_tcp_connection(key, stream);
+                }
+                return Ok(());
+            }
+            // A stale pooled connection fails before any body bytes arrive;
+            // once lines were delivered a retry would duplicate them.
+            Err(err) if reused && attempt == 0 && !delivered => {
+                last_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("HTTP request failed")))
+}
+
+/// One streaming NDJSON request on an open connection. Returns whether the
+/// connection is reusable (response fully consumed, no `Connection: close`).
+fn ndjson_request_on_stream(
+    stream: &mut TcpStream,
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &[u8],
+    delivered: &mut bool,
+    on_line: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<bool> {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\nAccept: application/x-ndjson\r\nContent-Type: application/json\r\n"
+    );
+    let token = peer_token();
+    if !token.is_empty() {
+        request.push_str(&format!("{PEER_TOKEN_HEADER}: {token}\r\n"));
+    }
+    request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(body)?;
+
+    // Read headers; anything past the blank line is the first body bytes.
+    let mut raw = Vec::new();
+    let mut buf = [0_u8; 16 * 1024];
+    let split = loop {
+        if let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            break split;
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            bail!("peer closed connection before HTTP headers");
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if raw.len() > 128 * 1024 {
+            bail!("peer HTTP headers are too large");
+        }
+    };
+    let header_text = String::from_utf8_lossy(&raw[..split]).to_string();
+    let pending = raw[split + 4..].to_vec();
+    let mut lines = header_text.lines();
+    let status_line = lines.next().unwrap_or("").to_string();
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
+    let connection_close = headers
+        .iter()
+        .any(|(name, value)| name == "connection" && value.to_ascii_lowercase().contains("close"));
+    let chunked = headers.iter().any(|(name, value)| {
+        name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
+    });
+    let content_length: Option<usize> = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .and_then(|(_, value)| value.parse().ok());
+
+    if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+        // Collect a bounded error body for the same peer-error classification
+        // the buffered path provides.
+        let mut error_body = Vec::new();
+        let collect = &mut |chunk: &[u8]| -> Result<()> {
+            if error_body.len() < 64 * 1024 {
+                error_body.extend_from_slice(chunk);
+            }
+            Ok(())
+        };
+        if chunked {
+            stream_chunked_body(stream, pending, collect).ok();
+        } else if let Some(total) = content_length {
+            stream_sized_body(stream, pending, total, collect).ok();
+        }
+        let detail: String = String::from_utf8_lossy(&error_body)
+            .trim()
+            .chars()
+            .take(2048)
+            .collect();
+        if detail.is_empty() {
+            bail!("peer returned non-200 response: {}", status_line.trim());
+        }
+        bail!(
+            "peer returned non-200 response: {}: {detail}",
+            status_line.trim()
+        );
+    }
+
+    let mut splitter = NdjsonLineSplitter {
+        carry: Vec::new(),
+        on_line,
+    };
+    let sink = &mut |chunk: &[u8]| -> Result<()> {
+        if !chunk.is_empty() {
+            *delivered = true;
+        }
+        splitter.feed(chunk)
+    };
+    if chunked {
+        stream_chunked_body(stream, pending, sink)?;
+    } else if let Some(total) = content_length {
+        stream_sized_body(stream, pending, total, sink)?;
+    } else {
+        // No framing: read to EOF; the connection cannot be reused.
+        sink(&pending)?;
+        loop {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            sink(&buf[..n])?;
+        }
+        splitter.finish()?;
+        return Ok(false);
+    }
+    splitter.finish()?;
+    Ok(!connection_close)
+}
+
+struct NdjsonLineSplitter<'a> {
+    carry: Vec<u8>,
+    on_line: &'a mut dyn FnMut(&[u8]) -> Result<()>,
+}
+
+impl NdjsonLineSplitter<'_> {
+    fn feed(&mut self, chunk: &[u8]) -> Result<()> {
+        let joined;
+        let data: &[u8] = if self.carry.is_empty() {
+            chunk
+        } else {
+            joined = [self.carry.as_slice(), chunk].concat();
+            &joined
+        };
+        let mut start = 0;
+        while let Some(pos) = data[start..].iter().position(|&b| b == b'\n') {
+            let line = &data[start..start + pos];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            (self.on_line)(line)?;
+            start += pos + 1;
+        }
+        self.carry = data[start..].to_vec();
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.carry.is_empty() {
+            return Ok(());
+        }
+        let line = std::mem::take(&mut self.carry);
+        let trimmed = line.strip_suffix(b"\r").unwrap_or(&line);
+        (self.on_line)(trimmed)
+    }
+}
+
+/// Deliver a `Content-Length` body to `sink`, starting from the bytes already
+/// read past the headers.
+fn stream_sized_body<R: Read>(
+    stream: &mut R,
+    pending: Vec<u8>,
+    total: usize,
+    sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<usize> {
+    let mut consumed = 0;
+    if !pending.is_empty() {
+        let take = pending.len().min(total);
+        sink(&pending[..take])?;
+        consumed += take;
+    }
+    let mut buf = [0_u8; 16 * 1024];
+    while consumed < total {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            bail!("peer closed connection mid-body");
+        }
+        let take = n.min(total - consumed);
+        sink(&buf[..take])?;
+        consumed += take;
+    }
+    Ok(consumed)
+}
+
+/// Decode a `Transfer-Encoding: chunked` body incrementally, delivering
+/// payload bytes to `sink`. Consumes the terminating chunk and trailer so the
+/// connection stays reusable.
+fn stream_chunked_body<R: Read>(
+    stream: &mut R,
+    mut pending: Vec<u8>,
+    sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut buf = [0_u8; 16 * 1024];
+    let mut fill = |pending: &mut Vec<u8>, stream: &mut R| -> Result<()> {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            bail!("peer closed connection mid-chunked-body");
+        }
+        pending.extend_from_slice(&buf[..n]);
+        Ok(())
+    };
+    loop {
+        // Chunk-size line: hex size, optional extensions after ';'.
+        let line_end = loop {
+            if let Some(pos) = find_crlf(&pending) {
+                break pos;
+            }
+            if pending.len() > 16 * 1024 {
+                bail!("chunk-size line too large");
+            }
+            fill(&mut pending, stream)?;
+        };
+        let size_text = std::str::from_utf8(&pending[..line_end])
+            .context("invalid chunk-size line encoding")?;
+        let size_field = size_text.split(';').next().unwrap_or("").trim();
+        let size =
+            usize::from_str_radix(size_field, 16).context("invalid chunk size in response")?;
+        pending.drain(..line_end + 2);
+        if size == 0 {
+            // Trailer section: zero or more header lines, then an empty line.
+            loop {
+                let pos = loop {
+                    if let Some(pos) = find_crlf(&pending) {
+                        break pos;
+                    }
+                    fill(&mut pending, stream)?;
+                };
+                let empty = pos == 0;
+                pending.drain(..pos + 2);
+                if empty {
+                    return Ok(());
+                }
+            }
+        }
+        let mut remaining = size;
+        while remaining > 0 {
+            if pending.is_empty() {
+                fill(&mut pending, stream)?;
+            }
+            let take = remaining.min(pending.len());
+            sink(&pending[..take])?;
+            pending.drain(..take);
+            remaining -= take;
+        }
+        while pending.len() < 2 {
+            fill(&mut pending, stream)?;
+        }
+        if &pending[..2] != b"\r\n" {
+            bail!("malformed chunk terminator");
+        }
+        pending.drain(..2);
+    }
+}
+
+fn find_crlf(data: &[u8]) -> Option<usize> {
+    data.windows(2).position(|window| window == b"\r\n")
+}
+
 pub fn configure_tcp_connection_pool(max_idle: usize) {
     TCP_CONNECTION_POOL_LIMIT.store(max_idle, Ordering::Relaxed);
     if let Some(pool) = TCP_CONNECTION_POOL.get() {
@@ -1112,6 +1417,70 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn chunked_body_decodes_across_read_boundaries() {
+        // "hello " (6) + "world" (5) split so chunk headers and payloads
+        // straddle the initial pending buffer and later reads.
+        let wire = b"6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n";
+        for split in 0..wire.len() {
+            let pending = wire[..split].to_vec();
+            let mut rest = std::io::Cursor::new(wire[split..].to_vec());
+            let mut out = Vec::new();
+            stream_chunked_body(&mut rest, pending, &mut |chunk| {
+                out.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(out, b"hello world", "split at {split}");
+        }
+    }
+
+    #[test]
+    fn chunked_body_rejects_truncation() {
+        let wire = b"6\r\nhel";
+        let mut rest = std::io::Cursor::new(Vec::new());
+        let result = stream_chunked_body(&mut rest, wire.to_vec(), &mut |_| Ok(()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sized_body_delivers_exactly_content_length() {
+        let mut rest = std::io::Cursor::new(b"body-and-then-garbage".to_vec());
+        let mut out = Vec::new();
+        let consumed = stream_sized_body(&mut rest, Vec::new(), 4, &mut |chunk| {
+            out.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(consumed, 4);
+        assert_eq!(out, b"body");
+    }
+
+    #[test]
+    fn ndjson_lines_split_across_chunks() {
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        let mut on_line = |line: &[u8]| {
+            lines.push(line.to_vec());
+            Ok(())
+        };
+        let mut splitter = NdjsonLineSplitter {
+            carry: Vec::new(),
+            on_line: &mut on_line,
+        };
+        splitter.feed(b"{\"a\":1}\r\n{\"b\"").unwrap();
+        splitter.feed(b":2}\n").unwrap();
+        splitter.feed(b"{\"c\":3}").unwrap();
+        splitter.finish().unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                b"{\"a\":1}".to_vec(),
+                b"{\"b\":2}".to_vec(),
+                b"{\"c\":3}".to_vec()
+            ]
+        );
+    }
 
     #[test]
     fn merge_discovered_keeps_multiple_local_ids_by_host() {

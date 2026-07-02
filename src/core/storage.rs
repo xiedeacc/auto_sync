@@ -89,7 +89,7 @@ fn mount_for_path(mounts: &str, path: &Path) -> Option<(String, String)> {
 /// `/proc/self/mounts` octal-escapes spaces/tabs/newlines/backslashes
 /// (e.g. `\040` for a space).
 #[cfg(any(target_os = "linux", test))]
-fn unescape_mount_field(field: &str) -> String {
+pub(crate) fn unescape_mount_field(field: &str) -> String {
     let mut out = String::with_capacity(field.len());
     let mut chars = field.chars().peekable();
     while let Some(c) = chars.next() {

@@ -18,6 +18,34 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// Hasher for the weak-sum lookup map. The map is probed once per byte of the
+/// new file, so the default SipHash (DoS-hardened, ~10x slower for a 4-byte
+/// key) is pure overhead here: keys are already well-mixed 32-bit rolling
+/// checksums of file content, and a Fibonacci multiply spreads them across
+/// buckets. There is no adversarial-key concern — a delta either matches
+/// blocks or falls back to literals, and the whole-file hash is the backstop.
+#[derive(Default, Clone, Copy)]
+struct WeakKeyHasher(u64);
+
+impl std::hash::Hasher for WeakKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write_u32(&mut self, key: u32) {
+        self.0 = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Only u32 keys are ever hashed; keep a correct (if slow) fallback.
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+}
+
+type WeakSumMap = HashMap<u32, Vec<usize>, std::hash::BuildHasherDefault<WeakKeyHasher>>;
+
 /// rsync's default minimum block length.
 const BLOCK_SIZE: usize = 700;
 /// Cap on block length for very large files (rsync MAX_BLOCK_SIZE is 128 KiB).
@@ -153,7 +181,7 @@ pub fn build_delta(new_data: &[u8], sums: &BlockSums) -> Vec<u8> {
         return out;
     }
 
-    let mut map: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut map = WeakSumMap::default();
     for (idx, block) in sums.blocks.iter().enumerate() {
         map.entry(block.weak).or_default().push(idx);
     }

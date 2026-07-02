@@ -53,10 +53,6 @@ const DELTA_MAX_SIZE: u64 = 512 * 1024 * 1024;
 /// worker over budget waits until others release; a single request larger than
 /// the whole budget is still allowed to run alone so it cannot deadlock.
 const TRANSFER_MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
-/// When the destination is flash, wholesale subtree copies queue file entries
-/// and flush them through the parallel pool in batches of this size; the batch
-/// bounds memory while keeping the pool saturated between flush barriers.
-const WHOLESALE_PARALLEL_BATCH: usize = 1024;
 
 /// Serializes every run of the sync engine within a process. With the daemon,
 /// web server and (optional) desktop UI now sharing one process, the scheduled
@@ -531,7 +527,7 @@ pub fn scan_destination_now(
                     dst_machine_id,
                     &dst_machine,
                     &dst_root,
-                    std::slice::from_ref(&source_info.name),
+                    &diff_paths_all_recursive(std::slice::from_ref(&source_info.name)),
                     TransferSnapshotMode::Destination,
                     &[],
                     sync.checksum,
@@ -621,18 +617,7 @@ fn zfs_diff_compare(
     let Some(dst_changed) = zfs_diff_changed_paths_live(&dst_base, &dst_live_root) else {
         return Ok(None);
     };
-    let src_set: BTreeSet<String> = src_changed.into_iter().collect();
-    let mut union: BTreeSet<String> = src_set.clone();
-    union.extend(dst_changed.iter().cloned());
-    // Paths only the destination touched since its baseline are hard evidence
-    // that the destination was written; hash them on both sides regardless of
-    // the checksum setting so an in-place rewrite that restores size+mtime
-    // cannot clear itself.
-    let dst_only: Vec<String> = dst_changed
-        .into_iter()
-        .filter(|p| !src_set.contains(p))
-        .collect();
-    let paths: Vec<String> = union.into_iter().collect();
+    let (paths, dst_only) = diff_union_and_dst_only(src_changed, dst_changed);
     info!(
         source = source.id,
         destination = destination_id,
@@ -642,7 +627,7 @@ fn zfs_diff_compare(
         "compare served by zfs diff against verified baselines"
     );
     cancel::check()?;
-    let mut source_snapshot = take_snapshot_paths_with_excludes(
+    let mut source_snapshot = take_snapshot_diff_paths_with_excludes(
         &src_live_root,
         &paths,
         SnapshotMode::Source,
@@ -650,7 +635,7 @@ fn zfs_diff_compare(
         sync.checksum,
     )?;
     reject_dangerous_destination(&dst_live_root)?;
-    let mut dst_snapshot = take_snapshot_paths_with_excludes(
+    let mut dst_snapshot = take_snapshot_diff_paths_with_excludes(
         &dst_live_root,
         &paths,
         SnapshotMode::Destination,
@@ -691,7 +676,7 @@ fn zfs_diff_compare(
 /// drives [`entries_match_with`] even outside checksum mode.
 fn add_hash_evidence(
     root: &Path,
-    rel_paths: &[String],
+    rel_paths: &[DiffPath],
     mode: SnapshotMode,
     excludes: &[PathBuf],
     entries: &mut Vec<SnapshotEntry>,
@@ -699,7 +684,7 @@ fn add_hash_evidence(
     if rel_paths.is_empty() {
         return Ok(());
     }
-    let hashed = take_snapshot_paths_with_excludes(root, rel_paths, mode, excludes, true)?;
+    let hashed = take_snapshot_diff_paths_with_excludes(root, rel_paths, mode, excludes, true)?;
     if hashed.is_empty() {
         return Ok(());
     }
@@ -985,6 +970,12 @@ pub struct TransferSnapshotPathsRequest {
     pub root: PathBuf,
     pub mode: TransferSnapshotMode,
     pub rel_paths: Vec<String>,
+    /// Subset of `rel_paths` that must NOT be recursed when they are
+    /// directories (`M`-only zfs-diff entries: the dir entry itself changed,
+    /// every changed child has its own path). Absent/empty from old senders —
+    /// everything then recurses, which is slower but always correct.
+    #[serde(default)]
+    pub non_recursive: Vec<String>,
     #[serde(default)]
     pub excludes: Vec<PathBuf>,
     #[serde(default)]
@@ -1299,15 +1290,104 @@ pub fn transfer_snapshot(req: TransferSnapshotRequest) -> Result<Vec<SnapshotEnt
     }
 }
 
+/// Terminal line of a streamed snapshot response: the walk's outcome arrives
+/// AFTER the entries (a 200 status was already sent when streaming began), so
+/// the requester must see an explicit ok before trusting the manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotStreamStatus {
+    #[serde(rename = "__status__")]
+    pub status: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+impl SnapshotStreamStatus {
+    pub fn from_result(result: &Result<()>) -> Self {
+        match result {
+            Ok(()) => Self {
+                status: "ok".to_string(),
+                message: String::new(),
+            },
+            Err(err) => Self {
+                status: "error".to_string(),
+                message: format!("{err:#}"),
+            },
+        }
+    }
+}
+
+/// Target size of one streamed NDJSON buffer handed to the HTTP layer.
+const SNAPSHOT_STREAM_BUFFER: usize = 48 * 1024;
+
+/// [`transfer_snapshot`] in streaming form: entries are serialized and handed
+/// to `sink` (one NDJSON line each, batched into ~48KB buffers) while the
+/// walk runs, so the serving peer never buffers the whole manifest or its
+/// JSON text. The caller appends the [`SnapshotStreamStatus`] line.
+pub fn transfer_snapshot_stream(
+    req: TransferSnapshotRequest,
+    sink: &mut dyn FnMut(Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    let _cancellable = cancel::begin_target(
+        snapshot_request_cancel_kind(&req.purpose),
+        snapshot_request_cancel_target(&req.scope),
+    );
+    let mut buf: Vec<u8> = Vec::with_capacity(SNAPSHOT_STREAM_BUFFER + 1024);
+    {
+        let mut emit = |entry: SnapshotEntry| -> Result<()> {
+            serde_json::to_writer(&mut buf, &entry)
+                .context("failed to serialize snapshot entry")?;
+            buf.push(b'\n');
+            if buf.len() >= SNAPSHOT_STREAM_BUFFER {
+                sink(std::mem::take(&mut buf))?;
+            }
+            Ok(())
+        };
+        match req.mode {
+            TransferSnapshotMode::Source => take_snapshot_with_excludes_streamed(
+                &req.root,
+                SnapshotMode::Source,
+                &req.excludes,
+                req.checksum,
+                &mut emit,
+            )?,
+            TransferSnapshotMode::Destination => {
+                reject_dangerous_destination(&req.root)?;
+                if req.root.exists() {
+                    take_snapshot_with_excludes_streamed(
+                        &req.root,
+                        SnapshotMode::Destination,
+                        &[],
+                        req.checksum,
+                        &mut emit,
+                    )?;
+                }
+            }
+        }
+    }
+    if !buf.is_empty() {
+        sink(buf)?;
+    }
+    Ok(())
+}
+
 pub fn transfer_snapshot_paths(req: TransferSnapshotPathsRequest) -> Result<Vec<SnapshotEntry>> {
     let _cancellable = cancel::begin_target(
         snapshot_request_cancel_kind(&req.purpose),
         snapshot_request_cancel_target(&req.scope),
     );
+    let non_recursive: BTreeSet<&str> = req.non_recursive.iter().map(String::as_str).collect();
+    let paths: Vec<DiffPath> = req
+        .rel_paths
+        .iter()
+        .map(|rel| DiffPath {
+            rel: rel.clone(),
+            recursive: !non_recursive.contains(rel.as_str()),
+        })
+        .collect();
     match req.mode {
-        TransferSnapshotMode::Source => take_snapshot_paths_with_excludes(
+        TransferSnapshotMode::Source => take_snapshot_diff_paths_with_excludes(
             &req.root,
-            &req.rel_paths,
+            &paths,
             SnapshotMode::Source,
             &req.excludes,
             req.checksum,
@@ -1317,9 +1397,9 @@ pub fn transfer_snapshot_paths(req: TransferSnapshotPathsRequest) -> Result<Vec<
             if !req.root.exists() {
                 return Ok(Vec::new());
             }
-            take_snapshot_paths_with_excludes(
+            take_snapshot_diff_paths_with_excludes(
                 &req.root,
-                &req.rel_paths,
+                &paths,
                 SnapshotMode::Destination,
                 &[],
                 req.checksum,
@@ -2377,12 +2457,15 @@ fn sync_cycle_for_source_inner(
                     let sync = effective_sync_config(cfg, dst);
                     let empty = Vec::new();
                     let rel_paths = paths_by_index.get(&dst_index).unwrap_or(&empty);
+                    // Watcher events carry no recursion info: treat every
+                    // path as a full subtree (a created/renamed directory's
+                    // children may not each have their own event).
                     match sync_endpoint_event_paths(
                         &live_source_endpoint,
                         &dst_endpoint,
                         &dst.id,
                         cycle.id,
-                        rel_paths,
+                        &diff_paths_all_recursive(rel_paths),
                         &[],
                         &source.excludes,
                         &sync,
@@ -2588,7 +2671,7 @@ fn sync_cycle_for_source_inner(
                                         "verified",
                                     )?;
                                     let touched: BTreeSet<String> =
-                                        rel_paths.iter().cloned().collect();
+                                        rel_paths.iter().map(|path| path.rel.clone()).collect();
                                     record_destination_verified_baselines(
                                         state,
                                         source,
@@ -2902,7 +2985,7 @@ fn full_zfs_diff_paths(
     destination_id: &str,
     zfs: &ZfsSnapshot,
     dst_root: &Path,
-) -> Result<Option<(Vec<String>, Vec<String>)>> {
+) -> Result<Option<(Vec<DiffPath>, Vec<DiffPath>)>> {
     let Some(src_base) = state.destination_verified_snapshot(&source.id, destination_id)? else {
         return Ok(None);
     };
@@ -2930,17 +3013,7 @@ fn full_zfs_diff_paths(
     let Some(dst_changed) = zfs_diff_changed_paths_live(&dst_base, &dst_live_root) else {
         return Ok(None);
     };
-    let src_set: BTreeSet<String> = src_changed.into_iter().collect();
-    let mut union: BTreeSet<String> = src_set.clone();
-    union.extend(dst_changed.iter().cloned());
-    // Paths only the destination touched are hard evidence of a dst-side
-    // write; the caller hashes them so a size+mtime-restoring rewrite cannot
-    // pass the comparison.
-    let dst_only: Vec<String> = dst_changed
-        .into_iter()
-        .filter(|p| !src_set.contains(p))
-        .collect();
-    Ok(Some((union.into_iter().collect(), dst_only)))
+    Ok(Some(diff_union_and_dst_only(src_changed, dst_changed)))
 }
 
 fn cycle_has_remote_target(
@@ -3118,6 +3191,8 @@ fn sync_cycle_with_transfer(
                     };
                     let dst_root =
                         destination_root_for_source(source, &source_info, &dst.path, &dst_machine);
+                    // Watcher events carry no recursion info: treat every
+                    // path as a full subtree.
                     match sync_directory_event_paths_with_transfer(
                         source_machine_id,
                         &source_machine,
@@ -3127,7 +3202,7 @@ fn sync_cycle_with_transfer(
                         &dst_root,
                         &dst.id,
                         cycle.id,
-                        rel_paths,
+                        &diff_paths_all_recursive(rel_paths),
                         &source.excludes,
                         &sync,
                     ) {
@@ -3637,7 +3712,7 @@ fn sync_directory_event_paths_with_transfer(
     dst_root: &Path,
     destination_id: &str,
     cycle_id: i64,
-    rel_paths: &[String],
+    rel_paths: &[DiffPath],
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
 ) -> Result<()> {
@@ -3666,14 +3741,14 @@ fn sync_directory_event_paths_with_transfer(
         sync.checksum,
         timeout,
     )?;
-    let source_map = map_entries(&source_snapshot);
-    let dst_map = map_entries(&dst_snapshot);
+    let source_map = map_entry_refs(&source_snapshot);
+    let dst_map = map_entry_refs(&dst_snapshot);
 
     let mut remove_paths: Vec<String> = source_snapshot
         .iter()
         .filter(|entry| {
             dst_map
-                .get(&entry.rel_path)
+                .get(entry.rel_path.as_str())
                 .is_some_and(|existing| existing.file_type != entry.file_type)
         })
         .map(|entry| entry.rel_path.clone())
@@ -3686,11 +3761,12 @@ fn sync_directory_event_paths_with_transfer(
                 .filter(|rel| {
                     !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
                 })
-                .cloned(),
+                .map(|rel| rel.to_string()),
         );
-        for rel in rel_paths {
+        for path in rel_paths {
+            let rel = path.rel.as_str();
             if !source_map.contains_key(rel) && !is_rel_excluded(Path::new(rel), excludes) {
-                remove_paths.push(rel.clone());
+                remove_paths.push(rel.to_string());
             }
         }
     }
@@ -3728,7 +3804,7 @@ fn sync_directory_event_paths_with_transfer(
     let pending: Vec<(&SnapshotEntry, bool)> = source_snapshot
         .iter()
         .filter(|entry| entry.file_type == "file" || entry.file_type == "symlink")
-        .filter_map(|entry| match dst_map.get(&entry.rel_path) {
+        .filter_map(|entry| match dst_map.get(entry.rel_path.as_str()) {
             Some(existing) if entries_match_exact(entry, existing, sync) => None,
             Some(existing) => Some((entry, should_attempt_delta(entry, existing))),
             None => Some((entry, false)),
@@ -3736,7 +3812,7 @@ fn sync_directory_event_paths_with_transfer(
         .collect();
     let mode_fixes: Vec<TransferModeSpec> = source_snapshot
         .iter()
-        .filter_map(|entry| match dst_map.get(&entry.rel_path) {
+        .filter_map(|entry| match dst_map.get(entry.rel_path.as_str()) {
             Some(existing)
                 if entries_match_exact(entry, existing, sync)
                     && entry_mode_differs(entry, existing) =>
@@ -3939,14 +4015,14 @@ fn sync_file_with_transfer(
             sync.checksum,
             snapshot_timeout(sync),
         )?;
-        let dst_map = map_entries(&dst_snapshot);
-        let needs_copy = match dst_map.get(&entry.rel_path) {
+        let dst_map = map_entry_refs(&dst_snapshot);
+        let needs_copy = match dst_map.get(entry.rel_path.as_str()) {
             Some(existing) => !entries_match(entry, existing, sync),
             None => true,
         };
         if needs_copy {
             let mut use_delta = false;
-            if let Some(existing) = dst_map.get(&entry.rel_path) {
+            if let Some(existing) = dst_map.get(entry.rel_path.as_str()) {
                 if existing.file_type != entry.file_type {
                     remove_path_on_machine(
                         dst_machine_id,
@@ -3980,9 +4056,12 @@ fn sync_file_with_transfer(
     }
     // Verify just the transferred file paths instead of re-walking the whole
     // destination directory.
-    let rel_paths: Vec<String> = source_snapshot
+    let rel_paths: Vec<DiffPath> = source_snapshot
         .iter()
-        .map(|entry| entry.rel_path.clone())
+        .map(|entry| DiffPath {
+            rel: entry.rel_path.clone(),
+            recursive: true,
+        })
         .collect();
     let actual = snapshot_paths_on_machine(
         dst_machine_id,
@@ -4056,7 +4135,7 @@ fn snapshot_paths_on_machine(
     machine_id: &str,
     machine: &crate::core::config::MachineConfig,
     root: &Path,
-    rel_paths: &[String],
+    paths: &[DiffPath],
     mode: TransferSnapshotMode,
     excludes: &[PathBuf],
     checksum: bool,
@@ -4065,7 +4144,12 @@ fn snapshot_paths_on_machine(
     let req = TransferSnapshotPathsRequest {
         root: root.to_path_buf(),
         mode,
-        rel_paths: rel_paths.to_vec(),
+        rel_paths: diff_path_rels(paths),
+        non_recursive: paths
+            .iter()
+            .filter(|path| !path.recursive)
+            .map(|path| path.rel.clone())
+            .collect(),
         excludes: excludes.to_vec(),
         checksum,
         purpose: snapshot_purpose().to_string(),
@@ -4112,10 +4196,63 @@ fn remote_snapshot_with_progress(
             thread::sleep(Duration::from_millis(250));
         }
     });
-    let result = remote_post_json(machine, "/api/transfer/snapshot", req, timeout);
+    let result = remote_snapshot_streamed(machine, req, timeout).or_else(|err| {
+        // A peer without the streaming endpoint (mid-rollout mixed versions)
+        // answers 404/405; everything else — including a status-line error
+        // from a failed walk — must not trigger a second whole-tree walk.
+        if error_is_missing_endpoint(&err) {
+            remote_post_json(machine, "/api/transfer/snapshot", req, timeout)
+        } else {
+            Err(err)
+        }
+    });
     stop.store(true, Ordering::Relaxed);
     let _ = poller.join();
     result
+}
+
+fn error_is_missing_endpoint(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("non-200 response: HTTP/1.1 404")
+        || text.contains("non-200 response: HTTP/1.1 405")
+}
+
+/// Fetch a whole-tree snapshot via the peer's streaming NDJSON endpoint,
+/// parsing entries as they arrive instead of buffering ~100MB of JSON first.
+/// The trailing [`SnapshotStreamStatus`] line decides success: streaming
+/// starts before the peer's walk finishes, so transport-level 200 alone
+/// proves nothing.
+fn remote_snapshot_streamed(
+    machine: &crate::core::config::MachineConfig,
+    req: &TransferSnapshotRequest,
+    timeout: Duration,
+) -> Result<Vec<SnapshotEntry>> {
+    let mut entries = Vec::new();
+    let mut status: Option<SnapshotStreamStatus> = None;
+    crate::core::machines::remote_post_ndjson(
+        machine,
+        "/api/transfer/snapshot-stream",
+        req,
+        timeout,
+        &mut |line| {
+            if line.is_empty() {
+                return Ok(());
+            }
+            if let Ok(mark) = serde_json::from_slice::<SnapshotStreamStatus>(line) {
+                status = Some(mark);
+                return Ok(());
+            }
+            let entry: SnapshotEntry = serde_json::from_slice(line)
+                .context("failed to parse streamed snapshot entry")?;
+            entries.push(entry);
+            Ok(())
+        },
+    )?;
+    match status {
+        Some(mark) if mark.status == "ok" => Ok(entries),
+        Some(mark) => bail!("peer snapshot walk failed: {}", mark.message),
+        None => bail!("peer snapshot stream ended without a status line"),
+    }
 }
 
 fn prepare_dir_on_machine(
@@ -4595,6 +4732,11 @@ fn push_entries_parallel(
 /// failures are collected up to [`MAX_PER_FILE_TRANSFER_FAILURES`] so one bad
 /// file does not discard the progress of the rest of the batch. An aggregate
 /// transfer meter must already be active.
+///
+/// Parallelism is media-aware: parallel small-file writes pay off on flash
+/// but thrash rotational heads, so a destination detected as HDD runs the
+/// pool with one worker. Undetectable media keep the configured parallel
+/// default (local copy batches always ran parallel before detection existed).
 fn copy_entries_parallel(
     src_root: &Path,
     dst_root: &Path,
@@ -4610,7 +4752,11 @@ fn copy_entries_parallel(
             failed: Vec::new(),
         });
     }
-    let workers = resolve_parallelism(sync.max_parallel_transfers, entries.len());
+    let workers = if storage::path_is_rotational(dst_root) == Some(true) {
+        1
+    } else {
+        resolve_parallelism(sync.max_parallel_transfers, entries.len())
+    };
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
     let fatal_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
@@ -4706,10 +4852,10 @@ fn verify_snapshot_entries(
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
 ) -> Result<()> {
-    let expected = map_entries(expected);
-    let actual = map_entries(actual);
+    let expected = map_entry_refs(expected);
+    let actual = map_entry_refs(actual);
     for (rel, want) in &expected {
-        if ignored_paths.contains(rel) {
+        if ignored_paths.contains(*rel) {
             continue;
         }
         match actual.get(rel) {
@@ -4722,7 +4868,7 @@ fn verify_snapshot_entries(
     }
     if sync.mirror {
         for rel in actual.keys() {
-            if is_rel_excluded(Path::new(rel), excludes) || ignored_paths.contains(rel) {
+            if is_rel_excluded(Path::new(rel), excludes) || ignored_paths.contains(*rel) {
                 continue;
             }
             if !expected.contains_key(rel) {
@@ -4909,7 +5055,7 @@ fn zfs_diff_changed_paths(
     base_full_name: &str,
     new_full_name: &str,
     source_live_root: &Path,
-) -> Option<Vec<String>> {
+) -> Option<Vec<DiffPath>> {
     if base_full_name == new_full_name {
         return Some(Vec::new());
     }
@@ -4934,11 +5080,72 @@ fn zfs_diff_changed_paths(
     Some(parse_zfs_diff(&text, source_live_root))
 }
 
+/// One changed path from `zfs diff`, plus whether per-path snapshotting must
+/// recurse below it when it is a directory. `M` on a directory means only the
+/// directory entry itself changed (every changed child reports its own diff
+/// line), so M-dirs skip the subtree walk — recursing them turned "one file
+/// added to a big directory" into a walk of that whole directory. Created,
+/// deleted, and renamed directories carry their subtree implicitly (rename
+/// emits a single `R` line for the dir) and must recurse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffPath {
+    rel: String,
+    recursive: bool,
+}
+
+/// Wrap plain relative paths (watcher events, wire requests without recursion
+/// info) as fully recursive diff paths — the conservative, always-correct
+/// reading.
+fn diff_paths_all_recursive(rel_paths: &[String]) -> Vec<DiffPath> {
+    rel_paths
+        .iter()
+        .map(|rel| DiffPath {
+            rel: rel.clone(),
+            recursive: true,
+        })
+        .collect()
+}
+
+/// The relative paths of `paths`, for logging, wire requests and touched sets.
+fn diff_path_rels(paths: &[DiffPath]) -> Vec<String> {
+    paths.iter().map(|path| path.rel.clone()).collect()
+}
+
+/// Merge both sides' diff paths into one union (recursion flags OR-merged on
+/// collisions) and extract the destination-only subset. Paths only the
+/// destination touched since its baseline are hard evidence of a dst-side
+/// write; callers hash them on both sides regardless of the checksum setting
+/// so a size+mtime-restoring rewrite cannot clear itself.
+fn diff_union_and_dst_only(
+    src_changed: Vec<DiffPath>,
+    dst_changed: Vec<DiffPath>,
+) -> (Vec<DiffPath>, Vec<DiffPath>) {
+    let mut union: BTreeMap<String, bool> = src_changed
+        .into_iter()
+        .map(|path| (path.rel, path.recursive))
+        .collect();
+    let src_rels: BTreeSet<String> = union.keys().cloned().collect();
+    let mut dst_only = Vec::new();
+    for path in dst_changed {
+        if !src_rels.contains(&path.rel) {
+            dst_only.push(path.clone());
+        }
+        let slot = union.entry(path.rel).or_insert(path.recursive);
+        *slot |= path.recursive;
+    }
+    let union = union
+        .into_iter()
+        .map(|(rel, recursive)| DiffPath { rel, recursive })
+        .collect();
+    (union, dst_only)
+}
+
 /// Parse `zfs diff -H` output into source-relative paths. Each line is
 /// `<change>\t<path>` (or `R\t<old>\t<new>` for renames); paths are absolute
-/// under the dataset mountpoint and octal-escaped.
-fn parse_zfs_diff(output: &str, source_live_root: &Path) -> Vec<String> {
-    let mut paths = BTreeSet::new();
+/// under the dataset mountpoint and octal-escaped. A path reported under
+/// multiple change kinds keeps the stronger (recursive) reading.
+fn parse_zfs_diff(output: &str, source_live_root: &Path) -> Vec<DiffPath> {
+    let mut paths: BTreeMap<String, bool> = BTreeMap::new();
     for line in output.lines() {
         let mut fields = line.split('\t');
         let Some(change) = fields.next() else {
@@ -4947,6 +5154,7 @@ fn parse_zfs_diff(output: &str, source_live_root: &Path) -> Vec<String> {
         if !matches!(change, "-" | "+" | "M" | "R") {
             continue;
         }
+        let recursive = change != "M";
         for raw in fields {
             let abs = unescape_zfs_path(raw);
             if let Ok(rel) = Path::new(&abs).strip_prefix(source_live_root) {
@@ -4960,12 +5168,16 @@ fn parse_zfs_diff(output: &str, source_live_root: &Path) -> Vec<String> {
                     if rel_str_is_internal(&rel_str) {
                         continue;
                     }
-                    paths.insert(rel_str);
+                    let slot = paths.entry(rel_str).or_insert(recursive);
+                    *slot |= recursive;
                 }
             }
         }
     }
-    paths.into_iter().collect()
+    paths
+        .into_iter()
+        .map(|(rel, recursive)| DiffPath { rel, recursive })
+        .collect()
 }
 
 /// `zfs diff` escapes bytes outside the printable ASCII range as `\NNN` (three
@@ -5008,6 +5220,12 @@ fn resolve_zfs_dataset(source: &SourceGroupConfig) -> Result<ZfsDataset> {
             .path_in_dataset
             .clone()
             .unwrap_or_else(|| path_in_dataset(&source.src, &mountpoint).unwrap_or_default());
+        let live_root = if path_in_dataset.as_os_str().is_empty() {
+            mountpoint.clone()
+        } else {
+            mountpoint.join(&path_in_dataset)
+        };
+        ensure_no_nested_mounts(dataset, &live_root)?;
         return Ok(ZfsDataset {
             name: dataset.clone(),
             mountpoint,
@@ -5034,6 +5252,7 @@ fn resolve_zfs_dataset(source: &SourceGroupConfig) -> Result<ZfsDataset> {
     let Some((name, mountpoint)) = best else {
         bail!("source is not on a zfs dataset: {}", source_path.display());
     };
+    ensure_no_nested_mounts(&name, &source_path)?;
     let path_in_dataset = path_in_dataset(&source_path, &mountpoint)?;
     Ok(ZfsDataset {
         name,
@@ -5208,7 +5427,7 @@ fn snapshot_cycle_suffix_matches(name: &str, prefix: &str) -> bool {
 /// LIVE filesystem (`zfs diff -H <snapshot>` with no second argument diffs
 /// against the current state). Same contract as [`zfs_diff_changed_paths`]:
 /// `None` means "no reliable diff — fall back".
-fn zfs_diff_changed_paths_live(base_full_name: &str, live_root: &Path) -> Option<Vec<String>> {
+fn zfs_diff_changed_paths_live(base_full_name: &str, live_root: &Path) -> Option<Vec<DiffPath>> {
     let base_exists = Command::new("zfs")
         .args(["list", "-H", "-t", "snapshot", base_full_name])
         .stdout(Stdio::null())
@@ -5251,12 +5470,81 @@ fn resolve_dataset_for_path(path: &Path) -> Result<ZfsDataset> {
     let Some((name, mountpoint)) = best else {
         bail!("path is not on a zfs dataset: {}", canonical.display());
     };
+    ensure_no_nested_mounts(&name, &canonical)?;
     let path_in_dataset = path_in_dataset(&canonical, &mountpoint)?;
     Ok(ZfsDataset {
         name,
         mountpoint,
         path_in_dataset,
     })
+}
+
+/// Refuse ZFS snapshot/diff use when foreign filesystems are mounted inside
+/// the tree the dataset is expected to cover (W6): their contents belong to
+/// another filesystem, so this dataset's snapshots would read the subtree as
+/// missing (a snapshot-backed mirror would DELETE it on the destination) and
+/// `zfs diff` would never report its changes. Callers degrade to the live
+/// manifest walk, which sees through mount points.
+fn ensure_no_nested_mounts(dataset: &str, live_root: &Path) -> Result<()> {
+    let nested = nested_mounts_under(live_root);
+    if let Some(first) = nested.first() {
+        bail!(
+            "{} nested filesystem(s) mounted under {} (e.g. {}): their contents are invisible \
+             to snapshots and zfs diff of dataset {dataset}; unmount them or use the manifest \
+             backend for this tree",
+            nested.len(),
+            live_root.display(),
+            first.display()
+        );
+    }
+    Ok(())
+}
+
+/// Mount points strictly below `live_root`, read from `/proc/self/mounts`.
+/// ZFS `.zfs` control-dir automounts (visited snapshots) are not real
+/// nesting and are excluded.
+#[cfg(target_os = "linux")]
+fn nested_mounts_under(live_root: &Path) -> Vec<PathBuf> {
+    let Ok(canonical) = live_root.canonicalize() else {
+        return Vec::new();
+    };
+    let Ok(mounts) = fs::read_to_string("/proc/self/mounts") else {
+        return Vec::new();
+    };
+    nested_mounts_in(&mounts, &canonical)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nested_mounts_under(_live_root: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn nested_mounts_in(mounts: &str, canonical_root: &Path) -> Vec<PathBuf> {
+    let mut nested = Vec::new();
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(_device) = fields.next() else {
+            continue;
+        };
+        let Some(raw_mount) = fields.next() else {
+            continue;
+        };
+        let mount_point = PathBuf::from(crate::core::storage::unescape_mount_field(raw_mount));
+        if mount_point == canonical_root || !mount_point.starts_with(canonical_root) {
+            continue;
+        }
+        let Ok(rel) = mount_point.strip_prefix(canonical_root) else {
+            continue;
+        };
+        if rel.components().any(|c| c.as_os_str() == ".zfs") {
+            continue;
+        }
+        nested.push(mount_point);
+    }
+    nested.sort();
+    nested.dedup();
+    nested
 }
 
 /// Snapshot-name prefix for one (source, destination) pair's dst-side
@@ -5828,41 +6116,44 @@ fn sync_destination_fast_missing_dirs(
     })?;
     let result = (|| {
         let mut changing_paths = BTreeSet::new();
-        let mut copied_paths = BTreeSet::new();
         info!(
             destination = destination_id,
-            "reconcile: scanning destination tree"
+            "reconcile: scanning source and destination trees concurrently"
         );
-        let dst_snapshot =
-            take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
-        let dst_map = map_entries(&dst_snapshot);
-        info!(
-            destination = destination_id,
-            dst_entries = dst_snapshot.len(),
-            "reconcile: scanning source tree + copying missing dirs"
-        );
-        let mut source_snapshot = Vec::new();
-        // Total is unknown up front (scan and copy interleave); the meter still
-        // tracks throughput so the UI shows a live, non-zero transfer speed.
-        let transfer_guard = progress::begin_transfer(destination_id, dst_root, 0);
-        let mut wholesale_failed: Vec<(String, anyhow::Error)> = Vec::new();
-        collect_source_snapshot_copying_missing_dirs(
-            src_root,
-            dst_root,
-            destination_id,
-            cycle_id,
-            excludes,
-            sync,
-            &dst_map,
-            &mut source_snapshot,
-            &mut copied_paths,
-            &mut changing_paths,
-            &mut wholesale_failed,
-        )?;
-        let source_map = map_entries(&source_snapshot);
+        // The two trees are independent (typically different disks or pools):
+        // scanning them concurrently roughly halves the reconcile's dominant
+        // scan phase versus the old serial dst-then-src walk.
+        let cancel_token = cancel::current_token();
+        let (dst_result, source_result) = thread::scope(|scope| {
+            let src_handle = scope.spawn(|| {
+                let _cancel = cancel::enter(cancel_token.clone());
+                take_snapshot_with_excludes(src_root, SnapshotMode::Source, excludes, sync.checksum)
+            });
+            let dst_result =
+                take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum);
+            (
+                dst_result,
+                src_handle.join().expect("source scan thread panicked"),
+            )
+        });
+        let dst_snapshot = dst_result?;
+        let source_snapshot = source_result?;
+        let dst_map = map_entry_refs(&dst_snapshot);
+        let source_map = map_entry_refs(&source_snapshot);
 
+        // Everything this pass writes/removes/chmods, for the baseline
+        // refresh cross-check.
+        let mut touched: BTreeSet<String> = BTreeSet::new();
+
+        // Missing/blocked directories (snapshot order is breadth-first, so
+        // parents come before children). Directory mode is applied at
+        // end-of-cycle (deepest-first) so a read-only source dir does not
+        // block writing its children.
         for entry in source_snapshot.iter().filter(|e| e.file_type == "dir") {
-            if copied_paths.contains(&entry.rel_path) {
+            if dst_map
+                .get(entry.rel_path.as_str())
+                .is_some_and(|existing| existing.file_type == "dir")
+            {
                 continue;
             }
             let target = dst_root.join(&entry.rel_path);
@@ -5871,15 +6162,13 @@ fn sync_destination_fast_missing_dirs(
             }
             fs::create_dir_all(&target)
                 .with_context(|| format!("failed to create directory {}", target.display()))?;
-            // Directory mode is applied at end-of-cycle (deepest-first) so a
-            // read-only source dir does not block writing its children.
+            touched.insert(entry.rel_path.clone());
         }
 
         let to_copy: Vec<&SnapshotEntry> = source_snapshot
             .iter()
             .filter(|e| e.file_type == "file" || e.file_type == "symlink")
-            .filter(|e| !copied_paths.contains(&e.rel_path))
-            .filter(|e| match dst_map.get(&e.rel_path) {
+            .filter(|e| match dst_map.get(e.rel_path.as_str()) {
                 Some(existing) => !entries_match(e, existing, sync),
                 None => true,
             })
@@ -5887,44 +6176,46 @@ fn sync_destination_fast_missing_dirs(
         info!(
             destination = destination_id,
             source_entries = source_snapshot.len(),
+            dst_entries = dst_snapshot.len(),
             to_copy = to_copy.len(),
             "reconcile: copying changed/missing files"
         );
+        let total_bytes: u64 = to_copy
+            .iter()
+            .filter(|e| e.file_type == "file")
+            .map(|e| e.size.max(0) as u64)
+            .sum();
+        let transfer_guard = progress::begin_transfer(destination_id, dst_root, total_bytes);
         let outcome =
             copy_entries_parallel(src_root, dst_root, destination_id, cycle_id, &to_copy, sync)?;
         drop(transfer_guard);
+        touched.extend(to_copy.iter().map(|e| e.rel_path.clone()));
 
         // Content-equal files whose permission bits drifted: chmod in place.
-        let mut mode_fixed: Vec<String> = Vec::new();
-        for entry in source_snapshot
-            .iter()
-            .filter(|e| e.file_type == "file")
-            .filter(|e| !copied_paths.contains(&e.rel_path))
-        {
-            if let Some(existing) = dst_map.get(&entry.rel_path) {
+        for entry in source_snapshot.iter().filter(|e| e.file_type == "file") {
+            if let Some(existing) = dst_map.get(entry.rel_path.as_str()) {
                 if entries_match(entry, existing, sync) && entry_mode_differs(entry, existing) {
                     let path = safe_join_rel(dst_root, &entry.rel_path)?;
                     set_mode(&path, entry.mode)
                         .with_context(|| format!("failed to set mode on {}", entry.rel_path))?;
-                    mode_fixed.push(entry.rel_path.clone());
+                    touched.insert(entry.rel_path.clone());
                 }
             }
         }
 
-        let mut trashed: Vec<String> = Vec::new();
         if sync.mirror {
             let mut extra_paths: Vec<String> = dst_map
                 .keys()
                 .filter(|rel| {
                     !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
                 })
-                .cloned()
+                .map(|rel| rel.to_string())
                 .collect();
             extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
             for rel in extra_paths {
                 move_to_trash(dst_root, &rel, cycle_id)
                     .with_context(|| format!("failed to remove extra destination path {rel}"))?;
-                trashed.push(rel);
+                touched.insert(rel);
             }
         }
 
@@ -5933,27 +6224,16 @@ fn sync_destination_fast_missing_dirs(
             destination = destination_id,
             "reconcile: verifying copied entries"
         );
-        // Verify everything this cycle wrote: the bulk-copied missing subtrees
-        // and the changed-file batch. Untouched entries were compared against
-        // the fresh destination scan above.
+        // Verify everything this cycle wrote (the changed/missing batch,
+        // whole missing subtrees included). Untouched entries were compared
+        // against the fresh destination scan above.
         let mut ignored = outcome.unverifiable_paths();
         ignored.extend(changing_paths.iter().cloned());
-        ignored.extend(wholesale_failed.iter().map(|(path, _)| path.clone()));
-        let bulk_copied = source_snapshot
-            .iter()
-            .filter(|e| copied_paths.contains(&e.rel_path));
-        verify_copied_entries(
-            dst_root,
-            to_copy.iter().copied().chain(bulk_copied),
-            &ignored,
-            sync,
-        )?;
+        verify_copied_entries(dst_root, to_copy.iter().copied(), &ignored, sync)?;
         info!(destination = destination_id, "reconcile: verified ok");
         changing_paths.extend(outcome.changing.iter().cloned());
-        let mut all_failed = wholesale_failed;
-        all_failed.extend(outcome.failed);
-        let failed_count = all_failed.len();
-        if let Some((path, err)) = all_failed.into_iter().next() {
+        let failed_count = outcome.failed.len();
+        if let Some((path, err)) = outcome.failed.into_iter().next() {
             return Err(err.context(format!(
                 "{failed_count} file transfer(s) failed (first: {path})"
             )));
@@ -5961,12 +6241,6 @@ fn sync_destination_fast_missing_dirs(
         if !changing_paths.is_empty() {
             return Err(source_changing_error(&changing_paths));
         }
-        // Everything this pass wrote/removed/chmod'd, for the baseline
-        // refresh cross-check.
-        let mut touched = copied_paths;
-        touched.extend(to_copy.iter().map(|e| e.rel_path.clone()));
-        touched.extend(mode_fixed);
-        touched.extend(trashed);
         Ok((source_snapshot, touched))
     })();
     cleanup_tmp_cycle(dst_root, cycle_id);
@@ -5975,284 +6249,13 @@ fn sync_destination_fast_missing_dirs(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_source_snapshot_copying_missing_dirs(
-    src_root: &Path,
-    dst_root: &Path,
-    destination_id: &str,
-    cycle_id: i64,
-    excludes: &[PathBuf],
-    sync: &NativeSyncConfig,
-    dst_map: &BTreeMap<String, SnapshotEntry>,
-    source_snapshot: &mut Vec<SnapshotEntry>,
-    copied_paths: &mut BTreeSet<String>,
-    changing_paths: &mut BTreeSet<String>,
-    failed: &mut Vec<(String, anyhow::Error)>,
-) -> Result<()> {
-    let scan_progress = progress::start_scan(src_root);
-    let mut entries_seen = 0_u64;
-    let mut queue = VecDeque::from([src_root.to_path_buf()]);
-    while let Some(dir) = queue.pop_front() {
-        let mut children = sorted_read_dir(&dir)?;
-        for child in children.drain(..) {
-            if entry_is_excluded(src_root, &child, excludes) {
-                continue;
-            }
-            let rel = child
-                .strip_prefix(src_root)
-                .with_context(|| format!("failed to strip root from {}", child.display()))?;
-            let Ok(rel_path) = rel_to_string(rel) else {
-                warn!(path = %child.display(), "skipping entry with non-UTF-8 name");
-                continue;
-            };
-            entries_seen += 1;
-            let metadata = fs::symlink_metadata(&child)
-                .with_context(|| format!("failed to read metadata {}", child.display()))?;
-            let scan_path = if metadata.is_dir() {
-                child.as_path()
-            } else {
-                child.parent().unwrap_or(src_root)
-            };
-            scan_progress.update(scan_path, entries_seen);
-            let Some(entry) = snapshot_entry_if_supported(&child, rel_path.clone(), sync.checksum)?
-            else {
-                continue;
-            };
-            if entry.file_type == "dir"
-                && destination_subtree_missing_or_wrong_type(dst_map, &entry)
-            {
-                copy_missing_directory_tree(
-                    src_root,
-                    dst_root,
-                    destination_id,
-                    cycle_id,
-                    &child,
-                    &entry.rel_path,
-                    excludes,
-                    sync,
-                    source_snapshot,
-                    copied_paths,
-                    changing_paths,
-                    failed,
-                )?;
-                continue;
-            }
-            let is_dir = entry.file_type == "dir";
-            source_snapshot.push(entry);
-            if is_dir {
-                queue.push_back(child);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn destination_subtree_missing_or_wrong_type(
-    dst_map: &BTreeMap<String, SnapshotEntry>,
-    entry: &SnapshotEntry,
-) -> bool {
-    entry.file_type == "dir"
-        && !dst_map
-            .get(&entry.rel_path)
-            .is_some_and(|dst_entry| dst_entry.file_type == "dir")
-}
-
-#[allow(clippy::too_many_arguments)]
-fn copy_missing_directory_tree(
-    src_root: &Path,
-    dst_root: &Path,
-    destination_id: &str,
-    cycle_id: i64,
-    subtree_root: &Path,
-    subtree_rel: &str,
-    excludes: &[PathBuf],
-    sync: &NativeSyncConfig,
-    source_snapshot: &mut Vec<SnapshotEntry>,
-    copied_paths: &mut BTreeSet<String>,
-    changing_paths: &mut BTreeSet<String>,
-    failed: &mut Vec<(String, anyhow::Error)>,
-) -> Result<()> {
-    // Flash destinations take the parallel copy pool; rotational and
-    // undetectable media keep the sequential path (parallel small-file writes
-    // thrash HDD heads, and unknown must not regress the proven default).
-    let parallel_files = storage::path_is_rotational(dst_root) == Some(false);
-    let mut pending: Vec<SnapshotEntry> = Vec::new();
-    let mut dir_specs = Vec::new();
-    let mut queue = VecDeque::from([subtree_root.to_path_buf()]);
-    while let Some(dir) = queue.pop_front() {
-        let rel = dir
-            .strip_prefix(src_root)
-            .with_context(|| format!("failed to strip root from {}", dir.display()))?;
-        let rel_path = rel_to_string(rel)?;
-        if is_rel_excluded(Path::new(&rel_path), excludes) {
-            continue;
-        }
-        let Some(entry) = snapshot_entry_if_supported(&dir, rel_path.clone(), sync.checksum)?
-        else {
-            continue;
-        };
-        if entry.file_type != "dir" {
-            continue;
-        }
-        let target = dst_root.join(&entry.rel_path);
-        if path_blocks_directory(&target) {
-            move_to_trash(dst_root, &entry.rel_path, cycle_id)?;
-        }
-        fs::create_dir_all(&target)
-            .with_context(|| format!("failed to create directory {}", target.display()))?;
-        // Mode applied at end via set_dir_mtimes (deepest-first), after children.
-        copied_paths.insert(entry.rel_path.clone());
-        dir_specs.push(TransferDirSpec {
-            rel_path: entry.rel_path.clone(),
-            mode: entry.mode,
-            mtime_ns: entry.mtime_ns,
-        });
-        source_snapshot.push(entry);
-
-        let mut children = sorted_read_dir(&dir)?;
-        for child in children.drain(..) {
-            if entry_is_excluded(src_root, &child, excludes) {
-                continue;
-            }
-            let metadata = fs::symlink_metadata(&child)
-                .with_context(|| format!("failed to read metadata {}", child.display()))?;
-            if metadata.is_dir() {
-                queue.push_back(child);
-                continue;
-            }
-            let rel = child
-                .strip_prefix(src_root)
-                .with_context(|| format!("failed to strip root from {}", child.display()))?;
-            let Ok(rel_path) = rel_to_string(rel) else {
-                warn!(path = %child.display(), "skipping entry with non-UTF-8 name");
-                continue;
-            };
-            let Some(entry) = snapshot_entry_if_supported(&child, rel_path, sync.checksum)? else {
-                continue;
-            };
-            if parallel_files {
-                // Parents already exist: the BFS creates each directory when
-                // it is popped, before its children are enqueued.
-                copied_paths.insert(entry.rel_path.clone());
-                pending.push(entry);
-                if pending.len() >= WHOLESALE_PARALLEL_BATCH {
-                    flush_wholesale_copies(
-                        src_root,
-                        dst_root,
-                        destination_id,
-                        cycle_id,
-                        &mut pending,
-                        source_snapshot,
-                        changing_paths,
-                        failed,
-                        sync,
-                    )?;
-                }
-                continue;
-            }
-            if let Err(err) = copy_entry(src_root, dst_root, destination_id, cycle_id, &entry)
-                .with_context(|| format!("failed to copy {}", entry.rel_path))
-            {
-                let paths = source_changed_paths(&err);
-                if paths.is_empty() {
-                    // Tolerate up to the shared cap (one unreadable file must
-                    // not abort a first full sync of the whole tree); the
-                    // entry stays out of the manifest so verify skips it and
-                    // the next cycle retries just this file.
-                    warn!(
-                        rel_path = entry.rel_path,
-                        error = %err,
-                        "wholesale file copy failed; continuing with remaining files"
-                    );
-                    push_failure_capped(failed, entry.rel_path.clone(), err)?;
-                    copied_paths.insert(entry.rel_path.clone());
-                    continue;
-                }
-                changing_paths.extend(paths);
-            } else {
-                cancel::add_synced_files(1);
-            }
-            copied_paths.insert(entry.rel_path.clone());
-            source_snapshot.push(entry);
-        }
-    }
-    flush_wholesale_copies(
-        src_root,
-        dst_root,
-        destination_id,
-        cycle_id,
-        &mut pending,
-        source_snapshot,
-        changing_paths,
-        failed,
-        sync,
-    )?;
-    set_dir_mtimes(dst_root, &dir_specs)
-        .with_context(|| format!("failed to set directory mtimes for {subtree_rel}"))?;
-    Ok(())
-}
-
-/// Append a per-file failure, aborting only past the shared tolerance cap.
-fn push_failure_capped(
-    failed: &mut Vec<(String, anyhow::Error)>,
-    rel_path: String,
-    err: anyhow::Error,
-) -> Result<()> {
-    failed.push((rel_path, err));
-    if failed.len() >= MAX_PER_FILE_TRANSFER_FAILURES {
-        let (path, err) = failed.pop().expect("failure list cannot be empty at its cap");
-        return Err(err.context(format!(
-            "giving up after {MAX_PER_FILE_TRANSFER_FAILURES} file copy failures (last: {path})"
-        )));
-    }
-    Ok(())
-}
-
-/// Drains the wholesale-copy batch through the parallel pool. Source-changing
-/// entries and per-file hard failures are tolerated (collected for the
-/// caller, same contract as the main to_copy batch); only exceeding the
-/// shared failure cap aborts.
-#[allow(clippy::too_many_arguments)]
-fn flush_wholesale_copies(
-    src_root: &Path,
-    dst_root: &Path,
-    destination_id: &str,
-    cycle_id: i64,
-    pending: &mut Vec<SnapshotEntry>,
-    source_snapshot: &mut Vec<SnapshotEntry>,
-    changing_paths: &mut BTreeSet<String>,
-    failed: &mut Vec<(String, anyhow::Error)>,
-    sync: &NativeSyncConfig,
-) -> Result<()> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let refs: Vec<&SnapshotEntry> = pending.iter().collect();
-    let outcome = copy_entries_parallel(src_root, dst_root, destination_id, cycle_id, &refs, sync)?;
-    changing_paths.extend(outcome.changing);
-    let mut failed_rels: BTreeSet<String> = BTreeSet::new();
-    for (path, err) in outcome.failed {
-        failed_rels.insert(path.clone());
-        push_failure_capped(failed, path, err)?;
-    }
-    // Failed entries stay out of the manifest: they are not on the
-    // destination, so verify must not expect them and mirror must not act on
-    // them; the next cycle retries.
-    source_snapshot.extend(
-        pending
-            .drain(..)
-            .filter(|entry| !failed_rels.contains(&entry.rel_path)),
-    );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn sync_endpoint_event_paths(
     source: &SourceEndpoint,
     dst: &DestinationEndpoint,
     destination_id: &str,
     cycle_id: i64,
-    rel_paths: &[String],
-    force_hash_paths: &[String],
+    rel_paths: &[DiffPath],
+    force_hash_paths: &[DiffPath],
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
 ) -> Result<()> {
@@ -6306,8 +6309,8 @@ fn sync_destination_event_paths(
     dst_root: &Path,
     destination_id: &str,
     cycle_id: i64,
-    rel_paths: &[String],
-    force_hash_paths: &[String],
+    rel_paths: &[DiffPath],
+    force_hash_paths: &[DiffPath],
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
 ) -> Result<()> {
@@ -6321,14 +6324,14 @@ fn sync_destination_event_paths(
         )
     })?;
     let result = (|| {
-        let mut source_snapshot = take_snapshot_paths_with_excludes(
+        let mut source_snapshot = take_snapshot_diff_paths_with_excludes(
             src_root,
             rel_paths,
             SnapshotMode::Source,
             excludes,
             sync.checksum,
         )?;
-        let mut dst_snapshot = take_snapshot_paths_with_excludes(
+        let mut dst_snapshot = take_snapshot_diff_paths_with_excludes(
             dst_root,
             rel_paths,
             SnapshotMode::Destination,
@@ -6372,7 +6375,7 @@ fn sync_destination_event_paths(
         )?;
         drop(transfer_guard);
 
-        let mut actual = take_snapshot_paths_with_excludes(
+        let mut actual = take_snapshot_diff_paths_with_excludes(
             dst_root,
             rel_paths,
             SnapshotMode::Destination,
@@ -6405,21 +6408,21 @@ fn sync_changed_entries_local(
     dst_root: &Path,
     destination_id: &str,
     cycle_id: i64,
-    rel_paths: &[String],
+    rel_paths: &[DiffPath],
     source_snapshot: &[SnapshotEntry],
     dst_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
     changing_paths: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let source_map = map_entries(source_snapshot);
-    let dst_map = map_entries(dst_snapshot);
+    let source_map = map_entry_refs(source_snapshot);
+    let dst_map = map_entry_refs(dst_snapshot);
 
     let mut type_mismatch: Vec<String> = source_snapshot
         .iter()
         .filter(|entry| {
             dst_map
-                .get(&entry.rel_path)
+                .get(entry.rel_path.as_str())
                 .is_some_and(|existing| existing.file_type != entry.file_type)
         })
         .map(|entry| entry.rel_path.clone())
@@ -6442,7 +6445,7 @@ fn sync_changed_entries_local(
     let to_copy: Vec<&SnapshotEntry> = source_snapshot
         .iter()
         .filter(|e| e.file_type == "file" || e.file_type == "symlink")
-        .filter(|e| match dst_map.get(&e.rel_path) {
+        .filter(|e| match dst_map.get(e.rel_path.as_str()) {
             Some(existing) => !entries_match_exact(e, existing, sync),
             None => true,
         })
@@ -6461,7 +6464,7 @@ fn sync_changed_entries_local(
 
     // Content-equal files whose permission bits drifted: chmod in place.
     for entry in source_snapshot.iter() {
-        if let Some(existing) = dst_map.get(&entry.rel_path) {
+        if let Some(existing) = dst_map.get(entry.rel_path.as_str()) {
             if entries_match_exact(entry, existing, sync) && entry_mode_differs(entry, existing) {
                 let path = safe_join_rel(dst_root, &entry.rel_path)?;
                 set_mode(&path, entry.mode)
@@ -6481,14 +6484,15 @@ fn sync_changed_entries_local(
                     && !rel_str_is_internal(rel)
                     && !is_rel_excluded(Path::new(rel), excludes)
             })
-            .cloned()
+            .map(|rel| rel.to_string())
             .collect();
-        for rel in rel_paths {
+        for path in rel_paths {
+            let rel = path.rel.as_str();
             if !source_map.contains_key(rel)
                 && !rel_str_is_internal(rel)
                 && !is_rel_excluded(Path::new(rel), excludes)
             {
-                extra_paths.push(rel.clone());
+                extra_paths.push(rel.to_string());
             }
         }
         extra_paths.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
@@ -6603,12 +6607,27 @@ fn take_snapshot_with_excludes(
     checksum: bool,
 ) -> Result<Vec<SnapshotEntry>> {
     let mut entries = Vec::new();
+    take_snapshot_with_excludes_streamed(root, mode, excludes, checksum, &mut |entry| {
+        entries.push(entry);
+        Ok(())
+    })?;
+    Ok(entries)
+}
+
+/// Walk the tree and hand each entry to `sink` as it is produced, so callers
+/// that forward entries elsewhere (the streaming snapshot endpoint) never
+/// hold the whole manifest in memory.
+fn take_snapshot_with_excludes_streamed(
+    root: &Path,
+    mode: SnapshotMode,
+    excludes: &[PathBuf],
+    checksum: bool,
+    sink: &mut dyn FnMut(SnapshotEntry) -> Result<()>,
+) -> Result<()> {
     let scan_progress = progress::start_scan(root);
     let mut entries_seen = 0_u64;
-    for_each_breadth_first_snapshot_path(root, root, mode, excludes, |path| {
+    for_each_breadth_first_snapshot_path(root, root, mode, excludes, |path, metadata| {
         entries_seen += 1;
-        let metadata = fs::symlink_metadata(path)
-            .with_context(|| format!("failed to read metadata {}", path.display()))?;
         let scan_path = if metadata.is_dir() {
             path
         } else {
@@ -6619,35 +6638,60 @@ fn take_snapshot_with_excludes(
             .strip_prefix(root)
             .with_context(|| format!("failed to strip root from {}", path.display()))?;
         let rel_path = rel_to_string(rel)?;
-        if let Some(entry) = snapshot_entry_if_supported(path, rel_path, checksum)? {
-            entries.push(entry);
+        if let Some(entry) = snapshot_entry_from_metadata(path, rel_path, checksum, metadata)? {
+            sink(entry)?;
         }
         Ok(())
-    })?;
-    Ok(entries)
+    })
 }
 
-fn take_snapshot_paths_with_excludes(
+fn take_snapshot_diff_paths_with_excludes(
     root: &Path,
-    rel_paths: &[String],
+    paths: &[DiffPath],
     mode: SnapshotMode,
     excludes: &[PathBuf],
     checksum: bool,
 ) -> Result<Vec<SnapshotEntry>> {
+    // Sorted order groups every descendant right after its ancestor, so a
+    // single "covering" cursor suffices for the ancestor dedup below.
+    let mut sorted: Vec<&DiffPath> = paths.iter().collect();
+    sorted.sort_by(|a, b| a.rel.cmp(&b.rel).then(b.recursive.cmp(&a.recursive)));
     let mut entries = BTreeMap::new();
-    for rel_path in rel_paths {
+    // The last kept path whose subtree walk covers subsequent descendants.
+    let mut covering: Option<&str> = None;
+    for path in sorted {
         // Internal dirs (trash/tmp/probe) must never be snapshot targets on
         // either side: recursing them turns the recycle bin into "entries".
-        if rel_str_is_internal(rel_path) {
+        if rel_str_is_internal(&path.rel) {
             continue;
         }
-        let rel = normalize_rel_path(rel_path)?;
+        // Ancestor dedup: a recursive path's walk already visits its whole
+        // subtree; re-walking each listed descendant (e.g. every `+` line
+        // under a created directory) multiplies the IO by the tree depth.
+        if let Some(anc) = covering {
+            if path.rel.len() > anc.len()
+                && path.rel.as_bytes()[anc.len()] == b'/'
+                && path.rel.starts_with(anc)
+            {
+                continue;
+            }
+        }
+        covering = path.recursive.then_some(path.rel.as_str());
+        let rel = normalize_rel_path(&path.rel)?;
         if matches!(mode, SnapshotMode::Source) && is_rel_excluded(&rel, excludes) {
             continue;
         }
-        let path = root.join(&rel);
-        collect_snapshot_path(root, &path, mode, excludes, checksum, &mut entries)
-            .with_context(|| format!("failed to snapshot changed path {rel_path}"))?;
+        let abs = root.join(&rel);
+        collect_snapshot_path(
+            root,
+            &abs,
+            mode,
+            excludes,
+            checksum,
+            path.recursive,
+            &mut entries,
+        )
+        .with_context(|| format!("failed to snapshot changed path {}", path.rel))?;
     }
     Ok(entries.into_values().collect())
 }
@@ -6658,6 +6702,7 @@ fn collect_snapshot_path(
     mode: SnapshotMode,
     excludes: &[PathBuf],
     checksum: bool,
+    recursive: bool,
     entries: &mut BTreeMap<String, SnapshotEntry>,
 ) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
@@ -6668,10 +6713,30 @@ fn collect_snapshot_path(
         }
     };
 
-    if metadata.is_dir() {
+    if metadata.is_dir() && recursive {
+        // The walk below visits children only: record the directory entry
+        // itself too (an empty created directory otherwise never reaches the
+        // destination via diff/event paths).
+        if path != root {
+            let rel = path
+                .strip_prefix(root)
+                .with_context(|| format!("failed to strip root from {}", path.display()))?;
+            match rel_to_string(rel) {
+                Ok(rel_path) => {
+                    if let Some(entry) =
+                        snapshot_entry_from_metadata(path, rel_path, checksum, &metadata)?
+                    {
+                        entries.insert(entry.rel_path.clone(), entry);
+                    }
+                }
+                Err(_) => {
+                    warn!(path = %path.display(), "skipping entry with non-UTF-8 name");
+                }
+            }
+        }
         let scan_progress = progress::start_scan(path);
         let mut entries_seen = 0_u64;
-        for_each_breadth_first_snapshot_path(root, path, mode, excludes, |item_path| {
+        for_each_breadth_first_snapshot_path(root, path, mode, excludes, |item_path, item_meta| {
             entries_seen += 1;
             scan_progress.update(item_path, entries_seen);
             let rel = item_path
@@ -6681,7 +6746,7 @@ fn collect_snapshot_path(
                 warn!(path = %item_path.display(), "skipping entry with non-UTF-8 name");
                 return Ok(());
             };
-            if let Some(entry) = snapshot_entry_if_supported(item_path, rel_path, checksum)? {
+            if let Some(entry) = snapshot_entry_from_metadata(item_path, rel_path, checksum, item_meta)? {
                 entries.insert(entry.rel_path.clone(), entry);
             }
             Ok(())
@@ -6696,7 +6761,7 @@ fn collect_snapshot_path(
         warn!(path = %path.display(), "skipping entry with non-UTF-8 name");
         return Ok(());
     };
-    if let Some(entry) = snapshot_entry_if_supported(path, rel_path, checksum)? {
+    if let Some(entry) = snapshot_entry_from_metadata(path, rel_path, checksum, &metadata)? {
         entries.insert(entry.rel_path.clone(), entry);
     }
     Ok(())
@@ -6712,12 +6777,24 @@ fn snapshot_entry_if_supported(
     rel_path: String,
     checksum: bool,
 ) -> Result<Option<SnapshotEntry>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to read metadata {}", path.display()))?;
+    snapshot_entry_from_metadata(path, rel_path, checksum, &metadata)
+}
+
+/// [`snapshot_entry_if_supported`] for callers that already hold the entry's
+/// metadata (the tree walkers lstat each child to classify it): one lstat per
+/// entry instead of re-reading it here.
+fn snapshot_entry_from_metadata(
+    path: &Path,
+    rel_path: String,
+    checksum: bool,
+    metadata: &fs::Metadata,
+) -> Result<Option<SnapshotEntry>> {
     // Per-entry cancellation poll: a single flat directory can hold hundreds
     // of thousands of entries (worse in checksum mode, where each file is
     // fully re-hashed), so per-directory polling alone is not enough.
     cancel::check()?;
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to read metadata {}", path.display()))?;
     let file_type = if metadata.file_type().is_symlink() {
         "symlink"
     } else if metadata.is_dir() {
@@ -6736,8 +6813,8 @@ fn snapshot_entry_if_supported(
         rel_path,
         file_type: file_type.to_string(),
         size: metadata.len() as i64,
-        mtime_ns: metadata_mtime_ns(&metadata)?,
-        mode: metadata_mode(&metadata),
+        mtime_ns: metadata_mtime_ns(metadata)?,
+        mode: metadata_mode(metadata),
         hash,
     }))
 }
@@ -6756,13 +6833,13 @@ fn for_each_breadth_first_snapshot_path<F>(
     mut visit: F,
 ) -> Result<()>
 where
-    F: FnMut(&Path) -> Result<()>,
+    F: FnMut(&Path, &fs::Metadata) -> Result<()>,
 {
     let start_metadata = fs::symlink_metadata(start)
         .with_context(|| format!("failed to read metadata {}", start.display()))?;
     if !start_metadata.is_dir() {
         if start != root {
-            visit(start)?;
+            visit(start, &start_metadata)?;
         }
         return Ok(());
     }
@@ -6776,7 +6853,7 @@ where
             let metadata = fs::symlink_metadata(&child)
                 .with_context(|| format!("failed to read metadata {}", child.display()))?;
             let is_dir = metadata.is_dir();
-            visit(&child)?;
+            visit(&child, &metadata)?;
             if is_dir {
                 queue.push_back(child);
             }
@@ -7326,15 +7403,8 @@ fn ensure_source_stable(src: &Path, entry: &SnapshotEntry) -> Result<()> {
     Ok(())
 }
 
-fn map_entries(entries: &[SnapshotEntry]) -> BTreeMap<String, SnapshotEntry> {
-    entries
-        .iter()
-        .map(|entry| (entry.rel_path.clone(), entry.clone()))
-        .collect()
-}
-
-/// Borrowing variant of [`map_entries`] for read-only comparisons over large
-/// snapshots, avoiding a full deep copy of every entry.
+/// Relative-path index over a snapshot for read-only comparisons; borrows
+/// instead of deep-copying every entry (snapshots run to ~600K entries).
 fn map_entry_refs(entries: &[SnapshotEntry]) -> BTreeMap<&str, &SnapshotEntry> {
     entries
         .iter()
@@ -8781,7 +8851,7 @@ mod tests {
                       M\t/other/outside.jpg\n";
         let paths = parse_zfs_diff(output, root);
         assert_eq!(
-            paths,
+            diff_path_rels(&paths),
             vec![
                 "a.jpg".to_string(),
                 "from.jpg".to_string(),
@@ -8791,8 +8861,152 @@ mod tests {
                 "with space.jpg".to_string(),
             ]
         );
+        // M entries only re-examine the entry itself; +/-/R carry subtrees.
+        let recursion: Vec<bool> = paths.iter().map(|p| p.recursive).collect();
+        assert_eq!(recursion, vec![false, true, true, true, true, false]);
         // The dataset root itself and paths outside the source root are skipped.
-        assert!(!paths.iter().any(|p| p.contains("outside")));
+        assert!(!paths.iter().any(|p| p.rel.contains("outside")));
+    }
+
+    #[test]
+    fn zfs_diff_m_dir_listed_under_multiple_kinds_stays_recursive() {
+        let root = Path::new("/tank");
+        let output = "M\t/tank/dir\n+\t/tank/dir\n";
+        let paths = parse_zfs_diff(output, root);
+        assert_eq!(
+            paths,
+            vec![DiffPath {
+                rel: "dir".to_string(),
+                recursive: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_path_snapshot_skips_descendants_of_recursive_ancestors() {
+        let temp = std::env::temp_dir().join(format!("auto_sync_diff_dedup_{}", std::process::id()));
+        fs::create_dir_all(temp.join("new_dir/sub")).unwrap();
+        fs::write(temp.join("new_dir/a.txt"), b"a").unwrap();
+        fs::write(temp.join("new_dir/sub/b.txt"), b"b").unwrap();
+        fs::write(temp.join("touched.txt"), b"t").unwrap();
+        // Mirrors zfs diff output for a created dir: the dir (recursive) plus
+        // every child listed individually — the walk must not repeat per child.
+        let paths = vec![
+            DiffPath {
+                rel: "new_dir".to_string(),
+                recursive: true,
+            },
+            DiffPath {
+                rel: "new_dir/a.txt".to_string(),
+                recursive: true,
+            },
+            DiffPath {
+                rel: "new_dir/sub".to_string(),
+                recursive: true,
+            },
+            DiffPath {
+                rel: "new_dir/sub/b.txt".to_string(),
+                recursive: true,
+            },
+            DiffPath {
+                rel: "touched.txt".to_string(),
+                recursive: false,
+            },
+        ];
+        let entries = take_snapshot_diff_paths_with_excludes(
+            &temp,
+            &paths,
+            SnapshotMode::Destination,
+            &[],
+            false,
+        )
+        .unwrap();
+        let rels: Vec<&str> = entries.iter().map(|e| e.rel_path.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec![
+                "new_dir",
+                "new_dir/a.txt",
+                "new_dir/sub",
+                "new_dir/sub/b.txt",
+                "touched.txt"
+            ]
+        );
+        fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn diff_path_snapshot_m_dir_takes_only_the_dir_entry() {
+        let temp = std::env::temp_dir().join(format!("auto_sync_diff_mdir_{}", std::process::id()));
+        fs::create_dir_all(temp.join("big_dir")).unwrap();
+        fs::write(temp.join("big_dir/child.txt"), b"c").unwrap();
+        let paths = vec![DiffPath {
+            rel: "big_dir".to_string(),
+            recursive: false,
+        }];
+        let entries = take_snapshot_diff_paths_with_excludes(
+            &temp,
+            &paths,
+            SnapshotMode::Destination,
+            &[],
+            false,
+        )
+        .unwrap();
+        let rels: Vec<&str> = entries.iter().map(|e| e.rel_path.as_str()).collect();
+        assert_eq!(rels, vec!["big_dir"], "children have their own diff lines");
+        fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn snapshot_stream_roundtrips_entries_and_matches_buffered_walk() {
+        let temp = std::env::temp_dir().join(format!("auto_sync_snap_stream_{}", std::process::id()));
+        fs::create_dir_all(temp.join("dir")).unwrap();
+        fs::write(temp.join("dir/a.txt"), b"aaa").unwrap();
+        fs::write(temp.join("top.txt"), b"t").unwrap();
+
+        let req = TransferSnapshotRequest {
+            root: temp.clone(),
+            mode: TransferSnapshotMode::Destination,
+            excludes: Vec::new(),
+            checksum: true,
+            purpose: String::new(),
+            scope: String::new(),
+        };
+        let mut wire = Vec::new();
+        transfer_snapshot_stream(req.clone(), &mut |buf| {
+            wire.extend_from_slice(&buf);
+            Ok(())
+        })
+        .unwrap();
+        let streamed: Vec<SnapshotEntry> = wire
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let buffered = transfer_snapshot(req).unwrap();
+        assert_eq!(
+            serde_json::to_value(&streamed).unwrap(),
+            serde_json::to_value(&buffered).unwrap()
+        );
+        assert!(streamed.iter().any(|e| e.rel_path == "dir/a.txt"));
+        fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn nested_mounts_detection_flags_foreign_mounts_only() {
+        let mounts = "\
+zfs_pool/data /zfs zfs rw 0 0
+zfs_pool/nested /zfs/nested zfs rw 0 0
+tmpfs /zfs/scratch tmpfs rw 0 0
+zfs_pool/data@snap /zfs/.zfs/snapshot/snap zfs ro 0 0
+other /zfs_other zfs rw 0 0
+";
+        let nested = nested_mounts_in(mounts, Path::new("/zfs"));
+        assert_eq!(
+            nested,
+            vec![PathBuf::from("/zfs/nested"), PathBuf::from("/zfs/scratch")]
+        );
+        assert!(nested_mounts_in(mounts, Path::new("/zfs_other")).is_empty());
     }
 
     #[test]
@@ -8812,7 +9026,7 @@ mod tests {
                       M\t/zfs_pool/real_change.txt\n";
         let paths = parse_zfs_diff(output, root);
         assert_eq!(
-            paths,
+            diff_path_rels(&paths),
             vec!["gone.txt".to_string(), "real_change.txt".to_string()]
         );
 
@@ -8824,9 +9038,12 @@ mod tests {
         ));
         fs::create_dir_all(temp.join(INTERNAL_TRASH).join("29")).unwrap();
         fs::write(temp.join(INTERNAL_TRASH).join("29").join("f.txt"), b"x").unwrap();
-        let entries = take_snapshot_paths_with_excludes(
+        let entries = take_snapshot_diff_paths_with_excludes(
             &temp,
-            &[format!("{INTERNAL_TRASH}/29"), INTERNAL_TRASH.to_string()],
+            &diff_paths_all_recursive(&[
+                format!("{INTERNAL_TRASH}/29"),
+                INTERNAL_TRASH.to_string(),
+            ]),
             SnapshotMode::Destination,
             &[],
             false,

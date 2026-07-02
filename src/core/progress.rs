@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 const STALE_AFTER: Duration = Duration::from_secs(8);
 const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const EWMA_NEW_SAMPLE_PERCENT: u64 = 35;
+/// Minimum interval between scan-progress state updates. Tree walks call
+/// [`ScanProgressGuard::update`] once per entry; without a gate that is one
+/// global-mutex acquisition plus a path-string allocation per entry —
+/// measurable at multi-hundred-thousand-entry scans, and far above the rate
+/// any UI reader samples at.
+const SCAN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 static TRANSFER_PROGRESS: OnceLock<Mutex<Option<TransferProgressState>>> = OnceLock::new();
 // Multiple tree walks can run at once on one machine (a local compare while a
@@ -135,6 +141,10 @@ pub struct TransferProgressGuard {
 
 pub struct ScanProgressGuard {
     token: u64,
+    /// Per-guard throttle clock (guards are used by one walk thread at a
+    /// time); updates within [`SCAN_UPDATE_INTERVAL`] of the last one return
+    /// before touching the shared state.
+    last_update: std::cell::Cell<Instant>,
 }
 
 impl TransferProgressGuard {
@@ -159,6 +169,11 @@ impl TransferProgressGuard {
 
 impl ScanProgressGuard {
     pub fn update(&self, current_path: &Path, entries_seen: u64) {
+        let now = Instant::now();
+        if now.duration_since(self.last_update.get()) < SCAN_UPDATE_INTERVAL {
+            return;
+        }
+        self.last_update.set(now);
         let mut progress = scan_progress_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -287,7 +302,10 @@ pub fn start_scan(root_path: &Path) -> ScanProgressGuard {
     };
     write_scan_progress_file(&state.view());
     progress.push(state);
-    ScanProgressGuard { token }
+    ScanProgressGuard {
+        token,
+        last_update: std::cell::Cell::new(now),
+    }
 }
 
 /// Begin an aggregate transfer that accumulates bytes across many concurrent

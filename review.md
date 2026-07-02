@@ -4,7 +4,7 @@
 
 ## 0''. 修复状态(2026-07-03,第五轮修复后)
 
-本轮全部结论已按用户要求集中修复(commits `39deeed` → 修复完成),各编号现状:
+本轮全部结论已按用户要求集中修复(commits `39deeed` → 修复完成);2026-07-03 第二轮把先前遗留的性能项(§8)与 W6 也全部做完,各编号现状:
 
 | 编号 | 现状 |
 |---|---|
@@ -28,8 +28,8 @@
 | S5 | **已修复**:删除的 (src,dst) 对的 offset 行修剪 + dstbase 快照回收(不再永久钉住 source 快照)。 |
 | S6/S7/S8 | **已修复**:文件 source 不打基线;Compare 对同 dst 活跃 sync 快速失败;destroy 退出码正确处理(单个 hold 不再阻塞清扫)。 |
 | L3-L9 | **已修复**:dst 根 symlink 拒绝(src 根警告);跨 OS target 分隔符归一 + hash 同步归一;Windows 目录链删除 RemoveDirectory 回退;Unix 间 target 原始字节传输;发送端 symlink 变化转黄;浏览器显示 symlink。L9 由失败容忍缓解(无专门降级)。 |
-| W6-W9 | W8 eager 溢出重建(10 分钟节流)、W9 mark 失败记 rescan **已修复**;W6(嵌套挂载点检测)**未做**——当前部署无嵌套 dataset,列为后续。 |
-| perf 一~四 | 部分完成:prune 空转门控(只在有进展的 pass 后跑)、sorted_read_dir 零分配排序已做;串行双树扫描、3×lstat、M 目录递归展开、map_entries 深拷贝、快照流式、delta 哈希、进度节流、统一介质并行度为**遗留优化项**(见 §8)。 |
+| W6-W9 | W8 eager 溢出重建(10 分钟节流)、W9 mark 失败记 rescan **已修复**;W6 **已修复**(2026-07-03 第二轮):`/proc/self/mounts` 嵌套挂载检测接入 `resolve_zfs_dataset`/`resolve_dataset_for_path`(排除 `.zfs` 自动挂载),源/目的树下有外来挂载即拒绝 snapshot/diff 快路径,Auto 后端降级 manifest 活树读并告警。 |
+| perf 一~四 | **已全部完成**(2026-07-03 第二轮):本地 walk Full 双树并行扫描(批发拷贝机制并入统一介质感知拷贝池,copy_entries_parallel 检出 HDD 即单 worker);扫描流水线 3×lstat 合并为 1(walker 传递 metadata);zfs diff 的 M 目录不再递归展开(只取目录条目本身,+/-/R 保持递归)+ 并集祖先去重(递归祖先覆盖的子路径跳过重复走树);map_entries 深拷贝全部换成借用索引 map_entry_refs;跨机整树快照改 NDJSON 流式(双端不再整体缓冲 JSON,见 F7 行);delta 弱和查找表换 u32 专用 hasher(免 SipHash);扫描进度更新 100ms 节流(不再每条目抢锁)。附带修复:空目录经 diff/事件路径现在能同步到位(递归目录快照包含目录条目本身)。 |
 | C3 | **已修复(文档)**:system_design.md §9 如实记录事件路径读活树 + 守卫链语义、两档判等、回收站保留、基线交叉核对、peer_token。 |
 
 > 范围:全量源码 + `system_design.md`,基于 commit `d2f3688`。只评审,不改代码。
@@ -47,7 +47,7 @@
 | F4 | fsync 默认关闭 | **已修复**:`NativeSyncConfig::default` 现在 `fsync: true`(config.rs:258,注释 config.rs:82-89),每个 sync pass 重新应用配置,接收端启动时也应用;`finish_received_file` 的 fsync 失败不再被吞。旧记录已过时。 |
 | F5 | put-file/chunk 只校验 size | **已修复**(所有跨机路径 blake3 端到端)。 |
 | F6 | peer API 无鉴权 + body 无上限 | **未变**(用户接受的内网取舍)。但本轮发现一个**新派生面**:未认证 UDP 发现应答可污染持久配置(P5,见 §5)。 |
-| F7 | 整文件入内存 × 并发 | **部分修复**(1 GiB 内存预算);跨机整树快照仍是单块 JSON 双端整体缓冲(见 §8)。 |
+| F7 | 整文件入内存 × 并发 | **已修复**(2026-07-03 第二轮补完):1 GiB 内存预算 + 跨机整树快照改 NDJSON 流式(`/api/transfer/snapshot-stream`,服务端边走树边发不再持有整份清单/JSON,请求端逐行解析不再缓冲整个响应体;末行 `__status__` 标记决定成败;旧对端 404 时回退缓冲端点)。 |
 | F8 | watcher 单错误死亡(Linux) | **已修复**:fanotify per-source 监督循环,出错 5s 退避重启(fanotify.rs:146-170);单事件持久化失败 warn+skip 不再杀线程。残余:重启窗口不置 rescan(W3)。 |
 | F9 | handle_paths 只增不删 | **已修复**:删除/移出事件按路径前缀清理缓存(fanotify.rs:512-536、859-863)。残余:清理是 O(整个 map) retain 且缓存无上限(W7)。 |
 
