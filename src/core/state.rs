@@ -456,6 +456,19 @@ impl State {
             }
 
             if due_destinations.is_empty() {
+                // No destination is due, but accumulated events should still
+                // advance the source's cycle so the UI shows work piling up
+                // (e.g. "verified 6 / latest 9" on a Saturday-scheduled
+                // destination). Close WITHOUT setting any target: the actual
+                // transfer waits for the schedule, which then applies the
+                // whole event backlog across the skipped cycles. Debounced on
+                // event quiescence so a steady write burst does not mint a
+                // cycle every scheduler tick.
+                if open_has_events && self.source_events_quiesced(&source.id)? {
+                    if let Some(closed_cycle) = self.close_current_cycle_for_source(&source.id)? {
+                        closed.push(closed_cycle);
+                    }
+                }
                 continue;
             }
 
@@ -672,6 +685,16 @@ impl State {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// True when the source's newest event is old enough that the current
+    /// write burst has settled (or no event time is known). Used to debounce
+    /// closing target-less cycles for scheduled-only destinations.
+    fn source_events_quiesced(&self, source_id: &str) -> Result<bool> {
+        let quiescence = chrono::Duration::seconds(10);
+        Ok(self
+            .latest_event_observed_at(source_id)?
+            .is_none_or(|at| Utc::now() - at >= quiescence))
     }
 
     pub fn latest_event_observed_at(&self, source_id: &str) -> Result<Option<DateTime<Utc>>> {
@@ -1696,6 +1719,99 @@ mod tests {
             state.advance_due_destination_targets(&cfg).unwrap().len(),
             1
         );
+
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn events_close_the_cycle_even_when_no_destination_is_due() {
+        // A source whose only destination is on a far-off weekly schedule
+        // must still advance its cycle when events accumulate (the UI shows
+        // "latest" moving ahead of "verified"); the destination gets NO
+        // target — transfer waits for the schedule.
+        let temp = temp_dir("state_close_without_due_dst");
+        let db = temp.join("state.sqlite");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+
+        let far_weekday = (Utc::now() + chrono::Duration::try_days(3).unwrap())
+            .format("%A")
+            .to_string()
+            .to_lowercase();
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups = vec![SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src,
+            add_directory: true,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst,
+                enabled: true,
+                schedule: ScheduleConfig {
+                    mode: crate::core::config::ScheduleMode::Weekly,
+                    time: "19:00".to_string(),
+                    timezone: String::new(),
+                    weekday: Some(far_weekday),
+                    sync_current_cycle_manually: false,
+                },
+                sync: None,
+            }],
+        }];
+
+        let state = State::open(&db).unwrap();
+        state.ensure_config(&cfg).unwrap();
+        state.ensure_open_cycle("src_1", Utc::now()).unwrap();
+        // Not a first sync: the destination has verified cycle 1 already.
+        state
+            .upsert_destination_status("src_1", "dst_1", Some(1), "green", "verified")
+            .unwrap();
+
+        // No events: nothing closes.
+        assert!(
+            state
+                .advance_due_destination_targets(&cfg)
+                .unwrap()
+                .is_empty()
+        );
+
+        state
+            .record_event("src_1", 0, "modify", Some("file.txt"), false)
+            .unwrap();
+        // Burst not quiesced yet (event just landed): still nothing closes.
+        assert!(
+            state
+                .advance_due_destination_targets(&cfg)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Backdate the last-event marker past the quiescence window.
+        state
+            .conn
+            .execute(
+                "UPDATE source_meta SET last_event_observed_at=?1 WHERE source_id='src_1'",
+                params![(Utc::now() - chrono::Duration::try_seconds(30).unwrap()).to_rfc3339()],
+            )
+            .unwrap();
+
+        let closed = state.advance_due_destination_targets(&cfg).unwrap();
+        assert_eq!(closed.len(), 1, "cycle closes once events quiesce");
+        // The destination was NOT targeted: transfer waits for its schedule.
+        let offset = state.destination_offset("src_1", "dst_1").unwrap();
+        assert_eq!(offset.target_cycle_id, None);
+        // The source's latest cycle advanced past the destination's verified.
+        let latest = state.latest_closed_cycle_id("src_1").unwrap();
+        assert_eq!(latest, Some(closed[0].id));
 
         std::fs::remove_dir_all(temp).ok();
     }
