@@ -417,6 +417,15 @@ pub fn scan_destination_now(
     let _serialized = scan_gate()
         .try_lock()
         .map_err(|_| anyhow!("{SCAN_ALREADY_RUNNING}"))?;
+    // The mirror direction of the sync↔compare courtesy: the engine defers a
+    // destination while its compare runs; a compare STARTED mid-sync would
+    // read a half-updated tree and report transient false differences.
+    if cancel::kind_target_active(
+        cancel::KIND_SYNC,
+        &cancel::target_for(source_id, destination_id),
+    ) {
+        bail!("a sync for this destination is running; compare after it finishes");
+    }
     let _kind = set_sync_kind_if_empty("scan");
     let _cancellable = cancel::begin_target(
         cancel::KIND_COMPARE,
@@ -2359,7 +2368,12 @@ fn sync_cycle_for_source_inner(
         }
     }
 
-    let source_view = SourceReadView::prepare(source, &live_source_endpoint, cycle.id)?;
+    let source_view = SourceReadView::prepare(
+        source,
+        &live_source_endpoint,
+        cycle.id,
+        Some(cycle.starts_at.timestamp()),
+    )?;
     let source_endpoint = source_view.endpoint.clone();
 
     info!(
@@ -2629,12 +2643,11 @@ fn sync_cycle_for_source_inner(
                         .zfs_snapshot
                         .as_ref()
                         .map(|z| z.full_name.as_str()),
-                    match &dst_endpoint {
-                        DestinationEndpoint::Dir { root } if sync.zfs_diff => {
-                            DstBaselineAction::Refresh(root.as_path())
-                        }
-                        _ => DstBaselineAction::Clear,
-                    },
+                    // File sources have no zfs-diff consumer (the Compare and
+                    // Full fast paths require a directory source): a dst
+                    // baseline here would pin the destination dataset's whole
+                    // churn for nothing.
+                    DstBaselineAction::Clear,
                     cycle.id,
                 )?;
                 info!(
@@ -3123,7 +3136,12 @@ fn sync_cycle_with_transfer(
             root: source_info.base.clone(),
             add_directory: source.add_directory,
         };
-        Some(SourceReadView::prepare(source, &live_endpoint, cycle.id)?)
+        Some(SourceReadView::prepare(
+            source,
+            &live_endpoint,
+            cycle.id,
+            Some(cycle.starts_at.timestamp()),
+        )?)
     } else {
         None
     };
@@ -3203,14 +3221,22 @@ fn sync_cycle_with_transfer(
                                     "green",
                                     "verified",
                                 )?;
-                                // Remote destination: no local dst dataset to
-                                // baseline, so only the source base is kept.
+                                // A mixed cycle (some remote target) routes
+                                // ALL destinations through this path: a LOCAL
+                                // ZFS dst keeps its baseline exactly like the
+                                // local incremental (source-side-only pass →
+                                // Retain); clearing it here killed the
+                                // dual-side fast paths on every mixed cycle.
                                 record_destination_verified_baselines(
                                     state,
                                     source,
                                     &dst.id,
                                     Some(&zfs.full_name),
-                                    DstBaselineAction::Clear,
+                                    if dst_machine_id == "local" {
+                                        DstBaselineAction::Retain
+                                    } else {
+                                        DstBaselineAction::Clear
+                                    },
                                     cycle.id,
                                 )?;
                                 continue;
@@ -3314,14 +3340,21 @@ fn sync_cycle_with_transfer(
                     "verified",
                 )?;
                 // Record the base snapshot for the next zfs diff (or clear it
-                // for non-ZFS sources so no stale base lingers). The
-                // destination is remote here: no local dst baseline.
+                // for non-ZFS sources so no stale base lingers). A LOCAL dst
+                // in this mixed cycle just had whole-tree equality established
+                // by the full manifest pass, which is exactly what a baseline
+                // Refresh requires; only truly remote destinations have no
+                // local dataset to snapshot.
                 record_destination_verified_baselines(
                     state,
                     source,
                     &dst.id,
                     zfs_snapshot.map(|zfs| zfs.full_name.as_str()),
-                    DstBaselineAction::Clear,
+                    if dst_machine_id == "local" && sync.zfs_diff {
+                        DstBaselineAction::Refresh(&dst_root)
+                    } else {
+                        DstBaselineAction::Clear
+                    },
                     cycle.id,
                 )?;
             }
@@ -4671,6 +4704,7 @@ impl SourceReadView {
         source: &SourceGroupConfig,
         live_endpoint: &SourceEndpoint,
         cycle_id: i64,
+        cycle_starts_epoch: Option<i64>,
     ) -> Result<Self> {
         match source.snapshot.backend {
             SnapshotBackend::Manifest => Ok(Self {
@@ -4678,7 +4712,7 @@ impl SourceReadView {
                 zfs_snapshot: None,
             }),
             SnapshotBackend::Auto | SnapshotBackend::Zfs => {
-                match ZfsSnapshot::create(source, cycle_id) {
+                match ZfsSnapshot::create(source, cycle_id, cycle_starts_epoch) {
                     Ok(snapshot) => {
                         let endpoint = match live_endpoint {
                             SourceEndpoint::Dir { add_directory, .. } => SourceEndpoint::Dir {
@@ -4738,7 +4772,11 @@ struct ZfsSnapshot {
 }
 
 impl ZfsSnapshot {
-    fn create(source: &SourceGroupConfig, cycle_id: i64) -> Result<Self> {
+    fn create(
+        source: &SourceGroupConfig,
+        cycle_id: i64,
+        cycle_starts_epoch: Option<i64>,
+    ) -> Result<Self> {
         let dataset = resolve_zfs_dataset(source)?;
         let snapshot_id = format!(
             "{}_{}_{:012}",
@@ -4747,7 +4785,7 @@ impl ZfsSnapshot {
             cycle_id
         );
         let full_name = format!("{}@{}", dataset.name, snapshot_id);
-        ensure_zfs_snapshot(&full_name)?;
+        ensure_zfs_snapshot(&full_name, cycle_starts_epoch)?;
         let source_path = dataset
             .mountpoint
             .join(".zfs")
@@ -4938,14 +4976,17 @@ fn zfs_filesystems() -> Result<Vec<(String, PathBuf)>> {
     ]))?;
     let mut filesystems = Vec::new();
     for line in output.lines() {
-        let mut parts = line.split_whitespace();
+        // `-H` output is TAB-separated; splitting on whitespace truncated
+        // mountpoints containing spaces (and the truncation could then match
+        // an unrelated real directory).
+        let mut parts = line.split('\t');
         let Some(name) = parts.next() else {
             continue;
         };
         let Some(mountpoint) = parts.next() else {
             continue;
         };
-        if mountpoint == "-" {
+        if mountpoint == "-" || mountpoint.is_empty() {
             continue;
         }
         filesystems.push((name.to_string(), PathBuf::from(mountpoint)));
@@ -4963,16 +5004,37 @@ fn zfs_mountpoint(dataset: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(mountpoint))
 }
 
-fn ensure_zfs_snapshot(full_name: &str) -> Result<()> {
-    if Command::new("zfs")
-        .args(["list", "-H", "-t", "snapshot", full_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-    {
-        return Ok(());
+/// Ensure `full_name` exists, guarding snapshot IDENTITY: names embed only
+/// (prefix, source/pair, cycle id), and cycle ids restart from 1 when the
+/// state database is reset — a leftover same-name snapshot from an older
+/// database generation would otherwise be silently adopted as this cycle's
+/// read view, rolling the destination back to stale data under a green
+/// status. A snapshot created before `not_created_before` (unix seconds,
+/// minus clock slack) is destroyed and recreated; `None` keeps the plain
+/// reuse semantics (same-cycle retry).
+fn ensure_zfs_snapshot(full_name: &str, not_created_before: Option<i64>) -> Result<()> {
+    if let Ok(raw) = command_stdout(Command::new("zfs").args([
+        "get", "-Hp", "-o", "value", "creation", full_name,
+    ])) {
+        let created = raw.trim().parse::<i64>().unwrap_or(0);
+        // 5 minutes of slack: the cycle row and the snapshot are stamped by
+        // clocks that may disagree slightly.
+        let stale = not_created_before.is_some_and(|bound| created < bound - 300);
+        if !stale {
+            return Ok(());
+        }
+        warn!(
+            snapshot = full_name,
+            created,
+            "same-name snapshot predates its cycle (older database generation?); recreating"
+        );
+        let status = Command::new("zfs")
+            .args(["destroy", full_name])
+            .status()
+            .context("failed to execute zfs destroy")?;
+        if !status.success() {
+            bail!("zfs destroy failed for stale same-name snapshot {full_name}");
+        }
     }
     let status = Command::new("zfs")
         .args(["snapshot", full_name])
@@ -5009,7 +5071,7 @@ fn cleanup_zfs_snapshots(
     ]))?;
     let snapshots: Vec<_> = output
         .lines()
-        .filter(|name| name.starts_with(&prefix))
+        .filter(|name| snapshot_cycle_suffix_matches(name, &prefix))
         .map(str::to_string)
         .collect();
     // Always keep the most recent `keep_extra_cycles + 1` snapshots plus the
@@ -5018,6 +5080,7 @@ fn cleanup_zfs_snapshots(
     let keep = source.snapshot.keep_extra_cycles.saturating_add(1);
     let retain_recent = snapshots.len().saturating_sub(keep);
     let referenced: BTreeSet<&str> = referenced.iter().map(String::as_str).collect();
+    let mut failures = 0_usize;
     for (index, snapshot) in snapshots.iter().enumerate() {
         if index >= retain_recent {
             break;
@@ -5030,10 +5093,27 @@ fn cleanup_zfs_snapshots(
             .status()
             .with_context(|| format!("failed to execute zfs destroy {snapshot}"))?;
         if !status.success() {
-            bail!("zfs destroy failed for {snapshot}");
+            // One held/busy snapshot must not block reclaiming the rest —
+            // bailing here let a single user hold pin every later snapshot.
+            warn!(snapshot, "zfs destroy failed; continuing with remaining snapshots");
+            failures += 1;
         }
     }
+    if failures > 0 {
+        warn!(failures, "some superseded source snapshots could not be destroyed");
+    }
     Ok(())
+}
+
+/// `<dataset>@<prefix>` names match only when the remainder after `prefix` is
+/// exactly `_` + a 12-digit cycle number. A bare starts_with let source id
+/// "docs" reclaim "docs_old"'s snapshots (including diff bases another
+/// destination still referenced), and destination id "a" destroy the
+/// (src, "a_b") pair's current baseline.
+fn snapshot_cycle_suffix_matches(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .is_some_and(|digits| digits.len() == 12 && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Relative paths (under `live_root`) changed between a snapshot and the
@@ -5188,7 +5268,10 @@ fn create_dst_baseline_snapshot(
         dst_baseline_prefix(source, destination_id),
         cycle_id
     );
-    ensure_zfs_snapshot(&full_name)?;
+    // A baseline Refresh must capture THIS pass's verified state: any
+    // same-name snapshot older than moments ago is a stale leftover (e.g.
+    // from a previous database generation) and gets recreated.
+    ensure_zfs_snapshot(&full_name, Some(Utc::now().timestamp()))?;
     Ok(full_name)
 }
 
@@ -5214,12 +5297,21 @@ fn cleanup_dst_baseline_snapshots(
     ) else {
         return;
     };
-    for snapshot in output.lines().filter(|name| name.starts_with(&prefix)) {
+    for snapshot in output
+        .lines()
+        .filter(|name| snapshot_cycle_suffix_matches(name, &prefix))
+    {
         if Some(snapshot) == current {
             continue;
         }
-        if let Err(err) = Command::new("zfs").args(["destroy", snapshot]).status() {
-            debug!(snapshot, error = %err, "failed to destroy superseded dst baseline snapshot");
+        match Command::new("zfs").args(["destroy", snapshot]).status() {
+            Ok(status) if status.success() => {}
+            // Held/busy snapshots were silently treated as destroyed before;
+            // the next verified pass retries, but the leak must be visible.
+            Ok(_) => warn!(snapshot, "zfs destroy of superseded dst baseline failed"),
+            Err(err) => {
+                warn!(snapshot, error = %err, "failed to run zfs destroy for dst baseline");
+            }
         }
     }
 }
@@ -5542,6 +5634,7 @@ fn sync_destination_fast_missing_dirs(
         // Total is unknown up front (scan and copy interleave); the meter still
         // tracks throughput so the UI shows a live, non-zero transfer speed.
         let transfer_guard = progress::begin_transfer(destination_id, dst_root, 0);
+        let mut wholesale_failed: Vec<(String, anyhow::Error)> = Vec::new();
         collect_source_snapshot_copying_missing_dirs(
             src_root,
             dst_root,
@@ -5553,6 +5646,7 @@ fn sync_destination_fast_missing_dirs(
             &mut source_snapshot,
             &mut copied_paths,
             &mut changing_paths,
+            &mut wholesale_failed,
         )?;
         let source_map = map_entries(&source_snapshot);
 
@@ -5629,6 +5723,7 @@ fn sync_destination_fast_missing_dirs(
         // the fresh destination scan above.
         let mut ignored = outcome.unverifiable_paths();
         ignored.extend(changing_paths.iter().cloned());
+        ignored.extend(wholesale_failed.iter().map(|(path, _)| path.clone()));
         let bulk_copied = source_snapshot
             .iter()
             .filter(|e| copied_paths.contains(&e.rel_path));
@@ -5640,8 +5735,10 @@ fn sync_destination_fast_missing_dirs(
         )?;
         info!(destination = destination_id, "reconcile: verified ok");
         changing_paths.extend(outcome.changing.iter().cloned());
-        let failed_count = outcome.failed.len();
-        if let Some((path, err)) = outcome.failed.into_iter().next() {
+        let mut all_failed = wholesale_failed;
+        all_failed.extend(outcome.failed);
+        let failed_count = all_failed.len();
+        if let Some((path, err)) = all_failed.into_iter().next() {
             return Err(err.context(format!(
                 "{failed_count} file transfer(s) failed (first: {path})"
             )));
@@ -5668,6 +5765,7 @@ fn collect_source_snapshot_copying_missing_dirs(
     source_snapshot: &mut Vec<SnapshotEntry>,
     copied_paths: &mut BTreeSet<String>,
     changing_paths: &mut BTreeSet<String>,
+    failed: &mut Vec<(String, anyhow::Error)>,
 ) -> Result<()> {
     let scan_progress = progress::start_scan(src_root);
     let mut entries_seen = 0_u64;
@@ -5710,6 +5808,7 @@ fn collect_source_snapshot_copying_missing_dirs(
                     source_snapshot,
                     copied_paths,
                     changing_paths,
+                    failed,
                 )?;
                 continue;
             }
@@ -5746,6 +5845,7 @@ fn copy_missing_directory_tree(
     source_snapshot: &mut Vec<SnapshotEntry>,
     copied_paths: &mut BTreeSet<String>,
     changing_paths: &mut BTreeSet<String>,
+    failed: &mut Vec<(String, anyhow::Error)>,
 ) -> Result<()> {
     // Flash destinations take the parallel copy pool; rotational and
     // undetectable media keep the sequential path (parallel small-file writes
@@ -5816,6 +5916,7 @@ fn copy_missing_directory_tree(
                         &mut pending,
                         source_snapshot,
                         changing_paths,
+                        failed,
                         sync,
                     )?;
                 }
@@ -5826,7 +5927,18 @@ fn copy_missing_directory_tree(
             {
                 let paths = source_changed_paths(&err);
                 if paths.is_empty() {
-                    return Err(err);
+                    // Tolerate up to the shared cap (one unreadable file must
+                    // not abort a first full sync of the whole tree); the
+                    // entry stays out of the manifest so verify skips it and
+                    // the next cycle retries just this file.
+                    warn!(
+                        rel_path = entry.rel_path,
+                        error = %err,
+                        "wholesale file copy failed; continuing with remaining files"
+                    );
+                    push_failure_capped(failed, entry.rel_path.clone(), err)?;
+                    copied_paths.insert(entry.rel_path.clone());
+                    continue;
                 }
                 changing_paths.extend(paths);
             } else {
@@ -5844,6 +5956,7 @@ fn copy_missing_directory_tree(
         &mut pending,
         source_snapshot,
         changing_paths,
+        failed,
         sync,
     )?;
     set_dir_mtimes(dst_root, &dir_specs)
@@ -5851,10 +5964,26 @@ fn copy_missing_directory_tree(
     Ok(())
 }
 
+/// Append a per-file failure, aborting only past the shared tolerance cap.
+fn push_failure_capped(
+    failed: &mut Vec<(String, anyhow::Error)>,
+    rel_path: String,
+    err: anyhow::Error,
+) -> Result<()> {
+    failed.push((rel_path, err));
+    if failed.len() >= MAX_PER_FILE_TRANSFER_FAILURES {
+        let (path, err) = failed.pop().expect("failure list cannot be empty at its cap");
+        return Err(err.context(format!(
+            "giving up after {MAX_PER_FILE_TRANSFER_FAILURES} file copy failures (last: {path})"
+        )));
+    }
+    Ok(())
+}
+
 /// Drains the wholesale-copy batch through the parallel pool. Source-changing
-/// entries are tolerated (collected for the caller, like the sequential path);
-/// any hard failure aborts the subtree copy, matching the sequential path's
-/// fail-fast contract.
+/// entries and per-file hard failures are tolerated (collected for the
+/// caller, same contract as the main to_copy batch); only exceeding the
+/// shared failure cap aborts.
 #[allow(clippy::too_many_arguments)]
 fn flush_wholesale_copies(
     src_root: &Path,
@@ -5864,6 +5993,7 @@ fn flush_wholesale_copies(
     pending: &mut Vec<SnapshotEntry>,
     source_snapshot: &mut Vec<SnapshotEntry>,
     changing_paths: &mut BTreeSet<String>,
+    failed: &mut Vec<(String, anyhow::Error)>,
     sync: &NativeSyncConfig,
 ) -> Result<()> {
     if pending.is_empty() {
@@ -5872,13 +6002,19 @@ fn flush_wholesale_copies(
     let refs: Vec<&SnapshotEntry> = pending.iter().collect();
     let outcome = copy_entries_parallel(src_root, dst_root, destination_id, cycle_id, &refs, sync)?;
     changing_paths.extend(outcome.changing);
-    let failed_count = outcome.failed.len();
-    if let Some((path, err)) = outcome.failed.into_iter().next() {
-        return Err(err.context(format!(
-            "{failed_count} wholesale file copy(s) failed (first: {path})"
-        )));
+    let mut failed_rels: BTreeSet<String> = BTreeSet::new();
+    for (path, err) in outcome.failed {
+        failed_rels.insert(path.clone());
+        push_failure_capped(failed, path, err)?;
     }
-    source_snapshot.append(pending);
+    // Failed entries stay out of the manifest: they are not on the
+    // destination, so verify must not expect them and mirror must not act on
+    // them; the next cycle retries.
+    source_snapshot.extend(
+        pending
+            .drain(..)
+            .filter(|entry| !failed_rels.contains(&entry.rel_path)),
+    );
     Ok(())
 }
 
@@ -6549,7 +6685,9 @@ fn copy_file(
     if let Some(parent) = tmp.parent() {
         fs::create_dir_all(parent)?;
     }
-    if tmp.exists() {
+    // lstat: a leftover dangling symlink at the tmp path reports exists()=false
+    // but must still be removed, or the copy writes through the link target.
+    if tmp.exists() || fs::symlink_metadata(&tmp).is_ok() {
         remove_any(&tmp)?;
     }
     copy_file_with_progress(src, dst_root, destination_id, entry, &tmp)
@@ -6720,7 +6858,9 @@ fn copy_symlink(
     if let Some(parent) = tmp.parent() {
         fs::create_dir_all(parent)?;
     }
-    if tmp.exists() {
+    // lstat: a leftover dangling symlink at the tmp path reports exists()=false
+    // but must still be removed, or the copy writes through the link target.
+    if tmp.exists() || fs::symlink_metadata(&tmp).is_ok() {
         remove_any(&tmp)?;
     }
     create_symlink_kind(&target, &tmp, symlink_points_to_dir(src))

@@ -109,16 +109,26 @@ fn unescape_mount_field(field: &str) -> String {
     out
 }
 
-/// Physical device paths from `zpool list -vHP <pool>` output: tab-separated,
-/// vdev rows carry the device path (grouping rows like `mirror-0` are skipped).
+/// Physical DATA vdev device paths from `zpool list -vHP <pool>` output:
+/// tab-separated, vdev rows carry the device path (grouping rows like
+/// `mirror-0` are skipped). Auxiliary sections (cache/log/spare/special)
+/// terminate the scan — an HDD hot-spare must not mark an all-flash pool
+/// rotational.
 #[cfg(any(target_os = "linux", test))]
 fn parse_zpool_devices(output: &str) -> Vec<String> {
-    output
-        .lines()
-        .filter_map(|line| line.split('\t').find(|field| !field.is_empty()))
-        .filter(|name| name.starts_with("/dev/"))
-        .map(str::to_string)
-        .collect()
+    let mut devices = Vec::new();
+    for line in output.lines() {
+        let Some(name) = line.split('\t').find(|field| !field.is_empty()) else {
+            continue;
+        };
+        if matches!(name, "cache" | "logs" | "log" | "spares" | "spare" | "special" | "dedup") {
+            break;
+        }
+        if name.starts_with("/dev/") {
+            devices.push(name.to_string());
+        }
+    }
+    devices
 }
 
 /// Any rotational member makes the whole set rotational (a pool is only as
@@ -258,11 +268,17 @@ zfs_pool/data/deep /zfs_pool/deep zfs rw 0 0
 
     #[test]
     fn zpool_vdev_devices_parse() {
+        // The HDD spare and cache device must NOT count: only data vdevs
+        // decide whether parallel small-file writes are safe.
         let output = "\
 zfs_pool\t10.9T\t5.06T\t5.81T\t-\t-\t5%\t46%\t1.00x\tONLINE\t-
 \tmirror-0\t10.9T\t5.06T\t5.81T\t-\t-\t5%\t46.4%\t-\tONLINE
 \t\t/dev/sda1\t10.9T\t-\t-\t-\t-\t-\t-\t-\tONLINE
 \t\t/dev/sdb1\t10.9T\t-\t-\t-\t-\t-\t-\t-\tONLINE
+cache\t-\t-\t-\t-\t-\t-\t-\t-\t-
+\t/dev/nvme1n1\t512G\t-\t-\t-\t-\t-\t-\t-\tONLINE
+spare\t-\t-\t-\t-\t-\t-\t-\t-\t-
+\t/dev/sdz1\t10.9T\t-\t-\t-\t-\t-\t-\t-\tAVAIL
 ";
         assert_eq!(
             parse_zpool_devices(output),
