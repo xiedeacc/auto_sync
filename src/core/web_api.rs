@@ -98,50 +98,67 @@ pub fn router(backend: Backend) -> Router {
         .with_state(backend)
 }
 
-/// Serve the web API on each given address (typically the LAN IP plus
-/// loopback — deliberately NOT 0.0.0.0, so the port is not exposed on other
-/// interfaces such as VPN/WAN-facing ones). Addresses that fail to bind are
-/// logged and skipped as long as at least one listener comes up.
-pub async fn serve(backend: Backend, addrs: Vec<SocketAddr>) -> Result<()> {
+/// How often the LAN-address watcher re-detects the preferred local IP.
+const LAN_BIND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Serve the web API on loopback plus the detected LAN address — deliberately
+/// NOT 0.0.0.0, so the port is not exposed on other interfaces (VPN,
+/// WAN-facing NICs).
+///
+/// Loopback binds immediately. The LAN address is detected and bound by a
+/// watcher loop: at startup this usually binds it on the first pass, but it
+/// also covers a network that comes up AFTER the daemon (boot before DHCP
+/// finished) and a DHCP address change at runtime — the new address is bound
+/// within one poll interval, no restart needed. A listener on a since-removed
+/// address is harmless (it simply never receives connections), and peers learn
+/// the new address through discovery.
+pub async fn serve(backend: Backend, port: u16) -> Result<()> {
     let _discovery = spawn_discovery_responder(backend.config_path(), backend.port());
     let app = router(backend);
-    let mut listeners = Vec::new();
-    for addr in addrs {
-        if listeners
-            .iter()
-            .any(|(bound, _): &(SocketAddr, tokio::net::TcpListener)| *bound == addr)
-        {
-            continue;
-        }
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => {
-                let url = format!("http://{addr}/");
-                info!(url = %url, "auto_sync web listening");
-                println!("auto_sync Web UI: {url}");
-                listeners.push((addr, listener));
+
+    let loopback = SocketAddr::from(([127, 0, 0, 1], port));
+    let loopback_listener = tokio::net::TcpListener::bind(loopback)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to bind web listener on {loopback}: {err}"))?;
+    info!(url = %format!("http://{loopback}/"), "auto_sync web listening");
+
+    // LAN watcher: detect-then-bind, re-checked periodically.
+    let lan_app = app.clone();
+    tokio::spawn(async move {
+        let mut bound: Vec<std::net::IpAddr> = vec![loopback.ip()];
+        loop {
+            let host = crate::core::config::preferred_local_host();
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if !ip.is_loopback() && !bound.contains(&ip) {
+                    let addr = SocketAddr::new(ip, port);
+                    match tokio::net::TcpListener::bind(addr).await {
+                        Ok(listener) => {
+                            let url = format!("http://{addr}/");
+                            info!(url = %url, "auto_sync web listening");
+                            println!("auto_sync Web UI: {url}");
+                            bound.push(ip);
+                            let app = lan_app.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = axum::serve(listener, app).await {
+                                    tracing::warn!(%addr, error = %err, "LAN web listener stopped");
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            tracing::warn!(%addr, error = %err, "failed to bind LAN web listener; retrying");
+                        }
+                    }
+                }
             }
-            Err(err) => {
-                tracing::warn!(%addr, error = %err, "failed to bind web listener; skipping address");
-            }
+            tokio::time::sleep(LAN_BIND_POLL_INTERVAL).await;
         }
-    }
-    if listeners.is_empty() {
-        anyhow::bail!("no web listener could be bound");
-    }
-    let mut tasks = Vec::new();
-    for (_, listener) in listeners {
-        let app = app.clone();
-        tasks.push(tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await
-        }));
-    }
-    for task in tasks {
-        task.await??;
-    }
+    });
+
+    axum::serve(loopback_listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
     Ok(())
 }
 
