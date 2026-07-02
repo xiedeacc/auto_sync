@@ -2297,12 +2297,16 @@ fn sync_cycle_for_source_inner(
                                             "green",
                                             "verified",
                                         )?;
+                                        // Source-side pass only: the dst
+                                        // baseline must NOT be refreshed here
+                                        // (it would hide dst drift from
+                                        // future zfs-diff Compares/Fulls).
                                         record_destination_verified_baselines(
                                             state,
                                             source,
                                             &dst.id,
                                             Some(&zfs.full_name),
-                                            Some(dst_root),
+                                            DstBaselineAction::Retain,
                                             cycle.id,
                                         )?;
                                         continue;
@@ -2362,7 +2366,7 @@ fn sync_cycle_for_source_inner(
                                         source,
                                         &dst.id,
                                         Some(&zfs.full_name),
-                                        Some(dst_root),
+                                        DstBaselineAction::Refresh(dst_root),
                                         cycle.id,
                                     )?;
                                     continue;
@@ -2418,7 +2422,11 @@ fn sync_cycle_for_source_inner(
                                 .zfs_snapshot
                                 .as_ref()
                                 .map(|z| z.full_name.as_str()),
-                            if sync.zfs_diff { Some(dst_root) } else { None },
+                            if sync.zfs_diff {
+                                DstBaselineAction::Refresh(dst_root)
+                            } else {
+                                DstBaselineAction::Clear
+                            },
                             cycle.id,
                         )?;
                         info!(
@@ -2485,8 +2493,10 @@ fn sync_cycle_for_source_inner(
                         .as_ref()
                         .map(|z| z.full_name.as_str()),
                     match &dst_endpoint {
-                        DestinationEndpoint::Dir { root } if sync.zfs_diff => Some(root.as_path()),
-                        _ => None,
+                        DestinationEndpoint::Dir { root } if sync.zfs_diff => {
+                            DstBaselineAction::Refresh(root.as_path())
+                        }
+                        _ => DstBaselineAction::Clear,
                     },
                     cycle.id,
                 )?;
@@ -3055,7 +3065,7 @@ fn sync_cycle_with_transfer(
                                     source,
                                     &dst.id,
                                     Some(&zfs.full_name),
-                                    None,
+                                    DstBaselineAction::Clear,
                                     cycle.id,
                                 )?;
                                 continue;
@@ -3166,7 +3176,7 @@ fn sync_cycle_with_transfer(
                     source,
                     &dst.id,
                     zfs_snapshot.map(|zfs| zfs.full_name.as_str()),
-                    None,
+                    DstBaselineAction::Clear,
                     cycle.id,
                 )?;
             }
@@ -4882,28 +4892,54 @@ fn dst_baseline_prefix(source: &SourceGroupConfig, destination_id: &str) -> Stri
     )
 }
 
-/// Record BOTH verified baselines for a destination: the source-side ZFS
-/// snapshot (diff base for incremental syncs) and — when the source base
-/// exists and the destination root is a local ZFS path — a destination-side
-/// snapshot taken now, while dst content equals the source base. With both
-/// bases Compare can `zfs diff` each side against its base and examine only
-/// the changed paths instead of walking two whole trees. Baseline failures
-/// never fail the sync: the dst base is cleared and Compare falls back to
-/// the full walk.
+/// What a verifying pass may do to the DESTINATION-side baseline snapshot.
+/// The invariant every zfs-diff shortcut rests on: a stored dst baseline's
+/// content equals its paired source baseline's content ACROSS THE WHOLE
+/// TREE. Only passes that actually established whole-tree equality may
+/// refresh it — a source-side-only pass refreshing the dst baseline would
+/// bake any dst drift that happened since the previous baseline into the
+/// new one, permanently hiding it from future zfs-diff Compares/Fulls.
+enum DstBaselineAction<'a> {
+    /// This pass made dst equal the source base across the whole tree
+    /// (walk-based full reconcile, full manifest sync, dual-side zfs Full):
+    /// snapshot the dst dataset now as the new baseline.
+    Refresh(&'a Path),
+    /// This pass only applied source-side changes (zfs-diff incremental):
+    /// keep the previous dst baseline — it still describes the last
+    /// whole-tree verified state. Compare's dst diff just grows until the
+    /// next whole-tree pass, staying correct.
+    Retain,
+    /// Not a local ZFS destination (or the feature is off): drop any stored
+    /// baseline so nothing stale lingers.
+    Clear,
+}
+
+/// Record the verified baselines for a destination: the source-side ZFS
+/// snapshot (diff base for incremental syncs) always advances with the
+/// verify; the destination-side baseline follows `action` (see
+/// [`DstBaselineAction`]). Baseline failures never fail the sync: the dst
+/// base is cleared and Compare falls back to the full walk.
 fn record_destination_verified_baselines(
     state: &State,
     source: &SourceGroupConfig,
     destination_id: &str,
     src_snapshot_name: Option<&str>,
-    local_dst_root: Option<&Path>,
+    action: DstBaselineAction<'_>,
     cycle_id: i64,
 ) -> Result<()> {
     state.set_destination_verified_snapshot(&source.id, destination_id, src_snapshot_name)?;
+    let dst_root = match action {
+        DstBaselineAction::Retain => return Ok(()),
+        DstBaselineAction::Clear => None,
+        // A dst baseline without a paired source base is meaningless.
+        DstBaselineAction::Refresh(_) if src_snapshot_name.is_none() => None,
+        DstBaselineAction::Refresh(dst_root) => Some(dst_root),
+    };
     let previous = state
         .destination_verified_dst_snapshot(&source.id, destination_id)
         .unwrap_or(None);
-    let dst_base = match (src_snapshot_name, local_dst_root) {
-        (Some(_), Some(dst_root)) => {
+    let dst_base = match dst_root {
+        Some(dst_root) => {
             match create_dst_baseline_snapshot(source, destination_id, dst_root, cycle_id) {
                 Ok(name) => Some(name),
                 Err(err) => {
@@ -4917,7 +4953,7 @@ fn record_destination_verified_baselines(
                 }
             }
         }
-        _ => None,
+        None => None,
     };
     state.set_destination_verified_dst_snapshot(&source.id, destination_id, dst_base.as_deref())?;
     cleanup_dst_baseline_snapshots(

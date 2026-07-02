@@ -705,7 +705,7 @@ fanotify overflow / USN gap（疑似丢事件）：
 
 Compare 的 zfs diff 快路径：
 
-- 引擎在本地 Dir→Dir 的验证成功点（zfs-diff 增量、全量 reconcile、generic 成功路径）除了记录源侧基准快照（`last_verified_snapshot_name`）外，若 dst 根也在本机 ZFS 数据集上，同时给 dst 数据集打基准快照（`<prefix>_dstbase_<src>_<dst>_<cycle>`，存 `destination_offset.last_verified_dst_snapshot_name`；旧基准即时清理，只保留当前一个）。此刻 dst 内容等于源基准内容，两个基准对应同一份已验证状态。
+- dst 基准快照只允许由**全树级验证**的成功路径刷新（walk 全量 reconcile、全清单 sync、双侧 zfs Full）：源侧 zfs-diff 增量只推进源基准并**保留**旧 dst 基准（Retain）——若在只看源侧的 pass 上刷新 dst 基准，会把期间发生的 dst 漂移"洗进"新基准，之后的 zfs diff Compare/Full 永远看不到该漂移。保留旧基准只是让 dst 侧 diff 集合变大，正确性不受影响。刷新时给 dst 数据集打基准快照（`<prefix>_dstbase_<src>_<dst>_<cycle>`，存 `destination_offset.last_verified_dst_snapshot_name`；旧基准即时清理，只保留当前一个）。此刻 dst 内容等于源基准内容，两个基准对应同一份已验证状态。
 - Compare 时若两个基准都在且各自数据集与实际路径匹配：`zfs diff -H <base>`（对活文件系统）分别取两侧自基准以来的变化路径，对并集做按路径快照（目录递归）再走常规清单对比——并集之外的路径在基准点已验证一致且此后未动，视为 in-sync。报告带 `method: "zfs_diff"`，entry 计数只覆盖被检查的路径。
 - 任一条件不满足（任一侧非 ZFS/非本机、缺基准、数据集不匹配、zfs 命令失败）自动回退全树扫描。远端 dst（跨机传输路径）不打 dst 基准，天然回退。
 
