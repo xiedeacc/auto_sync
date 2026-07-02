@@ -37,10 +37,14 @@ fn full_sync_over_http_transfer_protocol() -> Result<()> {
     write_bytes(source_root.join("nested/a/b/deep.txt"), b"deep\n")?; // bulk dirs
     write_bytes(source_root.join("space dir/with space.txt"), b"spaces\n")?;
     fs::create_dir_all(source_root.join("empty_dir"))?; // empty dir preserved
-    let big = vec![7_u8; 10 * 1024 * 1024]; // 10 MiB -> chunked path (>4 MiB)
+    // >16 MiB so it takes the streamed big-file path (offset + put-file-stream
+    // + finish) instead of the single-request put-file fast path.
+    let big = vec![7_u8; 20 * 1024 * 1024];
     write_bytes(source_root.join("media/big.bin"), &big)?;
     for i in 0..200 {
-        write_bytes(source_root.join(format!("many/file_{i:03}.dat")), b"x")?; // parallel small files
+        // Small files ride the put-files-batch path (one request + one
+        // durability barrier for the whole group).
+        write_bytes(source_root.join(format!("many/file_{i:03}.dat")), b"x")?;
     }
 
     // The mirrored destination root gets a stale extra file that must be deleted.
@@ -241,6 +245,7 @@ fn build_config(state_db: &Path, source_root: &Path, dest_parent: &Path, port: u
             machine_id: "localweb".to_string(),
             path: dest_parent.to_path_buf(),
             enabled: true,
+            paused: false,
             schedule: ScheduleConfig::default(),
             sync: None,
         }],

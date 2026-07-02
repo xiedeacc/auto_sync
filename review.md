@@ -2,6 +2,23 @@
 
 ---
 
+## 0'''. 第三轮补完(2026-07-03 晚)
+
+本轮把最后的功能性遗留全部落地:
+
+| 项 | 现状 |
+|---|---|
+| 小文件批量传输("streaming transfer" 遗留) | **已实现**:`/api/transfer/put-files-batch` —— ≤256KiB 的非 delta 文件按批(≤200 个 / ≤8MiB)打包成单个请求(`<json头>\n<原始字节>` 帧格式),接收端全部写入 tmp 后**成批 fsync**(ZFS 上连续 fsync 合并为约一次 ZIL 刷盘)再统一 rename 发布、父目录去重 fsync;单文件失败只计该文件,发送端 blake3 端到端校验保留;旧对端 404 时回退逐文件 put-file。控制机→源机委托走 `/api/transfer/push-files-batch`。消灭了小文件工作负载的"每文件一次往返 + 一次同步刷盘"瓶颈(此前 62MB/s 的主因)。 |
+| 大文件流式上传 | **已实现**:`/api/transfer/put-file-stream` —— >16MiB 文件的余量(断点 offset 起)以**单个定长请求体**流式发送,接收端边收边写 tmp(不再每 16MiB 一个请求体驻留内存),完整性仍由 finish-file 的全文件 blake3 把关;该路由豁免 1GiB body 上限(不缓冲,无内存风险);旧对端回退分块循环。 |
+| path_snapshot 清除(遗留) | **已实现**:该表生产代码只写不读(Changed Since 移除后无消费者)——4 处 `replace_snapshot` 写入、修剪器、读取函数全部删除,建库脚本改为 `DROP TABLE IF EXISTS`(老库一次性回收 61 万行);walk Full 不再为无人读的数据付 ~31 个分块事务。 |
+| W7(fanotify 句柄缓存) | **已修复**:缓存只存目录(DFID_NAME 记录的 base 按协议必为目录;文件句柄每事件至多解析一次不值得占位);lazy 缓存 128K 上限、溢出整体清空按需重灌;eager 预建走目录跳过文件(启动 walk 句柄系统调用按文件数折减);删除事件的前缀清扫作用在小一个数量级的 map 上。 |
+| 每目的地暂停/继续 | **新功能**:`DestinationConfig.paused`(配置字段,随委托推送同步到源机)。暂停=取消当前任务+调度器不再派发(pending target 保留,黄色 reason=paused);继续=从暂停处自动接续。UI:info 按钮左侧新增 ⏸/▶ 切换钮(替代原与删除按钮合并的 stop 钮;任务运行时删除钮改为禁用);手动 Sync 对暂停目的地明确拒绝。修复了"新增 src group 首次全量点停止后自动重启"的问题。 |
+| 测试补盲(§8 五) | **已补**:scheduler.rs 0→6 个(daily/weekly 边界、severity 回退、weekday 解析;本地时区无关写法);machines.rs `read_http_response`/`read_chunked_body` 泛型化到 `Read` 并补 5 个线格式测试;worker pool 容错语义 2 个(≤20 失败聚合、达上限熔断);批量/流式端点 3 个单测 + e2e 升级(200 小文件走批量端点、20MiB 大文件走流式端点,真实 HTTP)。 |
+| E10(kind 标签全局共享) | **核实为仅外观**:引擎 pass 由 SYNC_GATE 串行,重叠只可能让 task_log 的 kind 标签在 sync/compare 并存窗口内偏差,数据通路无影响;不改。 |
+| mod.rs 拆分 | **唯一未做的遗留**(纯代码组织,P3):~10K 行拆 6 个子模块是大型机械重构,不应与本轮大量行为变更混在同一个变更集里部署;建议下一轮单独提交。 |
+
+---
+
 ## 0''. 修复状态(2026-07-03,第五轮修复后)
 
 本轮全部结论已按用户要求集中修复(commits `39deeed` → 修复完成);2026-07-03 第二轮把先前遗留的性能项(§8)与 W6 也全部做完,各编号现状:

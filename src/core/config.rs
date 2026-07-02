@@ -177,6 +177,12 @@ pub struct DestinationConfig {
     pub machine_id: String,
     pub path: PathBuf,
     pub enabled: bool,
+    /// Paused destinations receive no work: the scheduler assigns them no
+    /// new targets, the engine holds their pending ones (kept, not dropped —
+    /// resuming continues where the pause left off), and manual syncs are
+    /// refused. Compare stays available (read-only).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
     pub schedule: ScheduleConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync: Option<NativeSyncConfig>,
@@ -346,6 +352,7 @@ impl Default for DestinationConfig {
             machine_id: "local".to_string(),
             path: PathBuf::new(),
             enabled: true,
+            paused: false,
             schedule: ScheduleConfig::default(),
             sync: None,
         }
@@ -1301,6 +1308,7 @@ mod tests {
                 path: PathBuf::from("/data/src/backup"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -1332,6 +1340,7 @@ mod tests {
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -1364,6 +1373,7 @@ mod tests {
                     path: PathBuf::from(" /data/dst "),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    paused: false,
                     sync: None,
                 },
                 DestinationConfig {
@@ -1372,6 +1382,7 @@ mod tests {
                     path: PathBuf::new(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    paused: false,
                     sync: None,
                 },
                 DestinationConfig {
@@ -1380,6 +1391,7 @@ mod tests {
                     path: PathBuf::from("/data/dst"),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    paused: false,
                     sync: None,
                 },
             ],
@@ -1400,6 +1412,7 @@ mod tests {
                 path: PathBuf::from("/unused"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -1642,6 +1655,7 @@ src = "/zfs"
                 path: PathBuf::from("/data/dst_1"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -1661,6 +1675,7 @@ src = "/zfs"
                 path: PathBuf::from("/data/dst_2"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });

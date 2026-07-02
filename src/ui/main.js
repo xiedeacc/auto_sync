@@ -405,13 +405,16 @@ function updateStatusUi() {
     if (cycle) {
       cycle.value = cycleDisplay(status);
     }
+    const paused = !!(configDestination(sourceId, destinationId) || {}).paused;
     const dot = row.querySelector(".dot");
     if (dot) {
       const dotClass = statusClass(status);
       const issueCount = status && status.issues ? status.issues.length : 0;
-      const dotTitle = dotClass === "yellow"
-        ? `${issueCount} changing file${issueCount === 1 ? "" : "s"}`
-        : ((status && status.status) || "red");
+      const dotTitle = status && status.status_reason === "paused"
+        ? "Paused"
+        : (dotClass === "yellow"
+          ? `${issueCount} changing file${issueCount === 1 ? "" : "s"}`
+          : ((status && status.status) || "red"));
       dot.className = `dot ${dotClass}`;
       dot.title = dotTitle;
       dot.setAttribute("aria-label", dotTitle);
@@ -421,10 +424,12 @@ function updateStatusUi() {
       const blocked = isSyncOrderBlocked(status);
       const activity = activityForSourceId(sourceId);
       const syncing = activityIsSyncing(activity);
-      syncSelect.disabled = busy || blocked || unavailable || syncing;
-      syncSelect.title = unavailable
-        ? unavailableLabel(status)
-        : (blocked ? blockedByLabel(status) : (syncing ? activitySyncingLabel(activity) : "Sync"));
+      syncSelect.disabled = busy || blocked || unavailable || syncing || paused;
+      syncSelect.title = paused
+        ? "Paused — resume to sync"
+        : (unavailable
+          ? unavailableLabel(status)
+          : (blocked ? blockedByLabel(status) : (syncing ? activitySyncingLabel(activity) : "Sync")));
     }
     const logButton = row.querySelector('[data-action="show-dst-log"]');
     if (logButton) {
@@ -438,6 +443,7 @@ function updateStatusUi() {
     if (repairButton) {
       const diffs = Number(status && status.scan_differences) || 0;
       repairButton.hidden = diffs === 0;
+      repairButton.disabled = paused;
       if (diffs > 0) {
         const when = (status && status.scan_at) || "";
         repairButton.title =
@@ -570,26 +576,27 @@ function compareScanRunning(source, dst) {
   );
 }
 
-// While a destination has a running task, its delete button gives way to a
-// stop button (and returns once the task ends).
+function configDestination(sourceId, destinationId) {
+  const source = findSourceById(sourceId);
+  return source && (source.destinations || []).find((item) => item.id === destinationId);
+}
+
+// While a destination has a running task, deleting it is blocked (pause the
+// task first via the pause button next to the info icon).
 function updateDstControls() {
   for (const row of el.sourcePanel.querySelectorAll(".destination-row")) {
     const source = findSourceById(row.dataset.sourceId);
     const dst = source
       && (source.destinations || []).find((item) => item.id === row.dataset.destinationId);
-    const stopButton = row.querySelector('[data-action="stop-dst"]');
     const removeButton = row.querySelector('[data-action="remove-dst"]');
-    if (!stopButton || !removeButton) {
+    if (!removeButton) {
       continue;
     }
     const act = dstActivity(source, dst);
-    stopButton.hidden = !act.active;
-    removeButton.hidden = act.active;
-    if (act.active) {
-      const title = act.scope === "compare" ? "Stop compare" : "Stop sync";
-      stopButton.title = title;
-      stopButton.setAttribute("aria-label", title);
-    }
+    removeButton.disabled = act.active;
+    removeButton.title = act.active
+      ? "A task is running — pause it first"
+      : "Remove destination";
   }
 }
 
@@ -1109,6 +1116,7 @@ function renderSyncRows(source, group) {
         <label class="actions-label">Sync</label>
         <span class="dst-info-cell">
           <button class="repair-scan-button icon" data-action="repair-scan" title="" aria-label="Sync compare differences" hidden>&#8646;</button>
+          <button class="pause-dst-button icon ${dst.paused ? "paused" : ""}" data-action="pause-dst" title="${dst.paused ? "Resume automatic sync" : "Pause sync (stops the running task and holds new ones)"}" aria-label="${dst.paused ? "Resume automatic sync" : "Pause sync"}">${dst.paused ? "&#9654;" : "&#9208;"}</button>
           <button class="destination-log-button icon destination-log-${escapeAttr(logIconState.kind)}" data-action="show-dst-log" title="${escapeAttr(logIconState.title)}" aria-label="${escapeAttr(logIconState.title)}"><span class="destination-log-icon" aria-hidden="true">i</span></button>
         </span>
         <button class="schedule-button" data-action="edit-schedule">${escapeHtml(scheduleLabel(dst.schedule))}</button>
@@ -1120,7 +1128,6 @@ function renderSyncRows(source, group) {
           <option value="full">Full</option>
           <option value="scan">Compare</option>
         </select>
-        <button class="danger icon dst-stop-button" data-action="stop-dst" title="Stop running task" aria-label="Stop running task" hidden>&#9632;</button>
         <button class="danger icon" data-action="remove-dst" title="Remove destination">x</button>
       </div>
     `;
@@ -1141,32 +1148,35 @@ function renderSyncRows(source, group) {
       await autoSaveConfig();
       renderSourcePanel();
     };
-    row.querySelector('[data-action="stop-dst"]').onclick = async (event) => {
+    row.querySelector('[data-action="pause-dst"]').onclick = async (event) => {
       const button = event.currentTarget;
-      const act = dstActivity(source, dst);
-      if (!act.active || button.disabled) {
+      if (button.disabled) {
         return;
       }
       button.disabled = true;
+      const pausing = !dst.paused;
       try {
-        const outcome = await invoke("cancel_activity", {
-          scope: act.scope,
-          sourceId: source.id,
-          destinationId: dst.id,
-        });
-        const remote = (outcome.machines || []).reduce(
-          (total, machine) => total + (machine.cancelled || 0),
-          0,
-        );
-        const total = (outcome.cancelled_local || 0) + remote;
-        setTransientMessage(
-          total
-            ? `Stop requested for ${source.id} -> ${dst.id}`
-            : "Nothing to stop",
-        );
+        // Persist the flag FIRST: the scheduler must already see the pause
+        // when the running task dies, or it would immediately restart it.
+        dst.paused = pausing;
+        await autoSaveConfig();
+        if (pausing) {
+          const act = dstActivity(source, dst);
+          if (act.active) {
+            await invoke("cancel_activity", {
+              scope: act.scope,
+              sourceId: source.id,
+              destinationId: dst.id,
+            });
+          }
+          setTransientMessage(`Paused ${source.id} -> ${dst.id}`);
+        } else {
+          setTransientMessage(`Resumed ${source.id} -> ${dst.id}`);
+        }
         await loadRuntimeStatus().catch(() => {});
-        updateDstControls();
+        renderSourcePanel();
       } catch (error) {
+        dst.paused = !pausing;
         setMessage(String(error));
       } finally {
         button.disabled = false;
@@ -1382,6 +1392,7 @@ function normalizeConfig(nextCfg) {
     source.excludes = cleanExcludeList(source.excludes || []);
     for (const dst of source.destinations || []) {
       dst.machine_id = machineIdOrLocal(dst.machine_id);
+      dst.paused = dst.paused === true;
       dst.schedule = normalizeSchedule(dst.schedule);
       dst.sync = normalizeOptionalNativeSyncConfig(dst.sync);
       latestDestinationSchedule = cloneSchedule(dst.schedule);

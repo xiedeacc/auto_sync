@@ -1613,6 +1613,7 @@ mod tests {
                     path: PathBuf::from("/zfs_pool"),
                     enabled: true,
                     schedule: crate::core::config::ScheduleConfig::default(),
+                    paused: false,
                     sync: None,
                 }],
             });
@@ -1651,6 +1652,7 @@ mod tests {
                 path: PathBuf::from("/zfs_pool"),
                 enabled: true,
                 schedule: crate::core::config::ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         };
@@ -1721,6 +1723,7 @@ mod tests {
                 path: PathBuf::from("/zfs_pool"),
                 enabled: true,
                 schedule: crate::core::config::ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         };
@@ -1822,6 +1825,7 @@ mod tests {
                     path: temp.join("dst"),
                     enabled: true,
                     schedule: crate::core::config::ScheduleConfig::default(),
+                    paused: false,
                     sync: None,
                 }],
             });
@@ -1858,6 +1862,7 @@ mod tests {
                     path: temp.join("dst_a"),
                     enabled: true,
                     schedule: crate::core::config::ScheduleConfig::default(),
+                    paused: false,
                     sync: None,
                 }],
             });

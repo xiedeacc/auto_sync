@@ -23,17 +23,20 @@ use crate::core::config::{AppConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
 use crate::core::state::{DestinationView, ScanReport, SnapshotEntry};
 use crate::core::sync::{
-    SyncRequestMode, TransferAck, TransferApplyDeltaQuery, TransferBlockSumsRequest,
-    TransferCleanupTmpRequest, TransferPathInfo, TransferPathInfoRequest,
-    TransferPrepareDirRequest, TransferPrepareDirsRequest, TransferPushFileRequest,
-    TransferPutFileQuery, TransferReceiveFileChunkQuery, TransferReceiveSymlinkRequest,
+    SyncRequestMode, TransferAck, TransferApplyDeltaQuery, TransferBatchAck,
+    TransferBatchOutcome, TransferBlockSumsRequest, TransferCleanupTmpRequest, TransferPathInfo,
+    TransferPathInfoRequest, TransferPrepareDirRequest, TransferPrepareDirsRequest,
+    TransferPushFileRequest, TransferPushFilesBatchRequest, TransferPutFileQuery,
+    TransferPutFilesBatchQuery, TransferReceiveFileChunkQuery, TransferReceiveSymlinkRequest,
     TransferRemovePathRequest, TransferRemovePathsRequest, TransferSetDirMtimesRequest,
     TransferSetModesRequest, TransferSnapshotPathsRequest, TransferSnapshotRequest,
     transfer_apply_delta, transfer_block_sums, transfer_cleanup_tmp, transfer_file_offset,
-    transfer_finish_file, transfer_path_info, transfer_prepare_dir, transfer_prepare_dirs,
-    transfer_push_file, transfer_put_file, transfer_receive_file_chunk, transfer_receive_symlink,
-    transfer_remove_path, transfer_remove_paths, transfer_set_dir_mtimes, transfer_set_modes,
-    transfer_snapshot, transfer_snapshot_paths, transfer_snapshot_stream,
+    transfer_finish_file, transfer_open_file_stream_target, transfer_path_info,
+    transfer_prepare_dir, transfer_prepare_dirs, transfer_push_file, transfer_push_files_batch,
+    transfer_put_file, transfer_put_files_batch, transfer_receive_file_chunk,
+    transfer_receive_symlink, transfer_remove_path, transfer_remove_paths,
+    transfer_set_dir_mtimes, transfer_set_modes, transfer_snapshot, transfer_snapshot_paths,
+    transfer_snapshot_stream,
 };
 
 /// Peer-only surface: these endpoints write/delete under destination roots
@@ -121,6 +124,20 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/transfer/cleanup-tmp", post(api_transfer_cleanup_tmp))
         .route("/api/transfer/file-offset", post(api_transfer_file_offset))
         .route("/api/transfer/put-file", post(api_transfer_put_file))
+        .route(
+            "/api/transfer/put-files-batch",
+            post(api_transfer_put_files_batch),
+        )
+        // Streamed big-file bodies are written to disk incrementally, so the
+        // request-size cap below must not apply (files exceed 1 GiB).
+        .route(
+            "/api/transfer/put-file-stream",
+            post(api_transfer_put_file_stream).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/transfer/push-files-batch",
+            post(api_transfer_push_files_batch),
+        )
         .route("/api/transfer/block-sums", post(api_transfer_block_sums))
         .route("/api/transfer/apply-delta", post(api_transfer_apply_delta))
         .route(
@@ -558,6 +575,60 @@ async fn api_transfer_put_file(
     body: Bytes,
 ) -> Result<Json<TransferAck>, ApiError> {
     blocking(move || Ok(Json(transfer_put_file(query, &body)?))).await
+}
+
+async fn api_transfer_put_files_batch(
+    Query(query): Query<TransferPutFilesBatchQuery>,
+    body: Bytes,
+) -> Result<Json<TransferBatchAck>, ApiError> {
+    blocking(move || Ok(Json(transfer_put_files_batch(query, &body)?))).await
+}
+
+async fn api_transfer_push_files_batch(
+    Json(req): Json<TransferPushFilesBatchRequest>,
+) -> Result<Json<TransferBatchOutcome>, ApiError> {
+    blocking(move || Ok(Json(transfer_push_files_batch(req)?))).await
+}
+
+/// Streamed big-file body: written to the tmp file chunk by chunk as it
+/// arrives, so neither a 16 MiB request body nor the whole file is ever
+/// buffered in memory. Validation and resume semantics match the chunk
+/// endpoint; integrity and publishing stay with /api/transfer/finish-file.
+async fn api_transfer_put_file_stream(
+    Query(query): Query<TransferReceiveFileChunkQuery>,
+    request: Request<axum::body::Body>,
+) -> Result<Json<TransferAck>, ApiError> {
+    use tokio::io::AsyncWriteExt;
+    use tokio_stream::StreamExt;
+
+    let open_query = query.clone();
+    let file =
+        tokio::task::spawn_blocking(move || transfer_open_file_stream_target(&open_query))
+            .await
+            .map_err(|err| ApiError(anyhow::anyhow!("request worker failed: {err}")))??;
+    let mut file = tokio::fs::File::from_std(file);
+    let size = query.size.max(0) as u64;
+    let mut written = query.offset;
+    let mut body = request.into_body().into_data_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| anyhow::anyhow!("failed to read streamed body: {err}"))?;
+        written = written
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("streamed file offset overflow"))?;
+        if written > size {
+            return Err(ApiError(anyhow::anyhow!(
+                "streamed file body exceeds expected size for {}",
+                query.rel_path
+            )));
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to write streamed body: {err}"))?;
+    }
+    file.flush()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to flush streamed body: {err}"))?;
+    Ok(Json(TransferAck { ok: true }))
 }
 
 async fn api_transfer_block_sums(

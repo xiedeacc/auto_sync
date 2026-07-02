@@ -179,6 +179,20 @@ pub fn queue_destination_sync(
     destination_id: &str,
     mode: SyncRequestMode,
 ) -> Result<()> {
+    let paused = cfg
+        .source_groups
+        .iter()
+        .find(|source| source.id == source_id)
+        .and_then(|source| {
+            source
+                .destinations
+                .iter()
+                .find(|dst| dst.id == destination_id)
+        })
+        .is_some_and(|dst| dst.paused);
+    if paused {
+        bail!("destination is paused; resume it before syncing");
+    }
     if matches!(mode, SyncRequestMode::RepairScan) {
         return queue_scan_repair(cfg, state, source_id, destination_id);
     }
@@ -314,29 +328,12 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
                     state.mark_cycle_status(cycle.id, "verified")?;
                 }
             }
-            // Drop stored snapshots no destination still needs (each keeps its
-            // in-flight target and its Changed-Since baseline); without this
-            // every full cycle's whole-tree snapshot accumulates forever.
-            // Only after a pass that did work: the prune probe scans the
-            // whole (potentially 600K-row) table, and running it every idle
-            // scheduler tick burned CPU and cache for nothing.
+            // Cycles every destination verified past can never be re-driven,
+            // so their event rows are dead weight. Only after a pass that did
+            // work: pruning every idle scheduler tick burned CPU for nothing.
             if !source_progressed {
                 continue;
             }
-            match state.prune_path_snapshots(&source.id) {
-                Ok(removed) if removed > 0 => {
-                    info!(
-                        source = source.id,
-                        removed, "pruned stored source snapshots"
-                    );
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(source = source.id, error = %err, "failed to prune stored source snapshots");
-                }
-            }
-            // Same for events: cycles every destination verified past can
-            // never be re-driven, so their event rows are dead weight.
             if let Err(err) = prune_verified_cycle_events(state, source) {
                 warn!(source = source.id, error = %err, "failed to prune event log");
             }
@@ -1185,6 +1182,63 @@ pub struct TransferPutFileQuery {
     pub full_hash: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferPutFilesBatchQuery {
+    pub root: String,
+    pub cycle_id: i64,
+}
+
+/// One frame header in a put-files-batch body: the JSON line is followed by
+/// exactly `size` raw payload bytes, then the next frame (or end of body).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BatchFileHeader {
+    rel_path: String,
+    size: i64,
+    mtime_ns: i64,
+    mode: u32,
+    /// blake3 of the payload; mandatory on this path (end-to-end integrity).
+    full_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchFileFailure {
+    pub rel_path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransferBatchAck {
+    pub ok: bool,
+    #[serde(default)]
+    pub failed: Vec<BatchFileFailure>,
+}
+
+/// Delegated batch push: the controller asks the SOURCE machine to read these
+/// small files and deliver them to the destination as one batched request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferPushFilesBatchRequest {
+    pub source_root: PathBuf,
+    pub entries: Vec<SnapshotEntry>,
+    pub destination: crate::core::config::MachineConfig,
+    pub destination_root: PathBuf,
+    pub destination_id: String,
+    pub cycle_id: i64,
+    pub transfer_timeout_secs: u64,
+    pub bwlimit_kbps: u64,
+}
+
+/// Per-file result of a batch push: how many actually landed, which sources
+/// were caught changing mid-read (tolerated), and which failed for per-file
+/// reasons on either side.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransferBatchOutcome {
+    pub sent: u64,
+    #[serde(default)]
+    pub changing: Vec<String>,
+    #[serde(default)]
+    pub failed: Vec<BatchFileFailure>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct PeerRuntimeStatus {
     scan: Option<PeerScanProgress>,
@@ -1650,6 +1704,179 @@ pub fn transfer_put_file(query: TransferPutFileQuery, bytes: &[u8]) -> Result<Tr
     Ok(transfer_ack())
 }
 
+/// Many small files in ONE request with ONE durability barrier. The body is a
+/// sequence of frames — `<json BatchFileHeader>\n<raw payload bytes>` — and
+/// the receiver stages every file first, fsyncs them as a group (consecutive
+/// fsyncs after all writes coalesce into roughly one log flush on ZFS, versus
+/// one synchronous flush per file on the per-file endpoint), then publishes
+/// the renames. Per-file failures are reported in the ack and do not abort
+/// the rest of the batch.
+pub fn transfer_put_files_batch(
+    query: TransferPutFilesBatchQuery,
+    body: &[u8],
+) -> Result<TransferBatchAck> {
+    let root = PathBuf::from(&query.root);
+    reject_dangerous_destination(&root)?;
+    let mut failed: Vec<BatchFileFailure> = Vec::new();
+    let mut staged: Vec<(SnapshotEntry, PathBuf, PathBuf)> = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        // Frame boundaries come from the header's size field; a malformed
+        // frame poisons everything after it, so that IS a whole-request error.
+        let newline = rest
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| anyhow!("malformed batch body: missing header terminator"))?;
+        let header: BatchFileHeader = serde_json::from_slice(&rest[..newline])
+            .context("malformed batch file header")?;
+        rest = &rest[newline + 1..];
+        let size = usize::try_from(header.size.max(0))
+            .map_err(|_| anyhow!("batch file size overflow for {}", header.rel_path))?;
+        if rest.len() < size {
+            bail!("malformed batch body: truncated payload for {}", header.rel_path);
+        }
+        let (payload, tail) = rest.split_at(size);
+        rest = tail;
+        let rel_path = header.rel_path.clone();
+        let stage = (|| -> Result<()> {
+            // Verify content end-to-end BEFORE writing (bit flips in transit
+            // that TCP's checksum can miss).
+            let actual = blake3::hash(payload).to_hex().to_string();
+            if actual != header.full_hash {
+                bail!("batch file content hash mismatch for {}", header.rel_path);
+            }
+            let entry = SnapshotEntry {
+                rel_path: header.rel_path.clone(),
+                file_type: "file".to_string(),
+                size: header.size,
+                mtime_ns: header.mtime_ns,
+                mode: header.mode,
+                hash: Some(header.full_hash.clone()),
+            };
+            let final_path = safe_join_rel(&root, &entry.rel_path)?;
+            let tmp = tmp_path(&root, query.cycle_id, &entry.rel_path);
+            if let Some(parent) = tmp.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&tmp, payload)
+                .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
+            staged.push((entry, tmp, final_path));
+            Ok(())
+        })();
+        if let Err(err) = stage {
+            failed.push(BatchFileFailure {
+                rel_path,
+                error: format!("{err:#}"),
+            });
+        }
+    }
+
+    // Durability barrier for the whole batch: verify + set metadata + fsync
+    // every staged file BEFORE any rename publishes it (same per-file order
+    // as finish_received_file, batched).
+    let mut publish: Vec<(SnapshotEntry, PathBuf, PathBuf)> = Vec::new();
+    for (entry, tmp, final_path) in staged {
+        let step = (|| -> Result<()> {
+            let actual = hash_file(&tmp)?;
+            if entry.hash.as_deref() != Some(actual.as_str()) {
+                remove_any(&tmp).ok();
+                bail!("received file hash mismatch at {}", entry.rel_path);
+            }
+            fsync_file(&tmp)
+                .with_context(|| format!("failed to fsync received file {}", entry.rel_path))?;
+            set_mode(&tmp, entry.mode).ok();
+            let mtime = FileTime::from_unix_time(
+                entry.mtime_ns / 1_000_000_000,
+                (entry.mtime_ns % 1_000_000_000) as u32,
+            );
+            if let Err(err) = set_file_mtime(&tmp, mtime) {
+                warn!(rel_path = entry.rel_path, error = %err, "failed to set received file mtime");
+            }
+            Ok(())
+        })();
+        match step {
+            Ok(()) => publish.push((entry, tmp, final_path)),
+            Err(err) => failed.push(BatchFileFailure {
+                rel_path: entry.rel_path.clone(),
+                error: format!("{err:#}"),
+            }),
+        }
+    }
+    // Publish the batch and flush each touched parent directory once.
+    let mut parents: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    for (entry, tmp, final_path) in publish {
+        let step = (|| -> Result<()> {
+            if let Some(parent) = final_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            replace_path(&root, query.cycle_id, &entry.rel_path, &tmp, &final_path)?;
+            Ok(())
+        })();
+        match step {
+            Ok(()) => {
+                if let Some(parent) = final_path.parent() {
+                    parents
+                        .entry(parent.to_path_buf())
+                        .or_insert_with(|| final_path.clone());
+                }
+            }
+            Err(err) => failed.push(BatchFileFailure {
+                rel_path: entry.rel_path.clone(),
+                error: format!("{err:#}"),
+            }),
+        }
+    }
+    for sample_child in parents.values() {
+        fsync_parent(sample_child).ok();
+    }
+    Ok(TransferBatchAck { ok: true, failed })
+}
+
+/// Open (and position) the tmp file a streamed big-file body will be written
+/// into, with the same validation and resume semantics as the 16 MiB chunk
+/// endpoint. Split out so the async streaming handler can run it on the
+/// blocking pool before consuming the body.
+pub fn transfer_open_file_stream_target(query: &TransferReceiveFileChunkQuery) -> Result<File> {
+    let root = Path::new(&query.root);
+    reject_dangerous_destination(root)?;
+    let size = query.size.max(0) as u64;
+    if query.offset > size {
+        bail!(
+            "stream offset {} exceeds expected size {} for {}",
+            query.offset,
+            size,
+            query.rel_path
+        );
+    }
+    let tmp = tmp_path(root, query.cycle_id, &query.rel_path);
+    if let Some(parent) = tmp.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if query.offset == 0 && (tmp.exists() || fs::symlink_metadata(&tmp).is_ok()) {
+        remove_any(&tmp)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&tmp)
+        .with_context(|| format!("failed to open temp file {}", tmp.display()))?;
+    let current_len = file.metadata()?.len();
+    if current_len < query.offset {
+        bail!(
+            "resume offset {} is beyond temp file length {} for {}",
+            query.offset,
+            current_len,
+            query.rel_path
+        );
+    }
+    if current_len > query.offset {
+        file.set_len(query.offset)?;
+    }
+    file.seek(SeekFrom::Start(query.offset))?;
+    Ok(file)
+}
+
 pub fn transfer_block_sums(req: TransferBlockSumsRequest) -> Result<delta::BlockSums> {
     reject_dangerous_destination(&req.root)?;
     let path = safe_join_rel(&req.root, &req.rel_path)?;
@@ -1794,6 +2021,139 @@ fn transfer_ack() -> TransferAck {
     TransferAck { ok: true }
 }
 
+/// Upper bound for a file to ride the small-file batch path.
+const SMALL_BATCH_FILE_MAX: u64 = 256 * 1024;
+/// Caps for one batch request: bounded sender/receiver memory and bounded
+/// retry cost while still amortizing the per-request round-trip and the
+/// receiver's durability barrier over many files.
+const SMALL_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SMALL_BATCH_MAX_FILES: usize = 200;
+
+/// Read the batch's files, verify them against their snapshot metadata, and
+/// deliver them to the destination as ONE put-files-batch request (falling
+/// back to per-file sends for peers without the endpoint). Sources caught
+/// changing mid-read are classified per file, not failed.
+pub fn transfer_push_files_batch(
+    req: TransferPushFilesBatchRequest,
+) -> Result<TransferBatchOutcome> {
+    let timeout = Duration::from_secs(req.transfer_timeout_secs.max(1));
+    let mut outcome = TransferBatchOutcome::default();
+    let mut body: Vec<u8> = Vec::new();
+    let mut included: Vec<&SnapshotEntry> = Vec::new();
+    let mut payload_bytes = 0_usize;
+    for entry in &req.entries {
+        cancel::check()?;
+        let read = (|| -> Result<Vec<u8>> {
+            let src = safe_join_rel(&req.source_root, &entry.rel_path)?;
+            let bytes = fs::read(&src)
+                .with_context(|| format!("failed to read {}", src.display()))?;
+            if bytes.len() as u64 != entry.size.max(0) as u64 {
+                bail!("source changed while copying {}", entry.rel_path);
+            }
+            if let Some(expected) = &entry.hash {
+                if blake3::hash(&bytes).to_hex().to_string() != *expected {
+                    bail!("source changed while copying {}", entry.rel_path);
+                }
+            }
+            // Catch same-size torn reads (mutation mid-read keeps the length).
+            ensure_source_stable(&src, entry)?;
+            Ok(bytes)
+        })();
+        match read {
+            Ok(bytes) => {
+                let header = BatchFileHeader {
+                    rel_path: entry.rel_path.clone(),
+                    size: entry.size,
+                    mtime_ns: entry.mtime_ns,
+                    mode: entry.mode,
+                    full_hash: blake3::hash(&bytes).to_hex().to_string(),
+                };
+                body.extend_from_slice(&serde_json::to_vec(&header)?);
+                body.push(b'\n');
+                payload_bytes += bytes.len();
+                body.extend_from_slice(&bytes);
+                included.push(entry);
+            }
+            Err(err) if transfer_error_is_source_changing(&err) => {
+                outcome.changing.push(entry.rel_path.clone());
+            }
+            Err(err) => outcome.failed.push(BatchFileFailure {
+                rel_path: entry.rel_path.clone(),
+                error: format!("{err:#}"),
+            }),
+        }
+    }
+    if included.is_empty() {
+        return Ok(outcome);
+    }
+    let api_path = format!(
+        "/api/transfer/put-files-batch?root={}&cycle_id={}",
+        encode_query_component(&req.destination_root.to_string_lossy()),
+        req.cycle_id
+    );
+    let ack: TransferBatchAck =
+        match remote_post_bytes(&req.destination, &api_path, &body, timeout) {
+            Ok(ack) => ack,
+            Err(err) if error_is_missing_endpoint(&err) => {
+                // Old peer: deliver the batch per file through the classic
+                // endpoints (send_file_tcp routes small files to put-file).
+                return push_batch_per_file_fallback(&req, &included, outcome, timeout);
+            }
+            Err(err) => return Err(err),
+        };
+    if !ack.ok {
+        bail!("peer rejected put-files-batch request");
+    }
+    let rejected: BTreeSet<&str> = ack
+        .failed
+        .iter()
+        .map(|failure| failure.rel_path.as_str())
+        .collect();
+    for entry in &included {
+        if rejected.contains(entry.rel_path.as_str()) {
+            continue;
+        }
+        outcome.sent += 1;
+        progress::record_transfer(&entry.rel_path, entry.size.max(0) as u64);
+    }
+    outcome.failed.extend(ack.failed);
+    throttle_after_transfer(payload_bytes, req.bwlimit_kbps);
+    Ok(outcome)
+}
+
+/// Per-file delivery of a planned batch for peers without the batch endpoint.
+fn push_batch_per_file_fallback(
+    req: &TransferPushFilesBatchRequest,
+    included: &[&SnapshotEntry],
+    mut outcome: TransferBatchOutcome,
+    timeout: Duration,
+) -> Result<TransferBatchOutcome> {
+    for entry in included {
+        cancel::check()?;
+        let src = safe_join_rel(&req.source_root, &entry.rel_path)?;
+        match send_file_tcp(
+            &req.destination,
+            &req.destination_root,
+            &req.destination_id,
+            req.cycle_id,
+            entry,
+            &src,
+            timeout,
+            req.bwlimit_kbps,
+        ) {
+            Ok(()) => outcome.sent += 1,
+            Err(err) if transfer_error_is_source_changing(&err) => {
+                outcome.changing.push(entry.rel_path.clone());
+            }
+            Err(err) => outcome.failed.push(BatchFileFailure {
+                rel_path: entry.rel_path.clone(),
+                error: format!("{err:#}"),
+            }),
+        }
+    }
+    Ok(outcome)
+}
+
 fn receive_symlink_target(
     dst_root: &Path,
     cycle_id: i64,
@@ -1911,6 +2271,132 @@ fn send_file_tcp(
         offset = 0;
     }
     let _ = destination_id;
+    // One streamed request delivers the whole remainder (the receiver writes
+    // it straight to disk); peers without the endpoint get the legacy 16 MiB
+    // request-per-chunk loop.
+    let full_hash = match send_file_body_streamed(
+        destination,
+        destination_root,
+        cycle_id,
+        entry,
+        src,
+        offset,
+        timeout,
+        bwlimit_kbps,
+    ) {
+        Ok(hash) => hash,
+        Err(err) if error_is_missing_endpoint(&err) => send_file_body_chunked(
+            destination,
+            destination_root,
+            cycle_id,
+            entry,
+            src,
+            offset,
+            timeout,
+            bwlimit_kbps,
+        )?,
+        Err(err) => return Err(err),
+    };
+    // Catch torn streams: the hash covers what was read, not a consistent
+    // version — a same-size mutation mid-stream would otherwise pass.
+    ensure_source_stable(src, entry)?;
+    let finish = TransferFinishFileRequest {
+        root: destination_root.to_path_buf(),
+        cycle_id,
+        entry: entry.clone(),
+        full_hash: Some(full_hash),
+    };
+    let ack: TransferAck =
+        remote_post_json(destination, "/api/transfer/finish-file", &finish, timeout)?;
+    if !ack.ok {
+        bail!("peer rejected TCP file transfer");
+    }
+    Ok(())
+}
+
+/// Stream the file's remainder (from `offset`) as ONE sized request body,
+/// hashing the WHOLE file on the way — bytes before the resume offset are
+/// read for hashing only. Neither side ever buffers more than one read
+/// chunk, unlike the legacy path's one 16 MiB request body per chunk on the
+/// receiver. Returns the whole-file blake3 hex.
+#[allow(clippy::too_many_arguments)]
+fn send_file_body_streamed(
+    destination: &crate::core::config::MachineConfig,
+    destination_root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    src: &Path,
+    offset: u64,
+    timeout: Duration,
+    bwlimit_kbps: u64,
+) -> Result<String> {
+    let total_size = entry.size.max(0) as u64;
+    let mut file = File::open(src).with_context(|| format!("failed to read {}", src.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let api_path = format!(
+        "/api/transfer/put-file-stream?root={}&rel_path={}&cycle_id={}&size={}&offset={}",
+        encode_query_component(&destination_root.to_string_lossy()),
+        encode_query_component(&entry.rel_path),
+        cycle_id,
+        entry.size,
+        offset
+    );
+    let content_length = total_size - offset;
+    let response = crate::core::machines::remote_post_octet_stream(
+        destination,
+        &api_path,
+        content_length,
+        &mut |out| {
+            let mut pos = 0_u64;
+            let mut buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
+            while pos < total_size {
+                // Per-chunk poll so a multi-gigabyte file aborts mid-stream
+                // instead of holding the cancel until the file completes.
+                cancel::check()?;
+                let remaining = (total_size - pos).min(TRANSFER_CHUNK_SIZE as u64) as usize;
+                let n = file.read(&mut buf[..remaining])?;
+                if n == 0 {
+                    // The file shrank below its snapshot size mid-stream;
+                    // canonical, parseable source-changing form.
+                    bail!("source changed while copying {}", entry.rel_path);
+                }
+                hasher.update(&buf[..n]);
+                let chunk_end = pos + n as u64;
+                if chunk_end > offset {
+                    let skip = offset.saturating_sub(pos) as usize;
+                    out.write_all(&buf[skip..n])?;
+                    let sent_now = n - skip;
+                    progress::record_transfer(&entry.rel_path, sent_now as u64);
+                    throttle_after_transfer(sent_now, bwlimit_kbps);
+                }
+                pos = chunk_end;
+            }
+            Ok(())
+        },
+        timeout,
+    )?;
+    let ack: TransferAck =
+        serde_json::from_slice(&response).context("failed to parse peer response")?;
+    if !ack.ok {
+        bail!("peer rejected streamed file body");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Legacy big-file delivery: one 16 MiB request per chunk. Kept as the
+/// fallback for peers without the put-file-stream endpoint.
+#[allow(clippy::too_many_arguments)]
+fn send_file_body_chunked(
+    destination: &crate::core::config::MachineConfig,
+    destination_root: &Path,
+    cycle_id: i64,
+    entry: &SnapshotEntry,
+    src: &Path,
+    offset: u64,
+    timeout: Duration,
+    bwlimit_kbps: u64,
+) -> Result<String> {
+    let total_size = entry.size.max(0) as u64;
     let mut file = File::open(src).with_context(|| format!("failed to read {}", src.display()))?;
     // Read from the start so we can hash the whole file end-to-end, but only
     // send the bytes from `offset` onward (resume). The 16 MiB buffer bounds
@@ -1919,14 +2405,10 @@ fn send_file_tcp(
     let mut pos = 0_u64;
     let mut buf = vec![0_u8; TRANSFER_CHUNK_SIZE];
     while pos < total_size {
-        // Per-chunk poll so a multi-gigabyte file aborts mid-stream instead of
-        // holding the cancel until the file completes.
         cancel::check()?;
         let remaining = (total_size - pos).min(TRANSFER_CHUNK_SIZE as u64) as usize;
         let n = file.read(&mut buf[..remaining])?;
         if n == 0 {
-            // The file shrank below its snapshot size mid-stream; report it in
-            // the canonical, parseable source-changing form.
             bail!("source changed while copying {}", entry.rel_path);
         }
         hasher.update(&buf[..n]);
@@ -1945,21 +2427,7 @@ fn send_file_tcp(
         }
         pos = chunk_end;
     }
-    // Catch torn streams: the hash covers what was read, not a consistent
-    // version — a same-size mutation mid-stream would otherwise pass.
-    ensure_source_stable(src, entry)?;
-    let finish = TransferFinishFileRequest {
-        root: destination_root.to_path_buf(),
-        cycle_id,
-        entry: entry.clone(),
-        full_hash: Some(hasher.finalize().to_hex().to_string()),
-    };
-    let ack: TransferAck =
-        remote_post_json(destination, "/api/transfer/finish-file", &finish, timeout)?;
-    if !ack.ok {
-        bail!("peer rejected TCP file transfer");
-    }
-    Ok(())
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2357,6 +2825,15 @@ fn sync_cycle_for_source_inner(
             continue;
         }
 
+        // Paused by the user: hold the pending target (resume picks it up
+        // exactly where the pause left off) without driving any work.
+        if dst.paused {
+            all_verified = false;
+            blocked_count += 1;
+            state.upsert_destination_status(&source.id, &dst.id, None, "yellow", "paused")?;
+            continue;
+        }
+
         // A compare for this destination is running: syncing changes under it
         // would skew its report, so hold the sync until it finishes (the
         // target stays; the next scheduler tick retries).
@@ -2718,8 +3195,7 @@ fn sync_cycle_for_source_inner(
                     &sync,
                 );
                 match sync_result {
-                    Ok((source_snapshot, touched)) => {
-                        state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
+                    Ok((_source_snapshot, touched)) => {
                         progressed = true;
                         state.clear_destination_issues(&source.id, &dst.id)?;
                         state.upsert_destination_status(
@@ -2778,7 +3254,6 @@ fn sync_cycle_for_source_inner(
             let snapshot = source_endpoint
                 .snapshot(&source.excludes, source_checksum)
                 .with_context(|| format!("failed to snapshot source {}", source.src.display()))?;
-            state.replace_snapshot(cycle.id, &source.id, &snapshot)?;
             shared_source_snapshot = Some(snapshot);
             shared_source_snapshot.as_ref().unwrap()
         };
@@ -3104,6 +3579,14 @@ fn sync_cycle_with_transfer(
                 "green",
                 "verified",
             )?;
+            continue;
+        }
+        // Paused by the user: hold the pending target (resume picks it up
+        // exactly where the pause left off) without driving any work.
+        if dst.paused {
+            all_verified = false;
+            blocked_count += 1;
+            state.upsert_destination_status(&source.id, &dst.id, None, "yellow", "paused")?;
             continue;
         }
         // A compare for this destination is running: syncing changes under it
@@ -3463,7 +3946,6 @@ fn sync_cycle_with_transfer(
                     format!("failed to snapshot destination {}", dst_root.display())
                 })?);
             }
-            state.replace_snapshot(cycle.id, &source.id, &snapshot)?;
             full_source_snapshot = Some(snapshot);
             full_source_snapshot
                 .as_ref()
@@ -3909,7 +4391,6 @@ fn sync_cycle_file_with_transfer(
             .max(snapshot_timeout_floor(source_checksum)),
     )?;
     source_snapshot.retain(|entry| entry.rel_path == source_info.name);
-    state.replace_snapshot(cycle.id, &source.id, &source_snapshot)?;
 
     let mut all_verified = true;
     let mut targeted_count = 0_usize;
@@ -3923,6 +4404,14 @@ fn sync_cycle_file_with_transfer(
             continue;
         }
         targeted_count += 1;
+        // Paused by the user: hold the pending target (resume picks it up
+        // exactly where the pause left off) without driving any work.
+        if dst.paused {
+            all_verified = false;
+            blocked_count += 1;
+            state.upsert_destination_status(&source.id, &dst.id, None, "yellow", "paused")?;
+            continue;
+        }
         if let Some(blocker) = sync_order_blocker(cfg, state, &source.id, &dst.id)? {
             all_verified = false;
             blocked_count += 1;
@@ -4556,6 +5045,7 @@ where
 /// paths changed mid-copy (tolerated; the destination goes yellow and the next
 /// cycle converges them), and which entries failed for per-file reasons (the
 /// rest of the batch still transferred, so progress is preserved).
+#[derive(Debug)]
 struct TransferOutcome {
     transferred: usize,
     changing: BTreeSet<String>,
@@ -4593,6 +5083,121 @@ impl TransferOutcome {
 /// retries on hundreds of thousands of doomed transfers.
 const MAX_PER_FILE_TRANSFER_FAILURES: usize = 20;
 
+/// A unit of work for the push pool: one entry, or one batch of small files
+/// delivered in a single request.
+enum PushWork<'a> {
+    Single(&'a SnapshotEntry, bool),
+    SmallBatch(Vec<&'a SnapshotEntry>),
+}
+
+/// Group small non-delta files into batch work items (bounded by
+/// [`SMALL_BATCH_MAX_FILES`]/[`SMALL_BATCH_MAX_BYTES`]); everything else
+/// stays a per-entry item. A batch of one gains nothing over put-file, so it
+/// degenerates to a Single.
+fn plan_push_work<'a>(entries: &[(&'a SnapshotEntry, bool)]) -> Vec<PushWork<'a>> {
+    fn flush<'a>(
+        work: &mut Vec<PushWork<'a>>,
+        batch: &mut Vec<&'a SnapshotEntry>,
+        batch_bytes: &mut usize,
+    ) {
+        match batch.len() {
+            0 => {}
+            1 => work.push(PushWork::Single(batch[0], false)),
+            _ => work.push(PushWork::SmallBatch(std::mem::take(batch))),
+        }
+        batch.clear();
+        *batch_bytes = 0;
+    }
+    let mut work = Vec::new();
+    let mut batch: Vec<&SnapshotEntry> = Vec::new();
+    let mut batch_bytes = 0_usize;
+    for (entry, use_delta) in entries {
+        let size = entry.size.max(0) as u64;
+        let small = entry.file_type == "file" && !use_delta && size <= SMALL_BATCH_FILE_MAX;
+        if !small {
+            work.push(PushWork::Single(entry, *use_delta));
+            continue;
+        }
+        if batch.len() >= SMALL_BATCH_MAX_FILES
+            || batch_bytes + size as usize > SMALL_BATCH_MAX_BYTES
+        {
+            flush(&mut work, &mut batch, &mut batch_bytes);
+        }
+        batch.push(entry);
+        batch_bytes += size as usize;
+    }
+    flush(&mut work, &mut batch, &mut batch_bytes);
+    work
+}
+
+/// Deliver one planned small-file batch, delegating to the source machine
+/// when the files live there (mirrors [`push_entry_between_machines`]).
+#[allow(clippy::too_many_arguments)]
+fn push_files_batch_between_machines(
+    source_machine_id: &str,
+    source_machine: &crate::core::config::MachineConfig,
+    source_root: &Path,
+    dst_machine: &crate::core::config::MachineConfig,
+    dst_root: &Path,
+    destination_id: &str,
+    cycle_id: i64,
+    batch: &[&SnapshotEntry],
+    sync: &NativeSyncConfig,
+) -> Result<TransferBatchOutcome> {
+    let req = TransferPushFilesBatchRequest {
+        source_root: source_root.to_path_buf(),
+        entries: batch.iter().map(|entry| (*entry).clone()).collect(),
+        destination: dst_machine.clone(),
+        destination_root: dst_root.to_path_buf(),
+        destination_id: destination_id.to_string(),
+        cycle_id,
+        transfer_timeout_secs: sync.transfer_timeout_secs.max(1),
+        bwlimit_kbps: sync.bwlimit_kbps,
+    };
+    if source_machine_id == "local" {
+        transfer_push_files_batch(req)
+    } else {
+        match remote_post_json(
+            source_machine,
+            "/api/transfer/push-files-batch",
+            &req,
+            transfer_timeout(sync),
+        ) {
+            Ok(outcome) => Ok(outcome),
+            // Old source machine without the batch endpoint: fall back to
+            // per-file delegated pushes.
+            Err(err) if error_is_missing_endpoint(&err) => {
+                let mut outcome = TransferBatchOutcome::default();
+                for entry in batch {
+                    match push_entry_between_machines(
+                        source_machine_id,
+                        source_machine,
+                        source_root,
+                        dst_machine,
+                        dst_root,
+                        destination_id,
+                        cycle_id,
+                        entry,
+                        false,
+                        sync,
+                    ) {
+                        Ok(()) => outcome.sent += 1,
+                        Err(err) if transfer_error_is_source_changing(&err) => {
+                            outcome.changing.push(entry.rel_path.clone());
+                        }
+                        Err(err) => outcome.failed.push(BatchFileFailure {
+                            rel_path: entry.rel_path.clone(),
+                            error: format!("{err:#}"),
+                        }),
+                    }
+                }
+                Ok(outcome)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
 /// Transfer the given entries to the destination using a bounded worker pool.
 /// Source-changing failures are collected (not fatal); other per-file failures
 /// are collected up to [`MAX_PER_FILE_TRANSFER_FAILURES`]; connection-level
@@ -4622,12 +5227,33 @@ fn push_entries_parallel(
         .map(|(entry, _)| entry.size.max(0) as u64)
         .sum();
     let _transfer = progress::begin_transfer(destination_id, dst_root, total_bytes);
-    let workers = resolve_parallelism(sync.max_parallel_transfers, entries.len());
+    // Small files ride shared batch requests (one round-trip + one receiver
+    // durability barrier for up to 200 files); everything else stays per-file.
+    let work = plan_push_work(entries);
+    let workers = resolve_parallelism(sync.max_parallel_transfers, work.len());
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
     let fatal_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let changing: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
     let failed: Mutex<Vec<(String, anyhow::Error)>> = Mutex::new(Vec::new());
+    // Push a failure under the shared cap; returns true when the cap was hit
+    // and the pool should abort with the aggregated fatal error.
+    let push_failed = |rel_path: String, err: anyhow::Error| -> bool {
+        let mut list = failed.lock().unwrap_or_else(|e| e.into_inner());
+        list.push((rel_path, err));
+        if list.len() >= MAX_PER_FILE_TRANSFER_FAILURES {
+            let (path, err) = list.pop().expect("failure list cannot be empty at its cap");
+            let mut slot = fatal_error.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(err.context(format!(
+                    "giving up after {MAX_PER_FILE_TRANSFER_FAILURES} \
+                     file transfer failures (last: {path})"
+                )));
+            }
+            return true;
+        }
+        false
+    };
     // Thread-locals do not cross spawn; carry the cancel token explicitly so
     // a cancel request stops the workers, not just the coordinating thread.
     let cancel_token = cancel::current_token();
@@ -4652,61 +5278,129 @@ fn push_entries_parallel(
                         break;
                     }
                     let idx = next.fetch_add(1, Ordering::Relaxed);
-                    if idx >= entries.len() {
+                    if idx >= work.len() {
                         break;
                     }
-                    let (entry, use_delta) = entries[idx];
-                    match with_transfer_retry(&entry.rel_path, || {
-                        push_entry_between_machines(
-                            source_machine_id,
-                            source_machine,
-                            source_root,
-                            dst_machine,
-                            dst_root,
-                            destination_id,
-                            cycle_id,
-                            entry,
-                            use_delta,
-                            sync,
-                        )
-                        .with_context(|| format!("failed to transfer {}", entry.rel_path))
-                    }) {
-                        Ok(()) => {
-                            done.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(err) if transfer_error_is_source_changing(&err) => {
-                            changing
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(entry.rel_path.clone());
-                        }
-                        Err(err) if transfer_error_is_fatal(&err) => {
-                            let mut slot = fatal_error.lock().unwrap_or_else(|e| e.into_inner());
-                            if slot.is_none() {
-                                *slot = Some(err);
-                            }
-                            break;
-                        }
-                        Err(err) => {
-                            warn!(
-                                rel_path = entry.rel_path,
-                                error = %err,
-                                "file transfer failed; continuing with remaining files"
-                            );
-                            let mut list = failed.lock().unwrap_or_else(|e| e.into_inner());
-                            list.push((entry.rel_path.clone(), err));
-                            if list.len() >= MAX_PER_FILE_TRANSFER_FAILURES {
-                                let (path, err) =
-                                    list.pop().expect("failure list cannot be empty at its cap");
-                                let mut slot =
-                                    fatal_error.lock().unwrap_or_else(|e| e.into_inner());
-                                if slot.is_none() {
-                                    *slot = Some(err.context(format!(
-                                        "giving up after {MAX_PER_FILE_TRANSFER_FAILURES} \
-                                         file transfer failures (last: {path})"
-                                    )));
+                    match &work[idx] {
+                        PushWork::Single(entry, use_delta) => {
+                            match with_transfer_retry(&entry.rel_path, || {
+                                push_entry_between_machines(
+                                    source_machine_id,
+                                    source_machine,
+                                    source_root,
+                                    dst_machine,
+                                    dst_root,
+                                    destination_id,
+                                    cycle_id,
+                                    entry,
+                                    *use_delta,
+                                    sync,
+                                )
+                                .with_context(|| {
+                                    format!("failed to transfer {}", entry.rel_path)
+                                })
+                            }) {
+                                Ok(()) => {
+                                    done.fetch_add(1, Ordering::Relaxed);
                                 }
-                                break;
+                                Err(err) if transfer_error_is_source_changing(&err) => {
+                                    changing
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .insert(entry.rel_path.clone());
+                                }
+                                Err(err) if transfer_error_is_fatal(&err) => {
+                                    let mut slot =
+                                        fatal_error.lock().unwrap_or_else(|e| e.into_inner());
+                                    if slot.is_none() {
+                                        *slot = Some(err);
+                                    }
+                                    break;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        rel_path = entry.rel_path,
+                                        error = %err,
+                                        "file transfer failed; continuing with remaining files"
+                                    );
+                                    if push_failed(entry.rel_path.clone(), err) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        PushWork::SmallBatch(batch) => {
+                            let label = format!(
+                                "batch of {} small files (first: {})",
+                                batch.len(),
+                                batch[0].rel_path
+                            );
+                            let mut batch_outcome: Option<TransferBatchOutcome> = None;
+                            let result = with_transfer_retry(&label, || {
+                                batch_outcome = Some(
+                                    push_files_batch_between_machines(
+                                        source_machine_id,
+                                        source_machine,
+                                        source_root,
+                                        dst_machine,
+                                        dst_root,
+                                        destination_id,
+                                        cycle_id,
+                                        batch,
+                                        sync,
+                                    )
+                                    .with_context(|| format!("failed to transfer {label}"))?,
+                                );
+                                Ok(())
+                            });
+                            match result {
+                                Ok(()) => {
+                                    let outcome = batch_outcome
+                                        .expect("batch outcome must be set on success");
+                                    done.fetch_add(outcome.sent, Ordering::Relaxed);
+                                    if !outcome.changing.is_empty() {
+                                        changing
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .extend(outcome.changing);
+                                    }
+                                    let mut abort = false;
+                                    for failure in outcome.failed {
+                                        warn!(
+                                            rel_path = failure.rel_path,
+                                            error = failure.error,
+                                            "file transfer failed; continuing with remaining files"
+                                        );
+                                        if push_failed(
+                                            failure.rel_path,
+                                            anyhow!(failure.error),
+                                        ) {
+                                            abort = true;
+                                            break;
+                                        }
+                                    }
+                                    if abort {
+                                        break;
+                                    }
+                                }
+                                Err(err) if transfer_error_is_fatal(&err) => {
+                                    let mut slot =
+                                        fatal_error.lock().unwrap_or_else(|e| e.into_inner());
+                                    if slot.is_none() {
+                                        *slot = Some(err);
+                                    }
+                                    break;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        batch = label,
+                                        error = %err,
+                                        "batch transfer failed; continuing with remaining work"
+                                    );
+                                    if push_failed(label, err) {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -8250,6 +8944,7 @@ mod tests {
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             },
         );
@@ -8271,6 +8966,7 @@ mod tests {
                 path: PathBuf::from("/dev"),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             },
         );
@@ -8293,6 +8989,7 @@ mod tests {
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             },
         )
@@ -8333,6 +9030,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -8349,6 +9047,279 @@ mod tests {
         assert_eq!(views[0].status, "green");
         assert_eq!(views[0].target_cycle_id, views[0].last_verified_cycle_id);
         assert!(views[0].target_cycle_id.is_some());
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    fn batch_entry(rel: &str, size: i64) -> SnapshotEntry {
+        SnapshotEntry {
+            rel_path: rel.to_string(),
+            file_type: "file".to_string(),
+            size,
+            mtime_ns: 1_000_000_000,
+            mode: 0o644,
+            hash: None,
+        }
+    }
+
+    #[test]
+    fn plan_push_work_batches_small_files_and_keeps_the_rest_single() {
+        let small_a = batch_entry("a.txt", 10);
+        let small_b = batch_entry("b.txt", 10);
+        let big = batch_entry("big.bin", (SMALL_BATCH_FILE_MAX + 1) as i64);
+        let delta = batch_entry("delta.bin", 10);
+        let lone = batch_entry("lone.txt", 10);
+
+        // Two adjacent smalls batch; the big and the delta-eligible file stay
+        // single work items.
+        let entries = vec![
+            (&small_a, false),
+            (&small_b, false),
+            (&big, false),
+            (&delta, true),
+        ];
+        let work = plan_push_work(&entries);
+        assert_eq!(work.len(), 3);
+        assert!(matches!(&work[0], PushWork::Single(entry, false) if entry.rel_path == "big.bin"));
+        assert!(
+            matches!(&work[1], PushWork::Single(entry, true) if entry.rel_path == "delta.bin")
+        );
+        assert!(matches!(&work[2], PushWork::SmallBatch(batch) if batch.len() == 2));
+
+        // A batch of one degenerates to a Single (no gain over put-file).
+        let entries = vec![(&lone, false)];
+        let work = plan_push_work(&entries);
+        assert_eq!(work.len(), 1);
+        assert!(matches!(&work[0], PushWork::Single(entry, false) if entry.rel_path == "lone.txt"));
+
+        // The per-batch file cap splits an oversized run.
+        let many: Vec<SnapshotEntry> = (0..SMALL_BATCH_MAX_FILES + 1)
+            .map(|i| batch_entry(&format!("f{i}"), 1))
+            .collect();
+        let refs: Vec<(&SnapshotEntry, bool)> = many.iter().map(|entry| (entry, false)).collect();
+        let work = plan_push_work(&refs);
+        assert_eq!(work.len(), 2);
+        assert!(
+            matches!(&work[0], PushWork::SmallBatch(batch) if batch.len() == SMALL_BATCH_MAX_FILES)
+        );
+        assert!(matches!(&work[1], PushWork::Single(..)));
+    }
+
+    #[test]
+    fn put_files_batch_roundtrips_and_reports_per_file_failures() {
+        let temp = temp_dir("put_files_batch");
+        let root = temp.join("dst");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut body: Vec<u8> = Vec::new();
+        let mut frame = |rel: &str, payload: &[u8], hash: &str| {
+            let header = BatchFileHeader {
+                rel_path: rel.to_string(),
+                size: payload.len() as i64,
+                mtime_ns: 1_700_000_000_000_000_000,
+                mode: 0o644,
+                full_hash: hash.to_string(),
+            };
+            body.extend_from_slice(&serde_json::to_vec(&header).unwrap());
+            body.push(b'\n');
+            body.extend_from_slice(payload);
+        };
+        let good = b"hello batch";
+        frame("dir/good.txt", good, &blake3::hash(good).to_hex().to_string());
+        // Wrong hash: must fail THAT file only, not the batch.
+        frame("bad.txt", b"corrupted", &blake3::hash(b"other").to_hex().to_string());
+        let also = b"second good";
+        frame("also.txt", also, &blake3::hash(also).to_hex().to_string());
+
+        let ack = transfer_put_files_batch(
+            TransferPutFilesBatchQuery {
+                root: root.to_string_lossy().to_string(),
+                cycle_id: 7,
+            },
+            &body,
+        )
+        .unwrap();
+        assert!(ack.ok);
+        assert_eq!(ack.failed.len(), 1);
+        assert_eq!(ack.failed[0].rel_path, "bad.txt");
+        assert_eq!(fs::read(root.join("dir/good.txt")).unwrap(), good);
+        assert_eq!(fs::read(root.join("also.txt")).unwrap(), also);
+        assert!(!root.join("bad.txt").exists());
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn stream_target_resumes_and_truncates_like_the_chunk_endpoint() {
+        let temp = temp_dir("stream_target");
+        let root = temp.join("dst");
+        fs::create_dir_all(&root).unwrap();
+        let query = |offset: u64| TransferReceiveFileChunkQuery {
+            root: root.to_string_lossy().to_string(),
+            rel_path: "video.bin".to_string(),
+            cycle_id: 3,
+            size: 100,
+            offset,
+        };
+
+        // Fresh write at offset 0.
+        let mut file = transfer_open_file_stream_target(&query(0)).unwrap();
+        file.write_all(b"0123456789").unwrap();
+        drop(file);
+        // Resume at 10 appends; a longer leftover tail would be truncated.
+        let mut file = transfer_open_file_stream_target(&query(10)).unwrap();
+        file.write_all(b"abc").unwrap();
+        drop(file);
+        let tmp = tmp_path(&root, 3, "video.bin");
+        assert_eq!(fs::read(&tmp).unwrap(), b"0123456789abc");
+        // Truncation on a SHORTER resume offset.
+        let file = transfer_open_file_stream_target(&query(5)).unwrap();
+        drop(file);
+        assert_eq!(fs::metadata(&tmp).unwrap().len(), 5);
+        // Offset beyond the tmp length must refuse (nothing to resume from).
+        assert!(transfer_open_file_stream_target(&query(50)).is_err());
+        // Offset beyond the expected size is invalid outright.
+        assert!(transfer_open_file_stream_target(&query(101)).is_err());
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn copy_pool_tolerates_bounded_per_file_failures() {
+        let temp = temp_dir("copy_pool_tolerates");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        for i in 0..5 {
+            fs::write(src.join(format!("good{i}.txt")), b"data").unwrap();
+        }
+        // Accurate size/mtime metadata (ensure_source_stable compares them).
+        let snapshot =
+            take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap();
+        let mut entries: Vec<SnapshotEntry> = snapshot
+            .into_iter()
+            .filter(|entry| entry.file_type == "file")
+            .collect();
+        for i in 0..3 {
+            entries.push(SnapshotEntry {
+                rel_path: format!("missing{i}.txt"),
+                file_type: "file".to_string(),
+                size: 4,
+                mtime_ns: 0,
+                mode: 0o644,
+                hash: None,
+            });
+        }
+        let entry_refs: Vec<&SnapshotEntry> = entries.iter().collect();
+
+        let sync = NativeSyncConfig::default();
+        let _meter = progress::begin_transfer("dst_pool", &dst, 0);
+        let outcome =
+            copy_entries_parallel(&src, &dst, "dst_pool", 1, &entry_refs, &sync).unwrap();
+        assert_eq!(outcome.transferred, 5);
+        assert_eq!(outcome.failed.len(), 3);
+        assert!(outcome.changing.is_empty());
+        for i in 0..5 {
+            assert_eq!(fs::read(dst.join(format!("good{i}.txt"))).unwrap(), b"data");
+        }
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn copy_pool_gives_up_at_the_failure_cap() {
+        let temp = temp_dir("copy_pool_cap");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let entries: Vec<SnapshotEntry> = (0..MAX_PER_FILE_TRANSFER_FAILURES + 5)
+            .map(|i| SnapshotEntry {
+                rel_path: format!("missing{i}.txt"),
+                file_type: "file".to_string(),
+                size: 4,
+                mtime_ns: 0,
+                mode: 0o644,
+                hash: None,
+            })
+            .collect();
+        let entry_refs: Vec<&SnapshotEntry> = entries.iter().collect();
+
+        let sync = NativeSyncConfig::default();
+        let _meter = progress::begin_transfer("dst_pool", &dst, 0);
+        let err = copy_entries_parallel(&src, &dst, "dst_pool", 1, &entry_refs, &sync)
+            .expect_err("a doomed destination must abort, not grind through every file");
+        assert!(format!("{err:#}").contains("giving up after"), "{err:#}");
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn paused_destination_holds_pending_target_until_resume() {
+        let temp = temp_dir("paused_dst_hold");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("hello.txt"), b"hello").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            add_directory: true,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+                paused: true,
+                sync: None,
+            }],
+        });
+
+        let mut state = State::open(&db).unwrap();
+
+        // The scheduler assigns a paused destination no target (even a first
+        // sync), and manual sync requests are refused outright.
+        assert_eq!(state.advance_due_destination_targets(&cfg).unwrap().len(), 0);
+        let err = queue_destination_sync(&cfg, &state, "src_1", "dst_1", SyncRequestMode::Incremental)
+            .unwrap_err();
+        assert!(err.to_string().contains("paused"), "{err:#}");
+
+        // A target pending from before the pause (the stopped first sync) is
+        // held — the engine drives no work and reports the pause.
+        state
+            .force_target_destination(&cfg, "src_1", "dst_1")
+            .unwrap()
+            .unwrap();
+        sync_all_pending(&cfg, &mut state).unwrap();
+        assert!(!dst.join("src").join("hello.txt").exists());
+        let views = state.destination_views(&cfg).unwrap();
+        assert_eq!(views[0].status_reason, "paused");
+
+        // Resuming continues the held target with no new request.
+        cfg.source_groups[0].destinations[0].paused = false;
+        sync_all_pending(&cfg, &mut state).unwrap();
+        assert_eq!(
+            fs::read(dst.join("src").join("hello.txt")).unwrap(),
+            b"hello"
+        );
+        let views = state.destination_views(&cfg).unwrap();
+        assert_eq!(views[0].status, "green");
 
         fs::remove_dir_all(temp).ok();
     }
@@ -8387,6 +9358,7 @@ mod tests {
                     path: dst_1.clone(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    paused: false,
                     sync: None,
                 },
                 DestinationConfig {
@@ -8398,6 +9370,7 @@ mod tests {
                         mode: ScheduleMode::Daily,
                         ..ScheduleConfig::default()
                     },
+                    paused: false,
                     sync: None,
                 },
             ],
@@ -8463,6 +9436,7 @@ mod tests {
                     path: dst_1.clone(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    paused: false,
                     sync: None,
                 },
                 DestinationConfig {
@@ -8474,6 +9448,7 @@ mod tests {
                         mode: ScheduleMode::Daily,
                         ..ScheduleConfig::default()
                     },
+                    paused: false,
                     sync: None,
                 },
             ],
@@ -8548,6 +9523,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -8593,6 +9569,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -8660,6 +9637,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -8726,6 +9704,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -8799,6 +9778,7 @@ mod tests {
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -9139,6 +10119,7 @@ other /zfs_other zfs rw 0 0
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -9210,6 +10191,7 @@ other /zfs_other zfs rw 0 0
                     path: dst_a.clone(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    paused: false,
                     sync: None,
                 },
                 DestinationConfig {
@@ -9218,6 +10200,7 @@ other /zfs_other zfs rw 0 0
                     path: dst_b.clone(),
                     enabled: true,
                     schedule: ScheduleConfig::default(),
+                    paused: false,
                     sync: Some(dst_b_sync),
                 },
             ],
@@ -9280,6 +10263,7 @@ other /zfs_other zfs rw 0 0
                 path: dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -9335,6 +10319,7 @@ other /zfs_other zfs rw 0 0
                 path: after_dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -9357,6 +10342,7 @@ other /zfs_other zfs rw 0 0
                 path: before_dst.clone(),
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         });
@@ -9493,6 +10479,7 @@ other /zfs_other zfs rw 0 0
                     mode: crate::core::config::ScheduleMode::Daily,
                     ..ScheduleConfig::default()
                 },
+                paused: false,
                 sync: None,
             }],
         };

@@ -46,9 +46,11 @@
         <label for="folder-machine">Machine</label>
         <select id="folder-machine"></select>
       </div>
-      <label id="folder-add-directory-row" class="folder-checkbox-row" hidden>
+      <label id="folder-add-directory-row" class="folder-checkbox-row" hidden
+             title="Checked: the selected folder itself is created inside the destination, so it syncs to <destination>/<folder name>/... Unchecked: only the folder's contents sync directly into the destination.">
         <input id="folder-add-directory" type="checkbox">
         <span>Add Directory</span>
+        <span class="folder-checkbox-hint">checked: sync as &lt;destination&gt;/&lt;folder name&gt;/…; unchecked: sync contents directly into the destination</span>
       </label>
       <div class="folder-path" id="folder-path"></div>
       <div class="folder-actions">

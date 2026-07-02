@@ -232,6 +232,7 @@ impl TestEnv {
                 machine_id: "nas".to_string(),
                 path: PathBuf::from(&self.remote_base),
                 enabled: true,
+                paused: false,
                 schedule: ScheduleConfig::default(),
                 sync: None,
             }],

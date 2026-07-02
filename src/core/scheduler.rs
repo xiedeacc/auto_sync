@@ -81,3 +81,117 @@ fn parse_weekday(value: &str) -> Result<Weekday> {
         other => bail!("invalid weekday: {other}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schedule(mode: ScheduleMode, time: &str, weekday: Option<&str>) -> ScheduleConfig {
+        ScheduleConfig {
+            mode,
+            time: time.to_string(),
+            weekday: weekday.map(str::to_string),
+            ..ScheduleConfig::default()
+        }
+    }
+
+    /// Boundaries are computed in the machine's LOCAL timezone; building the
+    /// expectations through the same `Local` conversion keeps these tests
+    /// correct in any timezone the suite runs in.
+    fn local_utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
+        Local
+            .with_ymd_and_hms(y, m, d, h, min, 0)
+            .single()
+            .expect("unambiguous local time")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn daily_boundary_is_the_next_occurrence_after_start() {
+        let cfg = schedule(ScheduleMode::Daily, "19:00", None);
+        // Start before today's slot → today's slot.
+        assert_eq!(
+            next_boundary_after(local_utc(2026, 6, 15, 10, 0), &cfg).unwrap(),
+            local_utc(2026, 6, 15, 19, 0)
+        );
+        // Start after today's slot → tomorrow's slot.
+        assert_eq!(
+            next_boundary_after(local_utc(2026, 6, 15, 20, 0), &cfg).unwrap(),
+            local_utc(2026, 6, 16, 19, 0)
+        );
+        // Start exactly AT the slot → strictly after, so the next day.
+        assert_eq!(
+            next_boundary_after(local_utc(2026, 6, 15, 19, 0), &cfg).unwrap(),
+            local_utc(2026, 6, 16, 19, 0)
+        );
+    }
+
+    #[test]
+    fn weekly_boundary_lands_on_the_configured_weekday() {
+        let cfg = schedule(ScheduleMode::Weekly, "19:00", Some("sat"));
+        // 2026-06-15 is a Monday; the next Saturday is 2026-06-20.
+        assert_eq!(
+            next_boundary_after(local_utc(2026, 6, 15, 10, 0), &cfg).unwrap(),
+            local_utc(2026, 6, 20, 19, 0)
+        );
+        // Start ON Saturday past the slot → the following Saturday.
+        assert_eq!(
+            next_boundary_after(local_utc(2026, 6, 20, 19, 30), &cfg).unwrap(),
+            local_utc(2026, 6, 27, 19, 0)
+        );
+        // Full weekday names accepted too.
+        let cfg = schedule(ScheduleMode::Weekly, "07:30", Some("Sunday"));
+        assert_eq!(
+            next_boundary_after(local_utc(2026, 6, 15, 10, 0), &cfg).unwrap(),
+            local_utc(2026, 6, 21, 7, 30)
+        );
+    }
+
+    #[test]
+    fn realtime_boundary_is_the_start_itself() {
+        let cfg = schedule(ScheduleMode::Realtime, "", None);
+        let start = local_utc(2026, 6, 15, 10, 0);
+        assert_eq!(next_boundary_after(start, &cfg).unwrap(), start);
+        assert!(cycle_is_due(start, start, &cfg));
+    }
+
+    #[test]
+    fn cycle_is_due_only_at_or_after_the_boundary() {
+        let cfg = schedule(ScheduleMode::Daily, "19:00", None);
+        let start = local_utc(2026, 6, 15, 10, 0);
+        let boundary = local_utc(2026, 6, 15, 19, 0);
+        assert!(!cycle_is_due(start, boundary - Duration::minutes(1), &cfg));
+        assert!(cycle_is_due(start, boundary, &cfg));
+        assert!(cycle_is_due(start, boundary + Duration::minutes(1), &cfg));
+    }
+
+    #[test]
+    fn invalid_schedule_falls_back_to_one_day() {
+        // An unparseable time must not wedge the cycle open forever: the
+        // fallback closes it after 24h.
+        let cfg = schedule(ScheduleMode::Daily, "not-a-time", None);
+        let start = local_utc(2026, 6, 15, 10, 0);
+        assert!(!cycle_is_due(start, start + Duration::hours(23), &cfg));
+        assert!(cycle_is_due(start, start + Duration::days(1), &cfg));
+        // Same for an invalid weekday on a weekly schedule.
+        let cfg = schedule(ScheduleMode::Weekly, "19:00", Some("caturday"));
+        assert!(!cycle_is_due(start, start + Duration::hours(23), &cfg));
+        assert!(cycle_is_due(start, start + Duration::days(1), &cfg));
+    }
+
+    #[test]
+    fn weekday_aliases_parse_and_junk_is_rejected() {
+        for (value, expected) in [
+            ("mon", Weekday::Mon),
+            ("Tuesday", Weekday::Tue),
+            ("WED", Weekday::Wed),
+            ("thu", Weekday::Thu),
+            ("friday", Weekday::Fri),
+            ("sat", Weekday::Sat),
+            ("sunday", Weekday::Sun),
+        ] {
+            assert_eq!(parse_weekday(value).unwrap(), expected, "{value}");
+        }
+        assert!(parse_weekday("caturday").is_err());
+    }
+}

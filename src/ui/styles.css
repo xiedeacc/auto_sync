@@ -352,27 +352,46 @@ th {
   display: none;
 }
 
-/* Swaps in for the delete button while this destination has a running
-   sync/compare; clicking it sends a destination-scoped cancel. */
-.dst-stop-button {
-  border-color: #b45309;
+/* Pause/resume toggle left of the info button: pausing cancels the running
+   task and holds pending/new ones; resuming lets the held work continue. */
+.pause-dst-button {
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #b45309;
+  border-radius: 6px;
   background: rgba(180, 83, 9, 0.1);
   color: #b45309;
   font-size: 12px;
+  line-height: 1;
 }
 
-.dst-stop-button:hover {
+.pause-dst-button:hover {
   background: rgba(180, 83, 9, 0.2);
 }
 
-.dst-stop-button:disabled {
+.pause-dst-button.paused {
+  border-color: #15803d;
+  background: rgba(21, 128, 61, 0.12);
+  color: #15803d;
+}
+
+.pause-dst-button.paused:hover {
+  background: rgba(21, 128, 61, 0.22);
+}
+
+.pause-dst-button:disabled {
   opacity: 0.6;
   cursor: default;
 }
 
-.dst-stop-button[hidden],
-.destination-row [data-action="remove-dst"][hidden] {
-  display: none;
+.destination-row [data-action="remove-dst"]:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* Latest Cycle cell hosts the restart-notice warning without adding a grid
@@ -1273,6 +1292,12 @@ th {
 .folder-checkbox-row input {
   width: 16px;
   height: 16px;
+}
+
+.folder-checkbox-hint {
+  font-size: 12px;
+  color: var(--muted);
+  opacity: 0.85;
 }
 
 .folder-actions {

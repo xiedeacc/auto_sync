@@ -48,6 +48,11 @@ const FAN_EVENT_INFO_TYPE_DFID: u8 = 3;
 const FAN_EVENT_INFO_TYPE_OLD_DFID_NAME: u8 = 10;
 const FAN_EVENT_INFO_TYPE_NEW_DFID_NAME: u8 = 12;
 const MAX_HANDLE_SZ: usize = 128;
+/// Cap on the LAZY handle→path cache (directories only). Past it the map is
+/// dropped wholesale and refills on demand — cheap, and correctness does not
+/// depend on the cache. Eager (pre-built) maps are exempt: without
+/// `open_by_handle_at` they are the only way to resolve events.
+const MAX_LAZY_HANDLE_CACHE: usize = 131_072;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -81,9 +86,13 @@ struct SourceRoot {
     id: String,
     root: PathBuf,
     is_file: bool,
-    /// handle→path cache. With lazy resolution (see `mount_fd`) it starts
-    /// nearly empty and fills with directories as events arrive; without it,
-    /// it is pre-built by walking the whole tree at startup.
+    /// handle→path cache, DIRECTORIES ONLY: DFID_NAME records carry the
+    /// parent directory's handle plus the child name, so directory handles
+    /// repeat for every child event while a file handle is looked up at most
+    /// once. With lazy resolution (see `mount_fd`) it starts nearly empty,
+    /// fills on demand, and is dropped wholesale past a size cap (refills
+    /// lazily); without lazy resolution it is pre-built by walking the tree's
+    /// directories at startup (uncapped — it must stay complete).
     handle_paths: HashMap<Vec<u8>, PathBuf>,
     /// An O_PATH fd of the source root for `open_by_handle_at`, present when
     /// the kernel/caps allow resolving file handles directly. This replaces
@@ -798,9 +807,20 @@ fn fid_record_path(source: &mut SourceRoot, record: &FidRecord) -> Result<Option
             if !path.starts_with(&source.root) && !file_parent {
                 return Ok(None);
             }
-            source
-                .handle_paths
-                .insert(record.handle.clone(), path.clone());
+            // Cache directory handles only: a record WITH a name is a
+            // DFID_NAME record whose base is a directory by protocol. Bare
+            // FID records (the object itself, possibly a file) resolve at
+            // most once per event and are not worth a cache slot.
+            if record.name.is_some() {
+                if source.handle_paths.len() >= MAX_LAZY_HANDLE_CACHE {
+                    // Cheap overflow policy: drop everything and refill on
+                    // demand. Correctness is unaffected — resolution is lazy.
+                    source.handle_paths.clear();
+                }
+                source
+                    .handle_paths
+                    .insert(record.handle.clone(), path.clone());
+            }
             path
         }
     };
@@ -822,6 +842,11 @@ fn track_new_path_and_mark_directory(
     let Ok(metadata) = std::fs::metadata(path) else {
         return true;
     };
+    // The cache holds directories only (files resolve at most once, and the
+    // map must stay small enough for removal's prefix sweep).
+    if !metadata.is_dir() {
+        return true;
+    }
     // With lazy handle resolution the cache fills on demand; pre-inserting
     // here just saves the first open_by_handle_at for the new path.
     let newly_tracked = match handle_key_from_path(path) {
@@ -831,9 +856,6 @@ fn track_new_path_and_mark_directory(
             .is_none(),
         Err(_) => true,
     };
-    if !metadata.is_dir() {
-        return true;
-    }
     if !newly_tracked {
         return true;
     }
@@ -998,9 +1020,14 @@ fn build_handle_path_map(root: &Path, is_file: bool) -> Result<HashMap<Vec<u8>, 
         return Ok(handles);
     }
 
+    // Directories only: DFID_NAME event records reference directory handles
+    // (parent + child name); file handles are never looked up. This also cuts
+    // the startup walk's handle syscalls by the tree's file count.
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
-        insert_handle_path(&mut handles, entry.path());
+        if entry.file_type().is_dir() {
+            insert_handle_path(&mut handles, entry.path());
+        }
     }
     Ok(handles)
 }

@@ -679,6 +679,66 @@ pub fn remote_post_bytes<T: DeserializeOwned>(
     serde_json::from_slice(&raw).context("failed to parse peer response")
 }
 
+/// POST a request whose body is STREAMED through `write_body` with a known
+/// Content-Length instead of being buffered in memory first (multi-gigabyte
+/// file pushes). Always opens a FRESH connection: a streamed body cannot be
+/// replayed on a stale pooled connection the way buffered requests are. The
+/// connection is returned to the pool afterwards when reusable. Returns the
+/// raw response body; non-200 responses use the same error wording as the
+/// buffered path so callers can classify missing endpoints.
+pub fn remote_post_octet_stream(
+    machine: &MachineConfig,
+    path: &str,
+    content_length: u64,
+    write_body: &mut dyn FnMut(&mut dyn Write) -> Result<()>,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let key = TcpConnectionKey {
+        host: machine.host.trim().to_ascii_lowercase(),
+        port: machine.port,
+    };
+    let mut stream = open_tcp_connection(&key, timeout)?;
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\n\
+         Accept: application/json\r\nContent-Type: application/octet-stream\r\n\
+         Content-Length: {content_length}\r\n",
+        host = machine.host,
+        port = machine.port,
+    );
+    let token = peer_token();
+    if !token.is_empty() {
+        request.push_str(&format!("{PEER_TOKEN_HEADER}: {token}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes())?;
+    write_body(&mut stream)?;
+    stream.flush()?;
+    let response = read_http_response(&mut stream)?;
+    if !response.status_line.starts_with("HTTP/1.1 200")
+        && !response.status_line.starts_with("HTTP/1.0 200")
+    {
+        let detail: String = String::from_utf8_lossy(&response.body)
+            .trim()
+            .chars()
+            .take(2048)
+            .collect();
+        if detail.is_empty() {
+            bail!(
+                "peer returned non-200 response: {}",
+                response.status_line.trim()
+            );
+        }
+        bail!(
+            "peer returned non-200 response: {}: {detail}",
+            response.status_line.trim()
+        );
+    }
+    if response.reusable {
+        return_tcp_connection(key, stream);
+    }
+    Ok(response.body)
+}
+
 /// POST a JSON request and stream the NDJSON response line by line through
 /// `on_line` (CR/LF stripped) instead of buffering the whole body. Whole-tree
 /// snapshot responses run to ~100MB of JSON — the buffered path holds all of
@@ -1195,7 +1255,7 @@ struct HttpResponse {
     reusable: bool,
 }
 
-fn read_http_response(stream: &mut TcpStream) -> Result<HttpResponse> {
+fn read_http_response<R: Read>(stream: &mut R) -> Result<HttpResponse> {
     let mut raw = Vec::new();
     let mut buf = [0_u8; 8192];
     let split = loop {
@@ -1260,7 +1320,7 @@ fn read_http_response(stream: &mut TcpStream) -> Result<HttpResponse> {
     })
 }
 
-fn read_chunked_body(stream: &mut TcpStream, mut pending: Vec<u8>) -> Result<Vec<u8>> {
+fn read_chunked_body<R: Read>(stream: &mut R, mut pending: Vec<u8>) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
         let line = read_crlf_line(stream, &mut pending)?;
@@ -1284,7 +1344,7 @@ fn read_chunked_body(stream: &mut TcpStream, mut pending: Vec<u8>) -> Result<Vec
     }
 }
 
-fn read_crlf_line(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Result<String> {
+fn read_crlf_line<R: Read>(stream: &mut R, pending: &mut Vec<u8>) -> Result<String> {
     loop {
         if let Some(pos) = pending.windows(2).position(|window| window == b"\r\n") {
             let line = String::from_utf8_lossy(&pending[..pos]).to_string();
@@ -1295,14 +1355,14 @@ fn read_crlf_line(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Result<Strin
     }
 }
 
-fn ensure_pending(stream: &mut TcpStream, pending: &mut Vec<u8>, needed: usize) -> Result<()> {
+fn ensure_pending<R: Read>(stream: &mut R, pending: &mut Vec<u8>, needed: usize) -> Result<()> {
     while pending.len() < needed {
         read_more(stream, pending)?;
     }
     Ok(())
 }
 
-fn read_more(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Result<()> {
+fn read_more<R: Read>(stream: &mut R, pending: &mut Vec<u8>) -> Result<()> {
     let mut buf = [0_u8; 8192];
     let n = stream.read(&mut buf)?;
     if n == 0 {
@@ -1417,6 +1477,55 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn http_response_reads_content_length_body_and_stays_reusable() {
+        let wire = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let response = read_http_response(&mut std::io::Cursor::new(wire.to_vec())).unwrap();
+        assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+        assert_eq!(response.body, b"hello");
+        assert!(response.reusable);
+    }
+
+    #[test]
+    fn http_response_connection_close_is_not_reusable() {
+        let wire = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        let response = read_http_response(&mut std::io::Cursor::new(wire.to_vec())).unwrap();
+        assert_eq!(response.body, b"ok");
+        assert!(!response.reusable);
+    }
+
+    #[test]
+    fn http_response_decodes_chunked_transfer_encoding() {
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                     6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n";
+        let response = read_http_response(&mut std::io::Cursor::new(wire.to_vec())).unwrap();
+        assert_eq!(response.body, b"hello world");
+        assert!(response.reusable);
+        // Chunk extensions after ';' are ignored.
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                     2;ext=1\r\nhi\r\n0\r\n\r\n";
+        let response = read_http_response(&mut std::io::Cursor::new(wire.to_vec())).unwrap();
+        assert_eq!(response.body, b"hi");
+    }
+
+    #[test]
+    fn http_response_without_framing_reads_to_eof_and_is_not_reusable() {
+        let wire = b"HTTP/1.0 200 OK\r\n\r\nstream-until-close";
+        let response = read_http_response(&mut std::io::Cursor::new(wire.to_vec())).unwrap();
+        assert_eq!(response.body, b"stream-until-close");
+        assert!(!response.reusable);
+    }
+
+    #[test]
+    fn http_response_rejects_truncated_body_and_headers() {
+        // Body shorter than Content-Length → error, not a silent short read.
+        let wire = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhel";
+        assert!(read_http_response(&mut std::io::Cursor::new(wire.to_vec())).is_err());
+        // Connection dropped before the header terminator.
+        let wire = b"HTTP/1.1 200 OK\r\nContent-Le";
+        assert!(read_http_response(&mut std::io::Cursor::new(wire.to_vec())).is_err());
+    }
 
     #[test]
     fn chunked_body_decodes_across_read_boundaries() {

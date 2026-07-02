@@ -194,6 +194,7 @@ impl TestEnv {
                 machine_id: "local".to_string(),
                 path: self.dst.clone(),
                 enabled: true,
+                paused: false,
                 schedule: ScheduleConfig {
                     mode: ScheduleMode::Realtime,
                     ..ScheduleConfig::default()

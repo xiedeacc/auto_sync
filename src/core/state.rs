@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 /// instances in the process share one DB file, so one lock covers them.
 static DB_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-/// Rows per transaction for bulk path_snapshot writes/deletes. Small enough
-/// that no single transaction holds SQLite's writer long (keeping UI and
-/// watcher writes responsive), large enough to amortize commit cost.
-const SNAPSHOT_WRITE_CHUNK: usize = 20_000;
+/// Rows per transaction for bulk event_log deletes. Small enough that no
+/// single transaction holds SQLite's writer long (keeping UI and watcher
+/// writes responsive), large enough to amortize commit cost.
+const EVENT_PRUNE_CHUNK: usize = 20_000;
 
 use crate::core::config::AppConfig;
 use crate::core::config::ScheduleMode;
@@ -266,17 +266,11 @@ impl State {
                 PRIMARY KEY (source_id, destination_id)
             );
 
-            CREATE TABLE IF NOT EXISTS path_snapshot (
-                cycle_id INTEGER NOT NULL,
-                source_id TEXT NOT NULL,
-                rel_path TEXT NOT NULL,
-                file_type TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                mtime_ns INTEGER NOT NULL,
-                mode INTEGER NOT NULL,
-                hash TEXT,
-                PRIMARY KEY (cycle_id, source_id, rel_path)
-            );
+            -- Historical whole-tree snapshot store: written by every full
+            -- pass (hundreds of thousands of rows) but read by nothing since
+            -- Changed-Since was removed. Dropped to reclaim old databases;
+            -- harmless no-op on fresh ones.
+            DROP TABLE IF EXISTS path_snapshot;
 
             CREATE TABLE IF NOT EXISTS destination_issue (
                 source_id TEXT NOT NULL,
@@ -540,7 +534,7 @@ impl State {
             let open_has_events = self.cycle_has_actionable_events(cycle.id)?;
             let mut due_destinations = Vec::new();
 
-            for dst in source.destinations.iter().filter(|d| d.enabled) {
+            for dst in source.destinations.iter().filter(|d| d.enabled && !d.paused) {
                 let offset = self.destination_offset(&source.id, &dst.id)?;
                 if let Some(target) = offset.target_cycle_id {
                     if offset.last_verified_cycle_id < Some(target) {
@@ -608,7 +602,9 @@ impl State {
             let Some(cycle) = self.close_current_cycle_for_source(&source.id)? else {
                 continue;
             };
-            for dst in source.destinations.iter().filter(|d| d.enabled) {
+            // Paused destinations are excluded: Sync All must not queue work
+            // that would spring back to life on resume unasked.
+            for dst in source.destinations.iter().filter(|d| d.enabled && !d.paused) {
                 self.set_destination_target(&source.id, &dst.id, cycle.id)?;
             }
             closed.push(cycle);
@@ -629,7 +625,7 @@ impl State {
         let Some(cycle) = self.close_current_cycle_for_source(source_id)? else {
             return Ok(None);
         };
-        for dst in source.destinations.iter().filter(|d| d.enabled) {
+        for dst in source.destinations.iter().filter(|d| d.enabled && !d.paused) {
             self.set_destination_target(source_id, &dst.id, cycle.id)?;
         }
         Ok(Some(cycle))
@@ -1688,165 +1684,6 @@ impl State {
         Ok(views)
     }
 
-    /// Replace the stored snapshot for a cycle in CHUNKED transactions. A
-    /// whole-tree snapshot can be hundreds of thousands of rows; writing it in
-    /// one transaction holds SQLite's writer for tens of seconds, starving
-    /// every other writer (UI requests, watcher events) past their busy
-    /// timeout ("database is locked"). Only the sync engine writes
-    /// path_snapshot (serialized by the sync gate), so releasing the writer
-    /// between chunks is safe; readers never use a cycle's rows until its
-    /// destinations verify afterwards.
-    pub fn replace_snapshot(
-        &mut self,
-        cycle_id: i64,
-        source_id: &str,
-        entries: &[SnapshotEntry],
-    ) -> Result<()> {
-        self.delete_path_snapshot_rows_chunked(
-            "cycle_id=?1 AND source_id=?2",
-            params![cycle_id, source_id],
-        )?;
-        for chunk in entries.chunks(SNAPSHOT_WRITE_CHUNK) {
-            let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-            let tx = self.conn.transaction()?;
-            {
-                let mut stmt = tx.prepare_cached(
-                    r#"
-                    INSERT INTO path_snapshot
-                        (cycle_id, source_id, rel_path, file_type, size, mtime_ns, mode, hash)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                    "#,
-                )?;
-                for entry in chunk {
-                    stmt.execute(params![
-                        cycle_id,
-                        source_id,
-                        entry.rel_path,
-                        entry.file_type,
-                        entry.size,
-                        entry.mtime_ns,
-                        entry.mode as i64,
-                        entry.hash
-                    ])?;
-                }
-            }
-            tx.commit()?;
-        }
-        Ok(())
-    }
-
-    /// Delete matching path_snapshot rows in bounded batches (rowid subquery —
-    /// works without SQLite's DELETE...LIMIT compile flag), releasing the
-    /// process write lock between batches so concurrent small writers are
-    /// never starved by a bulk delete.
-    fn delete_path_snapshot_rows_chunked(
-        &self,
-        where_clause: &str,
-        where_params: &[&dyn rusqlite::ToSql],
-    ) -> Result<usize> {
-        let sql = format!(
-            "DELETE FROM path_snapshot WHERE rowid IN \
-             (SELECT rowid FROM path_snapshot WHERE {where_clause} LIMIT {SNAPSHOT_WRITE_CHUNK})"
-        );
-        let mut total = 0_usize;
-        loop {
-            let removed = {
-                let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-                self.conn.execute(&sql, where_params)?
-            };
-            total += removed;
-            if removed < SNAPSHOT_WRITE_CHUNK {
-                return Ok(total);
-            }
-        }
-    }
-
-    pub fn snapshot_count(&self, cycle_id: i64, source_id: &str) -> Result<i64> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM path_snapshot WHERE cycle_id=?1 AND source_id=?2",
-                params![cycle_id, source_id],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-    }
-
-    /// The newest cycle at or before `cycle_id` that has stored snapshot rows
-    /// for this source. Changed-Since uses it as the comparison baseline when
-    /// the destination's exact last-verified cycle wrote no snapshot (event and
-    /// zfs-diff cycles do not): an OLDER baseline is safe — it only widens the
-    /// changed-path set — while a newer one could miss changes.
-    pub fn latest_snapshot_cycle_at_or_before(
-        &self,
-        source_id: &str,
-        cycle_id: i64,
-    ) -> Result<Option<i64>> {
-        self.conn
-            .query_row(
-                r#"
-                SELECT cycle_id FROM path_snapshot
-                WHERE source_id=?1 AND cycle_id<=?2
-                ORDER BY cycle_id DESC
-                LIMIT 1
-                "#,
-                params![source_id, cycle_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    /// Delete stored source snapshots this source no longer needs. Kept per
-    /// destination: its in-flight target cycle's snapshot and its Changed-Since
-    /// baseline (the newest snapshot cycle at or before its last verified
-    /// cycle). Without this, every full cycle's whole-tree snapshot (up to
-    /// hundreds of thousands of rows) accumulates in the database forever.
-    pub fn prune_path_snapshots(&self, source_id: &str) -> Result<usize> {
-        let mut keep: Vec<i64> = Vec::new();
-        {
-            let mut stmt = self.conn.prepare(
-                r#"
-                SELECT target_cycle_id, last_verified_cycle_id
-                FROM destination_offset
-                WHERE source_id=?1
-                "#,
-            )?;
-            let rows = stmt.query_map(params![source_id], |row| {
-                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?))
-            })?;
-            for row in rows {
-                let (target, last_verified) = row?;
-                if let Some(target) = target {
-                    keep.push(target);
-                }
-                if let Some(last_verified) = last_verified {
-                    if let Some(baseline) =
-                        self.latest_snapshot_cycle_at_or_before(source_id, last_verified)?
-                    {
-                        keep.push(baseline);
-                    }
-                }
-            }
-        }
-        keep.sort_unstable();
-        keep.dedup();
-        // Chunked delete: the first prune of a long-lived database can drop
-        // millions of accumulated rows, and doing that in one statement holds
-        // SQLite's writer long enough to starve every other writer.
-        if keep.is_empty() {
-            return self.delete_path_snapshot_rows_chunked("source_id=?1", params![source_id]);
-        }
-        let id_list = keep
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        self.delete_path_snapshot_rows_chunked(
-            &format!("source_id=?1 AND cycle_id NOT IN ({id_list})"),
-            params![source_id],
-        )
-    }
-
     /// Delete event rows for cycles every destination has already verified
     /// past; those cycles can never be re-driven, so their events are dead
     /// weight (realtime sources append events continuously and nothing else
@@ -1858,7 +1695,7 @@ impl State {
         let sql = format!(
             "DELETE FROM event_log WHERE rowid IN \
              (SELECT rowid FROM event_log WHERE source_id=?1 AND cycle_id<?2 \
-              LIMIT {SNAPSHOT_WRITE_CHUNK})"
+              LIMIT {EVENT_PRUNE_CHUNK})"
         );
         let mut total = 0_usize;
         loop {
@@ -1868,33 +1705,10 @@ impl State {
                     .execute(&sql, params![source_id, keep_from_cycle])?
             };
             total += removed;
-            if removed < SNAPSHOT_WRITE_CHUNK {
+            if removed < EVENT_PRUNE_CHUNK {
                 return Ok(total);
             }
         }
-    }
-
-    pub fn snapshot_entries(&self, cycle_id: i64, source_id: &str) -> Result<Vec<SnapshotEntry>> {
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT rel_path, file_type, size, mtime_ns, mode, hash
-            FROM path_snapshot
-            WHERE cycle_id=?1 AND source_id=?2
-            ORDER BY rel_path ASC
-            "#,
-        )?;
-        let rows = stmt.query_map(params![cycle_id, source_id], |row| {
-            Ok(SnapshotEntry {
-                rel_path: row.get(0)?,
-                file_type: row.get(1)?,
-                size: row.get(2)?,
-                mtime_ns: row.get(3)?,
-                mode: row.get::<_, i64>(4)? as u32,
-                hash: row.get(5)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
     }
 
     fn destination_issues(
@@ -2242,6 +2056,7 @@ mod tests {
                 path: dst,
                 enabled: true,
                 schedule: ScheduleConfig::default(),
+                paused: false,
                 sync: None,
             }],
         }];
@@ -2327,6 +2142,7 @@ mod tests {
                     weekday: Some(far_weekday),
                     sync_current_cycle_manually: false,
                 },
+                paused: false,
                 sync: None,
             }],
         }];
@@ -2440,55 +2256,6 @@ mod tests {
         assert_eq!(state.cycle_events("src_1", second_cycle).unwrap().len(), 1);
         // The startup-gap scalar survives pruning.
         assert!(state.latest_event_observed_at("src_1").unwrap().is_some());
-
-        std::fs::remove_dir_all(temp).ok();
-    }
-
-    #[test]
-    fn prune_path_snapshots_keeps_targets_and_baselines() {
-        let temp = temp_dir("state_prune_snapshots");
-        let db = temp.join("state.sqlite");
-        let mut state = State::open(&db).unwrap();
-
-        let entry = |rel: &str| SnapshotEntry {
-            rel_path: rel.to_string(),
-            file_type: "file".to_string(),
-            size: 1,
-            mtime_ns: 1,
-            mode: 0o644,
-            hash: None,
-        };
-        // Snapshots for cycles 1, 3, 5 (cycles 2 and 4 wrote none, like event
-        // or zfs-diff cycles).
-        for cycle_id in [1_i64, 3, 5] {
-            state
-                .replace_snapshot(cycle_id, "src_1", &[entry(&format!("f{cycle_id}"))])
-                .unwrap();
-        }
-        // dst_1 last verified cycle 4 (no snapshot of its own → baseline is 3),
-        // targeting cycle 5.
-        state.set_destination_target("src_1", "dst_1", 5).unwrap();
-        state
-            .upsert_destination_status("src_1", "dst_1", Some(4), "green", "verified")
-            .unwrap();
-
-        assert_eq!(
-            state
-                .latest_snapshot_cycle_at_or_before("src_1", 4)
-                .unwrap(),
-            Some(3)
-        );
-
-        let removed = state.prune_path_snapshots("src_1").unwrap();
-        assert_eq!(removed, 1, "only cycle 1's snapshot should be pruned");
-        assert!(state.snapshot_entries(1, "src_1").unwrap().is_empty());
-        assert_eq!(state.snapshot_entries(3, "src_1").unwrap().len(), 1);
-        assert_eq!(state.snapshot_entries(5, "src_1").unwrap().len(), 1);
-
-        // Another source's snapshots are untouched.
-        state.replace_snapshot(1, "src_2", &[entry("x")]).unwrap();
-        state.prune_path_snapshots("src_1").unwrap();
-        assert_eq!(state.snapshot_entries(1, "src_2").unwrap().len(), 1);
 
         std::fs::remove_dir_all(temp).ok();
     }
