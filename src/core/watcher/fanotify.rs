@@ -116,26 +116,48 @@ pub fn spawn_fanotify_thread(
             .collect();
         if sources.is_empty() {
             info!("fanotify watcher has no realtime sources");
+            crate::core::signal::mark_watcher_armed();
             while !shutdown.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(1));
             }
             return;
         }
 
+        // The startup change scan waits for every source's marks to be live
+        // (see signal::wait_watcher_armed): count down as each arms.
+        let pending_arms = Arc::new(std::sync::atomic::AtomicUsize::new(sources.len()));
         let mut handles = Vec::new();
         for source in sources {
             let mut source_cfg = cfg.clone();
             source_cfg.source_groups = vec![source];
             let db_path = db_path.clone();
             let shutdown = shutdown.clone();
+            let pending_arms = pending_arms.clone();
             handles.push(thread::spawn(move || {
+                let mut armed = false;
+                let mut note_armed = move || {
+                    if !armed {
+                        armed = true;
+                        if pending_arms.fetch_sub(1, Ordering::SeqCst) == 1 {
+                            crate::core::signal::mark_watcher_armed();
+                        }
+                    }
+                };
                 // Supervise: a watcher that errors out (read error, mark/setup
                 // failure) is restarted after a short backoff instead of dying
                 // silently for the lifetime of the process.
                 while !shutdown.load(Ordering::SeqCst) {
-                    match run_fanotify_loop(source_cfg.clone(), db_path.clone(), shutdown.clone()) {
+                    match run_fanotify_loop(
+                        source_cfg.clone(),
+                        db_path.clone(),
+                        shutdown.clone(),
+                        &mut note_armed,
+                    ) {
                         Ok(()) => break,
                         Err(err) => {
+                            // A watcher that cannot set up must not block the
+                            // startup scan forever.
+                            note_armed();
                             error!(error = %err, "fanotify source watcher stopped; restarting after backoff");
                             for _ in 0..50 {
                                 if shutdown.load(Ordering::SeqCst) {
@@ -177,10 +199,16 @@ fn source_needs_fanotify(source: &SourceGroupConfig) -> bool {
             .any(|dst| dst.enabled)
 }
 
-fn run_fanotify_loop(cfg: AppConfig, db_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<()> {
+fn run_fanotify_loop(
+    cfg: AppConfig,
+    db_path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+    on_armed: &mut dyn FnMut(),
+) -> Result<()> {
     let mut sources = source_roots(&cfg)?;
     if sources.is_empty() {
         info!("fanotify watcher has no enabled sources");
+        on_armed();
         while !shutdown.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_secs(1));
         }
@@ -215,6 +243,9 @@ fn run_fanotify_loop(cfg: AppConfig, db_path: PathBuf, shutdown: Arc<AtomicBool>
         }
     };
     let _guard = FdGuard(fd);
+    // Marks are live from here: events flow, so the startup change scan can
+    // safely begin (anything it misses from now on, the watcher records).
+    on_armed();
 
     let mut buf = vec![0_u8; 1024 * 64];
     while !shutdown.load(Ordering::SeqCst) {

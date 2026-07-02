@@ -309,6 +309,7 @@ Linux 后台进程对 `schedule.mode = "realtime"` 的 source 使用 fanotify。
 - 若 filesystem/mount mark 不可用，会回退到对 src 目录树逐目录注册 inode mark。
 - 无法解析路径的 FID/name 附属记录不会把 realtime cycle 标记为 Full/rescan；realtime 自动同步仍只按已解析的 event path 做增量同步。queue overflow 仍会写入需要 reconcile 的事件。
 - 删除、rename 和部分元数据变化不依赖事件流保证最终正确性，而是由周期关闭时的源目录快照和 dst 校验/reconcile 兜底。
+- 启动顺序（防事件丢失窗口）：调度器先启动 watcher 并等待其上报 armed（fanotify 在 mark 安装完成后、USN 在 reader 线程就位后通过 `signal::mark_watcher_armed` 通知；每个 source 各自计数，全部就绪才放行，最长等 15 分钟后放行并告警），然后才执行启动 mtime 变更扫描。若先扫描后装 mark，大树扫描的几分钟里"扫描器已经走过该目录、mark 还没生效"期间新建的文件会被两边同时漏掉；先装 mark 则两个机制重叠覆盖，重复记录同一路径无害。配置变更重启 watcher 走同样的顺序。
 
 建议 fanotify 策略：
 

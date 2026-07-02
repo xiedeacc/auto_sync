@@ -81,6 +81,7 @@ pub fn spawn_source_watcher_thread(
             .collect();
         if sources.is_empty() {
             info!("Windows USN watcher has no realtime local sources");
+            crate::core::signal::mark_watcher_armed();
             while !shutdown.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(1));
             }
@@ -95,6 +96,10 @@ pub fn spawn_source_watcher_thread(
                 run_resilient_source_watcher(source, db_path, shutdown);
             }));
         }
+        // USN journals open in milliseconds (no tree walk) and the persisted
+        // USN cursor detects any gap on its own (recording rescan_required),
+        // so the startup scan can proceed as soon as the readers are spawned.
+        crate::core::signal::mark_watcher_armed();
 
         while !shutdown.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_secs(1));

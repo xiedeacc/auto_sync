@@ -145,6 +145,7 @@ pub fn spawn_source_watcher_thread(
         tracing::info!(
             "realtime source watcher is not available on this platform; using periodic reconciliation"
         );
+        crate::core::signal::mark_watcher_armed();
         while !shutdown.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_secs(1));
         }

@@ -661,9 +661,16 @@ fn run_scheduler(
         Ok(_) => {}
         Err(err) => warn!(error = %err, "failed to sweep stale running tasks"),
     }
+
+    // Watcher FIRST, startup scan second: the scan can take minutes on a big
+    // tree, and a file created after the scanner passed its directory but
+    // before the watcher's marks existed would be missed by both. With the
+    // watcher armed before the scan starts, the two overlap instead of
+    // leaving a gap (duplicate coverage of one path is harmless).
+    let mut watcher_state = start_watcher(&cfg);
+    wait_for_watcher_armed(&shutdown);
     record_startup_changes(&cfg, &state);
 
-    let mut watcher_state = start_watcher(&cfg);
     let mut watcher_signature = config_signature(&cfg);
     let mut last_status_log =
         Instant::now() - Duration::from_secs(cfg.app.status_log_interval_secs);
@@ -675,8 +682,9 @@ fn run_scheduler(
                 if signature != watcher_signature {
                     info!("config changed; restarting source watcher");
                     stop_watcher(&mut watcher_state);
-                    record_startup_changes(&new_cfg, &state);
                     watcher_state = start_watcher(&new_cfg);
+                    wait_for_watcher_armed(&shutdown);
+                    record_startup_changes(&new_cfg, &state);
                     watcher_signature = signature;
                 }
                 cfg = new_cfg;
@@ -754,11 +762,29 @@ struct WatcherState {
 }
 
 fn start_watcher(cfg: &AppConfig) -> WatcherState {
+    auto_sync::core::signal::reset_watcher_armed();
     let stop = Arc::new(AtomicBool::new(false));
     let handle = spawn_source_watcher_thread(cfg.clone(), cfg.app.data_db.clone(), stop.clone());
     WatcherState {
         stop,
         handle: Some(handle),
+    }
+}
+
+/// Block until the watcher backend reports its marks/journals live (bounded;
+/// the fanotify prebuild fallback can take minutes on a huge tree). On
+/// timeout the startup scan proceeds anyway — a bounded risk beats never
+/// scanning.
+fn wait_for_watcher_armed(shutdown: &Arc<AtomicBool>) {
+    let deadline = Instant::now() + Duration::from_secs(900);
+    while !shutdown.load(Ordering::SeqCst) {
+        if auto_sync::core::signal::wait_watcher_armed(Duration::from_millis(500)) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            warn!("watcher did not report armed in time; running the startup scan anyway");
+            return;
+        }
     }
 }
 
