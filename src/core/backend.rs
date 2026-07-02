@@ -401,7 +401,8 @@ impl Backend {
                             let differences = report.to_add
                                 + report.to_update
                                 + report.to_delete
-                                + report.type_mismatch;
+                                + report.type_mismatch
+                                + report.metadata;
                             let entries = report.source_entries + report.dst_entries;
                             state.task_finish(task_id, "success", "", 0, differences, entries)
                         }

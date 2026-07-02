@@ -30,6 +30,7 @@ const FAN_MARK_MOUNT: u32 = 0x0000_0010;
 const FAN_MARK_FILESYSTEM: u32 = 0x0000_0100;
 
 const FAN_MODIFY: u64 = 0x0000_0002;
+const FAN_ATTRIB: u64 = 0x0000_0004;
 const FAN_CLOSE_WRITE: u64 = 0x0000_0008;
 const FAN_MOVED_FROM: u64 = 0x0000_0040;
 const FAN_MOVED_TO: u64 = 0x0000_0080;
@@ -216,7 +217,11 @@ fn run_fanotify_loop(
     state.ensure_config(&cfg)?;
     state.ensure_open_cycles(&cfg)?;
 
+    // FAN_ATTRIB (kernel 5.1+, FID mode only): chmod/touch produce events so
+    // metadata-only changes propagate; the Windows USN watcher listens to the
+    // equivalent BASIC_INFO/SECURITY reasons already.
     let fid_mask = FAN_MODIFY
+        | FAN_ATTRIB
         | FAN_CLOSE_WRITE
         | FAN_CREATE
         | FAN_DELETE
@@ -941,6 +946,9 @@ fn mask_to_kind(mask: u64) -> &'static str {
         "create"
     } else if mask & FAN_MODIFY != 0 {
         "modify"
+    } else if mask & FAN_ATTRIB != 0 {
+        // Same kind the Windows USN watcher records for BASIC_INFO/SECURITY.
+        "metadata"
     } else if mask & FAN_DELETE != 0 {
         "delete"
     } else if mask & FAN_MOVED_FROM != 0 {

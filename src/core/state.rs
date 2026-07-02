@@ -146,6 +146,9 @@ pub struct ScanReport {
     pub to_update: u64,
     pub to_delete: u64,
     pub type_mismatch: u64,
+    /// Content-equal files whose permission bits differ (repaired via chmod).
+    #[serde(default)]
+    pub metadata: u64,
     pub differences: Vec<ScanDiffEntry>,
     pub truncated: bool,
     #[serde(default)]

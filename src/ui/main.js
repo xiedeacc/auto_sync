@@ -84,7 +84,8 @@ async function checkPendingScans() {
             );
           } else {
             const total = Number(report.to_add || 0) + Number(report.to_update || 0)
-              + Number(report.to_delete || 0) + Number(report.type_mismatch || 0);
+              + Number(report.to_delete || 0) + Number(report.type_mismatch || 0)
+              + Number(report.metadata || 0);
             setTransientMessage(
               `Compare ${info.sourceId} -> ${info.destinationId} finished: `
                 + `${total} difference${total === 1 ? "" : "s"}`,
@@ -2085,6 +2086,7 @@ const SCAN_DIFF_KINDS = [
   { kind: "update", label: "Update (content differs)", field: "to_update" },
   { kind: "delete", label: "Delete (extra on dst)", field: "to_delete" },
   { kind: "type_mismatch", label: "Type mismatch", field: "type_mismatch" },
+  { kind: "metadata", label: "Metadata (permissions differ)", field: "metadata" },
 ];
 const SCAN_DIFF_MODAL_CAP = 50;
 
@@ -2180,7 +2182,7 @@ function renderMachineTasks(machine) {
     <div class="tasks-machine">
       ${title}
       <div class="task-row task-row-head">
-        <span>Status</span><span>Kind</span><span>Task</span><span>Started</span><span>Duration</span><span>Result</span>
+        <span>ID</span><span>Status</span><span>Kind</span><span>Task</span><span>Started</span><span>Duration</span><span>Result</span>
       </div>
       ${tasks.map(renderTaskRow).join("")}
     </div>`;
@@ -2193,6 +2195,7 @@ function renderTaskRow(task) {
   const result = taskResultLabel(task);
   return `
     <div class="task-row">
+      <span class="task-id">#${escapeHtml(String(task.id ?? ""))}</span>
       <span class="task-status task-status-${escapeAttr(task.status)}">${escapeHtml(task.status)}</span>
       <span>${escapeHtml(taskKindLabel(task.kind))}</span>
       <span class="task-target" title="${escapeAttr(target)}">${escapeHtml(target)}</span>
@@ -2338,6 +2341,7 @@ function scanKindLabel(kind) {
     case "update": return "~ update";
     case "delete": return "- delete";
     case "type_mismatch": return "! type";
+    case "metadata": return "# perms";
     default: return kind;
   }
 }
@@ -2359,7 +2363,8 @@ function renderScanReportSection(source, dst) {
       <div class="scan-diff-error">Compare failed: ${escapeHtml(report.error)}</div>
     `;
   }
-  const total = (report.to_add || 0) + (report.to_update || 0) + (report.to_delete || 0) + (report.type_mismatch || 0);
+  const total = (report.to_add || 0) + (report.to_update || 0) + (report.to_delete || 0)
+    + (report.type_mismatch || 0) + (report.metadata || 0);
   const title = `<div class="dst-log-section-title">Last compare — ${escapeHtml(formatScanTime(report.scanned_at))} (${total} difference${total === 1 ? "" : "s"})</div>`;
   const diffRows = SCAN_DIFF_KINDS.map(({ kind, label, field }) => {
     const count = report[field] || 0;

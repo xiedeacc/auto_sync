@@ -27,11 +27,12 @@ use crate::core::sync::{
     TransferPrepareDirRequest, TransferPrepareDirsRequest, TransferPushFileRequest,
     TransferPutFileQuery, TransferReceiveFileChunkQuery, TransferReceiveSymlinkRequest,
     TransferRemovePathRequest, TransferRemovePathsRequest, TransferSetDirMtimesRequest,
-    TransferSnapshotPathsRequest, TransferSnapshotRequest, transfer_apply_delta,
-    transfer_block_sums, transfer_cleanup_tmp, transfer_file_offset, transfer_finish_file,
-    transfer_path_info, transfer_prepare_dir, transfer_prepare_dirs, transfer_push_file,
-    transfer_put_file, transfer_receive_file_chunk, transfer_receive_symlink, transfer_remove_path,
-    transfer_remove_paths, transfer_set_dir_mtimes, transfer_snapshot, transfer_snapshot_paths,
+    TransferSetModesRequest, TransferSnapshotPathsRequest, TransferSnapshotRequest,
+    transfer_apply_delta, transfer_block_sums, transfer_cleanup_tmp, transfer_file_offset,
+    transfer_finish_file, transfer_path_info, transfer_prepare_dir, transfer_prepare_dirs,
+    transfer_push_file, transfer_put_file, transfer_receive_file_chunk, transfer_receive_symlink,
+    transfer_remove_path, transfer_remove_paths, transfer_set_dir_mtimes, transfer_set_modes,
+    transfer_snapshot, transfer_snapshot_paths,
 };
 
 pub fn router(backend: Backend) -> Router {
@@ -83,6 +84,7 @@ pub fn router(backend: Backend) -> Router {
             "/api/transfer/set-dir-mtimes",
             post(api_transfer_set_dir_mtimes),
         )
+        .route("/api/transfer/set-modes", post(api_transfer_set_modes))
         .route("/api/transfer/remove-path", post(api_transfer_remove_path))
         .route(
             "/api/transfer/remove-paths",
@@ -465,6 +467,12 @@ async fn api_transfer_set_dir_mtimes(
     Json(req): Json<TransferSetDirMtimesRequest>,
 ) -> Result<Json<TransferAck>, ApiError> {
     blocking(move || Ok(Json(transfer_set_dir_mtimes(req)?))).await
+}
+
+async fn api_transfer_set_modes(
+    Json(req): Json<TransferSetModesRequest>,
+) -> Result<Json<TransferAck>, ApiError> {
+    blocking(move || Ok(Json(transfer_set_modes(req)?))).await
 }
 
 async fn api_transfer_remove_path(

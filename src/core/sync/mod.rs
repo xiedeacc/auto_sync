@@ -216,7 +216,11 @@ fn queue_scan_repair(
     if !report.error.is_empty() {
         bail!("last compare failed ({}); run Compare again", report.error);
     }
-    let total = report.to_add + report.to_update + report.to_delete + report.type_mismatch;
+    let total = report.to_add
+        + report.to_update
+        + report.to_delete
+        + report.type_mismatch
+        + report.metadata;
     if total == 0 {
         return Ok(());
     }
@@ -515,6 +519,7 @@ pub fn scan_destination_now(
         &dst_snapshot,
         &source.excludes,
         &sync,
+        false,
     );
     state.put_scan_report(&report)?;
     Ok(report)
@@ -570,8 +575,17 @@ fn zfs_diff_compare(
     let Some(dst_changed) = zfs_diff_changed_paths_live(&dst_base, &dst_live_root) else {
         return Ok(None);
     };
-    let mut union: BTreeSet<String> = src_changed.into_iter().collect();
-    union.extend(dst_changed);
+    let src_set: BTreeSet<String> = src_changed.into_iter().collect();
+    let mut union: BTreeSet<String> = src_set.clone();
+    union.extend(dst_changed.iter().cloned());
+    // Paths only the destination touched since its baseline are hard evidence
+    // that the destination was written; hash them on both sides regardless of
+    // the checksum setting so an in-place rewrite that restores size+mtime
+    // cannot clear itself.
+    let dst_only: Vec<String> = dst_changed
+        .into_iter()
+        .filter(|p| !src_set.contains(p))
+        .collect();
     let paths: Vec<String> = union.into_iter().collect();
     info!(
         source = source.id,
@@ -582,7 +596,7 @@ fn zfs_diff_compare(
         "compare served by zfs diff against verified baselines"
     );
     cancel::check()?;
-    let source_snapshot = take_snapshot_paths_with_excludes(
+    let mut source_snapshot = take_snapshot_paths_with_excludes(
         &src_live_root,
         &paths,
         SnapshotMode::Source,
@@ -590,13 +604,29 @@ fn zfs_diff_compare(
         sync.checksum,
     )?;
     reject_dangerous_destination(&dst_live_root)?;
-    let dst_snapshot = take_snapshot_paths_with_excludes(
+    let mut dst_snapshot = take_snapshot_paths_with_excludes(
         &dst_live_root,
         &paths,
         SnapshotMode::Destination,
         &[],
         sync.checksum,
     )?;
+    if !sync.checksum {
+        add_hash_evidence(
+            &src_live_root,
+            &dst_only,
+            SnapshotMode::Source,
+            &source.excludes,
+            &mut source_snapshot,
+        )?;
+        add_hash_evidence(
+            &dst_live_root,
+            &dst_only,
+            SnapshotMode::Destination,
+            &[],
+            &mut dst_snapshot,
+        )?;
+    }
     let mut report = build_scan_report(
         &source.id,
         destination_id,
@@ -604,9 +634,40 @@ fn zfs_diff_compare(
         &dst_snapshot,
         &source.excludes,
         sync,
+        true,
     );
     report.method = "zfs_diff".to_string();
     Ok(Some(report))
+}
+
+/// Re-snapshot the given paths with hashing enabled and swap the results into
+/// `entries`. When both sides of a comparison carry a hash, hash evidence
+/// drives [`entries_match_with`] even outside checksum mode.
+fn add_hash_evidence(
+    root: &Path,
+    rel_paths: &[String],
+    mode: SnapshotMode,
+    excludes: &[PathBuf],
+    entries: &mut Vec<SnapshotEntry>,
+) -> Result<()> {
+    if rel_paths.is_empty() {
+        return Ok(());
+    }
+    let hashed = take_snapshot_paths_with_excludes(root, rel_paths, mode, excludes, true)?;
+    if hashed.is_empty() {
+        return Ok(());
+    }
+    let mut by_rel: BTreeMap<String, SnapshotEntry> = hashed
+        .into_iter()
+        .map(|entry| (entry.rel_path.clone(), entry))
+        .collect();
+    for entry in entries.iter_mut() {
+        if let Some(upgraded) = by_rel.remove(&entry.rel_path) {
+            *entry = upgraded;
+        }
+    }
+    entries.extend(by_rel.into_values());
+    Ok(())
 }
 
 fn machine_or_local(
@@ -644,15 +705,21 @@ struct ManifestDiff<'a> {
     missing_dirs: Vec<&'a SnapshotEntry>,
     /// Destination-only entries (mirror delete candidates), excludes applied.
     extras: Vec<&'a SnapshotEntry>,
+    /// Content-equal files whose permission bits differ (chmod in place).
+    mode_fixes: Vec<&'a SnapshotEntry>,
     /// Source entries already matching on the destination.
     in_sync: u64,
 }
 
+/// `exact` selects the evidence-path mtime comparison (see
+/// [`entries_match_exact`]): pass `true` when the manifests were built from a
+/// positive change list (events, zfs diff) rather than a whole-tree walk.
 fn diff_manifests<'a>(
     source_snapshot: &'a [SnapshotEntry],
     dst_snapshot: &'a [SnapshotEntry],
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
+    exact: bool,
 ) -> ManifestDiff<'a> {
     // Reference maps: the snapshots can each hold hundreds of thousands of
     // entries, and cloning both into owned maps doubles peak memory.
@@ -663,6 +730,7 @@ fn diff_manifests<'a>(
         type_mismatch: Vec::new(),
         missing_dirs: Vec::new(),
         extras: Vec::new(),
+        mode_fixes: Vec::new(),
         in_sync: 0,
     };
     for entry in source_snapshot {
@@ -681,8 +749,11 @@ fn diff_manifests<'a>(
                 diff.type_mismatch.push(entry);
             }
             Some(existing) => {
-                if entry.file_type == "dir" || entries_match(entry, existing, sync) {
+                if entry.file_type == "dir" || entries_match_with(entry, existing, sync, exact) {
                     diff.in_sync += 1;
+                    if entry_mode_differs(entry, existing) {
+                        diff.mode_fixes.push(entry);
+                    }
                 } else {
                     diff.transfer.push((entry, Some(existing)));
                 }
@@ -737,8 +808,9 @@ fn build_scan_report(
     dst_snapshot: &[SnapshotEntry],
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
+    exact: bool,
 ) -> ScanReport {
-    let diff = diff_manifests(source_snapshot, dst_snapshot, excludes, sync);
+    let diff = diff_manifests(source_snapshot, dst_snapshot, excludes, sync, exact);
     let mut report = ScanReport {
         source_id: source_id.to_string(),
         destination_id: destination_id.to_string(),
@@ -780,6 +852,10 @@ fn build_scan_report(
         report.type_mismatch += 1;
         push(&entry.rel_path, "type_mismatch", &entry.file_type);
     }
+    for entry in &diff.mode_fixes {
+        report.metadata += 1;
+        push(&entry.rel_path, "metadata", &entry.file_type);
+    }
     if sync.mirror {
         for entry in &diff.extras {
             report.to_delete += 1;
@@ -788,7 +864,11 @@ fn build_scan_report(
     }
     drop(push);
     diffs.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    let total = report.to_add + report.to_update + report.to_delete + report.type_mismatch;
+    let total = report.to_add
+        + report.to_update
+        + report.to_delete
+        + report.type_mismatch
+        + report.metadata;
     report.truncated = total > diffs.len() as u64;
     report.differences = diffs;
     report
@@ -990,6 +1070,20 @@ pub struct TransferPrepareDirsRequest {
 pub struct TransferSetDirMtimesRequest {
     pub root: PathBuf,
     pub dirs: Vec<TransferDirSpec>,
+}
+
+/// Chmod content-equal destination files whose permission bits drifted, in
+/// one request — a mode-only difference must not re-transfer file content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferSetModesRequest {
+    pub root: PathBuf,
+    pub items: Vec<TransferModeSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferModeSpec {
+    pub rel_path: String,
+    pub mode: u32,
 }
 
 /// Remove many destination paths in a single request. Paths are removed in the
@@ -1259,6 +1353,20 @@ pub fn transfer_prepare_dirs(req: TransferPrepareDirsRequest) -> Result<Transfer
 pub fn transfer_set_dir_mtimes(req: TransferSetDirMtimesRequest) -> Result<TransferAck> {
     reject_dangerous_destination(&req.root)?;
     set_dir_mtimes(&req.root, &req.dirs)?;
+    Ok(transfer_ack())
+}
+
+pub fn transfer_set_modes(req: TransferSetModesRequest) -> Result<TransferAck> {
+    reject_dangerous_destination(&req.root)?;
+    for item in &req.items {
+        let path = safe_join_rel(&req.root, &item.rel_path)?;
+        // Vanished since the comparison: nothing left to repair.
+        if fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        set_mode(&path, item.mode)
+            .with_context(|| format!("failed to set mode on {}", item.rel_path))?;
+    }
     Ok(transfer_ack())
 }
 
@@ -1564,7 +1672,7 @@ fn receive_symlink_target(
         remove_any(&tmp).ok();
         bail!("received symlink hash mismatch at {}", entry.rel_path);
     }
-    replace_path(&tmp, &final_path)?;
+    replace_path(dst_root, cycle_id, &entry.rel_path, &tmp, &final_path)?;
     fsync_parent(&final_path).ok();
     Ok(())
 }
@@ -1599,9 +1707,8 @@ fn finish_received_file(
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    replace_path(tmp, final_path)?;
+    replace_path(dst_root, cycle_id, &entry.rel_path, tmp, final_path)?;
     fsync_parent(final_path).ok();
-    let _ = (dst_root, cycle_id);
     Ok(())
 }
 
@@ -2170,6 +2277,7 @@ fn sync_cycle_for_source_inner(
                         &dst.id,
                         cycle.id,
                         rel_paths,
+                        &[],
                         &source.excludes,
                         &sync,
                     ) {
@@ -2289,6 +2397,7 @@ fn sync_cycle_for_source_inner(
                                     &dst.id,
                                     cycle.id,
                                     &rel_paths,
+                                    &[],
                                     &source.excludes,
                                     &sync,
                                 ) {
@@ -2337,7 +2446,7 @@ fn sync_cycle_for_source_inner(
                 // union equals a full pass at a fraction of the IO.
                 if sync.zfs_diff && cycle.manual_full_rescan {
                     if let Some(zfs) = source_view.zfs_snapshot.as_ref() {
-                        if let Some(rel_paths) =
+                        if let Some((rel_paths, dst_only)) =
                             full_zfs_diff_paths(state, source, &dst.id, zfs, dst_root)?
                         {
                             info!(
@@ -2353,6 +2462,7 @@ fn sync_cycle_for_source_inner(
                                 &dst.id,
                                 cycle.id,
                                 &rel_paths,
+                                &dst_only,
                                 &source.excludes,
                                 &sync,
                             ) {
@@ -2674,7 +2784,7 @@ fn full_zfs_diff_paths(
     destination_id: &str,
     zfs: &ZfsSnapshot,
     dst_root: &Path,
-) -> Result<Option<Vec<String>>> {
+) -> Result<Option<(Vec<String>, Vec<String>)>> {
     let Some(src_base) = state.destination_verified_snapshot(&source.id, destination_id)? else {
         return Ok(None);
     };
@@ -2702,9 +2812,17 @@ fn full_zfs_diff_paths(
     let Some(dst_changed) = zfs_diff_changed_paths_live(&dst_base, &dst_live_root) else {
         return Ok(None);
     };
-    let mut union: BTreeSet<String> = src_changed.into_iter().collect();
-    union.extend(dst_changed);
-    Ok(Some(union.into_iter().collect()))
+    let src_set: BTreeSet<String> = src_changed.into_iter().collect();
+    let mut union: BTreeSet<String> = src_set.clone();
+    union.extend(dst_changed.iter().cloned());
+    // Paths only the destination touched are hard evidence of a dst-side
+    // write; the caller hashes them so a size+mtime-restoring rewrite cannot
+    // pass the comparison.
+    let dst_only: Vec<String> = dst_changed
+        .into_iter()
+        .filter(|p| !src_set.contains(p))
+        .collect();
+    Ok(Some((union.into_iter().collect(), dst_only)))
 }
 
 fn cycle_has_remote_target(
@@ -3251,7 +3369,7 @@ fn sync_directory_with_transfer(
         )?,
     };
     // Same compare implementation the Scan report uses.
-    let diff = diff_manifests(source_snapshot, &dst_snapshot, excludes, sync);
+    let diff = diff_manifests(source_snapshot, &dst_snapshot, excludes, sync, false);
 
     // 1. Remove destination entries whose type no longer matches the source
     //    (e.g. a file that is now a directory). Deepest paths first.
@@ -3339,6 +3457,18 @@ fn sync_directory_with_transfer(
         )
         .context("failed to remove extra destination paths")?;
     }
+
+    // 5. Content-equal files whose permission bits drifted: chmod in place.
+    let mode_fixes: Vec<TransferModeSpec> = diff
+        .mode_fixes
+        .iter()
+        .map(|entry| TransferModeSpec {
+            rel_path: entry.rel_path.clone(),
+            mode: entry.mode,
+        })
+        .collect();
+    set_modes_on_machine(dst_machine_id, dst_machine, dst_root, &mode_fixes, timeout)
+        .context("failed to repair destination file modes")?;
 
     set_dir_mtimes_on_machine(dst_machine_id, dst_machine, dst_root, &dirs, timeout)
         .context("failed to set destination directory mtimes")?;
@@ -3450,13 +3580,30 @@ fn sync_directory_event_paths_with_transfer(
     prepare_dirs_on_machine(dst_machine_id, dst_machine, dst_root, &dirs, timeout)
         .context("failed to create changed destination directories")?;
 
+    // Event paths carry positive change evidence: exact comparison, so a
+    // same-size rewrite within the modify window still copies.
     let pending: Vec<(&SnapshotEntry, bool)> = source_snapshot
         .iter()
         .filter(|entry| entry.file_type == "file" || entry.file_type == "symlink")
         .filter_map(|entry| match dst_map.get(&entry.rel_path) {
-            Some(existing) if entries_match(entry, existing, sync) => None,
+            Some(existing) if entries_match_exact(entry, existing, sync) => None,
             Some(existing) => Some((entry, should_attempt_delta(entry, existing))),
             None => Some((entry, false)),
+        })
+        .collect();
+    let mode_fixes: Vec<TransferModeSpec> = source_snapshot
+        .iter()
+        .filter_map(|entry| match dst_map.get(&entry.rel_path) {
+            Some(existing)
+                if entries_match_exact(entry, existing, sync)
+                    && entry_mode_differs(entry, existing) =>
+            {
+                Some(TransferModeSpec {
+                    rel_path: entry.rel_path.clone(),
+                    mode: entry.mode,
+                })
+            }
+            _ => None,
         })
         .collect();
     let outcome = push_entries_parallel(
@@ -3470,6 +3617,8 @@ fn sync_directory_event_paths_with_transfer(
         &pending,
         sync,
     )?;
+    set_modes_on_machine(dst_machine_id, dst_machine, dst_root, &mode_fixes, timeout)
+        .context("failed to repair destination file modes")?;
     info!(
         destination = destination_id,
         cycle_id,
@@ -3896,6 +4045,30 @@ fn prepare_dirs_on_machine(
         };
         if !ack.ok {
             bail!("peer rejected prepare directories request");
+        }
+    }
+    Ok(())
+}
+
+fn set_modes_on_machine(
+    machine_id: &str,
+    machine: &crate::core::config::MachineConfig,
+    root: &Path,
+    items: &[TransferModeSpec],
+    timeout: Duration,
+) -> Result<()> {
+    for chunk in items.chunks(BULK_BATCH_SIZE) {
+        let req = TransferSetModesRequest {
+            root: root.to_path_buf(),
+            items: chunk.to_vec(),
+        };
+        let ack = if machine_id == "local" {
+            transfer_set_modes(req)?
+        } else {
+            remote_post_json(machine, "/api/transfer/set-modes", &req, timeout)?
+        };
+        if !ack.ok {
+            bail!("peer rejected set modes request");
         }
     }
     Ok(())
@@ -4395,7 +4568,9 @@ fn verify_snapshot_entries(
             continue;
         }
         match actual.get(rel) {
-            Some(got) if entries_match(want, got, sync) => {}
+            // Exact: the writes above stamped the destination with the
+            // source's own mtime, so anything coarser hides real drift.
+            Some(got) if entries_match_exact(want, got, sync) => {}
             Some(_) => bail!("destination mismatch at {rel}"),
             None => bail!("destination missing {rel}"),
         }
@@ -4629,6 +4804,12 @@ fn parse_zfs_diff(output: &str, source_live_root: &Path) -> Vec<String> {
                     continue;
                 }
                 if let Ok(rel_str) = rel_to_string(rel) {
+                    // Never let auto_sync's own trash/tmp/probe into the
+                    // union: mirror deletes rename into the trash, so every
+                    // destination-side diff after a delete names it.
+                    if rel_str_is_internal(&rel_str) {
+                        continue;
+                    }
                     paths.insert(rel_str);
                 }
             }
@@ -5246,11 +5427,11 @@ fn sync_destination(
         let dst_snapshot =
             take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum)?;
         // Same compare implementation the Scan report uses.
-        let diff = diff_manifests(source_snapshot, &dst_snapshot, excludes, sync);
+        let diff = diff_manifests(source_snapshot, &dst_snapshot, excludes, sync, false);
 
         for entry in source_snapshot.iter().filter(|e| e.file_type == "dir") {
             let target = dst_root.join(&entry.rel_path);
-            if target.exists() && !target.is_dir() {
+            if path_blocks_directory(&target) {
                 move_to_trash(dst_root, &entry.rel_path, cycle_id)?;
             }
             fs::create_dir_all(&target)
@@ -5279,6 +5460,13 @@ fn sync_destination(
                 move_to_trash(dst_root, &rel, cycle_id)
                     .with_context(|| format!("failed to remove extra destination path {rel}"))?;
             }
+        }
+
+        // Content-equal files whose permission bits drifted: chmod in place.
+        for entry in &diff.mode_fixes {
+            let path = safe_join_rel(dst_root, &entry.rel_path)?;
+            set_mode(&path, entry.mode)
+                .with_context(|| format!("failed to set mode on {}", entry.rel_path))?;
         }
 
         set_snapshot_dir_mtimes(dst_root, source_snapshot)?;
@@ -5348,7 +5536,7 @@ fn sync_destination_fast_missing_dirs(
                 continue;
             }
             let target = dst_root.join(&entry.rel_path);
-            if target.exists() && !target.is_dir() {
+            if path_blocks_directory(&target) {
                 move_to_trash(dst_root, &entry.rel_path, cycle_id)?;
             }
             fs::create_dir_all(&target)
@@ -5375,6 +5563,21 @@ fn sync_destination_fast_missing_dirs(
         let outcome =
             copy_entries_parallel(src_root, dst_root, destination_id, cycle_id, &to_copy, sync)?;
         drop(transfer_guard);
+
+        // Content-equal files whose permission bits drifted: chmod in place.
+        for entry in source_snapshot
+            .iter()
+            .filter(|e| e.file_type == "file")
+            .filter(|e| !copied_paths.contains(&e.rel_path))
+        {
+            if let Some(existing) = dst_map.get(&entry.rel_path) {
+                if entries_match(entry, existing, sync) && entry_mode_differs(entry, existing) {
+                    let path = safe_join_rel(dst_root, &entry.rel_path)?;
+                    set_mode(&path, entry.mode)
+                        .with_context(|| format!("failed to set mode on {}", entry.rel_path))?;
+                }
+            }
+        }
 
         if sync.mirror {
             let mut extra_paths: Vec<String> = dst_map
@@ -5541,7 +5744,7 @@ fn copy_missing_directory_tree(
             continue;
         }
         let target = dst_root.join(&entry.rel_path);
-        if target.exists() && !target.is_dir() {
+        if path_blocks_directory(&target) {
             move_to_trash(dst_root, &entry.rel_path, cycle_id)?;
         }
         fs::create_dir_all(&target)
@@ -5653,12 +5856,14 @@ fn flush_wholesale_copies(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_endpoint_event_paths(
     source: &SourceEndpoint,
     dst: &DestinationEndpoint,
     destination_id: &str,
     cycle_id: i64,
     rel_paths: &[String],
+    force_hash_paths: &[String],
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
 ) -> Result<()> {
@@ -5672,6 +5877,7 @@ fn sync_endpoint_event_paths(
             destination_id,
             cycle_id,
             rel_paths,
+            force_hash_paths,
             excludes,
             sync,
         ),
@@ -5705,12 +5911,14 @@ fn sync_endpoint_event_paths(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_destination_event_paths(
     src_root: &Path,
     dst_root: &Path,
     destination_id: &str,
     cycle_id: i64,
     rel_paths: &[String],
+    force_hash_paths: &[String],
     excludes: &[PathBuf],
     sync: &NativeSyncConfig,
 ) -> Result<()> {
@@ -5724,20 +5932,36 @@ fn sync_destination_event_paths(
         )
     })?;
     let result = (|| {
-        let source_snapshot = take_snapshot_paths_with_excludes(
+        let mut source_snapshot = take_snapshot_paths_with_excludes(
             src_root,
             rel_paths,
             SnapshotMode::Source,
             excludes,
             sync.checksum,
         )?;
-        let dst_snapshot = take_snapshot_paths_with_excludes(
+        let mut dst_snapshot = take_snapshot_paths_with_excludes(
             dst_root,
             rel_paths,
             SnapshotMode::Destination,
             &[],
             sync.checksum,
         )?;
+        if !sync.checksum {
+            add_hash_evidence(
+                src_root,
+                force_hash_paths,
+                SnapshotMode::Source,
+                excludes,
+                &mut source_snapshot,
+            )?;
+            add_hash_evidence(
+                dst_root,
+                force_hash_paths,
+                SnapshotMode::Destination,
+                &[],
+                &mut dst_snapshot,
+            )?;
+        }
         let mut changing_paths = BTreeSet::new();
         let total_bytes: u64 = source_snapshot
             .iter()
@@ -5759,13 +5983,22 @@ fn sync_destination_event_paths(
         )?;
         drop(transfer_guard);
 
-        let actual = take_snapshot_paths_with_excludes(
+        let mut actual = take_snapshot_paths_with_excludes(
             dst_root,
             rel_paths,
             SnapshotMode::Destination,
             &[],
             sync.checksum,
         )?;
+        if !sync.checksum {
+            add_hash_evidence(
+                dst_root,
+                force_hash_paths,
+                SnapshotMode::Destination,
+                &[],
+                &mut actual,
+            )?;
+        }
         verify_snapshot_entries(&source_snapshot, &actual, &changing_paths, excludes, sync)?;
         if !changing_paths.is_empty() {
             return Err(source_changing_error(&changing_paths));
@@ -5814,11 +6047,13 @@ fn sync_changed_entries_local(
         // Mode applied at end via set_snapshot_dir_mtimes (deepest-first).
     }
 
+    // Event/diff paths carry positive change evidence: exact comparison, so a
+    // same-size rewrite within the modify window still copies.
     let to_copy: Vec<&SnapshotEntry> = source_snapshot
         .iter()
         .filter(|e| e.file_type == "file" || e.file_type == "symlink")
         .filter(|e| match dst_map.get(&e.rel_path) {
-            Some(existing) => !entries_match(e, existing, sync),
+            Some(existing) => !entries_match_exact(e, existing, sync),
             None => true,
         })
         .collect();
@@ -5834,16 +6069,35 @@ fn sync_changed_entries_local(
         )));
     }
 
+    // Content-equal files whose permission bits drifted: chmod in place.
+    for entry in source_snapshot.iter() {
+        if let Some(existing) = dst_map.get(&entry.rel_path) {
+            if entries_match_exact(entry, existing, sync) && entry_mode_differs(entry, existing) {
+                let path = safe_join_rel(dst_root, &entry.rel_path)?;
+                set_mode(&path, entry.mode)
+                    .with_context(|| format!("failed to set mode on {}", entry.rel_path))?;
+            }
+        }
+    }
+
     if sync.mirror {
+        // rel_str_is_internal keeps the trash itself out of the delete set —
+        // trashing the trash renames it into its own subtree (fails) and the
+        // failure fallback would erase the recycle bin.
         let mut extra_paths: Vec<String> = dst_map
             .keys()
             .filter(|rel| {
-                !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
+                !source_map.contains_key(*rel)
+                    && !rel_str_is_internal(rel)
+                    && !is_rel_excluded(Path::new(rel), excludes)
             })
             .cloned()
             .collect();
         for rel in rel_paths {
-            if !source_map.contains_key(rel) && !is_rel_excluded(Path::new(rel), excludes) {
+            if !source_map.contains_key(rel)
+                && !rel_str_is_internal(rel)
+                && !is_rel_excluded(Path::new(rel), excludes)
+            {
                 extra_paths.push(rel.clone());
             }
         }
@@ -5991,6 +6245,11 @@ fn take_snapshot_paths_with_excludes(
 ) -> Result<Vec<SnapshotEntry>> {
     let mut entries = BTreeMap::new();
     for rel_path in rel_paths {
+        // Internal dirs (trash/tmp/probe) must never be snapshot targets on
+        // either side: recursing them turns the recycle bin into "entries".
+        if rel_str_is_internal(rel_path) {
+            continue;
+        }
         let rel = normalize_rel_path(rel_path)?;
         if matches!(mode, SnapshotMode::Source) && is_rel_excluded(&rel, excludes) {
             continue;
@@ -6163,6 +6422,16 @@ fn should_visit_path(root: &Path, path: &Path, mode: SnapshotMode, excludes: &[P
     name != INTERNAL_TMP && name != INTERNAL_TRASH && name != INTERNAL_PROBE
 }
 
+/// True when the relative path is (or lives under) one of auto_sync's own
+/// destination-side directories (trash/tmp/probe). Mirror deletes rename into
+/// the trash, so destination-side `zfs diff` output always names the trash
+/// after any delete; letting those paths into a diff union recurses the whole
+/// recycle bin into per-path snapshots and reports it as differences.
+fn rel_str_is_internal(rel: &str) -> bool {
+    let first = rel.split(['/', '\\']).next().unwrap_or(rel);
+    first == INTERNAL_TMP || first == INTERNAL_TRASH || first == INTERNAL_PROBE
+}
+
 fn entry_is_excluded(root: &Path, path: &Path, excludes: &[PathBuf]) -> bool {
     if path == root {
         return false;
@@ -6283,7 +6552,7 @@ fn copy_file(
         // re-transfer every cycle; make that visible instead of silent.
         warn!(rel_path = entry.rel_path, error = %err, "failed to set file mtime");
     }
-    replace_path(&tmp, final_path)?;
+    replace_path(dst_root, cycle_id, &entry.rel_path, &tmp, final_path)?;
     fsync_parent(final_path).ok();
     Ok(())
 }
@@ -6432,19 +6701,27 @@ fn copy_symlink(
         remove_any(&tmp).ok();
         bail!("source symlink changed while copying {}", entry.rel_path);
     }
-    replace_path(&tmp, final_path)?;
+    replace_path(dst_root, cycle_id, &entry.rel_path, &tmp, final_path)?;
     fsync_parent(final_path).ok();
     Ok(())
 }
 
-fn replace_path(tmp: &Path, final_path: &Path) -> Result<()> {
+fn replace_path(
+    dst_root: &Path,
+    cycle_id: i64,
+    rel: &str,
+    tmp: &Path,
+    final_path: &Path,
+) -> Result<()> {
     if final_path.exists() || fs::symlink_metadata(final_path).is_ok() {
         let tmp_meta = fs::symlink_metadata(tmp)?;
         let final_meta = fs::symlink_metadata(final_path)?;
         let compatible = (tmp_meta.is_file() && final_meta.is_file())
             || (tmp_meta.file_type().is_symlink() && final_meta.file_type().is_symlink());
         if !compatible {
-            remove_any(final_path)?;
+            // A type flip can replace a whole directory tree; it belongs in
+            // the recycle bin like every other destructive replacement.
+            move_to_trash(dst_root, rel, cycle_id)?;
         }
     }
     fs::rename(tmp, final_path).with_context(|| {
@@ -6474,11 +6751,49 @@ fn move_to_trash(dst_root: &Path, rel: &str, cycle_id: i64) -> Result<()> {
     }
     match fs::rename(&path, &trash) {
         Ok(()) => Ok(()),
-        Err(_) => {
+        // Vanished between the existence check and the rename — some other
+        // pass already removed it, which is the goal state.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        // Nested mounts can't rename across the device boundary; keep the
+        // recycle-bin promise with a copy into the trash before deleting.
+        Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
+            copy_tree_best_effort(&path, &trash).with_context(|| {
+                format!("failed to copy {rel} into the trash across devices")
+            })?;
             remove_any(&path)?;
             Ok(())
         }
+        // Anything else must fail loudly: silently degrading to a permanent
+        // recursive delete erased recycle-bin contents in the past.
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to move {} into the trash at {}",
+                path.display(),
+                trash.display()
+            )
+        }),
     }
+}
+
+/// Recursive copy used only for cross-device trash moves: preserves files,
+/// symlinks and directory structure (modes/mtimes are not needed for trash).
+fn copy_tree_best_effort(from: &Path, to: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(from)?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(from)?;
+        create_symlink_kind(&target, to, symlink_points_to_dir(from))?;
+        return Ok(());
+    }
+    if meta.is_file() {
+        fs::copy(from, to)?;
+        return Ok(());
+    }
+    fs::create_dir_all(to)?;
+    for child in fs::read_dir(from)? {
+        let child = child?;
+        copy_tree_best_effort(&child.path(), &to.join(child.file_name()))?;
+    }
+    Ok(())
 }
 
 /// Re-check just the entries this cycle wrote (per-path lstat, plus re-hash in
@@ -6505,7 +6820,8 @@ where
             bail!("destination missing {}", want.rel_path);
         }
         let got = snapshot_entry(&path, want.rel_path.clone(), sync.checksum)?;
-        if !entries_match(want, &got, sync) {
+        // Exact: the copy stamped the destination with the source's mtime.
+        if !entries_match_exact(want, &got, sync) {
             bail!("destination mismatch at {}", want.rel_path);
         }
     }
@@ -6513,16 +6829,47 @@ where
 }
 
 fn entries_match(left: &SnapshotEntry, right: &SnapshotEntry, sync: &NativeSyncConfig) -> bool {
+    entries_match_with(left, right, sync, false)
+}
+
+/// Exact-mtime variant for paths carrying positive change evidence (watcher
+/// events, `zfs diff` output). The modify window exists to absorb filesystem
+/// timestamp granularity during whole-tree quick checks; on an evidence path
+/// it would swallow a same-size rewrite landing within the window of the
+/// previously synced version and leave the drift green forever.
+fn entries_match_exact(left: &SnapshotEntry, right: &SnapshotEntry, sync: &NativeSyncConfig) -> bool {
+    entries_match_with(left, right, sync, true)
+}
+
+fn entries_match_with(
+    left: &SnapshotEntry,
+    right: &SnapshotEntry,
+    sync: &NativeSyncConfig,
+    exact: bool,
+) -> bool {
     if left.file_type != right.file_type {
         return false;
     }
     match left.file_type.as_str() {
         "dir" => mtimes_match(left.mtime_ns, right.mtime_ns, sync),
-        "file" if sync.checksum => left.size == right.size && left.hash == right.hash,
+        // Hash evidence wins whenever both sides carry one: checksum mode, or
+        // a targeted hash upgrade of suspicious paths (dst-side-only diffs).
+        "file" if sync.checksum || (left.hash.is_some() && right.hash.is_some()) => {
+            left.size == right.size && left.hash == right.hash
+        }
+        "file" if exact => {
+            left.size == right.size && mtimes_match_exact(left.mtime_ns, right.mtime_ns)
+        }
         "file" => left.size == right.size && mtimes_match(left.mtime_ns, right.mtime_ns, sync),
         "symlink" => left.hash == right.hash,
         _ => false,
     }
+}
+
+/// Content-equal file entries whose permission bits differ are repaired with
+/// a chmod in place instead of a re-copy (owner/group are not tracked).
+fn entry_mode_differs(left: &SnapshotEntry, right: &SnapshotEntry) -> bool {
+    left.file_type == "file" && left.mode != right.mode
 }
 
 fn should_attempt_delta(source: &SnapshotEntry, existing: &SnapshotEntry) -> bool {
@@ -6545,6 +6892,15 @@ fn should_attempt_delta(source: &SnapshotEntry, existing: &SnapshotEntry) -> boo
 fn mtimes_match(left_ns: i64, right_ns: i64, sync: &NativeSyncConfig) -> bool {
     let window_ns = (sync.modify_window_secs as i128) * 1_000_000_000;
     (left_ns as i128 - right_ns as i128).abs() <= window_ns
+}
+
+/// Windows FILETIME stores 100ns ticks, so a nanosecond mtime applied on an
+/// NTFS destination reads back truncated; tolerate that but nothing coarser —
+/// a genuine rewrite lands whole milliseconds-to-seconds away.
+const EXACT_MTIME_TOLERANCE_NS: i128 = 1_000;
+
+fn mtimes_match_exact(left_ns: i64, right_ns: i64) -> bool {
+    (left_ns as i128 - right_ns as i128).abs() <= EXACT_MTIME_TOLERANCE_NS
 }
 
 /// After reading a source file's content, confirm the file is still exactly
@@ -6620,6 +6976,16 @@ fn tmp_path(dst_root: &Path, cycle_id: i64, rel: &str) -> PathBuf {
         .join(cycle_id.to_string())
         .join(parent)
         .join(format!("{file_name}.tmp.{}", std::process::id()))
+}
+
+/// lstat check: does something sit at `path` that is not a real directory?
+/// A symlink counts even when it points at a directory — writing "into" it
+/// would land the subtree at the link target instead of the mirror path.
+fn path_blocks_directory(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type().is_symlink() || !meta.is_dir(),
+        Err(_) => false,
+    }
 }
 
 fn remove_any(path: &Path) -> Result<()> {
@@ -7952,6 +8318,86 @@ mod tests {
     }
 
     #[test]
+    fn zfs_diff_union_excludes_internal_trash_tmp_probe() {
+        // A mirror delete renames into .auto_sync_trash, so the destination's
+        // base->live diff always names the trash afterwards. Those paths must
+        // never enter the union: recursing them turned the whole recycle bin
+        // (~80K entries live) into per-path snapshot entries all reported as
+        // false "delete" differences.
+        let root = Path::new("/zfs_pool");
+        let output = "M\t/zfs_pool/\n\
+                      R\t/zfs_pool/gone.txt\t/zfs_pool/.auto_sync_trash/29/gone.txt\n\
+                      +\t/zfs_pool/.auto_sync_trash/29\n\
+                      M\t/zfs_pool/.auto_sync_trash\n\
+                      M\t/zfs_pool/.auto_sync_tmp/12/half.bin\n\
+                      +\t/zfs_pool/.auto_sync_probe\n\
+                      M\t/zfs_pool/real_change.txt\n";
+        let paths = parse_zfs_diff(output, root);
+        assert_eq!(
+            paths,
+            vec!["gone.txt".to_string(), "real_change.txt".to_string()]
+        );
+
+        // Defense in depth: even if an internal path reaches the per-path
+        // snapshot layer, it is skipped instead of recursed.
+        let temp = std::env::temp_dir().join(format!(
+            "auto_sync_internal_snap_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(temp.join(INTERNAL_TRASH).join("29")).unwrap();
+        fs::write(temp.join(INTERNAL_TRASH).join("29").join("f.txt"), b"x").unwrap();
+        let entries = take_snapshot_paths_with_excludes(
+            &temp,
+            &[format!("{INTERNAL_TRASH}/29"), INTERNAL_TRASH.to_string()],
+            SnapshotMode::Destination,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(entries.is_empty());
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn evidence_paths_use_exact_mtime_comparison() {
+        // A same-size rewrite landing within the modify window of the
+        // previously synced version passes the whole-tree quick check but must
+        // NOT pass on an evidence path (watcher event / zfs diff): that was a
+        // permanent silent-drift hole.
+        let sync = NativeSyncConfig::default(); // modify_window_secs = 1
+        let mut old = test_file_entry("f.txt", 10);
+        let mut new = test_file_entry("f.txt", 10);
+        old.mtime_ns = 1_000_000_000_000;
+        new.mtime_ns = old.mtime_ns + 800_000_000; // +0.8s, same size
+        assert!(entries_match(&new, &old, &sync), "walk quick check tolerates");
+        assert!(
+            !entries_match_exact(&new, &old, &sync),
+            "evidence path must treat it as changed"
+        );
+        // Sub-microsecond skew (NTFS FILETIME truncation) still matches.
+        new.mtime_ns = old.mtime_ns + 100;
+        assert!(entries_match_exact(&new, &old, &sync));
+
+        // Hash evidence wins when both sides carry one, even without checksum
+        // mode: an mtime-restoring rewrite cannot clear itself.
+        let mut tampered = test_file_entry("f.txt", 10);
+        tampered.mtime_ns = old.mtime_ns;
+        tampered.hash = Some("different".to_string());
+        old.hash = Some("original".to_string());
+        assert!(!entries_match(&tampered, &old, &sync));
+
+        // Mode-only drift: content matches, permissions differ.
+        let mut chmod = test_file_entry("f.txt", 10);
+        chmod.mtime_ns = 1_000_000_000_000;
+        chmod.mode = 0o600;
+        let mut base = test_file_entry("f.txt", 10);
+        base.mtime_ns = 1_000_000_000_000;
+        base.mode = 0o644;
+        assert!(entries_match_exact(&chmod, &base, &sync));
+        assert!(entry_mode_differs(&chmod, &base));
+    }
+
+    #[test]
     fn unescapes_zfs_octal_paths() {
         assert_eq!(unescape_zfs_path("a\\040b"), "a b");
         assert_eq!(unescape_zfs_path("tab\\011x"), "tab\tx");
@@ -8308,7 +8754,7 @@ mod tests {
         let mut sync = NativeSyncConfig::default();
         sync.mirror = true;
         sync.checksum = false;
-        let report = build_scan_report("s", "d", &source, &dst, &[], &sync);
+        let report = build_scan_report("s", "d", &source, &dst, &[], &sync, false);
         assert_eq!(report.to_add, 1, "new.txt");
         assert_eq!(report.to_update, 1, "changed.txt");
         assert_eq!(report.to_delete, 1, "extra.txt");
@@ -8318,7 +8764,7 @@ mod tests {
 
         // Mirror off: extra destination files are not flagged for deletion.
         sync.mirror = false;
-        let report = build_scan_report("s", "d", &source, &dst, &[], &sync);
+        let report = build_scan_report("s", "d", &source, &dst, &[], &sync, false);
         assert_eq!(report.to_delete, 0);
     }
 
@@ -8449,7 +8895,7 @@ mod tests {
         sync.mirror = true;
         sync.checksum = false;
         let excludes = vec![PathBuf::from("excluded")];
-        let diff = diff_manifests(&source, &dst, &excludes, &sync);
+        let diff = diff_manifests(&source, &dst, &excludes, &sync, false);
 
         assert_eq!(
             diff.transfer
