@@ -23,7 +23,7 @@ use crate::core::progress::{
     current_scan_progresses, current_transfer_progress,
 };
 use crate::core::state::{DestinationView, ScanReport, State as DbState};
-use crate::core::sync::{SyncRequestMode, current_sync_kind, sync_is_running};
+use crate::core::sync::{SyncRequestMode, current_sync_kind, current_sync_phase, sync_is_running};
 
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MANUAL_DISCOVERY_MIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -317,6 +317,7 @@ impl Backend {
         RuntimeStatus {
             syncing: sync_is_running(),
             sync_kind: current_sync_kind(),
+            sync_phase: current_sync_phase(),
             transfer: current_transfer_progress(),
             scan: current_scan_progress(),
             scans: current_scan_progresses(),
@@ -1388,6 +1389,10 @@ pub struct RuntimeStatus {
     pub syncing: bool,
     #[serde(default)]
     pub sync_kind: Option<String>,
+    /// Coarse phase of the running pass ("zfs diff", "transferring",
+    /// "verifying", "preparing"); `None` when idle or served by an old peer.
+    #[serde(default)]
+    pub sync_phase: Option<String>,
     pub transfer: Option<TransferProgressView>,
     /// The most recently updated walk (single-slot status-bar display).
     pub scan: Option<ScanProgressView>,

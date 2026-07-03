@@ -60,6 +60,10 @@ const TRANSFER_MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
 static SYNC_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 static SCAN_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 static SYNC_KIND: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// Coarse phase of the pass currently holding the sync gate (e.g. "zfs diff",
+/// "scanning", "transferring", "verifying"). Surfaced in the UI Info panel so a
+/// long-running task shows WHAT it is doing right now, not just that it is busy.
+static SYNC_PHASE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static TRANSFER_MEMORY: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
 
 fn transfer_memory() -> &'static (Mutex<u64>, Condvar) {
@@ -141,6 +145,38 @@ fn sync_kind_lock() -> &'static Mutex<Option<String>> {
     SYNC_KIND.get_or_init(|| Mutex::new(None))
 }
 
+pub fn current_sync_phase() -> Option<String> {
+    sync_phase_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+fn sync_phase_lock() -> &'static Mutex<Option<String>> {
+    SYNC_PHASE.get_or_init(|| Mutex::new(None))
+}
+
+/// Record the coarse phase of the running pass (plain setter; overwrites).
+/// `SyncPhaseReset` clears it when the top-level pass unwinds so it never
+/// sticks after work stops.
+fn set_sync_phase(phase: &str) {
+    *sync_phase_lock().lock().unwrap_or_else(|err| err.into_inner()) = Some(phase.to_string());
+}
+
+struct SyncPhaseReset;
+
+impl SyncPhaseReset {
+    fn enter() -> Self {
+        SyncPhaseReset
+    }
+}
+
+impl Drop for SyncPhaseReset {
+    fn drop(&mut self) {
+        *sync_phase_lock().lock().unwrap_or_else(|err| err.into_inner()) = None;
+    }
+}
+
 fn set_sync_kind(kind: &str) -> SyncKindGuard {
     let mut current = sync_kind_lock()
         .lock()
@@ -168,6 +204,9 @@ pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     // single concrete kind — no "automatic" alias — so the task log is
     // unambiguous.
     let _kind = set_sync_kind_if_empty("incremental");
+    // Clear the phase indicator when the whole pass unwinds so it never sticks
+    // after work stops (even on early error).
+    let _phase_reset = SyncPhaseReset::enter();
     let _cancellable = cancel::begin(cancel::KIND_SYNC);
     sync_all_pending_inner(cfg, state)
 }
@@ -444,6 +483,10 @@ pub fn scan_destination_now(
         bail!("a sync for this destination is running; compare after it finishes");
     }
     let _kind = set_sync_kind_if_empty("scan");
+    // Clear the phase indicator when the compare unwinds (zfs_diff_changed_paths
+    // below sets it to "zfs diff"; a full-walk compare leaves it unset and the
+    // UI derives "scanning" from the live scan progress).
+    let _phase_reset = SyncPhaseReset::enter();
     let _cancellable = cancel::begin_target(
         cancel::KIND_COMPARE,
         Some(cancel::target_for(source_id, destination_id)),
@@ -2779,6 +2822,9 @@ pub fn sync_cycle_for_source(
         .collect::<Vec<_>>()
         .join(",");
     let task_id = state.task_start(log_kind, &source.id, &destination_ids).ok();
+    // Phase indicator starts at "preparing"; the per-phase functions (zfs diff,
+    // transferring, verifying) overwrite it as the pass advances.
+    set_sync_phase("preparing");
     let action_started_at = chrono::Utc::now().to_rfc3339();
     let result = sync_cycle_for_source_inner(cfg, state, source, cycle);
     // A manual Full pass that began after a restart notice re-reads (or
@@ -5252,6 +5298,7 @@ fn push_entries_parallel(
     entries: &[(&SnapshotEntry, bool)],
     sync: &NativeSyncConfig,
 ) -> Result<TransferOutcome> {
+    set_sync_phase("transferring");
     if entries.is_empty() {
         return Ok(TransferOutcome {
             transferred: 0,
@@ -5791,6 +5838,7 @@ fn zfs_diff_changed_paths(
     new_full_name: &str,
     source_live_root: &Path,
 ) -> Option<Vec<DiffPath>> {
+    set_sync_phase("zfs diff");
     if base_full_name == new_full_name {
         return Some(Vec::new());
     }
@@ -8020,6 +8068,7 @@ fn verify_copied_entries<'a, I>(
 where
     I: IntoIterator<Item = &'a SnapshotEntry>,
 {
+    set_sync_phase("verifying");
     for want in copied {
         if want.file_type == "dir" || ignored_paths.contains(&want.rel_path) {
             continue;

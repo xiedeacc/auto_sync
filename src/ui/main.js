@@ -2385,6 +2385,7 @@ function renderDestinationLogModal() {
     ["Status", destinationStatusText(status)],
     ["Cycle", cycleDisplay(status)],
     ["Type", infoTypeLabel(source, dst, runtime, dstLogTask)],
+    ["Phase", infoPhaseLabel(source, dst, runtime, transfer, scan)],
     ["Snapshot", infoSnapshotLabel(source, dst, transfer, scan)],
     ["Summary", infoSummaryLabel(source, dst, report, dstLogTask)],
   ];
@@ -2406,6 +2407,39 @@ function infoTypeLabel(source, dst, runtime, task) {
       : (syncKindLabel(runtime && runtime.sync_kind) || "Sync");
   }
   return task ? taskKindLabel(task.kind) : "-";
+}
+
+// Phase: which stage the running task is in right now. The live scan/transfer
+// progress is authoritative when present (a walk or a file copy is definitely
+// happening); otherwise fall back to the engine's coarse phase flag, which
+// covers the stages that emit no progress (zfs diff, verifying, preparing).
+function infoPhaseLabel(source, dst, runtime, transfer, scan) {
+  const act = dstActivity(source, dst);
+  if (!act.active) {
+    return "-";
+  }
+  if (transfer) {
+    return "Transferring";
+  }
+  if (scan) {
+    return act.scope === "compare" ? "Comparing" : "Scanning";
+  }
+  const phase = runtime && runtime.sync_phase;
+  if (phase) {
+    return phaseLabel(phase);
+  }
+  return act.scope === "compare" ? "Comparing" : "Preparing";
+}
+
+function phaseLabel(phase) {
+  switch (String(phase || "").trim()) {
+    case "zfs diff": return "zfs diff";
+    case "scanning": return "Scanning";
+    case "transferring": return "Transferring";
+    case "verifying": return "Verifying";
+    case "preparing": return "Preparing";
+    default: return phase;
+  }
 }
 
 // Snapshot: live metrics of the current task at this instant.
