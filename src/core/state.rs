@@ -1629,7 +1629,20 @@ impl State {
             for dst in &source.destinations {
                 let offset = self.destination_offset(&source.id, &dst.id)?;
                 let target = offset.target_cycle_id;
-                let computed_status = if offset.status == "green"
+                let issues = self.destination_issues(&source.id, &dst.id)?;
+                // Plan A tolerates a source written under the copy: it advances
+                // the verified offset (so the scheduler stops re-walking the
+                // tree) but records the dirty paths as issues + events for the
+                // next cycle. Because verified advances, the stored status flips
+                // green on the next tick — so surface any outstanding
+                // source_changing issue as yellow here regardless, keeping the
+                // dirty files visible (yellow dot + issue modal) until a later
+                // cycle re-syncs and clears them.
+                let has_source_changing =
+                    issues.iter().any(|issue| issue.issue_kind == "source_changing");
+                let computed_status = if has_source_changing {
+                    "yellow".to_string()
+                } else if offset.status == "green"
                     && target.is_some()
                     && offset.last_verified_cycle_id >= target
                 {
@@ -1639,7 +1652,9 @@ impl State {
                 } else {
                     "red".to_string()
                 };
-                let computed_reason = if target.is_some()
+                let computed_reason = if has_source_changing {
+                    "source_changing".to_string()
+                } else if target.is_some()
                     && offset.last_verified_cycle_id < target
                     && matches!(
                         offset.status_reason.as_str(),
@@ -1673,7 +1688,7 @@ impl State {
                     status: computed_status,
                     status_reason: computed_reason,
                     updated_at: Some(offset.updated_at),
-                    issues: self.destination_issues(&source.id, &dst.id)?,
+                    issues,
                     scan_differences,
                     scan_at,
                     restart_notice_at: restart_notice_at.clone(),
@@ -1963,6 +1978,83 @@ mod tests {
         assert!(state.raise_restart_notice("src_n").unwrap());
         state.dismiss_restart_notice("src_n").unwrap();
         assert!(state.restart_notice("src_n").unwrap().is_none());
+
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn destination_view_stays_yellow_while_source_changing_issues_pend() {
+        let temp = temp_dir("state_source_changing_view");
+        let db = temp.join("state.sqlite");
+        let state = State::open(&db).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: PathBuf::from("/data/src"),
+            add_directory: true,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig::default(),
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: PathBuf::from("/mnt/dst"),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+                paused: false,
+                sync: None,
+            }],
+        });
+
+        // Plan A's steady state: the offset reads back green (verified advanced
+        // to its target), but a dirty file caught mid-write is still recorded.
+        state.set_destination_target("src_1", "dst_1", 5).unwrap();
+        state
+            .upsert_destination_status("src_1", "dst_1", Some(5), "green", "verified")
+            .unwrap();
+        state
+            .replace_destination_issues(
+                "src_1",
+                "dst_1",
+                5,
+                "source_changing",
+                &["docs/live.log".to_string()],
+                "source file changed while copying; deferred to the next cycle",
+            )
+            .unwrap();
+
+        let view = state
+            .destination_views(&cfg)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.destination_id == "dst_1")
+            .unwrap();
+        assert_eq!(
+            view.status, "yellow",
+            "a pending dirty file must surface as yellow even though verified advanced"
+        );
+        assert_eq!(view.status_reason, "source_changing");
+        assert!(
+            view.issues
+                .iter()
+                .any(|issue| issue.rel_path == "docs/live.log"),
+            "the dirty file must be listed for the issue modal"
+        );
+
+        // Clearing the issue (a later cycle re-synced the file) returns to green.
+        state.clear_destination_issues("src_1", "dst_1").unwrap();
+        let view = state
+            .destination_views(&cfg)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.destination_id == "dst_1")
+            .unwrap();
+        assert_eq!(view.status, "green");
 
         std::fs::remove_dir_all(temp).ok();
     }
