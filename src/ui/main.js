@@ -20,6 +20,10 @@ let scheduleEditor = null;
 let excludeEditor = null;
 let dstSyncEditor = null;
 let dstLogViewer = null;
+// The Info modal's "Type"/"Summary" rows come from the last task-log entry for
+// the open destination; refreshed on a timer while the modal is open.
+let dstLogTask = null;
+let dstLogTaskTimer = null;
 const scanReports = {};
 const scanPending = {};
 let checkingScans = false;
@@ -1215,10 +1219,8 @@ function renderSyncRows(source, group) {
       }
     };
     row.querySelector('[data-action="show-dst-log"]').onclick = () => {
-      // While a compare runs for this destination, the info icon shows the
-      // compare's live progress; otherwise the regular destination log.
-      const act = dstActivity(source, dst);
-      openDestinationLogModal(source, dst, act.scope === "compare" ? "scan" : "log");
+      // One uniform Info view for every task type (sync, compare, idle).
+      openDestinationLogModal(source, dst);
     };
     row.querySelector('[data-action="repair-scan"]').onclick = () => {
       const latestStatus = statusFor(source.id, dst.id);
@@ -2113,18 +2115,15 @@ const SCAN_DIFF_KINDS = [
 ];
 const SCAN_DIFF_MODAL_CAP = 50;
 
-function openDestinationLogModal(source, dst, mode = "log") {
-  dstLogViewer = {
-    sourceId: source.id,
-    destinationId: dst.id,
-    mode,
-  };
+function openDestinationLogModal(source, dst) {
+  dstLogViewer = { sourceId: source.id, destinationId: dst.id };
+  dstLogTask = null;
   renderDestinationLogModal();
   el.dstLogModal.hidden = false;
-  // In scan mode, pull the last stored report (from this or a prior session) if
-  // we don't already have a fresh one cached from a Scan run just now.
+  // The Summary row's compare stats come from the last stored report; pull it
+  // if we don't already have a fresh one cached from a Scan run just now.
   const key = scanReportKey(source.id, dst.id);
-  if (mode === "scan" && !scanReports[key]) {
+  if (!scanReports[key]) {
     invoke("scan_report", { sourceId: source.id, destinationId: dst.id })
       .then((report) => {
         if (report) {
@@ -2134,11 +2133,57 @@ function openDestinationLogModal(source, dst, mode = "log") {
       })
       .catch(() => {});
   }
+  refreshDstLogTask();
+  if (!dstLogTaskTimer) {
+    dstLogTaskTimer = setInterval(refreshDstLogTask, 3000);
+  }
 }
 
 function closeDestinationLogModal() {
   el.dstLogModal.hidden = true;
   dstLogViewer = null;
+  dstLogTask = null;
+  if (dstLogTaskTimer) {
+    clearInterval(dstLogTaskTimer);
+    dstLogTaskTimer = null;
+  }
+}
+
+// Find the newest task-log entry for the open destination across all machines
+// (the executing machine stores it; a cross-machine cycle's destination_id is
+// a comma-joined list).
+async function refreshDstLogTask() {
+  if (!dstLogViewer) {
+    return;
+  }
+  const { sourceId, destinationId } = dstLogViewer;
+  let machines;
+  try {
+    machines = await invoke("get_all_tasks", { limit: 50 });
+  } catch (error) {
+    return; // keep the last known task
+  }
+  if (!dstLogViewer || dstLogViewer.sourceId !== sourceId
+    || dstLogViewer.destinationId !== destinationId) {
+    return; // the user switched destinations mid-fetch
+  }
+  let best = null;
+  for (const machine of machines || []) {
+    for (const task of machine.tasks || []) {
+      if (task.source_id !== sourceId) {
+        continue;
+      }
+      const ids = String(task.destination_id || "").split(",").map((id) => id.trim());
+      if (!ids.includes(destinationId)) {
+        continue;
+      }
+      if (!best || Date.parse(task.started_at) > Date.parse(best.started_at)) {
+        best = task;
+      }
+    }
+  }
+  dstLogTask = best;
+  renderDestinationLogModal();
 }
 
 // ---------------------------------------------------------------------------
@@ -2291,9 +2336,8 @@ function renderDestinationLogModal() {
   }
   const source = findSourceById(dstLogViewer.sourceId);
   const dst = source && (source.destinations || []).find((item) => item.id === dstLogViewer.destinationId);
-  const scanMode = dstLogViewer.mode === "scan";
   if (el.dstLogTitle) {
-    el.dstLogTitle.textContent = scanMode ? "Compare" : "Destination Log";
+    el.dstLogTitle.textContent = "Info";
   }
   if (!source || !dst) {
     el.dstLogSummary.textContent = "Destination no longer exists";
@@ -2304,58 +2348,112 @@ function renderDestinationLogModal() {
   const activity = activityForSource(source);
   const runtime = activityRuntime(activity, source);
   const transfer = matchingTransfer(runtime, dst);
-  // Pick this destination's own compare walk from the live list; a walk
-  // without attribution (older peer build) is accepted as long as it is not
-  // tagged as a sync's tree walk.
+  // This destination's own compare walk from the live list; an unattributed
+  // walk (older peer) is accepted as long as it is not a sync's tree walk.
   const scan = runtimeScans(runtime).find(
     (item) =>
       item.kind !== "sync"
       && (!item.source_id || item.source_id === source.id)
       && (!item.destination_id || item.destination_id === dst.id),
   ) || null;
+  const report = scanReports[scanReportKey(source.id, dst.id)];
+  // A fixed row set for EVERY task type — same rows, same height whether this
+  // is a sync, a compare, or idle. Type/Snapshot/Summary carry the per-task
+  // specifics.
   const rows = [
     ["Task", `${source.id} -> ${dst.id}`],
-    ["Source Path", machinePathLabel(source.machine_id, source.src)],
-    ["Destination Path", machinePathLabel(dst.machine_id, dst.path)],
+    ["Path", `${machinePathLabel(source.machine_id, source.src)}  →  ${machinePathLabel(dst.machine_id, dst.path)}`],
     ["Status", destinationStatusText(status)],
     ["Cycle", cycleDisplay(status)],
+    ["Type", infoTypeLabel(source, dst, runtime, dstLogTask)],
+    ["Snapshot", infoSnapshotLabel(source, dst, transfer, scan)],
+    ["Summary", infoSummaryLabel(source, dst, report, dstLogTask)],
   ];
-  if (scanMode) {
-    // Scan view: only scan progress + report, never the sync runtime/transfer.
-    if (scan) {
-      rows.push(["Comparing", scan.current_path || scan.root_path || "-"]);
-      rows.push(["Entries", String(Number(scan.entries_seen || 0))]);
-    }
-  } else {
-    // Destination Log view: sync runtime/transfer, never the scan report.
-    if (activity && activity.error) {
-      rows.push(["Runtime", activity.error]);
-    } else if (runtime && runtime.syncing) {
-      rows.push(["Runtime", runtimeSyncLabel(runtime)]);
-    } else {
-      rows.push(["Runtime", "idle"]);
-    }
-    if (transfer) {
-      rows.push(["File", transfer.rel_path || "-"]);
-      rows.push(["Speed", formatBytesPerSecond(transfer.bytes_per_sec || 0)]);
-      rows.push(["Progress", formatTransferProgress(transfer) || "-"]);
-    } else {
-      rows.push(["Current file", "-"]);
-      rows.push(["Speed", "-"]);
-    }
-  }
   el.dstLogSummary.textContent = "";
   el.dstLogList.innerHTML = rows.map(([key, value]) => `
     <div class="dst-log-row">
       <div class="dst-log-key">${escapeHtml(key)}</div>
-      <div class="dst-log-value">${escapeHtml(value || "-")}</div>
+      <div class="dst-log-value" title="${escapeAttr(value || "-")}">${escapeHtml(value || "-")}</div>
     </div>
-  `).join("") + (scanMode ? renderScanReportSection(source, dst) : "");
-  if (scanMode) {
-    el.dstLogList.querySelectorAll("[data-scan-kind]").forEach((button) => {
-      button.onclick = () => openScanDiffModal(source, dst, button.getAttribute("data-scan-kind"));
-    });
+  `).join("");
+}
+
+// Type: the running task's kind if one is active, else the last task's kind.
+function infoTypeLabel(source, dst, runtime, task) {
+  const act = dstActivity(source, dst);
+  if (act.active) {
+    return act.scope === "compare"
+      ? "Compare"
+      : (syncKindLabel(runtime && runtime.sync_kind) || "Sync");
   }
+  return task ? taskKindLabel(task.kind) : "-";
+}
+
+// Snapshot: live metrics of the current task at this instant.
+function infoSnapshotLabel(source, dst, transfer, scan) {
+  const act = dstActivity(source, dst);
+  if (act.scope === "compare") {
+    if (scan) {
+      const entries = Number(scan.entries_seen || 0);
+      const path = compactStatusPath(scan.current_path || scan.root_path || "", 44);
+      return `${entries} entries${path ? ` · ${path}` : ""}`;
+    }
+    return "scanning…";
+  }
+  if (act.scope === "sync") {
+    if (transfer) {
+      const file = compactStatusPath(transfer.rel_path || "-", 40);
+      const speed = formatBytesPerSecond(transfer.bytes_per_sec || 0);
+      const progress = formatTransferProgress(transfer);
+      return `${file} · ${speed}${progress ? ` · ${progress}` : ""}`;
+    }
+    return "preparing…";
+  }
+  return "idle";
+}
+
+// Summary: final-result statistics of the current or last task — diff counts
+// for a compare, files moved for a sync.
+function infoSummaryLabel(source, dst, report, task) {
+  const act = dstActivity(source, dst);
+  const isCompare = act.scope === "compare" || (task && task.kind === "compare");
+  if (isCompare && report) {
+    if (report.error) {
+      return `compare failed: ${report.error}`;
+    }
+    const total = (report.to_add || 0) + (report.to_update || 0) + (report.to_delete || 0)
+      + (report.type_mismatch || 0) + (report.metadata || 0);
+    if (total === 0) {
+      return "in sync";
+    }
+    const parts = [];
+    if (report.to_add) parts.push(`+${report.to_add}`);
+    if (report.to_update) parts.push(`~${report.to_update}`);
+    if (report.to_delete) parts.push(`−${report.to_delete}`);
+    if (report.type_mismatch) parts.push(`!${report.type_mismatch}`);
+    if (report.metadata) parts.push(`#${report.metadata}`);
+    return `${total} difference${total === 1 ? "" : "s"} (${parts.join(" ")})`;
+  }
+  if (task) {
+    if (task.status === "running") {
+      return "running…";
+    }
+    const parts = [];
+    if (Number(task.files_synced || 0) > 0) {
+      parts.push(`${task.files_synced} file${task.files_synced === 1 ? "" : "s"}`);
+    }
+    if (Number(task.entries_scanned || 0) > 0) {
+      parts.push(`${task.entries_scanned} entries`);
+    }
+    if (task.error) {
+      parts.push(task.error);
+    }
+    if (!parts.length && task.status) {
+      parts.push(task.status);
+    }
+    return parts.join(" · ") || "-";
+  }
+  return "-";
 }
 
 function scanKindLabel(kind) {
@@ -2373,47 +2471,6 @@ function formatScanTime(value) {
   if (!value) return "-";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
-}
-
-function renderScanReportSection(source, dst) {
-  const report = scanReports[scanReportKey(source.id, dst.id)];
-  if (!report) {
-    return "";
-  }
-  if (report.error) {
-    return `
-      <div class="dst-log-section-title">Last compare — ${escapeHtml(formatScanTime(report.scanned_at))}</div>
-      <div class="scan-diff-error">Compare failed: ${escapeHtml(report.error)}</div>
-    `;
-  }
-  const total = (report.to_add || 0) + (report.to_update || 0) + (report.to_delete || 0)
-    + (report.type_mismatch || 0) + (report.metadata || 0);
-  const title = `<div class="dst-log-section-title">Last compare — ${escapeHtml(formatScanTime(report.scanned_at))} (${total} difference${total === 1 ? "" : "s"})</div>`;
-  const diffRows = SCAN_DIFF_KINDS.map(({ kind, label, field }) => {
-    const count = report[field] || 0;
-    const button = count > 0
-      ? `<button class="scan-diff-view" data-scan-kind="${escapeAttr(kind)}">View</button>`
-      : "";
-    return `
-      <div class="dst-log-row">
-        <div class="dst-log-key">${escapeHtml(label)}</div>
-        <div class="dst-log-value scan-count-value">${escapeHtml(String(count))}${button}</div>
-      </div>
-    `;
-  }).join("");
-  const extraRows = [
-    ["In sync", report.in_sync],
-    ["Source / Dst entries", `${report.source_entries || 0} / ${report.dst_entries || 0}`],
-  ].map(([key, value]) => `
-    <div class="dst-log-row">
-      <div class="dst-log-key">${escapeHtml(key)}</div>
-      <div class="dst-log-value">${escapeHtml(String(value ?? 0))}</div>
-    </div>
-  `).join("");
-  const footer = total === 0
-    ? `<div class="scan-diff-empty">Source and destination are in sync.</div>`
-    : "";
-  return title + diffRows + extraRows + footer;
 }
 
 function openScanDiffModal(source, dst, kind) {

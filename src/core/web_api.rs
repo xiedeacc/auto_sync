@@ -229,13 +229,25 @@ pub async fn serve(backend: Backend, port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../ui/index.html"))
+// The frontend assets are baked into the binary and change on every deploy;
+// no-store keeps a browser (or the desktop WebView2) from serving a stale
+// main.js/styles.css after an update.
+const NO_STORE: &str = "no-store";
+
+async fn index() -> Response {
+    (
+        [(header::CACHE_CONTROL, NO_STORE)],
+        Html(include_str!("../ui/index.html")),
+    )
+        .into_response()
 }
 
 async fn main_js() -> Response {
     (
-        [(header::CONTENT_TYPE, "application/javascript")],
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, NO_STORE),
+        ],
         include_str!("../ui/main.js"),
     )
         .into_response()
@@ -243,7 +255,10 @@ async fn main_js() -> Response {
 
 async fn styles_css() -> Response {
     (
-        [(header::CONTENT_TYPE, "text/css")],
+        [
+            (header::CONTENT_TYPE, "text/css"),
+            (header::CACHE_CONTROL, NO_STORE),
+        ],
         include_str!("../ui/styles.css"),
     )
         .into_response()

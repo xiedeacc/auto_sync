@@ -1193,7 +1193,7 @@ th {
   display: grid;
   grid-template-columns: 150px minmax(0, 1fr);
   gap: 10px;
-  align-items: start;
+  align-items: center;
   padding: 8px 0;
   border-bottom: 1px solid var(--line);
 }
@@ -1203,7 +1203,11 @@ th {
 }
 
 .dst-log-value {
-  overflow-wrap: anywhere;
+  /* Single line + ellipsis so every row is the same height regardless of
+     task type; the full value is available on hover (title attribute). */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
 }

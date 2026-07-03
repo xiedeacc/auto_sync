@@ -4,7 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>auto_sync</title>
-  <link rel="stylesheet" href="./styles.css">
+  <!-- Cache-bust the bundled assets: WebView2 (desktop) and browsers otherwise
+       heuristically cache main.js/styles.css by URL, so a redeployed binary's
+       new UI would not load until the cache expired. A per-load token forces a
+       fresh fetch every time (the assets are tiny and served from the binary). -->
+  <script>document.write('<link rel="stylesheet" href="./styles.css?v=' + Date.now() + '">');</script>
+  <noscript><link rel="stylesheet" href="./styles.css"></noscript>
 </head>
 <body>
   <header>
@@ -438,6 +443,6 @@
       };
     })();
   </script>
-  <script src="./main.js"></script>
+  <script>document.write('<scr' + 'ipt src="./main.js?v=' + Date.now() + '"></scr' + 'ipt>');</script>
 </body>
 </html>
