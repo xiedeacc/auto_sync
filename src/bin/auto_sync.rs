@@ -597,8 +597,34 @@ fn run_with_desktop(backend: Backend, port: u16, start_hidden: bool) {
             if let Err(err) = build_tray(app.handle()) {
                 warn!(error = %err, "failed to create system tray");
             }
-            // The window is created hidden (tauri.conf.json visible:false); show it
-            // now unless we were launched into the tray (e.g. via autostart).
+            // The window is created at RUNTIME (not tauri.conf.json) so its
+            // URL can carry the build id: WebView2 keeps a persistent disk
+            // cache keyed by URL and serves the bundled UI without
+            // revalidation, so a static URL kept rendering the PREVIOUS
+            // build's UI after every deploy. A per-build query string makes
+            // a fresh document load unavoidable (the asset resolver ignores
+            // the query); index.html then cache-busts its own subresources
+            // per load.
+            let window = tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::App(
+                    format!("index.html?b={}", env!("AUTO_SYNC_GIT_COMMIT_SHORT")).into(),
+                ),
+            )
+            .title("auto_sync")
+            .inner_size(1180.0, 760.0)
+            .min_inner_size(860.0, 620.0)
+            .resizable(true)
+            .visible(false)
+            .build()?;
+            // Hygiene: drop what previous builds left in the cache (the
+            // per-load busted assets would otherwise accumulate).
+            if let Err(err) = window.clear_all_browsing_data() {
+                warn!(error = %err, "failed to clear webview cache");
+            }
+            // The window starts hidden; show it now unless we were launched
+            // into the tray (e.g. via autostart).
             if !start_hidden {
                 show_main_window(app.handle());
             }
