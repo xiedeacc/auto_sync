@@ -18,6 +18,7 @@
   - [总体架构](#总体架构)
   - [模块划分](#模块划分)
   - [同步引擎](#同步引擎)
+  - [任务类型与并发](#任务类型与并发)
   - [ZFS snapshot 后端](#zfs-snapshot-后端)
   - [文件监听（fanotify / USN）](#文件监听fanotify--usn)
   - [调度与 cycle](#调度与-cycle)
@@ -191,7 +192,7 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 三种动作共享「完整对账 + 只修复差异」的语义，区别在计划来源：
 
-**Full（对账并同步）** — 仅用户在单个目标上手动触发（`Sync… → Full`）。`Sync All`、源级 `Sync`、目标级 `Incremental`、realtime 自动触发都按增量处理。Full 有两条实现，由 `sync.zfs_diff` 配置（全局默认 true，每个目标可覆盖关闭）自动选择：
+**Full（对账并同步）** — 用户在单个目标上手动触发（`Sync… → Full`），此外**目标首次同步**（无基准可增量）和**事件丢失后的全量重扫**也走同一条全量路径（引擎自动进入，Tasks 里同样标为 Full）。`Sync All`、源级 `Sync`、目标级 `Incremental`、realtime 自动触发按增量处理。Full 有两条实现，由 `sync.zfs_diff` 配置（全局默认 true，每个目标可覆盖关闭）自动选择：
 
 - **`zfs diff` 版**：源与目标都在本机 ZFS 且两侧基准快照都在时，`zfs diff` 各取两侧变化路径，对并集执行按路径同步（复制差异、mirror 删除多余、类型替换），并集之外不触碰。
 - **对比版**：前提不满足时回退——双树并行扫描 + 清单对账，执行顺序为：读源信息 → 并行生成源/目标完整清单 → 类型不同则先删除替换 → 批量建目录 → 只复制缺失或不匹配的文件/软链（大文件走 block delta）→ mirror 删除目标多余项 → 清理临时目录 → 只校验本轮写入。
@@ -205,6 +206,29 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 **跨机传输**：源/目标清单、批量 mkdir、批量 remove、文件推送都通过 peer HTTP transfer API 执行。本机 ZFS 源先创建 snapshot 只读视图供读取；目标有已验证基准快照时优先 `zfs diff` 增量。传输细节见[性能优化点](#性能优化点)。
 
 **回收站与临时目录**：mirror 删除统一进 `.auto_sync_trash/<cycle>/`，通过校验后按 `sync.trash_keep_days`（默认 30 天，0=永久）清理；临时文件写 `.auto_sync_tmp/<cycle>/`，完成后 fsync + 原子 rename，非当前 cycle 残留 7 天后清扫。`.auto_sync_*` 内部目录永不进入 diff 并集、清单或 mirror 删除集。
+
+### 任务类型与并发
+
+每次操作都在**执行机**的 `task_log` 表记一行，Tasks 面板按机器分组展示。当前的任务类型：
+
+| 类型（UI） | task_log kind | 触发来源 | 说明 |
+| --- | --- | --- | --- |
+| **Full** | `full` | 手动 `Sync… → Full`；**目标首次同步**；事件丢失后的全量重扫 | 完整读源+目标两棵树、对账、只修差异。首次同步没有基准可增量，因此必然是 Full——即使由调度器自动发起。 |
+| **Incremental** | `incremental` / `automatic` | 调度器到点/事件、`Sync All`、源级 `Sync`、目标级 `Incremental`、realtime | 只重放 `event_log` 中该目标自上次 verified 以来的事件路径。缺基准时自动退回完整 reconcile。 |
+| **Compare** | `compare` | 手动 `Sync… → Compare` | 只读对账，产出差异报告，不改动数据。 |
+| **Repair** | `repair_scan` | 点目标行的修复按钮（⇆） | 只同步上一次 Compare 报告里的差异路径。 |
+
+（历史类型 `startup_scan`、`changed_since` 已移除，不再产生。）
+
+**并发保证：任何时刻，同一个 `源 → 目标` 对最多只有一个任务在运行**——自动触发还是手动触发都一样。由三重机制保证：
+
+1. **SYNC_GATE（进程级互斥锁）** 串行化机器上**所有** sync pass。调度器的自动 pass、以及 Web/CLI/桌面手动触发的 sync，都必须先拿这把锁，拿不到就阻塞等待。所以两个 sync 永不并发，同一目标自然也不会有两个 sync。
+2. **SCAN_GATE** 串行化所有 Compare；Compare 之间也不并发。
+3. **跨闸门按目标互斥**：Compare 启动时若发现该目标正有 sync 在跑，直接拒绝（"a sync for this destination is running"）；sync 遇到该目标正有 Compare 在跑，则把该目标延后（黄色 `waiting_for_compare`），Compare 结束后下一个 tick 补上。因此同一目标上 sync 与 compare 绝不重叠。
+
+调度器本身是单线程，自动 pass 之间天然不重叠。
+
+**具体到「新增源→目标」的场景**：新增后调度器发起首次 **Full**（持 SYNC_GATE）。若此时源目录有文件更新，只会**写入 `event_log`**，不会并发触发一个增量任务——增量同样要 SYNC_GATE，且单线程调度器正阻塞在 Full 里。Full 跑完后，下一轮 pass 才把累积的事件做成增量。全程该「源→目标」只有一个任务。
 
 ### ZFS snapshot 后端
 

@@ -2761,7 +2761,9 @@ pub fn sync_cycle_for_source(
     // everything) is a Full, not an event-replay Incremental. Labelling it
     // "incremental" was misleading in the Tasks list. The restart-notice check
     // below still keys off the untouched `kind` so only a manual Full clears it.
-    let log_kind = if kind == "incremental" && cycle_runs_full_reconcile(state, source, cycle) {
+    let log_kind = if matches!(kind.as_str(), "incremental" | "automatic" | "sync")
+        && cycle_runs_full_reconcile(state, source, cycle)
+    {
         "full"
     } else {
         kind.as_str()
