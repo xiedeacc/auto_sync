@@ -2276,13 +2276,9 @@ function renderTaskRow(task) {
 function taskKindLabel(kind) {
   switch (String(kind || "").trim()) {
     case "compare": return "Compare";
-    case "incremental":
-    case "automatic":
-    case "sync": return "Incremental";
+    case "incremental": return "Incremental";
     case "full": return "Full";
-    case "changed_since": return "Changed Since";
     case "repair_scan": return "Repair";
-    case "startup_scan": return "Startup Scan";
     default: return kind || "-";
   }
 }
@@ -2633,10 +2629,8 @@ function activityIsSyncing(activity) {
 
 function syncKindLabel(kind) {
   switch (String(kind || "").trim()) {
-    case "incremental":
-    case "automatic": return "Incremental";
+    case "incremental": return "Incremental";
     case "full": return "Full";
-    case "changed_since": return "Changed Since";
     case "scan": return "Compare";
     default: return "";
   }

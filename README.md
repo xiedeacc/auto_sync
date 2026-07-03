@@ -214,7 +214,7 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 | 类型（UI） | task_log kind | 触发来源 | 说明 |
 | --- | --- | --- | --- |
 | **Full** | `full` | 手动 `Sync… → Full`；**目标首次同步**；事件丢失后的全量重扫 | 完整读源+目标两棵树、对账、只修差异。首次同步没有基准可增量，因此必然是 Full——即使由调度器自动发起。 |
-| **Incremental** | `incremental` / `automatic` | 调度器到点/事件、`Sync All`、源级 `Sync`、目标级 `Incremental`、realtime | 只重放 `event_log` 中该目标自上次 verified 以来的事件路径。缺基准时自动退回完整 reconcile。 |
+| **Incremental** | `incremental` | 调度器到点/事件、`Sync All`、源级 `Sync`、目标级 `Incremental`、realtime | 只重放 `event_log` 中该目标自上次 verified 以来的事件路径。缺基准时自动退回完整 reconcile。 |
 | **Compare** | `compare` | 手动 `Sync… → Compare` | 只读对账，产出差异报告，不改动数据。 |
 | **Repair** | `repair_scan` | 点目标行的修复按钮（⇆） | 只同步上一次 Compare 报告里的差异路径。 |
 
@@ -250,7 +250,12 @@ ZFS 后端是百万文件规模下的首选一致性方案：创建 snapshot 近
 
 **Windows（USN Journal）**：优先读 NTFS USN Journal（持久，覆盖停机窗口，游标断档自动记 `rescan_required`）；权限/环境不支持时回退 `ReadDirectoryChangesW` 递归 watcher。启动默认要求 elevated 进程：非管理员且未尝试过提权时用 `runas` 重新拉起 elevated 进程并退出当前进程（需 UAC 确认），失败则以普通权限继续。
 
-**启动语义（停机窗口）**：不再每次重启做全树 mtime 扫描。调度器启动 watcher 并等其上报 armed（所有 mark 就位，上限 15 分钟）后：Windows 靠 USN journal 无须提示；Linux（无 journal）为每个本机监听的源升起**重启提醒**（source 行 Latest Cycle 旁的 ⚠），直到用户对该源成功完成一次「提醒之后发起的」Compare/Full，或点击 ⚠ 手动忽略。重复重启不刷新已有提醒。
+**启动语义（停机窗口）**：不再每次重启做全树 mtime 扫描。调度器启动 watcher 并等其上报 armed（所有 mark 就位，上限 15 分钟）后，是否升起重启提醒**取决于该源所在机器的 watcher 能否覆盖停机期间的变化**（`watcher_covers_downtime()`，Windows 为 true、Linux 为 false）：
+
+- **Windows（NTFS USN Journal，持久）**：USN Journal 是文件系统级的持久日志，进程/系统重启都不会丢。watcher 把上次读到的位置存进 `windows_usn_cursor` 表，重启后从该游标继续回放,停机期间的所有变化都会被补齐（游标断档才记 `rescan_required`）→ **没有遗漏，无需任何提示**。
+- **Linux（fanotify，非持久）**：fanotify group 是绑定进程 fd 的内核对象，进程一退出，group 和未读事件就消失，没有任何持久日志。所以停机期间源发生了什么，重启后**无从得知** → 为每个本机监听的源升起**重启提醒**（source 行 Latest Cycle 旁的 ⚠），直到用户对该源成功完成一次「提醒之后发起的」Compare/Full（用时间戳区分，避免把重启前就在跑的动作误当覆盖），或点击 ⚠ 手动忽略。重复重启不刷新已有提醒（gap 起点只增不减）。
+
+> 因此 `src_2`（源 `/zfs` 在 NAS，fanotify 监听）重启后会出现 ⚠ 提醒，而 `src_3`（源在 Windows，USN 监听）不会——正是 NTFS USN 持久、fanotify 非持久这一差异导致的。
 
 ### 调度与 cycle
 

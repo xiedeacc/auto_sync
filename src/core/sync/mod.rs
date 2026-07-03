@@ -162,7 +162,12 @@ fn set_sync_kind_if_empty(kind: &str) -> SyncKindGuard {
 
 pub fn sync_all_pending(cfg: &AppConfig, state: &mut State) -> Result<()> {
     let _serialized = sync_gate().lock().unwrap_or_else(|err| err.into_inner());
-    let _kind = set_sync_kind_if_empty("automatic");
+    // A scheduler-driven pass (no explicit kind set by a manual entry point) is
+    // an event-replay incremental by default; a per-cycle refinement below
+    // promotes it to "full" when it actually re-walks the whole tree. Kept as a
+    // single concrete kind — no "automatic" alias — so the task log is
+    // unambiguous.
+    let _kind = set_sync_kind_if_empty("incremental");
     let _cancellable = cancel::begin(cancel::KIND_SYNC);
     sync_all_pending_inner(cfg, state)
 }
@@ -2754,16 +2759,14 @@ pub fn sync_cycle_for_source(
     // Task log: one row per cycle pass, opened while running (queryable
     // live), closed with the outcome; a pass that moved nothing is dropped
     // so the log holds real work, not scheduler heartbeats.
-    let kind = current_sync_kind().unwrap_or_else(|| "sync".to_string());
-    // Task-log label only: an auto "incremental" pass that actually reads the
-    // whole source tree (a destination's first sync has no baseline to replay
-    // events against, and an event-loss / manual full rescan re-reads
-    // everything) is a Full, not an event-replay Incremental. Labelling it
-    // "incremental" was misleading in the Tasks list. The restart-notice check
-    // below still keys off the untouched `kind` so only a manual Full clears it.
-    let log_kind = if matches!(kind.as_str(), "incremental" | "automatic" | "sync")
-        && cycle_runs_full_reconcile(state, source, cycle)
-    {
+    let kind = current_sync_kind().unwrap_or_else(|| "incremental".to_string());
+    // Task-log label only: an "incremental" pass that actually reads the whole
+    // source tree (a destination's first sync has no baseline to replay events
+    // against, and an event-loss / manual full rescan re-reads everything) is a
+    // Full, not an event-replay Incremental. Labelling it "incremental" was
+    // misleading in the Tasks list. The restart-notice check below still keys
+    // off the untouched `kind` so only a manual Full clears it.
+    let log_kind = if kind == "incremental" && cycle_runs_full_reconcile(state, source, cycle) {
         "full"
     } else {
         kind.as_str()
