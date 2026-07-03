@@ -397,6 +397,19 @@ function updateStatusUi() {
         ? "Destination unavailable"
         : (blocked ? "Blocked by sync order" : (syncing ? activitySyncingLabel(activity) : "Sync source"));
     }
+    const removeSource = group.querySelector('[data-action="remove-source"]');
+    if (removeSource) {
+      // Match the per-destination delete guard: block removing a source while
+      // ANY of its destinations has a task running (sync or compare), so the
+      // config can't be yanked out from under an in-flight pass. Stop it first.
+      const source = findSourceById(sourceId);
+      const active = !!source
+        && (source.destinations || []).some((dst) => dstActivity(source, dst).active);
+      removeSource.disabled = busy || active;
+      removeSource.title = active
+        ? "A task is running for this source — stop it first"
+        : "Remove source";
+    }
   }
 
   for (const row of el.sourcePanel.querySelectorAll(".destination-row")) {
@@ -1039,7 +1052,17 @@ function bindSourceControls(source, sourceIndex, group) {
       renderSourcePanel();
     }
   };
-  group.querySelector('[data-action="remove-source"]').onclick = async () => {
+  group.querySelector('[data-action="remove-source"]').onclick = async (event) => {
+    if (event.currentTarget.disabled) {
+      return;
+    }
+    // Guard the race between a task starting and updateStatusUi disabling the
+    // button: never remove a source whose destination has a task in flight.
+    const active = (source.destinations || []).some((dst) => dstActivity(source, dst).active);
+    if (active) {
+      setMessage("A task is running for this source — stop it (pause the destination) first");
+      return;
+    }
     cfg.source_groups.splice(sourceIndex, 1);
     await autoSaveConfig();
     render();

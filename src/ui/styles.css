@@ -399,7 +399,8 @@ th {
   cursor: default;
 }
 
-.destination-row [data-action="remove-dst"]:disabled {
+.destination-row [data-action="remove-dst"]:disabled,
+[data-action="remove-source"]:disabled {
   opacity: 0.5;
   cursor: default;
 }
