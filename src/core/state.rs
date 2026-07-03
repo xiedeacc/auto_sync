@@ -83,6 +83,10 @@ pub struct DestinationView {
     pub destination_id: String,
     pub path: String,
     pub enabled: bool,
+    /// The "Latest Cycle" shown in the UI: the latest closed cycle, or the
+    /// current open cycle's id when it already holds actionable events (see
+    /// `latest_cycle_id_for_display`). Named for history; no longer strictly
+    /// "closed".
     pub latest_closed_cycle_id: Option<i64>,
     pub target_cycle_id: Option<i64>,
     pub last_verified_cycle_id: Option<i64>,
@@ -878,6 +882,28 @@ impl State {
         Ok(value)
     }
 
+    /// The cycle id to surface as "Latest Cycle" in the UI. It is the latest
+    /// closed cycle, but if the current open cycle has ALREADY accumulated
+    /// actionable events, its id is surfaced too — so the number reflects
+    /// changes the watcher has seen the moment they arrive, without waiting for
+    /// the cycle to close. Closing runs at the top of the single-threaded
+    /// scheduler loop, right before `sync_all_pending`, so it can lag minutes
+    /// behind a long-running sync; this keeps the displayed number honest in
+    /// the meantime. The empty open cycle minted after each close carries no
+    /// events, so it does NOT bump the number until real work lands in it.
+    pub fn latest_cycle_id_for_display(&self, source_id: &str) -> Result<Option<i64>> {
+        let closed = self.latest_closed_cycle_id(source_id)?;
+        if let Some(open) = self.current_open_cycle(source_id)? {
+            if self.cycle_has_actionable_events(open.id)? {
+                return Ok(Some(match closed {
+                    Some(closed) => closed.max(open.id),
+                    None => open.id,
+                }));
+            }
+        }
+        Ok(closed)
+    }
+
     pub fn cycle_by_id(&self, source_id: &str, cycle_id: i64) -> Result<Option<Cycle>> {
         self.conn
             .query_row(
@@ -1621,7 +1647,7 @@ impl State {
     pub fn destination_views(&self, cfg: &AppConfig) -> Result<Vec<DestinationView>> {
         let mut views = Vec::new();
         for source in &cfg.source_groups {
-            let latest = self.latest_closed_cycle_id(&source.id)?;
+            let latest = self.latest_cycle_id_for_display(&source.id)?;
             let (restart_notice_at, restart_gap_started) = match self.restart_notice(&source.id)? {
                 Some((at, gap)) => (Some(at), gap),
                 None => (None, None),
@@ -2283,6 +2309,47 @@ mod tests {
         // The source's latest cycle advanced past the destination's verified.
         let latest = state.latest_closed_cycle_id("src_1").unwrap();
         assert_eq!(latest, Some(closed[0].id));
+
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn latest_cycle_display_surfaces_open_cycle_once_it_has_events() {
+        // The UI "Latest Cycle" must reflect changes the watcher has already
+        // recorded, without waiting for the (single-threaded, sync-blocked)
+        // scheduler to close the cycle — but an empty placeholder open cycle
+        // must not inflate the number.
+        let temp = temp_dir("state_latest_display_open_cycle");
+        let db = temp.join("state.sqlite");
+        let state = State::open(&db).unwrap();
+
+        // No cycles yet: nothing to show.
+        assert_eq!(state.latest_cycle_id_for_display("src_1").unwrap(), None);
+
+        // An empty open cycle (the placeholder minted after each close) must
+        // NOT bump the displayed latest.
+        state.ensure_open_cycle("src_1", Utc::now()).unwrap();
+        assert_eq!(
+            state.latest_cycle_id_for_display("src_1").unwrap(),
+            None,
+            "empty open cycle does not advance the displayed latest"
+        );
+
+        // A real event lands: the open cycle's id surfaces immediately, even
+        // though latest_closed still lags (the cycle has not closed).
+        state
+            .record_event("src_1", 0, "modify", Some("file.txt"), false)
+            .unwrap();
+        let open = state.current_open_cycle("src_1").unwrap().unwrap();
+        assert_eq!(
+            state.latest_cycle_id_for_display("src_1").unwrap(),
+            Some(open.id),
+            "open cycle with events surfaces before it closes"
+        );
+        assert!(
+            state.latest_closed_cycle_id("src_1").unwrap() < Some(open.id),
+            "latest_closed still lags the unclosed open cycle"
+        );
 
         std::fs::remove_dir_all(temp).ok();
     }
