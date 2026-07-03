@@ -27,6 +27,7 @@
   - [暂停继续、取消与任务历史](#暂停继续取消与任务历史)
   - [状态与 UI](#状态与-ui)
 - [配置文件](#配置文件)
+- [HTTP API](#http-api)
 - [部署](#部署)
 - [安全](#安全)
 
@@ -376,6 +377,70 @@ install_dir = "/opt/auto_sync"
 - 目标可离线：离线不删状态，只标红点，下次在线时从落后 cycle 补齐。
 - 路径类型规则：源可以是文件或目录；目标可以是目录，且源是文件、目标路径已存在为文件时允许 `文件 → 文件`；源是文件、目标不存在时按 `文件 → 目录` 处理；不支持 `目录 → 文件`。
 - 禁止把目标配到源的子目录（启动时检查嵌套，避免递归同步）。
+
+---
+
+## HTTP API
+
+Web 服务默认监听配置里的 `port`（通常 `18765`）。UI、`auto_syncctl` CLI、桌面端都走同一套 API。
+
+### 配置（增删改源/目标/机器委托/暂停）
+
+**没有**独立的「新增源」「新增目标」接口——配置是**整份读改写**：
+
+- `GET /api/config` → 完整 `AppConfig`（JSON）
+- `POST /api/config`（body = 完整 `AppConfig`）→ 校验后持久化，并处理委托下发
+
+新增/删除 source、destination，改路径/调度/exclude，暂停/恢复（`destinations[].paused`）都是同一路径：GET 拿配置 → 改 `source_groups` → POST 回去。POST 会整体校验（禁止 dst 嵌在自己 src 下、schedule 合法性等），不合法整份拒绝。
+
+```bash
+# 给 src_3 加一个 destination
+cfg=$(curl -s http://127.0.0.1:18765/api/config)
+echo "$cfg" | jq '.source_groups[2].destinations += [{"id":"dst_2","machine_id":"nas","path":"/zfs/wx2","enabled":true,"schedule":{"mode":"weekly","time":"19:00","timezone":"local","weekday":"saturday"}}]' \
+  | curl -s -X POST http://127.0.0.1:18765/api/config -H 'Content-Type: application/json' -d @-
+```
+
+### 触发任务
+
+| 接口 | body | 作用 |
+| --- | --- | --- |
+| `POST /api/sync-now` | — | Sync All（所有源，增量） |
+| `POST /api/sync-source-now` | `{source_id}` | 源级同步（该源全部目标，增量） |
+| `POST /api/sync-destination-now` | `{source_id, destination_id, mode?}` | 目标级同步。`mode`：`incremental`（默认）/ `full` / `repair` |
+| `POST /api/scan-destination-now` | `{source_id, destination_id}` | Compare（只读对账，产报告） |
+| `POST /api/cancel-activity` | `{scope?, source_id?, destination_id?, propagate?}` | 取消 sync/compare（`scope`=`sync`/`compare`，省略则都取消；`propagate` 转发到其它机器） |
+| `POST /api/dismiss-restart-notice` | `{source_id}` | 忽略重启 ⚠ 提醒 |
+
+四种任务都可触发：**Full / Incremental** 用 sync-destination-now 的 `mode`，**Compare** 用 scan-destination-now，**Repair** 用 `mode=repair`。
+
+```bash
+# 触发 Full
+curl -s -X POST http://127.0.0.1:18765/api/sync-destination-now \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id":"src_3","destination_id":"dst_1","mode":"full"}'
+```
+
+### 查询 / 监控
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /api/status` | 每目标状态（绿黄红、cycle、issues） |
+| `GET /api/sync-activity` | 所有机器运行时（含 build、当前 scan/transfer 进度） |
+| `GET /api/runtime-status` | 本机运行时 |
+| `GET /api/tasks?limit=` / `GET /api/all-tasks?limit=` | 本机 / 全机器任务历史 |
+| `GET /api/task-wait?...` | 长轮询等某 task 结束（脚本秒级感知完成） |
+| `GET /api/scan-report?source_id=&destination_id=` | Compare 报告 |
+| `GET /api/machines` · `GET /api/machines/discover` · `GET /api/browse-paths?path=` | 机器列表 / UDP 发现 / 远端目录浏览 |
+| `GET /api/health` | 本机身份与健康 |
+
+### 机器管理
+
+- `POST /api/machines`（加手动机器）、`DELETE /api/machines/:machine_id`（删）
+
+### 说明
+
+- `/api/transfer/*`（snapshot、put-file、apply-delta、put-files-batch…）是**机器之间的内部传输原语**，不面向用户直接调用。
+- **鉴权**：配了 `app.peer_token` 后，只有 `/api/transfer/*` 与委托推送要求匹配请求头；上面的**管理接口（config、sync-now 等）在内网信任模式下无鉴权**——要暴露到不可信网络必须自己加防火墙 / 反代认证（见[安全](#安全)）。
 
 ---
 
