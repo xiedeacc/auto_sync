@@ -149,7 +149,21 @@ function Copy-ReleaseBinaries {
         if (-not (Test-Path -LiteralPath $source)) {
             throw "Missing build artifact: $source"
         }
-        Copy-Item -LiteralPath $source -Destination (Join-Path $BinDir $binary) -Force
+        $target = Join-Path $BinDir $binary
+        # Leftover from a previous locked-target swap (see below).
+        Remove-Item -LiteralPath "$target.old" -Force -ErrorAction SilentlyContinue
+        try {
+            Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+        }
+        catch {
+            # The target is still running (an elevated instance survives the
+            # non-elevated Stop-AutoSyncProcesses below). A running exe can't
+            # be overwritten but can be renamed; the fresh instance started at
+            # the end of this script takes the single-instance lock over and
+            # stops the old process itself.
+            Move-Item -LiteralPath $target -Destination "$target.old" -Force
+            Copy-Item -LiteralPath $source -Destination $target -Force
+        }
     }
     # Remove stale binaries from the previous multi-binary layout.
     foreach ($stale in @("auto_syncd.exe", "auto_sync_web.exe", "auto_sync_gui.exe")) {

@@ -97,7 +97,9 @@ fn main() -> Result<()> {
             // A GUI-subsystem build has no console, so a plain returned Err
             // would otherwise vanish silently instead of reaching the user.
             error!(error = %err, "refusing to start: could not stop the previous auto_sync instance");
-            return Ok(());
+            // Still propagate the failure so launchers (schtasks, scripts)
+            // see a nonzero exit instead of a phantom success.
+            return Err(err);
         }
     };
 
@@ -165,7 +167,7 @@ fn acquire_single_instance_lock(path: &std::path::Path) -> Result<InstanceLock> 
         .with_context(|| format!("failed to open lock file {}", path.display()))?;
 
     if try_lock_file(&file)? {
-        write_lock_pid(&mut file)?;
+        write_lock_pid(&mut file, path)?;
         return Ok(InstanceLock { _file: file });
     }
 
@@ -175,21 +177,23 @@ fn acquire_single_instance_lock(path: &std::path::Path) -> Result<InstanceLock> 
             warn!(pid, "another auto_sync instance is running; stopping it");
             kill_process(pid);
         }
-        Some(pid) => {
+        // Unknown or stale holder PID: the lock is definitely held by some
+        // auto_sync process, so fall back to stopping every other auto_sync
+        // process by image name (otherwise the takeover promised above can
+        // never happen).
+        other => {
             warn!(
-                pid,
-                "lock file's PID is not an auto_sync process (stale/recycled); not killing it"
+                lock_pid = ?other,
+                "lock holder PID unknown or stale; stopping other auto_sync processes by name"
             );
-        }
-        None => {
-            warn!("lock is held but its PID could not be read from the lock file");
+            kill_other_auto_sync_processes();
         }
     }
 
     for _ in 0..25 {
         thread::sleep(Duration::from_millis(200));
         if try_lock_file(&file)? {
-            write_lock_pid(&mut file)?;
+            write_lock_pid(&mut file, path)?;
             return Ok(InstanceLock { _file: file });
         }
     }
@@ -200,16 +204,33 @@ fn acquire_single_instance_lock(path: &std::path::Path) -> Result<InstanceLock> 
     );
 }
 
-fn read_lock_pid(path: &std::path::Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Sidecar holding the lock holder's PID in a file nobody range-locks. On
+/// Windows the holder's LockFileEx exclusive lock blocks other processes from
+/// reading the lock file itself, so a takeover could never learn which PID to
+/// stop (it always hit the "PID could not be read" path and gave up).
+fn lock_pid_sidecar(path: &std::path::Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".pid");
+    PathBuf::from(name)
 }
 
-fn write_lock_pid(file: &mut std::fs::File) -> Result<()> {
+fn read_lock_pid(path: &std::path::Path) -> Option<u32> {
+    let parse = |text: String| text.trim().parse().ok();
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(parse)
+        .or_else(|| std::fs::read_to_string(lock_pid_sidecar(path)).ok().and_then(parse))
+}
+
+fn write_lock_pid(file: &mut std::fs::File, path: &std::path::Path) -> Result<()> {
     use std::io::{Seek, SeekFrom, Write};
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
     write!(file, "{}", std::process::id())?;
     file.flush()?;
+    // Best-effort: the sidecar is only a hint for a future takeover; failing
+    // to write it must not block startup.
+    let _ = std::fs::write(lock_pid_sidecar(path), std::process::id().to_string());
     Ok(())
 }
 
@@ -273,6 +294,48 @@ fn kill_process(pid: u32) {
 fn kill_process(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+/// Last-resort takeover path when the lock holder's PID can't be determined:
+/// stop every other auto_sync process by image name (same semantics as the
+/// deploy scripts' stop step).
+#[cfg(windows)]
+fn kill_other_auto_sync_processes() {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq auto_sync.exe", "/FO", "CSV", "/NH"])
+        .output();
+    let Ok(out) = output else { return };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        // CSV row: "auto_sync.exe","11184","Console","1","123,456 K"
+        let mut fields = line.split('"').filter(|part| !part.is_empty() && *part != ",");
+        let Some(image) = fields.next() else { continue };
+        if !image.eq_ignore_ascii_case("auto_sync.exe") {
+            continue;
+        }
+        let Some(pid) = fields.next().and_then(|raw| raw.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid != std::process::id() {
+            kill_process(pid);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_other_auto_sync_processes() {
+    let Ok(entries) = std::fs::read_dir("/proc") else { return };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != std::process::id() && process_is_auto_sync(pid) {
+            kill_process(pid);
+        }
     }
 }
 

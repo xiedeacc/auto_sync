@@ -19,6 +19,14 @@
   box-sizing: border-box;
 }
 
+/* Any author `display` rule on an element silently defeats the UA's
+   `[hidden] { display: none }`, so a `hidden` attribute set from JS stops
+   working the moment the element gains e.g. `display: inline-flex` (this bit
+   the pause button). Restore the attribute's semantics globally. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   min-width: 860px;
