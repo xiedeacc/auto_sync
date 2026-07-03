@@ -634,7 +634,11 @@ impl Backend {
     pub fn recent_tasks(&self, limit: usize) -> Result<Vec<crate::core::state::TaskLogEntry>> {
         let cfg = load_config(&self.config_path)?;
         let state_db = DbState::open(&cfg.app.data_db)?;
-        state_db.ensure_config(&cfg)?;
+        // Reading the task log is a pure WAL-snapshot read: it needs no config
+        // sync. Calling ensure_config here issues a write that must wait for the
+        // single SQLite writer, so during a busy sync (the writer is saturated
+        // with per-file result rows) opening Tasks stalled for seconds on both
+        // this machine and every peer whose /api/tasks handler runs this path.
         state_db.recent_tasks(limit)
     }
 

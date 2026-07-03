@@ -2704,6 +2704,28 @@ fn normalize_rel_path(rel_path: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// True when this cycle's pass reads the whole source tree for at least one of
+/// its targeted destinations (rather than replaying recorded event paths): a
+/// full/event-loss rescan, or a destination whose first sync has no verified
+/// baseline to compute an incremental against. Used only to label the task log.
+fn cycle_runs_full_reconcile(state: &State, source: &SourceGroupConfig, cycle: &Cycle) -> bool {
+    if cycle.needs_full_rescan {
+        return true;
+    }
+    source
+        .destinations
+        .iter()
+        .filter(|dst| dst.enabled)
+        .any(|dst| {
+            matches!(
+                state.destination_offset(&source.id, &dst.id),
+                Ok(offset)
+                    if offset.target_cycle_id == Some(cycle.id)
+                        && offset.last_verified_cycle_id.is_none()
+            )
+        })
+}
+
 pub fn sync_cycle_for_source(
     cfg: &AppConfig,
     state: &mut State,
@@ -2733,6 +2755,17 @@ pub fn sync_cycle_for_source(
     // live), closed with the outcome; a pass that moved nothing is dropped
     // so the log holds real work, not scheduler heartbeats.
     let kind = current_sync_kind().unwrap_or_else(|| "sync".to_string());
+    // Task-log label only: an auto "incremental" pass that actually reads the
+    // whole source tree (a destination's first sync has no baseline to replay
+    // events against, and an event-loss / manual full rescan re-reads
+    // everything) is a Full, not an event-replay Incremental. Labelling it
+    // "incremental" was misleading in the Tasks list. The restart-notice check
+    // below still keys off the untouched `kind` so only a manual Full clears it.
+    let log_kind = if kind == "incremental" && cycle_runs_full_reconcile(state, source, cycle) {
+        "full"
+    } else {
+        kind.as_str()
+    };
     let destination_ids = source
         .destinations
         .iter()
@@ -2740,7 +2773,7 @@ pub fn sync_cycle_for_source(
         .map(|dst| dst.id.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    let task_id = state.task_start(&kind, &source.id, &destination_ids).ok();
+    let task_id = state.task_start(log_kind, &source.id, &destination_ids).ok();
     let action_started_at = chrono::Utc::now().to_rfc3339();
     let result = sync_cycle_for_source_inner(cfg, state, source, cycle);
     // A manual Full pass that began after a restart notice re-reads (or
