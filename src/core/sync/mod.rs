@@ -8435,18 +8435,32 @@ fn record_destination_failure(
             &short_reason(err),
         )?;
     } else {
+        // Plan A — tolerate a live source that changed under the copy. The
+        // source is non-snapshot (a ZFS source is read from an immutable
+        // snapshot and never reaches here): everything stable was synced, only
+        // these paths changed mid-read. ADVANCE the verified offset to this
+        // cycle so the scheduler stops re-running a full reconcile forever
+        // against a source that never goes quiet (e.g. an app directory written
+        // continuously) — without this, verified stays below target, the ready
+        // check never skips the destination, and every wake re-walks the whole
+        // tree. Re-record the changed paths as source events so the next cycle
+        // (its schedule, or realtime) syncs just those paths instead of the
+        // whole tree.
+        for path in &changing_paths {
+            state.record_event(source_id, 0, "source_changing_deferred", Some(path), false)?;
+        }
         state.replace_destination_issues(
             source_id,
             destination_id,
             cycle_id,
             "source_changing",
             &changing_paths,
-            "source file changed while copying",
+            "source file changed while copying; deferred to the next cycle",
         )?;
         state.upsert_destination_status(
             source_id,
             destination_id,
-            None,
+            Some(cycle_id),
             "yellow",
             "source_changing",
         )?;
@@ -9634,6 +9648,49 @@ mod tests {
             .unwrap();
         assert_eq!(needs_full_rescan, 1);
         assert_eq!(manual_full_rescan, 1);
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn source_changing_failure_advances_verified_and_defers_the_changed_paths() {
+        // Plan A: when the source mutates under the copy (a live, non-snapshot
+        // source like an app directory being written continuously), the pass
+        // must still advance the destination's verified offset so the scheduler
+        // stops re-running a full reconcile forever, and it must re-record the
+        // changed paths as events so the next cycle picks them up.
+        let temp = temp_dir("source_changing_defers");
+        let db = temp.join("state.sqlite");
+        let state = State::open(&db).unwrap();
+
+        let mut paths = BTreeSet::new();
+        paths.insert("docs/live.log".to_string());
+        let err = source_changing_error(&paths);
+
+        record_destination_failure(&state, "src_1", "dst_1", 42, &err).unwrap();
+
+        let offset = state.destination_offset("src_1", "dst_1").unwrap();
+        assert_eq!(
+            offset.last_verified_cycle_id,
+            Some(42),
+            "source-changing pass must advance verified so the scheduler stops re-driving"
+        );
+        assert_eq!(offset.status, "yellow");
+        assert_eq!(offset.status_reason, "source_changing");
+
+        let open = state.current_open_cycle_id("src_1").unwrap().unwrap();
+        assert!(
+            state.cycle_has_actionable_events(open).unwrap(),
+            "the changed path must be re-recorded as an event for the next cycle"
+        );
+
+        // A real (non-source-changing) failure must still leave the destination
+        // red and NOT advance verified.
+        let hard = anyhow!("connection refused");
+        record_destination_failure(&state, "src_1", "dst_2", 42, &hard).unwrap();
+        let hard_offset = state.destination_offset("src_1", "dst_2").unwrap();
+        assert_eq!(hard_offset.last_verified_cycle_id, None);
+        assert_eq!(hard_offset.status, "red");
 
         fs::remove_dir_all(temp).ok();
     }
