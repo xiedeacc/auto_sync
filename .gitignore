@@ -6,6 +6,7 @@
 /conf/auto_sync.toml
 /conf/state/
 /conf/.auto_sync.lock
+/conf/.auto_sync.lock.pid
 /runtime/
 /logs/*
 !/logs/.gitkeep

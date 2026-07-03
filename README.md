@@ -1,94 +1,366 @@
 # auto_sync
 
-Rust directory sync tool for Linux headless/Web UI deployments, with LAN peer
-discovery and native TCP transfer for Linux and Windows peers.
+`auto_sync` 是一个用 Rust 实现的目录同步与备份工具。它以「对账后同步」（reconcile-then-transfer）为核心语义：先并行扫描源树和目标树、比对两份清单，只传输真正有差异的文件与软链，可选镜像删除目标端多余文件，并对本轮写入的内容做端到端校验。对 ZFS 源，系统以 ZFS snapshot + `zfs diff` 作为强一致基础，把百万级文件的对账压缩到秒级。
 
-The GUI is implemented with Tauri and uses WebKitGTK on Linux.
-Headless deployments can use the Web UI.
+一个可执行文件 `auto_sync` 同时承载调度器、文件监听、Web 服务，并在有显示环境时打开桌面窗口；`auto_syncctl` 是配套 CLI。支持 Linux（含无头 NAS / OpenWrt）与 Windows，支持局域网多机自动发现与跨机原生 TCP 传输。
 
-## LAN machines
+![auto_sync 界面](docs/AutoSync.png)
 
-The Web UI exposes a machine selector in path picking. Peers are discovered on
-UDP `18766`; the Web API listens on the configured `port`, commonly
-`18765`. Manual machines can also be added with host, port, SSH user, SSH
-port, and OS.
+---
 
-Cross-machine sync uses the auto_sync Web API and a keep-alive TCP connection
-pool. Full sync is reconcile-then-transfer (对账后同步): it scans the source
-and destination trees concurrently, compares the two manifests, transfers only
-mismatched files and symlinks (rsync-style block deltas for large changed
-files, blake3 end-to-end verification per file), optionally mirror-deletes
-destination extras, and verifies what the cycle wrote. Scan (对账不同步) runs
-the same concurrent compare without changing anything and produces a
-difference report. On ZFS sources, cycles diff against the destination's last
-verified snapshot via `zfs diff` instead of re-walking the tree.
+## 目录
 
-Windows deployment can use the system OpenSSH Server optional feature when
-requested, but `auto_sync` is launched through a current-user Startup launcher
-rather than a Windows service.
+- [功能简介](#功能简介)
+- [核心概念](#核心概念)
+- [快速开始](#快速开始)
+- [性能优化点](#性能优化点)
+- [系统设计](#系统设计)
+  - [总体架构](#总体架构)
+  - [模块划分](#模块划分)
+  - [同步引擎](#同步引擎)
+  - [ZFS snapshot 后端](#zfs-snapshot-后端)
+  - [文件监听（fanotify / USN）](#文件监听fanotify--usn)
+  - [调度与 cycle](#调度与-cycle)
+  - [一致性与校验](#一致性与校验)
+  - [局域网多机与配置委托](#局域网多机与配置委托)
+  - [暂停继续、取消与任务历史](#暂停继续取消与任务历史)
+  - [状态与 UI](#状态与-ui)
+- [配置文件](#配置文件)
+- [部署](#部署)
+- [安全](#安全)
 
-## Build
+---
 
-A single runtime binary `auto_sync` runs the scheduler, file watcher and web
-server in one process, and also opens the desktop window when a display is
-available. Build with the desktop (Tauri) feature for GUI hosts, or
-`--no-default-features` for a headless web-only build.
+## 功能简介
+
+- **多组源 → 多个目标**：每个源目录（或单个文件）可配置多个目标，每个目标有独立的调度、状态和进度。
+- **镜像语义**：`mirror` 模式下源删除的文件会在目标端删除（先进回收站，通过校验后再按保留策略清理）。
+- **三种触发策略**：每个目标独立设置 `realtime`（近实时）、`daily`（每天定时）、`weekly`（每周定时）。
+- **三种同步动作**：
+  - **Full（对账并同步）**：完整扫描两棵树，修复所有差异；
+  - **Incremental（增量）**：只重放监听到的事件路径；
+  - **Compare（对账不同步）**：只读比对，产出差异报告，不改动任何数据。
+- **ZFS 强一致**：源在 ZFS 上时用 snapshot 提供稳定读视图，用 `zfs diff` 增量计划，避免百万文件全树遍历。
+- **局域网多机**：UDP 自动发现 + 手动添加机器；跨机同步走 auto_sync 自己的 HTTP + 长连接 TCP 池，无需 rsync/SSH 隧道。
+- **桌面 + Web 双端 UI**：同一份 `src/ui` 前端，桌面用 Tauri，无头机器用浏览器访问 Web UI，共享同一后台状态。
+- **断点与并发友好**：大文件按 rsync 式 block delta 只传差异块；小文件成批打包传输；暂停/继续、跨机取消、任务历史一应俱全。
+- **跨平台**：Linux 用 fanotify 监听，Windows 用 NTFS USN Journal（并在需要时自动提权），无头 Linux 走 systemd，OpenWrt 走 procd。
+
+---
+
+## 核心概念
+
+| 概念 | 含义 |
+| --- | --- |
+| **Source（源）** | 一个源目录或单个文件；界面中一个 source group。 |
+| **Destination（目标）** | 源要同步到的目的地目录（或已存在的文件）；每个源可有多个。 |
+| **Schedule（调度）** | 用户可见的**触发规则**：`realtime` / `daily` / `weekly`。 |
+| **Cycle（周期）** | 后端生成的**源版本点**。对 ZFS 源，一个 cycle 对应一个 ZFS snapshot。cycle 创建时间不是备份完成时间；某目标完成后只是把自己的 `verified_cycle` 推进到该 cycle。界面 `Cycle` 列显示 `verified_cycle / target_cycle`。 |
+| **Add Directory** | **源侧独有**的开关。勾选时在目标下建一层以源目录名命名的子目录（`dst/<源名>/…`，相当于 rsync 源路径不带尾斜杠）；不勾时源目录内容直接铺到目标根（相当于带尾斜杠）。目标侧没有这个配置。 |
+
+状态颜色：
+
+- **绿**：目标在线，且 `verified_cycle ≥ target_cycle`。
+- **黄**：目标在线，但检测到源文件正在变化（`source_changing`）或正在等待同源 Compare 结束（`waiting_for_compare`）或已被手动暂停（`paused`）；点击可看详情。
+- **红**：离线、落后、同步失败或校验失败。
+
+---
+
+## 快速开始
+
+### 构建
+
+单个运行时二进制 `auto_sync` 在一个进程内运行调度器、文件监听和 Web 服务，有显示环境时还会打开桌面窗口。GUI 主机用默认 feature（含 Tauri）构建；无头主机用 `--no-default-features` 构建纯 Web 版本。
 
 ```bash
-# Desktop-capable build (default features include the GUI):
+# 桌面版（默认 feature 含 GUI）：
 cargo build --release --bin auto_sync --bin auto_syncctl
-# Headless (web only, no Tauri/webkit dependency):
+# 无头版（仅 Web，无 Tauri/webkit 依赖）：
 cargo build --release --no-default-features --bin auto_sync --bin auto_syncctl
-install -m 0755 target/release/auto_sync bin/auto_sync
+install -m 0755 target/release/auto_sync   bin/auto_sync
 install -m 0755 target/release/auto_syncctl bin/auto_syncctl
 ```
 
-## Run
+### 运行
 
 ```bash
-bin/auto_sync --config conf/auto_sync.toml            # scheduler + web (+ desktop if available)
-bin/auto_sync --config conf/auto_sync.toml --no-gui   # force web-only
+bin/auto_sync   --config conf/auto_sync.toml            # 调度器 + Web（有显示时含桌面窗口）
+bin/auto_sync   --config conf/auto_sync.toml --no-gui   # 强制无头 Web
+bin/auto_sync   --config conf/auto_sync.toml --hidden   # 启动时窗口隐藏到托盘（自启动用）
 bin/auto_syncctl --config conf/auto_sync.toml status
 bin/auto_syncctl --config conf/auto_sync.toml sync-now --close-current
 ```
 
-Local Linux systemd deploy:
+Web API 默认监听配置里的 `port`（通常 `18765`）；局域网机器通过 UDP `18766` 互相发现。
+
+### 部署
+
+所有部署都走项目脚本，不要用临时命令：
 
 ```bash
-scripts/deploy_local.sh
-```
-
-The local deploy script builds the release binary, installs it to
-`/opt/auto_sync`, installs `conf/auto_sync.linux.toml` as the local config,
-installs the systemd unit, and starts the single `auto_sync.service` on Linux.
-It first checks the Ubuntu/Debian build environment and installs missing build
-dependencies plus Rust stable only when needed. On Linux hosts without a GUI
-environment it builds the headless (web-only) variant; with a GUI it builds with
-desktop support. NAS, tiger Linux, and OpenWrt share the same Linux config
-template.
-
-Machine deploy helpers:
-
-```bash
+# Windows（在 Windows 本机运行）：构建到仓库 bin\，用当前用户登录任务启动单个 auto_sync 进程
 pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1
-ssh -p 10022 root@192.168.2.247 'cd /opt/auto_sync && git pull && scripts/deploy_local.sh'
+
+# Linux / NAS（在目标机本机运行）：构建到 /opt/auto_sync，安装 systemd unit 并启动
+scripts/deploy_local.sh --install-dir /opt/auto_sync
+
+# OpenWrt：交叉编译 aarch64，安装 procd init 脚本
 scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 ```
 
-`deploy_windows.ps1` is run locally on Windows, builds the release binary into
-the repository `bin\` directory, keeps config under `conf\`, and creates a
-current-user Startup launcher for the single `auto_sync` process instead
-of installing it as a Windows service. OpenSSH setup is opt-in via
-`-InstallSshd`. NAS is Ubuntu x64 and builds on NAS itself under
-`/opt/auto_sync`; use `git pull` plus `scripts/deploy_local.sh` on
-NAS for deployments. `deploy_local.sh` installs missing Ubuntu/Debian build
-dependencies and Rust stable on first run, then skips setup on later runs. The
-Windows daemon uses the NTFS USN Journal for realtime local source change
-detection; suspected event loss (journal gaps or resets) automatically
-triggers a full reconcile (对账) of the affected destinations, and drift can
-always be checked with Scan and repaired with a manual Full sync. The GUI and
-Web UI share this daemon-backed state instead of running separate watcher
-logic.
-`deploy_openwrt.sh` cross-compiles aarch64 OpenWrt binaries when needed,
-installs the `conf/auto_sync.procd` procd init script, and deploys to
-`/opt/auto_sync`.
+部署脚本会**保留已有的 `conf/auto_sync.toml`**，只有目标配置不存在时才用模板初始化。NAS 在本机编译（不做 Windows→Linux 交叉编译），保留 Cargo 构建缓存；Windows 运行时以管理员权限自启（以便读取 USN Journal），通过单实例锁接管旧进程。
+
+---
+
+## 性能优化点
+
+`auto_sync` 面向的是「NAS 上 ZFS 数据集，约 60 万～90 万条目、TB 级容量」这种规模，性能优化贯穿对账、传输、监听三条主线：
+
+### 对账（扫描与比对）
+
+- **ZFS `zfs diff` 快路径**：源与目标都在本机 ZFS、且两侧已验证基准快照都在时，Full 和 Compare 都只对「两侧自基准以来变化路径的并集」做同步/比对，并集之外的路径视为已一致——把百万文件对账压缩到与差异量成正比的秒级。任一前提不满足自动回退全树扫描。
+- **双树并行扫描**：Full / Compare 回退到全树时，源树和目标树（通常在不同机器上）并行遍历，把对账阶段耗时约减半。
+- **每条目单次 lstat**：树遍历对每个条目只做一次 `lstat`，结果在扫描、比对、校验各阶段复用。
+- **`zfs diff` 并集裁剪**：`M`（修改）目录只取目录条目本身（变化的子项各有自己的 diff 行），`+`/`-`/`R` 保持整树递归，且被递归祖先覆盖的子路径不再重复走树。
+- **只校验本轮写入**：Full 完成后只对本轮实际写入/修改的路径逐个校验（跨机路径在落盘前已做过 blake3 端到端校验），未改动的条目在对账阶段已确认一致，不再整树重扫——避免每轮开销随树规模翻倍。
+- **FxHash + 精确判等**：清单比对用 FxHash；判等分两档——全树 quick-check 用 `modify_window_secs`（默认 1s）容差吸收跨平台时间戳粒度，携带变化证据的路径（事件、`zfs diff`）用精确 mtime 比较（仅容忍 Windows FILETIME 的 100ns 截断），避免同尺寸亚秒改写被容差吞掉。
+
+### 传输
+
+- **小文件成批打包**：≤256KiB 的非 delta 小文件按批打进单个 `/api/transfer/put-files-batch` 请求（≤200 个 / ≤8MiB，帧格式 `<json头>\n<原始字节>`）。接收端全部写入临时文件后**成批 fsync**（ZFS 上连续 fsync 合并为约一次 ZIL 刷盘）再统一 rename 发布、父目录去重 fsync——消灭小文件「每文件一次往返 + 一次同步刷盘」的吞吐上限。
+- **大文件流式传输**：>16MiB 大文件的余量（断点 offset 起）以单个定长请求体流式发送，接收端边收边写，不再每 16MiB 一个请求体驻留内存；完整性由 finish-file 的全文件 blake3 把关。
+- **rsync 式 block delta**：已存在的大文件只传变化块，不整文件重传。
+- **长连接 TCP 池**：跨机传输复用 keep-alive 连接池（默认 100 连接），避免每文件握手。
+- **介质感知并行**：本地拷贝走统一 worker 池——目标检测为 HDD 时单 worker 顺序写（避免机械盘随机寻道抖动），flash/未知则并行；跨机传输默认 32 路并行（可配 `max_parallel_transfers`）。
+- **流式清单交换**：跨机整树快照走 `/api/transfer/snapshot-stream` NDJSON 端点，服务端边走树边发、请求端逐行解析，双端都不缓冲整份 JSON。
+- **整棵子树快拷贝**：大范围新增时按子树整体并行拷贝，而非逐文件调度。
+
+### 监听与启动
+
+- **fanotify 懒加载 handle 表**：可用 `open_by_handle_at` 时不再预建全树 handle 表（90 万条目 HDD 上预建约 3 分钟），事件到达时按需解析路径并缓存，缓存上限 131072 条、溢出即清。
+- **filesystem mark 免递归**：filesystem/mount mark 模式下新建目录天然被覆盖，无需递归补注册 mark。
+- **不做启动全树扫描**：重启不再每次做全树 mtime 扫描（90 万条 HDD 树一次要 10 分钟以上随机读）；Windows 用持久 USN journal 覆盖停机窗口，Linux 用「重启提醒」让用户按需 Compare/Full。
+- **进度节流**：进度视图更新有节流，避免高频刷新拖慢传输主循环。
+
+---
+
+## 系统设计
+
+### 总体架构
+
+系统按职责分为五层，全部运行在单个 `auto_sync` 进程内：
+
+1. **配置层**：读写 `conf/auto_sync.toml`，管理 source/destination、调度、机器列表、日志与传输参数；GUI 改配置时原子替换文件。
+2. **状态层**：SQLite（WAL 模式）持久化事件、周期、offset、任务和校验结果；进程重启后据此恢复。
+3. **事件层**：Linux 用 fanotify、Windows 用 USN Journal 收集源目录变化，作为触发提示落盘。
+4. **同步层**：cycle 到点时为每个目标生成同步计划，执行拷贝/删除/校验并推进 offset；跨机时通过 peer HTTP + TCP 传输执行。
+5. **展示与控制层**：Tauri 桌面窗口与 Web UI 展示配置、状态、进度；后台按 `status_log_interval_secs` 输出状态日志；`auto_syncctl` 提供 CLI 控制。
+
+进程形态（历史上的 `auto_syncd` / `auto_sync_gui` / `auto_sync_web` 已合并为单一 `auto_sync`）：
+
+- **桌面模式**：有显示环境时打开 Tauri 窗口，前端资源 `src/ui` 由 `include_str!` 打进二进制，通过 Tauri asset 协议加载；窗口 URL 带构建号（`index.html?b=<commit>`）以彻底规避 WebView2 陈旧缓存。
+- **无头 Web 模式**：`--no-gui` 或无显示环境时只跑 Web UI，浏览器访问同一前端。
+- **后台模式**：Linux 由 systemd 拉起，Windows 由当前用户登录计划任务拉起。
+
+### 模块划分
+
+代码位于 `src/core/`，实际模块（按职责）：
+
+| 模块 | 职责 |
+| --- | --- |
+| `backend.rs` | 业务门面：配置读写、状态聚合、手动同步/取消入口、配置委托与反向删除。 |
+| `config.rs` | 配置结构、加载、校验、规范化（含源/目标嵌套检查、路径类型规则）。 |
+| `state.rs` | SQLite 状态库：cycle、offset、event_log、destination_issue、task_log 的读写与恢复。 |
+| `storage.rs` | SQLite 连接、PRAGMA、schema 初始化与迁移。 |
+| `scheduler.rs` | daily/weekly 周期计算，判断每个目标的 schedule 是否到期。 |
+| `sync/mod.rs` | 同步引擎核心：Full/Incremental 计划与执行、双树扫描、拷贝/删除/校验、跨机传输、暂停语义。 |
+| `sync/delta.rs` | rsync 式 block delta 算法。 |
+| `watcher/fanotify.rs` | Linux fanotify 监听（FID/name 模式、懒加载 handle 解析、overflow 处理）。 |
+| `watcher/windows_usn.rs` | Windows NTFS USN Journal 监听，及 `ReadDirectoryChangesW` 回退。 |
+| `machines.rs` | 局域网机器发现、HTTP peer 调用、长连接 TCP 传输池、流式传输原语。 |
+| `web_api.rs` | HTTP API 路由（状态、同步、取消、传输端点、配置委托）。 |
+| `peer_notify.rs` | 把本机状态变化推送给对端机器，UI 约 2s 内刷新。 |
+| `progress.rs` | 扫描/传输实时进度视图，按 source/destination 归属。 |
+| `cancel.rs` | 协作式取消令牌，贯穿遍历、传输 worker、分块发送各检查点。 |
+| `signal.rs` | watcher-armed 握手（等所有 mark 就位再放行调度，堵住启动丢事件窗口）。 |
+| `status.rs` / `logging.rs` | 状态文本聚合、tracing 日志初始化（按天滚动）。 |
+
+入口在 `src/bin/`：`auto_sync.rs`（主进程：单实例锁、可选提权、调度线程、Web/桌面）与 `auto_syncctl.rs`（CLI）。
+
+### 同步引擎
+
+三种动作共享「完整对账 + 只修复差异」的语义，区别在计划来源：
+
+**Full（对账并同步）** — 仅用户在单个目标上手动触发（`Sync… → Full`）。`Sync All`、源级 `Sync`、目标级 `Incremental`、realtime 自动触发都按增量处理。Full 有两条实现，由 `sync.zfs_diff` 配置（全局默认 true，每个目标可覆盖关闭）自动选择：
+
+- **`zfs diff` 版**：源与目标都在本机 ZFS 且两侧基准快照都在时，`zfs diff` 各取两侧变化路径，对并集执行按路径同步（复制差异、mirror 删除多余、类型替换），并集之外不触碰。
+- **对比版**：前提不满足时回退——双树并行扫描 + 清单对账，执行顺序为：读源信息 → 并行生成源/目标完整清单 → 类型不同则先删除替换 → 批量建目录 → 只复制缺失或不匹配的文件/软链（大文件走 block delta）→ mirror 删除目标多余项 → 清理临时目录 → 只校验本轮写入。
+
+复制中源文件发生变化（size/hash 校验不过）不会让目标变红：该路径记 `source_changing` 黄色 issue，其余文件照常传，下一轮收敛。单文件硬失败最多容忍 20 个，连接级失败才立即终止本轮。
+
+**Incremental（增量）** — 重放 event_log 中该目标自上次 verified cycle 以来的事件路径，只对这些路径做增量同步。积压中出现 `rescan_required`（overflow / USN gap）或目标从未完成首次全量时，自动退回完整 reconcile。
+
+**Compare（对账不同步）** — 只读比对，产出差异报告，不改动数据。同样有 `zfs diff` 快路径与全树回退。报告差异存在时目标行显示修复按钮（⇆），点击后只同步这些差异路径。
+
+**跨机传输**：源/目标清单、批量 mkdir、批量 remove、文件推送都通过 peer HTTP transfer API 执行。本机 ZFS 源先创建 snapshot 只读视图供读取；目标有已验证基准快照时优先 `zfs diff` 增量。传输细节见[性能优化点](#性能优化点)。
+
+**回收站与临时目录**：mirror 删除统一进 `.auto_sync_trash/<cycle>/`，通过校验后按 `sync.trash_keep_days`（默认 30 天，0=永久）清理；临时文件写 `.auto_sync_tmp/<cycle>/`，完成后 fsync + 原子 rename，非当前 cycle 残留 7 天后清扫。`.auto_sync_*` 内部目录永不进入 diff 并集、清单或 mirror 删除集。
+
+### ZFS snapshot 后端
+
+ZFS 后端是百万文件规模下的首选一致性方案：创建 snapshot 近似瞬时，不随文件数线性复制。
+
+- **快照命名**：`<dataset>@<prefix>_<source_id>_<cycle_id>`。auto_sync 只管理自己 `prefix` 命名的快照，绝不碰用户或其他工具创建的快照。
+- **dataset 识别**：对 source realpath 在 `zfs list` 挂载点上做最长前缀匹配；源是 dataset 子目录时，仍对整个 dataset 建快照，解析 `zfs diff` 时只保留子目录下的路径。
+- **嵌套挂载守卫**：解析 dataset 时读 `/proc/self/mounts`，若树内有外来挂载点（嵌套 dataset、bind mount，`.zfs` 自动挂载除外）则拒绝对该树用 snapshot/diff——否则快照读视图会把嵌套子树当成「已删除」。此时 auto 后端降级 manifest 活树读并告警，显式 zfs 后端报错。
+- **基准快照与刷新守卫**：目标基准快照（`<prefix>_dstbase_…`）只允许由**全树级验证**的成功路径刷新；只看源侧的 `zfs diff` 增量只推进源基准、**保留**旧目标基准（Retain），避免把期间的目标漂移「洗进」新基准。刷新前用 `zfs diff 旧基线→新基线` 交叉核对本轮触碰集，发现外部写入则降级 Retain。
+- **快照清理**：按 refcount 执行（cursor 引用 + 运行中 task 引用 + `keep_extra_cycles` 窗口 + 最新快照），只有 refcount 为 0 的 auto_sync 快照才进入删除；后台限速执行，失败只记状态不影响同步。
+
+非 ZFS 源回退 manifest 模式：从 live source 读取，用复制前后 fingerprint 校验捕捉「正在写入的文件」，一旦 size/mtime/hash 变化就标 `source_changing` 并跳过，不推进 verified offset。百万文件场景建议把源放到 ZFS 上。
+
+### 文件监听（fanotify / USN）
+
+监听的职责是尽快发现运行期变化并触发近实时同步，**不承担最终一致性的唯一责任**——最终一致由 Full/Compare 兜底。
+
+**Linux（fanotify）**：优先 FID/name 模式（`FAN_REPORT_FID | DIR_FID | NAME | TARGET_FID`），注册 create/modify/close_write/delete/move/delete_self/move_self 等事件。`file handle → path` 优先懒加载解析并缓存；解析路径必须落在 source root 内。每个 source 单独一个 fanotify group，一个源的 `FAN_Q_OVERFLOW` 只把该源标记 `needs_reconcile`，不污染其他源。FID 模式或 filesystem mark 不可用时回退传统 fd-path 模式。
+
+**Windows（USN Journal）**：优先读 NTFS USN Journal（持久，覆盖停机窗口，游标断档自动记 `rescan_required`）；权限/环境不支持时回退 `ReadDirectoryChangesW` 递归 watcher。启动默认要求 elevated 进程：非管理员且未尝试过提权时用 `runas` 重新拉起 elevated 进程并退出当前进程（需 UAC 确认），失败则以普通权限继续。
+
+**启动语义（停机窗口）**：不再每次重启做全树 mtime 扫描。调度器启动 watcher 并等其上报 armed（所有 mark 就位，上限 15 分钟）后：Windows 靠 USN journal 无须提示；Linux（无 journal）为每个本机监听的源升起**重启提醒**（source 行 Latest Cycle 旁的 ⚠），直到用户对该源成功完成一次「提醒之后发起的」Compare/Full，或点击 ⚠ 手动忽略。重复重启不刷新已有提醒。
+
+### 调度与 cycle
+
+- 每个目标独立判断自己的 schedule 是否到期；同源多个目标在同一窗口需要同一版本点时复用同一 cycle/snapshot。
+- **realtime**：fanotify/USN 尽快触发小批量同步。**不做后台周期对账**（用户明确决定）：疑似丢事件（overflow、USN gap、启动 gap）自动触发一次完整 reconcile 修复；其余漂移由用户手动 Scan 检查、Full 修复。`reconcile_interval` 配置保留但当前不驱动周期任务。
+- **daily / weekly**：同样监听源目录，事件持续累积，到点时把该目标自上次 verified cycle 以来所有 cycle 的事件积压一次性应用（event-path 增量），而非全树扫描；出现 `rescan_required` 或首次全量则退回完整 reconcile。事件保留到所有 enabled 目标都 verified 越过其 cycle 才修剪。
+- **手动同步**：为选定源关闭当前 open cycle、创建新 target cycle，让 enabled 目标追赶。目标离线或校验失败不推进 `verified_cycle`，下一轮继续重试。
+
+> 历史说明：Changed-Since 模式已移除，其语义由 `zfs diff` 增量与 Full 覆盖；只写不读的 `path_snapshot` 表已删除（建库时 DROP，老库一次性回收）。
+
+### 一致性与校验
+
+保证「不丢失任何文件不一致」的关键机制：
+
+- 事件先落盘再进内存队列；overflow/watcher 中断标记 `needs_reconcile`。
+- ZFS 源基于 snapshot/diff 生成最终计划，而非只信事件流。
+- 每个目标独立 cycle offset，离线不跳周期，恢复后从最旧未验证 cycle 追赶；offset 只在任务完成且校验通过后推进。
+- 临时文件 + fsync + 原子 rename 降低崩溃半文件风险；重启时把遗留 running 任务恢复为 retry，未验证 cycle 重新校验或重做。
+- rename 失败只对跨设备（EXDEV，降级 copy+delete 进回收站）和已消失（NotFound）两类安全错误降级，其余向上报错，绝不静默递归硬删。
+
+> realtime 绿点语义是「事件都已应用」，不等于「整棵树已验证」——这是用户接受的取舍。Compare 用于检查漂移，手动 Full 用于修复。
+
+### 局域网多机与配置委托
+
+- **发现**：UDP `18766` 广播发现对端；也可手动添加机器（host、port、SSH user/port、OS、install_dir）。Web UI 路径选择器可切换机器浏览远端目录。
+- **委托执行**：源选在远程机器时，控制机保存配置后把该 source group 下发到源所在机器，由源机器的进程真正执行。下发的 group 把源机器自身重写为 `local`，并用 `managed_by` 标记控制机；控制机只保留完整配置供 UI，并通过网络读远端最新状态。
+- **双向删除传播**：控制机删除委托条目时，其推送的（可能为空的）集合让执行机同步删除；反方向，执行机删除带 `managed_by` 的条目时会**先**调用控制机的 `/api/config/remove-delegated-entry`（控制机用执行机的 live health id 验证请求者身份后删除自己的副本并再次推送收敛），控制机不可达则本地保存直接失败并明确报错——否则控制机下一次推送会静默复活已删条目。
+- **鉴权**：`app.peer_token`（各机器配同一值）非空时，`/api/transfer/*` 与委托推送要求匹配请求头；为空保持内网信任模式。请求体上限 1 GiB（流式传输端点豁免）。
+
+### 暂停继续、取消与任务历史
+
+- **每目标暂停/继续**：`DestinationConfig.paused` 配置字段（随委托推送同步到源机）。暂停 = 取消该目标当前任务且调度器不再派发新工作，pending target 保留、状态黄色 `paused`；继续 = 调度器从暂停处自动接续（首次全量等被打断的传输无需重新发起）。UI 是 info 按钮左侧的 ⏸/▶ 切换钮，**仅在有同步运行中或已暂停时显示**；手动 Sync 对暂停目标明确拒绝，Compare（只读）不受影响。
+- **协作式取消**：所有目录遍历（每目录 + 每条目）、并行传输 worker（每文件）、分块大文件发送（每 16MiB）都有取消检查点，几十万条目的 HDD 扫描也能秒级停止。入口：`POST /api/cancel-activity`、UI 停止按钮、`auto_syncctl cancel`、桌面 command。按 `source_id|destination_id` 精确定位，绝不误杀其他 pass；`propagate = true` 时转发到所有已知机器。取消后 cycle 的手动标记清除、in-flight target 撤销（verified 基准保留），下次 schedule/事件/手动同步重新拿到 target。
+- **任务历史（task_log）**：每个 sync pass 和每次 compare 在执行机 SQLite `task_log` 记一行（kind、source/destination、起止时间、duration、status、error、files_synced、differences、entries_scanned）。运行中行 `ended_at IS NULL` 随时可查（`GET /api/tasks?limit=`）。惰性保留最新 100 条已结束行；无实际传输的 pass 直接丢弃行避免心跳刷屏；重启时把遗留 running 行标记 aborted。
+
+### 状态与 UI
+
+- 源页面展示每个源及其多个目标，每个目标独立显示 Schedule、Cycle、状态点。
+- **Schedule 列**：`realtime` 显示 `Realtime`，`daily` 显示时间如 `02:00`，`weekly` 显示星期缩写加时间如 `Sat 19:00`。
+- **Cycle 列**：`verified_cycle / target_cycle`。
+- **info（ⓘ）弹窗**：统一 7 行等高布局——Task、Path（源→目标合一行）、Status、Cycle、Type（当前任务类型）、Snapshot（当下实时指标）、Summary（最终统计），所有任务类型行数一致。
+- 支持增删改源与目标、查看后端进度/上次同步时间/下次 schedule、`Sync All` / 源级 / 目标级手动同步（触发前先保存配置）。删除目标只移除配置并释放其快照保留引用，不删目标路径下已有数据。
+- 后台每 `status_log_interval_secs` 输出一次每目标的在线状态、target/verified cycle、进度和错误原因。
+
+---
+
+## 配置文件
+
+主配置 `conf/auto_sync.toml`，示例：
+
+```toml
+[app]
+data_db = "conf/state/auto_sync.sqlite"
+log_dir = "logs"
+status_log_interval_secs = 300
+port = 18765
+tcp_connection_pool_size = 100
+peer_token = ""                 # 各机器配同一非空值即开启 peer 鉴权；空 = 内网信任
+
+  [app.sync]
+  mirror = true                 # 源删除 → 目标删除
+  checksum = false              # 是否强制 hash 校验
+  transfer_timeout_secs = 120
+  max_parallel_transfers = 32
+  modify_window_secs = 1        # 全树 quick-check 的时间戳容差
+  zfs_diff = true               # ZFS 快路径全局开关（每目标可覆盖）
+  fsync = true
+  trash_keep_days = 30          # 回收站保留天数，0 = 永久
+
+[[source_groups]]
+id = "photos"
+src = "/data/photos"
+add_directory = false           # false：内容进目标根；true：目标下建 photos/ 子目录
+enabled = true
+mode = "mirror"
+
+  [source_groups.snapshot]
+  backend = "auto"              # auto | zfs | manifest
+  prefix = "auto_sync"
+  keep_extra_cycles = 2
+
+  [[source_groups.destinations]]
+  id = "nas_backup"
+  path = "/mnt/nas/photos"
+  enabled = true
+    [source_groups.destinations.schedule]
+    mode = "weekly"             # realtime | daily | weekly
+    time = "19:00"
+    timezone = "local"
+    weekday = "saturday"
+
+[[machines]]
+id = "nas"
+name = "nas"
+host = "192.168.2.247"
+port = 18765
+ssh_user = "root"
+ssh_port = 10022
+os = "linux"
+install_dir = "/opt/auto_sync"
+```
+
+配置原则：
+
+- GUI 改配置先写临时文件再原子替换；热重载只增量更新 source/destination，不清空状态库。
+- `source_groups.id` 和 `destinations.id` 必须稳定，作为 offset 和状态表外键。
+- 目标可离线：离线不删状态，只标红点，下次在线时从落后 cycle 补齐。
+- 路径类型规则：源可以是文件或目录；目标可以是目录，且源是文件、目标路径已存在为文件时允许 `文件 → 文件`；源是文件、目标不存在时按 `文件 → 目录` 处理；不支持 `目录 → 文件`。
+- 禁止把目标配到源的子目录（启动时检查嵌套，避免递归同步）。
+
+---
+
+## 部署
+
+| 目标 | 命令（在目标机本机运行） | 说明 |
+| --- | --- | --- |
+| Windows | `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1` | 构建到仓库 `bin\`，当前用户登录任务启动单进程；不装 Windows 服务。运行时进程以管理员权限自启（读 USN Journal）。 |
+| Linux / NAS | `scripts/deploy_local.sh --install-dir /opt/auto_sync` | 本机编译、装 systemd unit 并启动 `auto_sync.service`；首次自动补齐 Ubuntu/Debian 构建依赖和 Rust stable。 |
+| OpenWrt | `scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root` | 交叉编译 aarch64，渲染 `conf/auto_sync.procd` 为 `/etc/init.d/auto_sync`。 |
+
+标准更新路径（NAS 直接在 NAS 上执行，保留构建缓存，不 `git reset --hard`、不清 `target`）：
+
+```bash
+# NAS
+ssh -p 10022 root@192.168.2.247 "cd /opt/auto_sync && git pull --ff-only && scripts/deploy_local.sh --install-dir /opt/auto_sync"
+```
+
+systemd unit 由 `auto_syncctl print-systemd` 生成（不在 `conf/` 里）。fanotify 需较高权限：daemon 需 `CAP_DAC_READ_SEARCH`（懒加载 handle 解析）与 `CAP_SYS_ADMIN`（filesystem mark），同步只读目录还需 `CAP_DAC_OVERRIDE`，unit 已授予。
+
+---
+
+## 安全
+
+- SSH 部署优先密钥认证，不在配置保存明文密码；远程控制走 SSH。
+- 所有路径配置规范化，禁止目标配到源子目录；启动检测源之间嵌套。
+- 删除默认进 `.auto_sync_trash` 并记 audit log。
+- Web UI 是配置写入口，生产环境至少需一种保护：防火墙限制到可信 LAN/IP、反向代理认证、`peer_token`，或仅本机地址监听。
