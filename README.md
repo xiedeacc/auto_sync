@@ -267,6 +267,24 @@ ZFS 后端是百万文件规模下的首选一致性方案：创建 snapshot 近
 
 > 历史说明：Changed-Since 模式已移除，其语义由 `zfs diff` 增量与 Full 覆盖；只写不读的 `path_snapshot` 表已删除（建库时 DROP，老库一次性回收）。
 
+#### cycle 如何增长
+
+界面「Latest Cycle」按**源安静了几次**在涨，**不是按写了几个文件**在涨。理解这点能避免误解「几十万文件为什么只 +几个 cycle」：
+
+- **cycle 是源的版本点，不是每文件一个**。同一时刻源始终只有一个 `open` cycle 在累积事件；一个 cycle 会把它开着这段时间里的**全部**文件事件（可能几十万条）打包进去。
+- **关闭条件（防抖）**：对没到 schedule 的源，只有当「有堆积事件」**且**「源已静默 ≥ 10 秒」（`source_events_quiesced`）时，才关闭当前 open cycle、Latest Cycle +1，并开一个新的 open cycle。这是刻意防抖——否则稳定写入会每个调度 tick（5 秒）就铸一个 cycle。
+- **推论**：一次**连续不断**的写入/传输（中间没有 ≥10 秒空档）**只 +1 个 cycle**（在它结束、安静下来那一刻关闭）。若看到 +N，说明这段时间里有 N 个「忙一阵→静默≥10 秒」的独立波次——例如跨越数小时的多波活动，每波各关一个 cycle。cycle 数反映的是「安静间隙的个数」，与文件数量无关。
+- **一个文件出现在多个 cycle 里**：增量同步把 `(verified, target]` 区间内所有 cycle 的事件路径**去重成一个集合**（`BTreeSet`）再逐一处理，所以该文件**只复制一次**；即便如此也要先和目标端比对指纹，一致则跳过、不重传。
+
+#### 落后多个 cycle 如何追平
+
+目标可能落后源好几个 cycle（如 weekly 目标平时 verified 停在旧 cycle、Latest 一直涨）。触发同步时**一趟直接追平到最新，而不是一个 cycle 一趟**：
+
+- 调度到点或手动触发时，`advance_due` / `force_target` 关闭当前 open cycle 并把该 cycle（**最新的**）设为目标；中间被跳过的 cycle 不单独设目标。
+- **增量**：`events_between_cycles(verified, target)` 取出从上次 verified 到目标之间**所有** cycle 的事件积压，去重后在**一趟** pass 里全部应用，verified 直接跳到目标（最新）。不逐 cycle 步进。
+- **Full**：直接对源当前状态做整树对账，同样一趟追平到最新。
+- 若积压里出现 `rescan_required`（overflow / USN gap）或目标从未首次全量，增量自动退回完整 reconcile。
+
 ### 一致性与校验
 
 保证「不丢失任何文件不一致」的关键机制：
