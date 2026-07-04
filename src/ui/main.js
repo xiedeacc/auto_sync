@@ -32,24 +32,62 @@ function scanReportKey(sourceId, destinationId) {
   return `${sourceId}|${destinationId}`;
 }
 
-// A pending compare whose report never arrives (consumed by a repair, or the
-// scan silently never started) must not pin the row's stop button forever:
-// once no compare walk has been visible for this long, give up on it.
+// Fallback only: a pending compare that the task log shows neither running nor
+// terminally failed (it silently never started, or was consumed by a repair)
+// must not pin the row's stop button forever. Once nothing has looked alive
+// for this long, give up. This is NOT the primary running check — that comes
+// authoritatively from the task log (see checkPendingScans).
 const SCAN_PENDING_GRACE_MS = 30000;
 
-// While a background scan is running, poll for its report (identified by a new
-// scanned_at) and surface it in the info panel when it completes.
+// Newest task of `kind` for (sourceId, destinationId) across every machine's
+// task log. destination_id may be a comma-joined list for a cross-machine
+// cycle, so match by membership. Returns null when none is found.
+function newestTaskFor(machines, sourceId, destinationId, kind) {
+  let best = null;
+  for (const machine of machines || []) {
+    for (const task of machine.tasks || []) {
+      if (task.source_id !== sourceId) continue;
+      if (kind && task.kind !== kind) continue;
+      const ids = String(task.destination_id || "").split(",").map((id) => id.trim());
+      if (!ids.includes(destinationId)) continue;
+      if (!best || Date.parse(task.started_at) > Date.parse(best.started_at)) {
+        best = task;
+      }
+    }
+  }
+  return best;
+}
+
+// While a background compare is pending, follow its authoritative lifecycle in
+// the task log (get_all_tasks, which aggregates this machine AND every managed
+// runtime machine) rather than guessing from runtime scan attribution. A
+// compare for a remote-managed source executes on the destination's machine,
+// so its "running" state never appears in this UI's local runtime scan list —
+// the old heuristic then wrongly declared it "no longer running" after 30s
+// while it was in fact still running elsewhere. The task log is the source of
+// truth for running/ended, so we ask it directly.
 async function checkPendingScans() {
   if (checkingScans) return;
   const entries = Object.entries(scanPending);
   if (!entries.length) return;
   checkingScans = true;
   try {
+    let taskMachines = null;
+    try {
+      taskMachines = await invoke("get_all_tasks", { limit: 50 });
+    } catch (_error) {
+      taskMachines = null; // fall back to the runtime-scan signal this tick
+    }
     for (const [key, info] of entries) {
       const source = findSourceById(info.sourceId);
       const dst = source
         && (source.destinations || []).find((item) => item.id === info.destinationId);
-      if (source && dst && compareScanRunning(source, dst)) {
+      // Authoritative: is a compare for this pair still running on ANY machine?
+      const compareTask = taskMachines
+        ? newestTaskFor(taskMachines, info.sourceId, info.destinationId, "compare")
+        : null;
+      const authoritativeRunning = Boolean(compareTask && compareTask.status === "running");
+      if (authoritativeRunning || (source && dst && compareScanRunning(source, dst))) {
         info.lastSeenRunning = Date.now();
       }
       let report;
@@ -62,6 +100,29 @@ async function checkPendingScans() {
         continue;
       }
       if (!report || !report.scanned_at || report.scanned_at === info.prev) {
+        // The task log says it is still running: keep waiting, never give up.
+        if (authoritativeRunning) continue;
+        // Ended without producing a new report: if the task log recorded a
+        // terminal failure for our compare, surface it precisely instead of
+        // the generic timeout message. Guard on started_at (with LAN clock
+        // skew tolerance) so a stale earlier failure is not mistaken for ours.
+        const terminalFailure = compareTask
+          && compareTask.status !== "running"
+          && compareTask.status !== "success"
+          && Date.parse(compareTask.started_at) >= (info.startedAt || 0) - 60000;
+        if (terminalFailure) {
+          delete scanPending[key];
+          setTransientMessage(
+            `Compare ${info.sourceId} -> ${info.destinationId} ${compareTask.status}`
+              + (compareTask.error ? `: ${compareTask.error}` : ""),
+            15000,
+          );
+          updateDstControls();
+          continue;
+        }
+        // No running compare and no terminal failure on record: fall back to
+        // the grace window (measured from when we last saw it alive) to retire
+        // a compare that silently never started.
         const lastAlive = info.lastSeenRunning || info.startedAt || 0;
         if (Date.now() - lastAlive > SCAN_PENDING_GRACE_MS) {
           delete scanPending[key];
