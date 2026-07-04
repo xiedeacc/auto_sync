@@ -676,7 +676,7 @@ fn run_with_desktop(backend: Backend, port: u16, start_hidden: bool) {
                 ),
             )
             .title("auto_sync")
-            .inner_size(1180.0, 760.0)
+            .inner_size(1180.0, 1000.0)
             .min_inner_size(860.0, 620.0)
             .resizable(true)
             .visible(false)

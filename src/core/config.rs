@@ -137,6 +137,11 @@ pub struct SourceGroupConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excludes: Vec<PathBuf>,
     pub enabled: bool,
+    /// Display order in the UI source list (ascending). Purely cosmetic — it
+    /// does not affect sync behaviour. The UI keeps these contiguous
+    /// (0, 1, 2, ...) as the user drags sources to reorder.
+    #[serde(default)]
+    pub order: i64,
     pub mode: SyncMode,
     pub snapshot: SnapshotConfig,
     pub destinations: Vec<DestinationConfig>,
@@ -313,6 +318,7 @@ impl Default for SourceGroupConfig {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: Vec::new(),
@@ -1300,6 +1306,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {
@@ -1332,6 +1339,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {
@@ -1364,6 +1372,7 @@ mod tests {
                 PathBuf::new(),
             ],
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: vec![
@@ -1404,6 +1413,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {
@@ -1647,6 +1657,7 @@ src = "/zfs"
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {
@@ -1667,6 +1678,7 @@ src = "/zfs"
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {

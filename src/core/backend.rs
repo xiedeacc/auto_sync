@@ -1806,6 +1806,7 @@ mod tests {
                 managed_by: String::new(),
                 excludes: Vec::new(),
                 enabled: true,
+                order: 0,
                 mode: crate::core::config::SyncMode::Mirror,
                 snapshot: crate::core::config::SnapshotConfig::default(),
                 destinations: vec![crate::core::config::DestinationConfig {
@@ -1845,6 +1846,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: crate::core::config::SyncMode::Mirror,
             snapshot: crate::core::config::SnapshotConfig::default(),
             destinations: vec![crate::core::config::DestinationConfig {
@@ -1916,6 +1918,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: crate::core::config::SyncMode::Mirror,
             snapshot: crate::core::config::SnapshotConfig::default(),
             destinations: vec![crate::core::config::DestinationConfig {
@@ -2018,6 +2021,7 @@ mod tests {
                 managed_by: String::new(),
                 excludes: Vec::new(),
                 enabled: true,
+                order: 0,
                 mode: crate::core::config::SyncMode::Mirror,
                 snapshot: crate::core::config::SnapshotConfig::default(),
                 destinations: vec![crate::core::config::DestinationConfig {
@@ -2055,6 +2059,7 @@ mod tests {
                 managed_by: String::new(),
                 excludes: Vec::new(),
                 enabled: true,
+                order: 0,
                 mode: crate::core::config::SyncMode::Mirror,
                 snapshot: crate::core::config::SnapshotConfig::default(),
                 destinations: vec![crate::core::config::DestinationConfig {
@@ -2101,6 +2106,7 @@ mod tests {
             managed_by: managed_by.to_string(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: crate::core::config::SyncMode::Mirror,
             snapshot: crate::core::config::SnapshotConfig::default(),
             destinations: vec![

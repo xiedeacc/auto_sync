@@ -2024,6 +2024,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {
@@ -2163,6 +2164,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 reconcile_interval_secs: 1,
@@ -2246,6 +2248,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {

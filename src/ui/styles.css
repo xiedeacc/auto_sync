@@ -243,10 +243,49 @@ th {
 }
 
 .source-group {
+  position: relative;
   margin-left: -18px;
   padding: 10px 14px 12px 28px;
   border-radius: 6px;
   background: #f8fafc;
+}
+
+/* Reorder grip: lives in the card's left gutter so it never disturbs the
+ * inner grid. Only this element is draggable. */
+.source-drag-handle {
+  position: absolute;
+  left: 7px;
+  top: 12px;
+  width: 16px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #94a3b8;
+  cursor: grab;
+  user-select: none;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.source-drag-handle:hover {
+  color: #475569;
+}
+
+.source-drag-handle:active {
+  cursor: grabbing;
+}
+
+.source-group.dragging {
+  opacity: 0.45;
+}
+
+.source-group.drop-before {
+  box-shadow: inset 0 3px 0 0 #2563eb;
+}
+
+.source-group.drop-after {
+  box-shadow: inset 0 -3px 0 0 #2563eb;
 }
 
 .panel {

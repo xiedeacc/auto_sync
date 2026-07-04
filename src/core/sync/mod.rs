@@ -8965,6 +8965,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: Vec::new(),
@@ -9120,6 +9121,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -9376,6 +9378,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -9447,6 +9450,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -9525,6 +9529,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -9613,6 +9618,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -9659,6 +9665,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -9770,6 +9777,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -9837,6 +9845,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -9911,6 +9920,7 @@ mod tests {
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -10252,6 +10262,7 @@ other /zfs_other zfs rw 0 0
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -10326,6 +10337,7 @@ other /zfs_other zfs rw 0 0
             managed_by: String::new(),
             excludes: vec![],
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: vec![
@@ -10396,6 +10408,7 @@ other /zfs_other zfs rw 0 0
             managed_by: String::new(),
             excludes: vec![PathBuf::from("skip.txt"), PathBuf::from("skip_dir")],
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -10452,6 +10465,7 @@ other /zfs_other zfs rw 0 0
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -10475,6 +10489,7 @@ other /zfs_other zfs rw 0 0
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig {
                 backend: SnapshotBackend::Manifest,
@@ -10612,6 +10627,7 @@ other /zfs_other zfs rw 0 0
             managed_by: String::new(),
             excludes: Vec::new(),
             enabled: true,
+            order: 0,
             mode: SyncMode::Mirror,
             snapshot: SnapshotConfig::default(),
             destinations: vec![DestinationConfig {

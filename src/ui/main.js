@@ -947,6 +947,7 @@ function renderSourcePanel() {
     group.className = "source-group";
     group.dataset.sourceId = source.id;
     group.innerHTML = `
+    <span class="source-drag-handle" draggable="true" title="Drag to reorder" aria-label="Drag to reorder source">⠿</span>
     <div class="source-layout">
       <div class="sync-row source-row">
         <div class="row-left">
@@ -981,6 +982,73 @@ function renderSourcePanel() {
     bindSourceControls(source, sourceIndex, group);
     renderSyncRows(source, group);
   });
+  setupSourceReorder(stack);
+}
+
+// Drag-and-drop reordering of the source cards. Only the grip handle is
+// draggable (so inputs/buttons stay usable); on drop we move the source within
+// cfg.source_groups, renumber `order`, persist, and re-render.
+function setupSourceReorder(stack) {
+  let draggingId = null;
+  const clearMarkers = () => {
+    stack.querySelectorAll(".source-group").forEach((card) => {
+      card.classList.remove("dragging", "drop-before", "drop-after");
+    });
+  };
+  stack.querySelectorAll(".source-drag-handle").forEach((handle) => {
+    const card = handle.closest(".source-group");
+    handle.addEventListener("dragstart", (event) => {
+      draggingId = card.dataset.sourceId;
+      card.classList.add("dragging");
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        try { event.dataTransfer.setData("text/plain", draggingId); } catch (_e) {}
+      }
+    });
+    handle.addEventListener("dragend", () => {
+      draggingId = null;
+      clearMarkers();
+    });
+  });
+  const dropTarget = (event) => {
+    const over = event.target.closest && event.target.closest(".source-group");
+    if (!over || over.dataset.sourceId === draggingId) return null;
+    const rect = over.getBoundingClientRect();
+    return { over, before: event.clientY < rect.top + rect.height / 2 };
+  };
+  stack.addEventListener("dragover", (event) => {
+    if (!draggingId) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    stack.querySelectorAll(".source-group").forEach((card) => {
+      card.classList.remove("drop-before", "drop-after");
+    });
+    const target = dropTarget(event);
+    if (target) target.over.classList.add(target.before ? "drop-before" : "drop-after");
+  });
+  stack.addEventListener("drop", (event) => {
+    if (!draggingId) return;
+    event.preventDefault();
+    const target = dropTarget(event);
+    const movedId = draggingId;
+    draggingId = null;
+    clearMarkers();
+    if (target) reorderSource(movedId, target.over.dataset.sourceId, target.before);
+  });
+}
+
+async function reorderSource(movedId, targetId, before) {
+  const groups = cfg.source_groups;
+  const from = groups.findIndex((source) => source.id === movedId);
+  if (from < 0) return;
+  const [moved] = groups.splice(from, 1);
+  let insertAt = groups.findIndex((source) => source.id === targetId);
+  if (insertAt < 0) insertAt = groups.length;
+  else if (!before) insertAt += 1;
+  groups.splice(insertAt, 0, moved);
+  groups.forEach((source, index) => { source.order = index; });
+  await autoSaveConfig();
+  render();
 }
 
 function renderSyncOrderPanel(container) {
@@ -3003,6 +3071,17 @@ function updateCfgFromForm() {
     source.destinations = dedupeDestinationsByPath(source.destinations);
     return source;
   }).filter((source) => source.src);
+  // Display order: sort by the persisted `order` (stable, so equal/missing
+  // values keep current array order), then renumber contiguously so the array
+  // position — which edits and drag-reordering both index into — always
+  // matches the order field.
+  cfg.source_groups.forEach((source, index) => {
+    if (typeof source.order !== "number" || Number.isNaN(source.order)) {
+      source.order = index;
+    }
+  });
+  cfg.source_groups.sort((a, b) => a.order - b.order);
+  cfg.source_groups.forEach((source, index) => { source.order = index; });
   cfg.sync_order = cleanSyncOrder(cfg.sync_order || []);
 }
 
