@@ -679,6 +679,12 @@ fn run_with_desktop(backend: Backend, port: u16, start_hidden: bool) {
             .inner_size(1180.0, 1000.0)
             .min_inner_size(860.0, 620.0)
             .resizable(true)
+            // Tauri's OS-level drag-drop handler (on by default) swallows drag
+            // events before the webview sees them, breaking in-page HTML5
+            // drag-and-drop (the source-list reorder grip). We don't use OS
+            // file drop anywhere, so turn the handler off and let the page
+            // handle drag events itself.
+            .disable_drag_drop_handler()
             .visible(false)
             .build()?;
             // Hygiene: drop what previous builds left in the cache (the
