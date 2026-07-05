@@ -48,6 +48,7 @@ pub struct CancelToken {
     flag: Arc<AtomicBool>,
     target: Option<Arc<str>>,
     files: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
 }
 
 thread_local! {
@@ -102,6 +103,7 @@ pub fn begin_targets(kind: &str, targets: Vec<String>) -> OpGuard {
         flag,
         target: token_target,
         files: Arc::new(AtomicU64::new(0)),
+        failed: Arc::new(AtomicU64::new(0)),
     };
     let previous = CURRENT.with(|current| current.replace(Some(token)));
     OpGuard { id, previous }
@@ -125,6 +127,27 @@ pub fn synced_files() -> u64 {
             .borrow()
             .as_ref()
             .map_or(0, |token| token.files.load(Ordering::Relaxed))
+    })
+}
+
+/// Credit `count` files that FAILED to transfer to the operation on this
+/// thread (mirrors [`add_synced_files`]). Feeds the task log's summary so a
+/// partially-failed sync reports "N synced · M failed". No-op outside an op.
+pub fn add_failed_files(count: u64) {
+    CURRENT.with(|current| {
+        if let Some(token) = current.borrow().as_ref() {
+            token.failed.fetch_add(count, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Files that failed to transfer so far by the operation on this thread.
+pub fn failed_files() -> u64 {
+    CURRENT.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .map_or(0, |token| token.failed.load(Ordering::Relaxed))
     })
 }
 

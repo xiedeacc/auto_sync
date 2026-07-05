@@ -2838,13 +2838,19 @@ pub fn sync_cycle_for_source(
     }
     if let Some(task_id) = task_id {
         let files = cancel::synced_files();
+        // For a sync the task log's `differences` column carries the failed-file
+        // count (a sync has no diff count of its own), so the Info summary can
+        // report "N synced · M failed".
+        let failed = cancel::failed_files();
         let record = match &result {
-            Ok(outcome) if files == 0 && !outcome.progressed => state.task_discard(task_id),
-            Ok(_) => state.task_finish(task_id, "success", "", files, 0, 0),
-            Err(err) if cancel::error_is_cancelled(err) => {
-                state.task_finish(task_id, "cancelled", cancel::CANCELLED_MESSAGE, files, 0, 0)
+            Ok(outcome) if files == 0 && failed == 0 && !outcome.progressed => {
+                state.task_discard(task_id)
             }
-            Err(err) => state.task_finish(task_id, "failed", &format!("{err:#}"), files, 0, 0),
+            Ok(_) => state.task_finish(task_id, "success", "", files, failed, 0),
+            Err(err) if cancel::error_is_cancelled(err) => {
+                state.task_finish(task_id, "cancelled", cancel::CANCELLED_MESSAGE, files, failed, 0)
+            }
+            Err(err) => state.task_finish(task_id, "failed", &format!("{err:#}"), files, failed, 0),
         };
         if let Err(err) = record {
             warn!(source = source.id, error = %err, "failed to record task log entry");
@@ -5502,10 +5508,12 @@ fn push_entries_parallel(
     }
     let transferred = done.load(Ordering::Relaxed) as usize;
     cancel::add_synced_files(transferred as u64);
+    let failed = failed.into_inner().unwrap_or_else(|err| err.into_inner());
+    cancel::add_failed_files(failed.len() as u64);
     Ok(TransferOutcome {
         transferred,
         changing: changing.into_inner().unwrap_or_else(|err| err.into_inner()),
-        failed: failed.into_inner().unwrap_or_else(|err| err.into_inner()),
+        failed,
     })
 }
 
@@ -5620,10 +5628,12 @@ fn copy_entries_parallel(
     }
     let transferred = done.load(Ordering::Relaxed) as usize;
     cancel::add_synced_files(transferred as u64);
+    let failed = failed.into_inner().unwrap_or_else(|err| err.into_inner());
+    cancel::add_failed_files(failed.len() as u64);
     Ok(TransferOutcome {
         transferred,
         changing: changing.into_inner().unwrap_or_else(|err| err.into_inner()),
-        failed: failed.into_inner().unwrap_or_else(|err| err.into_inner()),
+        failed,
     })
 }
 

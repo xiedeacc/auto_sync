@@ -2594,8 +2594,13 @@ function infoSnapshotLabel(source, dst, transfer, scan) {
   return "idle";
 }
 
-// Summary: final-result statistics of the current or last task — diff counts
-// for a compare, files moved for a sync.
+// Summary: final-result statistics of the current or last task.
+//  - Compare: how many entries differ (broken down by kind) and how many were
+//    in sync. Prefers the cached scan report (has the per-kind breakdown);
+//    falls back to the task log's own differences/entries_scanned counters
+//    (e.g. a cross-machine compare with no report cached locally).
+//  - Sync: how many files were synced, and — since the task log's `differences`
+//    column carries the failed-file count for a sync — how many failed.
 function infoSummaryLabel(source, dst, report, task) {
   const act = dstActivity(source, dst);
   const isCompare = act.scope === "compare" || (task && task.kind === "compare");
@@ -2605,8 +2610,9 @@ function infoSummaryLabel(source, dst, report, task) {
     }
     const total = (report.to_add || 0) + (report.to_update || 0) + (report.to_delete || 0)
       + (report.type_mismatch || 0) + (report.metadata || 0);
+    const matched = Number(report.in_sync || 0);
     if (total === 0) {
-      return "in sync";
+      return matched > 0 ? `in sync (${matched} compared)` : "in sync";
     }
     const parts = [];
     if (report.to_add) parts.push(`+${report.to_add}`);
@@ -2614,26 +2620,40 @@ function infoSummaryLabel(source, dst, report, task) {
     if (report.to_delete) parts.push(`−${report.to_delete}`);
     if (report.type_mismatch) parts.push(`!${report.type_mismatch}`);
     if (report.metadata) parts.push(`#${report.metadata}`);
-    return `${total} difference${total === 1 ? "" : "s"} (${parts.join(" ")})`;
+    const matchedNote = matched > 0 ? `, ${matched} in sync` : "";
+    return `${total} difference${total === 1 ? "" : "s"} (${parts.join(" ")})${matchedNote}`;
   }
   if (task) {
     if (task.status === "running") {
       return "running…";
     }
-    const parts = [];
-    if (Number(task.files_synced || 0) > 0) {
-      parts.push(`${task.files_synced} file${task.files_synced === 1 ? "" : "s"}`);
+    if (task.kind === "compare") {
+      if (task.error) return `compare failed: ${task.error}`;
+      const diffs = Number(task.differences || 0);
+      const scanned = Number(task.entries_scanned || 0);
+      const scannedNote = scanned > 0 ? ` · ${scanned} compared` : "";
+      return diffs === 0
+        ? `in sync${scannedNote}`
+        : `${diffs} difference${diffs === 1 ? "" : "s"}${scannedNote}`;
     }
-    if (Number(task.entries_scanned || 0) > 0) {
-      parts.push(`${task.entries_scanned} entries`);
+    // Sync task: files_synced = succeeded, differences = failed (see the
+    // engine's task_finish, which stashes the failed-file count there).
+    const synced = Number(task.files_synced || 0);
+    const failed = Number(task.differences || 0);
+    if (failed > 0) {
+      const attempted = synced + failed;
+      const tail = task.error ? ` (${task.error})` : "";
+      return `${synced}/${attempted} files synced · ${failed} failed${tail}`;
     }
-    if (task.error) {
-      parts.push(task.error);
+    if (task.error && task.status !== "success") {
+      return synced > 0
+        ? `${synced} synced, then failed: ${task.error}`
+        : `failed: ${task.error}`;
     }
-    if (!parts.length && task.status) {
-      parts.push(task.status);
+    if (synced > 0) {
+      return `${synced} file${synced === 1 ? "" : "s"} synced`;
     }
-    return parts.join(" · ") || "-";
+    return task.status === "success" ? "no changes" : (task.status || "-");
   }
   return "-";
 }
