@@ -2843,14 +2843,22 @@ pub fn sync_cycle_for_source(
         // report "N synced · M failed".
         let failed = cancel::failed_files();
         let record = match &result {
-            Ok(outcome) if files == 0 && failed == 0 && !outcome.progressed => {
-                state.task_discard(task_id)
-            }
-            Ok(_) => state.task_finish(task_id, "success", "", files, failed, 0),
             Err(err) if cancel::error_is_cancelled(err) => {
                 state.task_finish(task_id, "cancelled", cancel::CANCELLED_MESSAGE, files, failed, 0)
             }
             Err(err) => state.task_finish(task_id, "failed", &format!("{err:#}"), files, failed, 0),
+            // The inner pass returns Ok even when a destination went red (it
+            // records the red status and marks the cycle failed, but does not
+            // propagate an Err). Such a pass MUST be logged as failed — never
+            // discarded as a no-op just because it transferred 0 files.
+            Ok(_) if failed_pass_reason(state, source, cycle.id).is_some() => {
+                let reason = failed_pass_reason(state, source, cycle.id).unwrap_or_default();
+                state.task_finish(task_id, "failed", &reason, files, failed, 0)
+            }
+            Ok(outcome) if files == 0 && failed == 0 && !outcome.progressed => {
+                state.task_discard(task_id)
+            }
+            Ok(_) => state.task_finish(task_id, "success", "", files, failed, 0),
         };
         if let Err(err) = record {
             warn!(source = source.id, error = %err, "failed to record task log entry");
@@ -8484,6 +8492,36 @@ fn short_reason(err: &anyhow::Error) -> String {
 /// Record a destination sync failure: tolerated source-changing errors become
 /// yellow `source_changing` issues (the next cycle converges them); everything
 /// else goes red with a short reason.
+/// If this pass left the cycle `failed` (a destination went red — offline,
+/// dir-create failure, an unusable event plan, ...), return a human reason
+/// assembled from the red destinations' statuses. `None` when the pass did not
+/// fail. The task-finish logic uses this so a failed pass is always logged (as
+/// `failed`) rather than discarded as a no-op when it transferred 0 files.
+fn failed_pass_reason(state: &State, source: &SourceGroupConfig, cycle_id: i64) -> Option<String> {
+    let status = state.cycle_by_id(&source.id, cycle_id).ok().flatten()?.status;
+    if status != "failed" {
+        return None;
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    for dst in source.destinations.iter().filter(|dst| dst.enabled) {
+        if let Ok(offset) = state.destination_offset(&source.id, &dst.id) {
+            if offset.status == "red" {
+                let reason = if offset.status_reason.is_empty() {
+                    "failed".to_string()
+                } else {
+                    offset.status_reason.clone()
+                };
+                reasons.push(format!("{}: {}", dst.id, reason));
+            }
+        }
+    }
+    Some(if reasons.is_empty() {
+        "sync pass failed".to_string()
+    } else {
+        reasons.join("; ")
+    })
+}
+
 fn record_destination_failure(
     state: &State,
     source_id: &str,
