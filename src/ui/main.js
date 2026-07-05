@@ -2612,7 +2612,7 @@ function infoSummaryLabel(source, dst, report, task) {
       + (report.type_mismatch || 0) + (report.metadata || 0);
     const matched = Number(report.in_sync || 0);
     if (total === 0) {
-      return matched > 0 ? `in sync (${matched} compared)` : "in sync";
+      return matched > 0 ? `0 differences (${matched} in sync)` : "0 differences";
     }
     const parts = [];
     if (report.to_add) parts.push(`+${report.to_add}`);
@@ -2633,7 +2633,7 @@ function infoSummaryLabel(source, dst, report, task) {
       const scanned = Number(task.entries_scanned || 0);
       const scannedNote = scanned > 0 ? ` · ${scanned} compared` : "";
       return diffs === 0
-        ? `in sync${scannedNote}`
+        ? `0 differences${scannedNote}`
         : `${diffs} difference${diffs === 1 ? "" : "s"}${scannedNote}`;
     }
     // Sync task: files_synced = succeeded, differences = failed (see the
