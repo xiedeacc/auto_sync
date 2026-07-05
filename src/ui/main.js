@@ -2796,6 +2796,11 @@ function infoSummaryLabel(source, dst, report, task, scan, runtime) {
       const tail = task.error ? ` (${task.error})` : "";
       return `${synced}/${attempted} files synced · ${failed} failed${tail}`;
     }
+    if (task.status === "warning") {
+      // A tolerated source-changing pass: everything stable was copied, only the
+      // files that changed mid-copy were deferred. Not a failure.
+      return task.error ? `⚠ ${task.error}` : `${synced} files synced (with warnings)`;
+    }
     if (task.error && task.status !== "success") {
       return synced > 0
         ? `${synced} synced, then failed: ${task.error}`

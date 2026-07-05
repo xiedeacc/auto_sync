@@ -2911,6 +2911,18 @@ pub fn sync_cycle_for_source(
                 state.task_finish(task_id, "cancelled", cancel::CANCELLED_MESSAGE, files, failed, 0)
             }
             Err(err) => state.task_finish(task_id, "failed", &format!("{err:#}"), files, failed, 0),
+            // A pass that "failed" only because the live source changed under
+            // the copy (destinations yellow `source_changing`, none red) copied
+            // everything stable and deferred the changed paths to the next
+            // cycle — log it as a warning, not a failure, and say why.
+            Ok(_) if source_changing_only_pass(state, source, cycle.id).is_some() => {
+                let n = source_changing_only_pass(state, source, cycle.id).unwrap_or(0);
+                let reason = format!(
+                    "{files} files synced; {n} destination(s) had files change during \
+                     the copy — deferred to the next cycle"
+                );
+                state.task_finish(task_id, "warning", &reason, files, failed, 0)
+            }
             // The inner pass returns Ok even when a destination went red (it
             // records the red status and marks the cycle failed, but does not
             // propagate an Err). Such a pass MUST be logged as failed — never
@@ -8647,6 +8659,34 @@ fn failed_pass_reason(state: &State, source: &SourceGroupConfig, cycle_id: i64) 
     })
 }
 
+/// When a pass left the cycle `failed` ONLY because the live source changed
+/// under the copy (every affected destination is yellow `source_changing`, none
+/// red), returns the number of affected destinations. Such a pass copied
+/// everything that was stable and deferred just the changed paths to the next
+/// cycle — it is a warning, not a failure, and must not be logged red.
+fn source_changing_only_pass(
+    state: &State,
+    source: &SourceGroupConfig,
+    cycle_id: i64,
+) -> Option<usize> {
+    let status = state.cycle_by_id(&source.id, cycle_id).ok().flatten()?.status;
+    if status != "failed" {
+        return None;
+    }
+    let mut changing = 0usize;
+    for dst in source.destinations.iter().filter(|dst| dst.enabled) {
+        if let Ok(offset) = state.destination_offset(&source.id, &dst.id) {
+            if offset.status == "red" {
+                return None; // a genuine failure is present — not a warning
+            }
+            if offset.status_reason == "source_changing" {
+                changing += 1;
+            }
+        }
+    }
+    (changing > 0).then_some(changing)
+}
+
 fn record_destination_failure(
     state: &State,
     source_id: &str,
@@ -9977,7 +10017,7 @@ mod tests {
 
         let open = state.current_open_cycle_id("src_1").unwrap().unwrap();
         assert!(
-            state.cycle_has_actionable_events(open).unwrap(),
+            state.cycle_has_actionable_events("src_1", open).unwrap(),
             "the changed path must be re-recorded as an event for the next cycle"
         );
 

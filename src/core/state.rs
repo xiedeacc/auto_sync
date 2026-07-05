@@ -535,7 +535,7 @@ impl State {
             let Some(cycle) = self.current_open_cycle(&source.id)? else {
                 continue;
             };
-            let open_has_events = self.cycle_has_actionable_events(cycle.id)?;
+            let open_has_events = self.cycle_has_actionable_events(&source.id, cycle.id)?;
             let mut due_destinations = Vec::new();
 
             for dst in source.destinations.iter().filter(|d| d.enabled && !d.paused) {
@@ -718,26 +718,38 @@ impl State {
             .map_err(Into::into)
     }
 
-    pub fn cycle_has_events(&self, cycle_id: i64) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM event_log WHERE cycle_id=?1",
-            params![cycle_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+    // NOTE: both predicates below MUST filter on source_id, not cycle_id alone.
+    // The only event_log index is (source_id, cycle_id, event_id); a cycle_id-only
+    // WHERE cannot use it and degrades to a full-table scan — catastrophic once a
+    // chatty source bloats the log (a WeChat flood put 566k events in one cycle
+    // and this ran per source per scheduler tick, thrashing the DB at 300+ MB/s).
+    // EXISTS short-circuits at the first matching row instead of counting all.
+    pub fn cycle_has_events(&self, source_id: &str, cycle_id: i64) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM event_log WHERE source_id=?1 AND cycle_id=?2)",
+                params![source_id, cycle_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(Into::into)
     }
 
-    pub fn cycle_has_actionable_events(&self, cycle_id: i64) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            r#"
-            SELECT COUNT(*)
-            FROM event_log
-            WHERE cycle_id=?1 AND (rel_path IS NOT NULL OR rescan_required <> 0)
-            "#,
-            params![cycle_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+    pub fn cycle_has_actionable_events(&self, source_id: &str, cycle_id: i64) -> Result<bool> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM event_log
+                    WHERE source_id=?1 AND cycle_id=?2
+                      AND (rel_path IS NOT NULL OR rescan_required <> 0)
+                )
+                "#,
+                params![source_id, cycle_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(Into::into)
     }
 
     /// Events recorded in cycles AFTER `after_cycle_id` and up to (including)
@@ -894,7 +906,7 @@ impl State {
     pub fn latest_cycle_id_for_display(&self, source_id: &str) -> Result<Option<i64>> {
         let closed = self.latest_closed_cycle_id(source_id)?;
         if let Some(open) = self.current_open_cycle(source_id)? {
-            if self.cycle_has_actionable_events(open.id)? {
+            if self.cycle_has_actionable_events(source_id, open.id)? {
                 return Ok(Some(match closed {
                     Some(closed) => closed.max(open.id),
                     None => open.id,

@@ -553,6 +553,11 @@ th {
   color: #b45309;
 }
 
+.task-status-warning {
+  color: #b45309;
+  font-weight: 600;
+}
+
 .actions-label {
   grid-column: span 2;
 }
