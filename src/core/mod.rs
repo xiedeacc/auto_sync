@@ -7,6 +7,7 @@ pub mod peer_notify;
 pub mod progress;
 pub mod scheduler;
 pub mod signal;
+pub mod standby;
 pub mod state;
 pub mod status;
 pub mod storage;

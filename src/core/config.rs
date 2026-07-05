@@ -24,6 +24,13 @@ pub struct AppConfig {
     pub source_groups: Vec<SourceGroupConfig>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sync_order: Vec<SyncOrderRule>,
+    /// Disks that should spin up only on a schedule (cold-backup HDDs). Any
+    /// sync/compare/full touching one of a pool's `mount_roots` is deferred
+    /// while that pool is outside its wake window, so the disk stays parked.
+    /// Empty (the default) keeps every disk always-available — the feature is
+    /// entirely dormant until a pool is configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub standby_pools: Vec<StandbyPoolConfig>,
     #[serde(default, skip_serializing)]
     pub deploy: DeployConfig,
 }
@@ -121,6 +128,74 @@ pub enum ScheduleMode {
     Realtime,
     Daily,
     Weekly,
+}
+
+/// A cold-backup disk/pool that should stay parked and spin up only on a
+/// schedule. See [`AppConfig::standby_pools`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StandbyPoolConfig {
+    /// Display/reference name, e.g. "zfs" or "zfs_pool".
+    pub name: String,
+    /// Filesystem roots that live on this pool's disks. A task is gated when
+    /// its source OR destination root is at/under any of these paths.
+    pub mount_roots: Vec<PathBuf>,
+    /// Physical block devices to `hdparm -Y` when the window closes (Linux,
+    /// only when `active_spindown`). Use stable `/dev/disk/by-id/...` names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
+    pub enabled: bool,
+    /// Actively spin the devices down (`hdparm -Y`) at window close. When
+    /// false the pool is only *gated* (tasks deferred) and spin-down is left
+    /// to the OS idle timer (`hdparm -S`).
+    pub active_spindown: bool,
+    pub wake: WakeSchedule,
+}
+
+impl Default for StandbyPoolConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mount_roots: Vec::new(),
+            devices: Vec::new(),
+            enabled: true,
+            active_spindown: false,
+            wake: WakeSchedule::default(),
+        }
+    }
+}
+
+/// When a standby pool is allowed to be awake. The window OPENS at the
+/// scheduled weekday/time on every `every_weeks`-th week (counted from
+/// `anchor_date`); it stays open until the pool's backlog drains and quiesces
+/// (bounded by `max_window_minutes`), then the disk is parked again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WakeSchedule {
+    /// 1 = every week, 4 = every 4th week, etc. (>=1).
+    pub every_weeks: u32,
+    /// Weekday the window opens on, e.g. "saturday".
+    pub weekday: String,
+    /// Local time the window opens, "HH:MM".
+    pub time: String,
+    /// ISO date (YYYY-MM-DD) that week-0 is counted from, so `every_weeks`
+    /// cadence is stable across restarts. Any date on the intended cadence.
+    pub anchor_date: String,
+    /// Hard cap on how long the pool stays awake after opening, even if work
+    /// has not drained (guards against a stuck task pinning the disk on).
+    pub max_window_minutes: u64,
+}
+
+impl Default for WakeSchedule {
+    fn default() -> Self {
+        Self {
+            every_weeks: 1,
+            weekday: "saturday".to_string(),
+            time: "10:00".to_string(),
+            anchor_date: "2026-01-03".to_string(), // a Saturday
+            max_window_minutes: 12 * 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +326,7 @@ impl Default for AppConfig {
             machines: vec![MachineConfig::local()],
             source_groups: Vec::new(),
             sync_order: Vec::new(),
+            standby_pools: Vec::new(),
             deploy: DeployConfig::default(),
         }
     }

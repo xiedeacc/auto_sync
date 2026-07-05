@@ -3028,6 +3028,48 @@ fn sync_cycle_for_source_inner(
             continue;
         }
 
+        // Cold-backup standby: if this source or destination lives on a pool
+        // that is parked (outside its wake window), hold the target so the work
+        // backlogs and the disk stays asleep. When the pool IS awake this also
+        // refuses to run if the pool root is not a real mount — otherwise a
+        // "sync" would read an empty tree and mirror-delete the whole backup.
+        if !cfg.standby_pools.is_empty() {
+            let roots = [source.src.as_path(), dst.path.as_path()];
+            match crate::core::standby::gate_for_roots(
+                &cfg.standby_pools,
+                &roots,
+                chrono::Local::now(),
+            ) {
+                Ok(Some(gate)) => {
+                    all_verified = false;
+                    let not_mounted =
+                        matches!(gate, crate::core::standby::Gate::NotMounted { .. });
+                    if not_mounted {
+                        had_unblocked_failure = true;
+                    } else {
+                        blocked_count += 1;
+                    }
+                    state.upsert_destination_status(
+                        &source.id,
+                        &dst.id,
+                        None,
+                        if not_mounted { "red" } else { "yellow" },
+                        &gate.status_reason(),
+                    )?;
+                    continue;
+                }
+                Ok(None) => {}
+                // A malformed wake schedule must not wedge backups shut; log and
+                // proceed rather than block on a config parse error.
+                Err(err) => warn!(
+                    source = source.id,
+                    destination = dst.id,
+                    error = %err,
+                    "standby gate evaluation failed; proceeding"
+                ),
+            }
+        }
+
         let dst_endpoint =
             match DestinationEndpoint::resolve(&live_source_endpoint, dst).and_then(|endpoint| {
                 endpoint.check_online()?;

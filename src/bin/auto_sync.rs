@@ -828,6 +828,14 @@ fn run_scheduler(
             error!(error = %err, "sync pending cycles failed");
         }
 
+        // Standby lifecycle: open/close each cold-backup pool's wake window and
+        // spin its disks down when it closes. Never park while any sync is in
+        // flight (coarse but safe: don't stop a disk mid-write).
+        if !cfg.standby_pools.is_empty() {
+            let syncing = auto_sync::core::sync::sync_is_running();
+            auto_sync::core::standby::tick(&cfg.standby_pools, |_pool| syncing);
+        }
+
         if last_status_log.elapsed() >= Duration::from_secs(cfg.app.status_log_interval_secs) {
             log_destination_status(&state, &cfg);
             last_status_log = Instant::now();

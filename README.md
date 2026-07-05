@@ -175,6 +175,7 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 | `state.rs` | SQLite 状态库：cycle、offset、event_log、destination_issue、task_log 的读写与恢复。 |
 | `storage.rs` | SQLite 连接、PRAGMA、schema 初始化与迁移。 |
 | `scheduler.rs` | daily/weekly 周期计算，判断每个目标的 schedule 是否到期。 |
+| `standby.rs` | 冷备盘 standby：唤醒窗口计算、按挂载根匹配任务、挂载安全校验、`hdparm -Y` 停转。 |
 | `sync/mod.rs` | 同步引擎核心：Full/Incremental 计划与执行、双树扫描、拷贝/删除/校验、跨机传输、暂停语义。 |
 | `sync/delta.rs` | rsync 式 block delta 算法。 |
 | `watcher/fanotify.rs` | Linux fanotify 监听（FID/name 模式、懒加载 handle 解析、overflow 处理）。 |
@@ -206,7 +207,18 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 **跨机传输**：源/目标清单、批量 mkdir、批量 remove、文件推送都通过 peer HTTP transfer API 执行。本机 ZFS 源先创建 snapshot 只读视图供读取；目标有已验证基准快照时优先 `zfs diff` 增量。传输细节见[性能优化点](#性能优化点)。
 
-**回收站与临时目录**：mirror 删除统一进 `.auto_sync_trash/<cycle>/`，通过校验后按 `sync.trash_keep_days`（默认 30 天，0=永久）清理；临时文件写 `.auto_sync_tmp/<cycle>/`，完成后 fsync + 原子 rename，非当前 cycle 残留 7 天后清扫。`.auto_sync_*` 内部目录永不进入 diff 并集、清单或 mirror 删除集。
+**回收站与临时目录**：mirror 删除统一进 `.auto_sync_trash/<cycle>/`，通过校验后按 `sync.trash_keep_days`（默认 30 天，0=永久）清理；临时文件写 `.auto_sync_tmp/<cycle>/`，完成后 fsync + 原子 rename，非当前 cycle 残留 7 天后清扫。`.auto_sync_*` 内部目录永不进入 diff 并集、清单或 mirror 删除集，且**源、目标两侧遍历都剪掉**（源本身也可能是别处的目标而积累了 `.auto_sync_trash`）。
+
+### 磁盘 standby（冷备盘定时唤醒）
+
+顶层配置 `standby_pools`：把冷备 HDD 池设成"只在计划窗口内唤醒"，窗口外的一切 sync/compare/full 都被推迟（任务积压），盘保持停转。为空时功能完全休眠，所有盘始终可用。
+
+每个池：`name`、`mount_roots`（该池的挂载根，任务的源或目标落在其下即受门控）、`devices`（`/dev/disk/by-id/...`，用于 `hdparm -Y` 停转）、`active_spindown`（true 才主动停转，否则只推迟任务、停转交给系统 `hdparm -S`）、`wake`（`every_weeks` 周期 + `weekday` + `time` + `anchor_date` 计数锚点 + `max_window_minutes` 窗口上限）。
+
+- **门控**：`sync_cycle_for_source` 在处理每个目标前调用 `standby::gate_for_roots`；池不在唤醒窗口 → 目标置 `yellow` 并附原因 `disk <pool> in standby until <下次唤醒>`，不执行、不失败，等下个窗口批量补齐（与 paused / waiting_for_compare 同一套"挂起"机制）。
+- **挂载安全**：池处于唤醒窗口时，还会校验其 `mount_roots` 确实是挂载点（`st_dev` 与父目录不同）。若池未导入、`/zfs` 只是根文件系统上的空壳目录 → 置 `red: disk <pool> not mounted`，**拒绝同步**，杜绝"读到空树把整份备份镜像删光"。
+- **多池依赖免特判**：`/zfs→/zfs_pool` 同时触及两个池，只有两者都在窗口内才跑。让 `/zfs` 每周唤醒、`/zfs_pool` 每 4 周在同一天唤醒，则每 4 周两者重叠时该任务才执行，其余周只跑写入 `/zfs` 的任务。
+- **停转时机**：调度循环每 tick 驱动 `standby::tick`，窗口 open→close 且当前无 sync 在跑时，对该池 `devices` 执行 `hdparm -Y`（不在写入中途停盘）。
 
 ### 任务类型与并发
 
