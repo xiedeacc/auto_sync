@@ -2516,7 +2516,7 @@ function renderDestinationLogModal() {
     ["Type", infoTypeLabel(source, dst, runtime, dstLogTask)],
     ["Phase", infoPhaseLabel(source, dst, runtime, transfer, scan)],
     ["Snapshot", infoSnapshotLabel(source, dst, transfer, scan)],
-    ["Summary", infoSummaryLabel(source, dst, report, dstLogTask)],
+    ["Summary", infoSummaryLabel(source, dst, report, dstLogTask, scan)],
   ];
   el.dstLogSummary.textContent = "";
   el.dstLogList.innerHTML = rows.map(([key, value]) => `
@@ -2601,9 +2601,25 @@ function infoSnapshotLabel(source, dst, transfer, scan) {
 //    (e.g. a cross-machine compare with no report cached locally).
 //  - Sync: how many files were synced, and — since the task log's `differences`
 //    column carries the failed-file count for a sync — how many failed.
-function infoSummaryLabel(source, dst, report, task) {
+function infoSummaryLabel(source, dst, report, task, scan) {
   const act = dstActivity(source, dst);
-  const isCompare = act.scope === "compare" || (task && task.kind === "compare");
+  // A task is running RIGHT NOW: show live progress, never a prior result.
+  // The cached report / last task row is from the PREVIOUS run and stays
+  // stale until this run finishes — showing its "0 differences" mid-compare
+  // is exactly the bug this guards against.
+  if (act.active) {
+    if (act.scope === "compare") {
+      const entries = scan ? Number(scan.entries_seen || 0) : 0;
+      return entries > 0
+        ? `comparing… ${entries} entries compared so far`
+        : "comparing… (waiting for result)";
+    }
+    if (act.scope === "sync") {
+      return "syncing…";
+    }
+    return "running…";
+  }
+  const isCompare = (task && task.kind === "compare") || (!task && Boolean(report));
   if (isCompare && report) {
     if (report.error) {
       return `compare failed: ${report.error}`;
@@ -2625,7 +2641,11 @@ function infoSummaryLabel(source, dst, report, task) {
   }
   if (task) {
     if (task.status === "running") {
-      return "running…";
+      // Cross-machine: dstActivity may not see a remote walk, but the task log
+      // (authoritative) does — still never show a stale prior result.
+      return task.kind === "compare"
+        ? "comparing… (waiting for result)"
+        : "syncing…";
     }
     if (task.kind === "compare") {
       if (task.error) return `compare failed: ${task.error}`;
