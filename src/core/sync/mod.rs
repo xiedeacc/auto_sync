@@ -7772,14 +7772,23 @@ fn sorted_read_dir(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn should_visit_path(root: &Path, path: &Path, mode: SnapshotMode, excludes: &[PathBuf]) -> bool {
-    if matches!(mode, SnapshotMode::Source) {
-        return !entry_is_excluded(root, path, excludes);
-    }
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_default();
-    name != INTERNAL_TMP && name != INTERNAL_TRASH && name != INTERNAL_PROBE
+    // auto_sync's own bookkeeping dirs (trash/tmp/probe) are never user data and
+    // must be pruned on BOTH sides of the walk. A source that is itself another
+    // mapping's destination accumulates `.auto_sync_trash`; without this the
+    // source walk treats the recycle bin as content to replicate, and — because
+    // the destination walk hides it — every one of those entries shows up as a
+    // `to_add` difference that no sync or repair can ever clear.
+    if name == INTERNAL_TMP || name == INTERNAL_TRASH || name == INTERNAL_PROBE {
+        return false;
+    }
+    if matches!(mode, SnapshotMode::Source) {
+        return !entry_is_excluded(root, path, excludes);
+    }
+    true
 }
 
 /// True when the relative path is (or lives under) one of auto_sync's own
@@ -9068,6 +9077,33 @@ mod tests {
         let paths: Vec<String> = snapshot.into_iter().map(|entry| entry.rel_path).collect();
 
         assert_eq!(paths, vec!["a", "b.txt", "a/deep.txt"]);
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn source_walk_prunes_auto_sync_internal_dirs() {
+        // A source that is itself another mapping's destination accumulates
+        // `.auto_sync_trash`. It must never enter a source snapshot, or every
+        // trash entry becomes a `to_add` the destination lacks and no sync can
+        // clear (the real /zfs → /zfs_pool "14147 phantom differences" bug).
+        let temp = temp_dir("source_walk_prunes_internal");
+        let src = temp.join("src");
+        fs::create_dir_all(src.join("keep")).unwrap();
+        fs::write(src.join("keep").join("real.txt"), b"real").unwrap();
+        fs::create_dir_all(src.join(INTERNAL_TRASH).join("57")).unwrap();
+        fs::write(src.join(INTERNAL_TRASH).join("57").join("gone.jpg"), b"x").unwrap();
+        fs::create_dir_all(src.join(INTERNAL_TMP)).unwrap();
+        fs::write(src.join(INTERNAL_PROBE), b"p").unwrap();
+
+        let snapshot =
+            take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap();
+        let paths: Vec<String> = snapshot.into_iter().map(|entry| entry.rel_path).collect();
+
+        assert_eq!(paths, vec!["keep", "keep/real.txt"]);
+        assert!(
+            !paths.iter().any(|p| p.starts_with(".auto_sync")),
+            "internal dirs leaked into source snapshot: {paths:?}"
+        );
         fs::remove_dir_all(temp).ok();
     }
 

@@ -2713,9 +2713,12 @@ function infoSummaryLabel(source, dst, report, task, scan, runtime) {
     if (report.to_delete) parts.push(`−${report.to_delete}`);
     if (report.type_mismatch) parts.push(`!${report.type_mismatch}`);
     if (report.metadata) parts.push(`#${report.metadata}`);
+    // `matched` and `total` are disjoint sets, so the number of entries actually
+    // compared is their sum — spell it out, or "1063833 matched" reads as if the
+    // whole tree were 1063833 (the 14147 differing entries are NOT in it).
     const note = scoped
       ? (checked > 0 ? ` of ${checked} changed paths` : "")
-      : (matched > 0 ? `, ${matched} matched` : "");
+      : (matched > 0 ? ` · ${matched} / ${matched + total} matched` : "");
     return `${total} difference${total === 1 ? "" : "s"} (${parts.join(" ")})${note}`;
   }
   if (task) {
