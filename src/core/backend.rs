@@ -23,7 +23,9 @@ use crate::core::progress::{
     current_scan_progresses, current_transfer_progress,
 };
 use crate::core::state::{DestinationView, ScanReport, State as DbState};
-use crate::core::sync::{SyncRequestMode, current_sync_kind, current_sync_phase, sync_is_running};
+use crate::core::sync::{
+    SyncRequestMode, current_sync_kind, current_sync_phase, current_sync_plan, sync_is_running,
+};
 
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MANUAL_DISCOVERY_MIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -318,6 +320,9 @@ impl Backend {
             syncing: sync_is_running(),
             sync_kind: current_sync_kind(),
             sync_phase: current_sync_phase(),
+            sync_plan: current_sync_plan().map(|(total, to_copy, matched, done)| {
+                [total, to_copy, matched, done]
+            }),
             transfer: current_transfer_progress(),
             scan: current_scan_progress(),
             scans: current_scan_progresses(),
@@ -1393,6 +1398,11 @@ pub struct RuntimeStatus {
     /// "verifying", "preparing"); `None` when idle or served by an old peer.
     #[serde(default)]
     pub sync_phase: Option<String>,
+    /// Live file-count progress of the running sync: `[total, to_copy, matched,
+    /// done]`. `None` when idle, before the plan is known, or served by an old
+    /// peer. Lets the UI show "synced X / Y · Z unchanged (N total)".
+    #[serde(default)]
+    pub sync_plan: Option<[u64; 4]>,
     pub transfer: Option<TransferProgressView>,
     /// The most recently updated walk (single-slot status-bar display).
     pub scan: Option<ScanProgressView>,

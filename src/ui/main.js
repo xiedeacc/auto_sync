@@ -2528,7 +2528,7 @@ function renderDestinationLogModal() {
     ["Type", infoTypeLabel(source, dst, runtime, dstLogTask)],
     ["Phase", infoPhaseLabel(source, dst, runtime, transfer, scan, dstLogTask)],
     ["Snapshot", infoSnapshotLabel(source, dst, transfer, scan)],
-    ["Summary", infoSummaryLabel(source, dst, report, dstLogTask, scan)],
+    ["Summary", infoSummaryLabel(source, dst, report, dstLogTask, scan, runtime)],
   ];
   el.dstLogSummary.textContent = "";
   el.dstLogList.innerHTML = rows.map(([key, value]) => `
@@ -2658,7 +2658,18 @@ function infoSnapshotLabel(source, dst, transfer, scan) {
 //    (e.g. a cross-machine compare with no report cached locally).
 //  - Sync: how many files were synced, and — since the task log's `differences`
 //    column carries the failed-file count for a sync — how many failed.
-function infoSummaryLabel(source, dst, report, task, scan) {
+// Live file-count progress of a running sync, from runtime.sync_plan
+// ([total, to_copy, matched, done]). Empty string when no plan is published yet
+// (still scanning/preparing) so the caller falls back to "syncing…".
+function syncProgressLabel(runtime) {
+  const plan = runtime && runtime.sync_plan;
+  if (!Array.isArray(plan) || plan.length < 4) return "";
+  const [total, toCopy, matched, done] = plan.map((n) => Number(n) || 0);
+  if (total === 0 && toCopy === 0 && matched === 0) return "";
+  return `synced ${done} / ${toCopy} to copy · ${matched} unchanged (${total} total)`;
+}
+
+function infoSummaryLabel(source, dst, report, task, scan, runtime) {
   const act = dstActivity(source, dst);
   // A task is running RIGHT NOW: show live progress, never a prior result.
   // The cached report / last task row is from the PREVIOUS run and stays
@@ -2672,7 +2683,7 @@ function infoSummaryLabel(source, dst, report, task, scan) {
         : "comparing… (waiting for result)";
     }
     if (act.scope === "sync") {
-      return "syncing…";
+      return syncProgressLabel(runtime) || "syncing…";
     }
     return "running…";
   }
@@ -2713,7 +2724,7 @@ function infoSummaryLabel(source, dst, report, task, scan) {
       // (authoritative) does — still never show a stale prior result.
       return task.kind === "compare"
         ? "comparing… (waiting for result)"
-        : "syncing…";
+        : (syncProgressLabel(runtime) || "syncing…");
     }
     if (task.kind === "compare") {
       if (task.error) return `compare failed: ${task.error}`;

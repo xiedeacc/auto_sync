@@ -64,6 +64,9 @@ static SYNC_KIND: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 /// "scanning", "transferring", "verifying"). Surfaced in the UI Info panel so a
 /// long-running task shows WHAT it is doing right now, not just that it is busy.
 static SYNC_PHASE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// Live file-count progress (total / to-copy / matched / done) of the running
+/// pass; see [`SyncPlan`].
+static SYNC_PLAN: OnceLock<Mutex<Option<Arc<SyncPlan>>>> = OnceLock::new();
 static TRANSFER_MEMORY: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
 
 fn transfer_memory() -> &'static (Mutex<u64>, Condvar) {
@@ -163,6 +166,58 @@ fn set_sync_phase(phase: &str) {
     *sync_phase_lock().lock().unwrap_or_else(|err| err.into_inner()) = Some(phase.to_string());
 }
 
+/// Live file-count progress for the pass currently holding the sync gate. Set
+/// once the reconcile plan is known (after the two-tree diff), so the UI can
+/// show "synced X / Y to copy · Z unchanged (N total)" during a long Full
+/// instead of a bare "syncing…". `done` is bumped by the transfer workers.
+/// A plain global (like `SYNC_PHASE`) so `runtime_status` can read it off the
+/// web thread; cleared by `SyncPhaseReset` when the pass unwinds.
+struct SyncPlan {
+    total: u64,
+    to_copy: u64,
+    matched: u64,
+    done: AtomicU64,
+}
+
+fn sync_plan_lock() -> &'static Mutex<Option<Arc<SyncPlan>>> {
+    SYNC_PLAN.get_or_init(|| Mutex::new(None))
+}
+
+fn set_sync_plan(total: u64, to_copy: u64, matched: u64) {
+    *sync_plan_lock().lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::new(SyncPlan {
+        total,
+        to_copy,
+        matched,
+        done: AtomicU64::new(0),
+    }));
+}
+
+fn sync_plan_add_done(count: u64) {
+    if let Some(plan) = sync_plan_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+    {
+        plan.done.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+/// `(total, to_copy, matched, done)` for the running pass, if a plan is set.
+pub fn current_sync_plan() -> Option<(u64, u64, u64, u64)> {
+    sync_plan_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .map(|plan| {
+            (
+                plan.total,
+                plan.to_copy,
+                plan.matched,
+                plan.done.load(Ordering::Relaxed),
+            )
+        })
+}
+
 struct SyncPhaseReset;
 
 impl SyncPhaseReset {
@@ -174,6 +229,7 @@ impl SyncPhaseReset {
 impl Drop for SyncPhaseReset {
     fn drop(&mut self) {
         *sync_phase_lock().lock().unwrap_or_else(|err| err.into_inner()) = None;
+        *sync_plan_lock().lock().unwrap_or_else(|err| err.into_inner()) = None;
     }
 }
 
@@ -4230,6 +4286,14 @@ fn sync_directory_with_transfer(
             )
         })
         .collect();
+    // Publish the plan so the UI can show live "synced X / Y to copy · Z
+    // unchanged (N total)" during the transfer (a big Full is otherwise a long
+    // silent "syncing…").
+    set_sync_plan(
+        source_snapshot.len() as u64,
+        pending.len() as u64,
+        diff.in_sync,
+    );
     let transfer_started = Instant::now();
     let outcome = push_entries_parallel(
         source_machine_id,
@@ -5524,6 +5588,7 @@ fn push_entries_parallel(
     }
     let transferred = done.load(Ordering::Relaxed) as usize;
     cancel::add_synced_files(transferred as u64);
+    sync_plan_add_done(transferred as u64);
     let failed = failed.into_inner().unwrap_or_else(|err| err.into_inner());
     cancel::add_failed_files(failed.len() as u64);
     Ok(TransferOutcome {
@@ -5644,6 +5709,7 @@ fn copy_entries_parallel(
     }
     let transferred = done.load(Ordering::Relaxed) as usize;
     cancel::add_synced_files(transferred as u64);
+    sync_plan_add_done(transferred as u64);
     let failed = failed.into_inner().unwrap_or_else(|err| err.into_inner());
     cancel::add_failed_files(failed.len() as u64);
     Ok(TransferOutcome {
