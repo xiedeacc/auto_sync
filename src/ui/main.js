@@ -2514,7 +2514,7 @@ function renderDestinationLogModal() {
     ["Status", destinationStatusText(status)],
     ["Cycle", cycleDisplay(status)],
     ["Type", infoTypeLabel(source, dst, runtime, dstLogTask)],
-    ["Phase", infoPhaseLabel(source, dst, runtime, transfer, scan)],
+    ["Phase", infoPhaseLabel(source, dst, runtime, transfer, scan, dstLogTask)],
     ["Snapshot", infoSnapshotLabel(source, dst, transfer, scan)],
     ["Summary", infoSummaryLabel(source, dst, report, dstLogTask, scan)],
   ];
@@ -2542,9 +2542,14 @@ function infoTypeLabel(source, dst, runtime, task) {
 // progress is authoritative when present (a walk or a file copy is definitely
 // happening); otherwise fall back to the engine's coarse phase flag, which
 // covers the stages that emit no progress (zfs diff, verifying, preparing).
-function infoPhaseLabel(source, dst, runtime, transfer, scan) {
+// `task` is the authoritative task-log row (cross-machine): a remote-executing
+// task (e.g. a NAS sync viewed from the controller) is invisible to the local
+// runtime-scan detection, so without it a long silent stage (a multi-minute
+// `zfs diff`) would show "-" the whole time.
+function infoPhaseLabel(source, dst, runtime, transfer, scan, task) {
   const act = dstActivity(source, dst);
-  if (!act.active) {
+  const taskRunning = Boolean(task && task.status === "running");
+  if (!act.active && !taskRunning) {
     return "-";
   }
   if (transfer) {
@@ -2557,7 +2562,10 @@ function infoPhaseLabel(source, dst, runtime, transfer, scan) {
   if (phase) {
     return phaseLabel(phase);
   }
-  return act.scope === "compare" ? "Comparing" : "Preparing";
+  // Running but no local detail (a remote task with no phase relayed): fall
+  // back to the task kind so the row still reads as active, not "-".
+  const isCompare = act.scope === "compare" || (task && task.kind === "compare");
+  return isCompare ? "Comparing" : "Syncing";
 }
 
 function phaseLabel(phase) {
@@ -2673,7 +2681,13 @@ function infoSummaryLabel(source, dst, report, task, scan) {
     if (synced > 0) {
       return `${synced} file${synced === 1 ? "" : "s"} synced`;
     }
-    return task.status === "success" ? "no changes" : (task.status || "-");
+    if (task.status === "cancelled" || task.status === "aborted") {
+      return task.status;
+    }
+    // Succeeded but copied nothing: the destination already matched every
+    // reconciled path (e.g. an incremental that advanced the cycle but found
+    // all files already in place). Say so plainly rather than "no changes".
+    return task.status === "success" ? "0 files copied" : (task.status || "-");
   }
   return "-";
 }
