@@ -493,7 +493,7 @@ curl -s -X POST http://127.0.0.1:18765/api/sync-destination-now \
 ssh -p 10022 root@192.168.2.247 "cd /opt/auto_sync && git pull --ff-only && scripts/deploy_local.sh --install-dir /opt/auto_sync"
 ```
 
-systemd unit 由 `auto_syncctl print-systemd` 生成（不在 `conf/` 里）。fanotify 需较高权限：daemon 需 `CAP_DAC_READ_SEARCH`（懒加载 handle 解析）与 `CAP_SYS_ADMIN`（filesystem mark），同步只读目录还需 `CAP_DAC_OVERRIDE`，unit 已授予。
+systemd unit 由 `auto_syncctl print-systemd` 生成（不在 `conf/` 里）。fanotify 需较高权限：daemon 需 `CAP_DAC_READ_SEARCH`（懒加载 handle 解析）与 `CAP_SYS_ADMIN`（filesystem mark），同步只读目录还需 `CAP_DAC_OVERRIDE`；磁盘 standby 主动停转（`hdparm -y` 的 `HDIO_DRIVE_CMD` ioctl）需 `CAP_SYS_RAWIO`（`CAP_SYS_ADMIN` 不够）。unit 均已授予。
 
 ---
 
