@@ -5843,12 +5843,27 @@ impl ZfsSnapshot {
 /// produced (base snapshot missing, command failed) so the caller falls back to
 /// a full reconcile. `zfs diff` is authoritative, so a successful diff is a
 /// complete list of changed/added/removed/renamed paths.
+/// A Phase label for a running `zfs diff` that names the cycle span it covers
+/// (parsed from the snapshot names, `…_000000000057` → 57). A diff's cost is
+/// proportional to how many cycles separate the base from the target, so
+/// surfacing "zfs diff 57→85" makes a slow catch-up self-explaining instead of
+/// looking frozen. Falls back to plain "zfs diff" when the names don't parse.
+fn zfs_diff_phase_label(base_full_name: &str, new_full_name: &str) -> String {
+    let cycle_of = |name: &str| -> Option<i64> {
+        name.rsplit('_').next().and_then(|tail| tail.parse::<i64>().ok())
+    };
+    match (cycle_of(base_full_name), cycle_of(new_full_name)) {
+        (Some(base), Some(to)) if base != to => format!("zfs diff {base}→{to}"),
+        _ => "zfs diff".to_string(),
+    }
+}
+
 fn zfs_diff_changed_paths(
     base_full_name: &str,
     new_full_name: &str,
     source_live_root: &Path,
 ) -> Option<Vec<DiffPath>> {
-    set_sync_phase("zfs diff");
+    set_sync_phase(&zfs_diff_phase_label(base_full_name, new_full_name));
     if base_full_name == new_full_name {
         return Some(Vec::new());
     }
@@ -9721,6 +9736,27 @@ mod tests {
         assert_eq!(manual_full_rescan, 1);
 
         fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn zfs_diff_phase_label_reports_the_cycle_span() {
+        assert_eq!(
+            zfs_diff_phase_label(
+                "ssd@auto_sync_src_4_000000000057",
+                "ssd@auto_sync_src_4_000000000085"
+            ),
+            "zfs diff 57→85"
+        );
+        // Same base and target (nothing to catch up): plain label.
+        assert_eq!(
+            zfs_diff_phase_label(
+                "ssd@auto_sync_src_4_000000000085",
+                "ssd@auto_sync_src_4_000000000085"
+            ),
+            "zfs diff"
+        );
+        // Unparseable names fall back gracefully.
+        assert_eq!(zfs_diff_phase_label("weird", "names"), "zfs diff");
     }
 
     #[test]
