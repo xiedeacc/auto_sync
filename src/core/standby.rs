@@ -226,10 +226,13 @@ pub fn spin_down_devices(pool: &StandbyPoolConfig) {
     for dev in &pool.devices {
         #[cfg(target_os = "linux")]
         {
-            match std::process::Command::new("hdparm").arg("-Y").arg(dev).status() {
+            // `-y` = STANDBY (spins down, auto-wakes on the next I/O). NOT `-Y`
+            // (SLEEP), which is lower power but can require a bus reset to wake —
+            // unsafe for a pool that must come back on the next scheduled access.
+            match std::process::Command::new("hdparm").arg("-y").arg(dev).status() {
                 Ok(s) if s.success() => info!(pool = pool.name, device = dev, "spun down disk"),
-                Ok(s) => warn!(pool = pool.name, device = dev, code = ?s.code(), "hdparm -Y failed"),
-                Err(e) => warn!(pool = pool.name, device = dev, error = %e, "hdparm -Y errored"),
+                Ok(s) => warn!(pool = pool.name, device = dev, code = ?s.code(), "hdparm -y failed"),
+                Err(e) => warn!(pool = pool.name, device = dev, error = %e, "hdparm -y errored"),
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -272,16 +275,20 @@ impl StandbyManager {
     ) {
         for pool in pools.iter().filter(|p| p.enabled) {
             let open = is_within_wake_window(now, &pool.wake).unwrap_or(false);
-            let was = self.awake.get(&pool.name).copied().unwrap_or(false);
-            if open && !was {
-                info!(pool = pool.name, "wake window opened");
-                self.awake.insert(pool.name.clone(), true);
-            } else if !open && was {
-                // Don't park a disk mid-write; retry next tick once it's idle.
+            let prev = self.awake.get(&pool.name).copied();
+            if open {
+                if prev != Some(true) {
+                    info!(pool = pool.name, "wake window opened");
+                    self.awake.insert(pool.name.clone(), true);
+                }
+            } else if prev != Some(false) {
+                // Outside the window and not already parked. `prev == None` on a
+                // fresh start (restart wakes the disk), so park it now rather than
+                // waiting for a transition that never comes. Never park mid-write.
                 if busy(&pool.name) {
                     continue;
                 }
-                info!(pool = pool.name, "wake window closed; parking disk");
+                info!(pool = pool.name, "outside wake window; parking disk");
                 spin_down_devices(pool);
                 self.awake.insert(pool.name.clone(), false);
             }

@@ -7866,9 +7866,32 @@ fn entry_is_excluded(root: &Path, path: &Path, excludes: &[PathBuf]) -> bool {
 }
 
 fn is_rel_excluded(rel: &Path, excludes: &[PathBuf]) -> bool {
-    excludes
+    excludes.iter().any(|exclude| {
+        if exclude.as_os_str().to_string_lossy().contains('*') {
+            glob_segment_prefix_match(rel, exclude)
+        } else {
+            rel == exclude || rel.starts_with(exclude)
+        }
+    })
+}
+
+/// Prefix match with `*` as a single-path-segment wildcard, so a pattern like
+/// `*/cache` excludes `<any>/cache` and everything under it (used for
+/// per-account WeChat cache/temp dirs whose first segment varies). The pattern
+/// matches when every one of its segments matches the corresponding leading
+/// segment of `rel` (`*` matches any one segment); extra trailing `rel`
+/// segments are the excluded subtree.
+fn glob_segment_prefix_match(rel: &Path, pattern: &Path) -> bool {
+    let star = std::ffi::OsStr::new("*");
+    let rel_segs: Vec<_> = rel.iter().collect();
+    let pat_segs: Vec<_> = pattern.iter().collect();
+    if rel_segs.len() < pat_segs.len() {
+        return false;
+    }
+    pat_segs
         .iter()
-        .any(|exclude| rel == exclude || rel.starts_with(exclude))
+        .zip(&rel_segs)
+        .all(|(p, r)| *p == star || p == r)
 }
 
 fn copy_entry(
@@ -9160,6 +9183,27 @@ mod tests {
 
         assert_eq!(paths, vec!["a", "b.txt", "a/deep.txt"]);
         fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn rel_excludes_support_segment_glob_and_plain_prefix() {
+        let excludes = vec![
+            PathBuf::from("*/cache"),
+            PathBuf::from("*/temp"),
+            PathBuf::from("Backup/old"),
+        ];
+        // `*/cache` matches any account's cache dir and its subtree...
+        assert!(is_rel_excluded(Path::new("x774796_4d47/cache"), &excludes));
+        assert!(is_rel_excluded(Path::new("wxid_abc/cache/img/1.dat"), &excludes));
+        assert!(is_rel_excluded(Path::new("wxid_abc/temp/x"), &excludes));
+        // ...but not the precious dirs next to it.
+        assert!(!is_rel_excluded(Path::new("x774796_4d47/db_storage/c.db"), &excludes));
+        assert!(!is_rel_excluded(Path::new("x774796_4d47/msg/a"), &excludes));
+        // A top-level `cache` (no account segment) is NOT matched by `*/cache`.
+        assert!(!is_rel_excluded(Path::new("cache"), &excludes));
+        // Plain (non-glob) prefix still works.
+        assert!(is_rel_excluded(Path::new("Backup/old/f"), &excludes));
+        assert!(!is_rel_excluded(Path::new("Backup/new/f"), &excludes));
     }
 
     #[test]
