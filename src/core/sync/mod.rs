@@ -2809,7 +2809,15 @@ pub fn sync_cycle_for_source(
     // Full, not an event-replay Incremental. Labelling it "incremental" was
     // misleading in the Tasks list. The restart-notice check below still keys
     // off the untouched `kind` so only a manual Full clears it.
-    let log_kind = if kind == "incremental" && cycle_runs_full_reconcile(state, source, cycle) {
+    let log_kind = if kind == "repair_scan" && cycle.manual_full_rescan {
+        // A Compare-repair that escalated to a full reconcile because the stored
+        // report was truncated (a difference kind exceeded the per-kind cap, so
+        // the sample could not name every path). Record it as "repair_full" so
+        // the Tasks list and the Info panel agree and the escalation is visible
+        // — not a bare "Repair" (hiding that it went full) nor a bare "Full"
+        // (hiding what triggered it).
+        "repair_full"
+    } else if kind == "incremental" && cycle_runs_full_reconcile(state, source, cycle) {
         "full"
     } else {
         kind.as_str()

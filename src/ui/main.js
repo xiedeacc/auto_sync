@@ -2442,6 +2442,7 @@ function taskKindLabel(kind) {
     case "incremental": return "Incremental";
     case "full": return "Full";
     case "repair_scan": return "Repair";
+    case "repair_full": return "Repair → Full";
     default: return kind || "-";
   }
 }
@@ -2571,12 +2572,17 @@ function copyTextToClipboard(text) {
 }
 
 // Type: the running task's kind if one is active, else the last task's kind.
+// The authoritative task-log row (task) is preferred while a task runs so the
+// Info panel agrees with the Tasks list — e.g. a Compare-repair that escalated
+// to a full reconcile reads "Repair → Full" in both, not "Full" here and
+// "Repair" there. Falls back to the coarse runtime sync_kind only when the
+// task row is not yet available.
 function infoTypeLabel(source, dst, runtime, task) {
   const act = dstActivity(source, dst);
   if (act.active) {
-    return act.scope === "compare"
-      ? "Compare"
-      : (syncKindLabel(runtime && runtime.sync_kind) || "Sync");
+    if (act.scope === "compare") return "Compare";
+    if (task && task.status === "running") return taskKindLabel(task.kind);
+    return syncKindLabel(runtime && runtime.sync_kind) || "Sync";
   }
   return task ? taskKindLabel(task.kind) : "-";
 }

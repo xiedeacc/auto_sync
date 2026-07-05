@@ -202,7 +202,7 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 **Incremental（增量）** — 重放 event_log 中该目标自上次 verified cycle 以来的事件路径，只对这些路径做增量同步。积压中出现 `rescan_required`（overflow / USN gap）或目标从未完成首次全量时，自动退回完整 reconcile。
 
-**Compare（对账不同步）** — 只读比对，产出差异报告，不改动数据。同样有 `zfs diff` 快路径与全树回退。报告差异存在时目标行显示修复按钮（⇆），点击后只同步这些差异路径。
+**Compare（对账不同步）** — 只读比对，产出差异报告，不改动数据。同样有 `zfs diff` 快路径与全树回退。报告差异存在时目标行显示修复按钮（⇆），点击后只同步这些差异路径；若差异过多导致报告被截断，修复会自动升级为全量对账（见[任务类型与并发](#任务类型与并发)的 Repair → Full）。
 
 **跨机传输**：源/目标清单、批量 mkdir、批量 remove、文件推送都通过 peer HTTP transfer API 执行。本机 ZFS 源先创建 snapshot 只读视图供读取；目标有已验证基准快照时优先 `zfs diff` 增量。传输细节见[性能优化点](#性能优化点)。
 
@@ -217,9 +217,12 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 | **Full** | `full` | 手动 `Sync… → Full`；**目标首次同步**；事件丢失后的全量重扫 | 完整读源+目标两棵树、对账、只修差异。首次同步没有基准可增量，因此必然是 Full——即使由调度器自动发起。 |
 | **Incremental** | `incremental` | 调度器到点/事件、`Sync All`、源级 `Sync`、目标级 `Incremental`、realtime | 只重放 `event_log` 中该目标自上次 verified 以来的事件路径。缺基准时自动退回完整 reconcile。 |
 | **Compare** | `compare` | 手动 `Sync… → Compare` | 只读对账，产出差异报告，不改动数据。 |
-| **Repair** | `repair_scan` | 点目标行的修复按钮（⇆） | 只同步上一次 Compare 报告里的差异路径。 |
+| **Repair** | `repair_scan` | 点目标行的修复按钮（⇆） | 只同步上一次 Compare 报告里的差异路径（定点修复，不重扫整树）。 |
+| **Repair → Full** | `repair_full` | 点修复按钮（⇆），但报告被截断 | Repair 因差异过多被**升级为全量对账**（见下）。task_log 记 `repair_full`，Tasks 与 Info 都显示 `Repair → Full`——既保留触发动作（Repair），也表明实际执行（Full）。 |
 
 （历史类型 `startup_scan`、`changed_since` 已移除，不再产生。）
+
+**Repair 何时升级为 Full**：Compare 报告每个差异类别（新增/更新/删除/类型不符/权限）最多存 `SCAN_DIFF_PER_KIND_CAP = 200` 条样本。若**任一类别的真实差异数 > 200**，报告存不下全部、被标记 `truncated`。此时点修复,只修样本会漏掉其余，所以 `queue_scan_repair` **自动升级为完整 reconcile**（`mark_cycle_manual_full_rescan`）——即把这次 Repair 当 Full 跑，修复包括目标侧漂移在内的所有差异。全部类别都 ≤ 200 时才走定点 Repair。
 
 **并发保证：任何时刻，同一个 `源 → 目标` 对最多只有一个任务在运行**——自动触发还是手动触发都一样。由三重机制保证：
 
