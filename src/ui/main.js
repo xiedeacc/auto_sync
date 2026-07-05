@@ -361,6 +361,13 @@ function configEditInProgress() {
   if (busy || savingConfig) {
     return true;
   }
+  // An open editing modal holds a REFERENCE into the current cfg (its source
+  // object). Swapping cfg out from under it orphans that reference, so the
+  // user's edit (e.g. removing an exclude) saves to an object no longer in cfg
+  // and is silently lost. Never refresh cfg while one of these is open.
+  if (excludeEditor || scheduleEditor || dstSyncEditor || folderPicker) {
+    return true;
+  }
   const active = document.activeElement;
   if (!active) {
     return false;
