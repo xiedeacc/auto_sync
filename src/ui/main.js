@@ -1,6 +1,10 @@
 const invoke = invokeBackend;
 const STATUS_POLL_MS = 5000;
 const RUNTIME_STATUS_POLL_MS = 1000;
+// Re-fetch the config (source groups, schedules, machines) so changes made
+// elsewhere — another machine's UI, a delegated push, or a direct API edit —
+// show up in an already-open window instead of freezing at the load snapshot.
+const CONFIG_POLL_MS = 4000;
 
 let cfg = null;
 let statuses = [];
@@ -15,6 +19,10 @@ let statusPolling = false;
 let statusPollTimer = null;
 let runtimeStatusPollTimer = null;
 let runtimeStatusPolling = false;
+let configPollTimer = null;
+let configPolling = false;
+// True while saveConfig() is writing: never overwrite the model mid-save.
+let savingConfig = false;
 let folderPicker = null;
 let scheduleEditor = null;
 let excludeEditor = null;
@@ -340,6 +348,47 @@ function startStatusPolling() {
   }
   if (!runtimeStatusPollTimer) {
     runtimeStatusPollTimer = setInterval(refreshRuntimeStatusOnly, RUNTIME_STATUS_POLL_MS);
+  }
+  if (!configPollTimer) {
+    configPollTimer = setInterval(refreshConfigOnly, CONFIG_POLL_MS);
+  }
+}
+
+// A config edit lives in the DOM inputs until saveConfig() reads them, so
+// refreshing while the user is typing (or mid-save) would clobber it. Skip
+// then; otherwise adopt the backend config only when it actually differs.
+function configEditInProgress() {
+  if (busy || savingConfig) {
+    return true;
+  }
+  const active = document.activeElement;
+  if (!active) {
+    return false;
+  }
+  const tag = active.tagName;
+  return tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA";
+}
+
+async function refreshConfigOnly() {
+  if (configPolling || !cfg || configEditInProgress()) {
+    return;
+  }
+  configPolling = true;
+  try {
+    const next = await invoke("get_config");
+    normalizeConfig(next);
+    // Re-check after the await: the user may have started editing meanwhile.
+    if (configEditInProgress()) {
+      return;
+    }
+    if (JSON.stringify(next) !== JSON.stringify(cfg)) {
+      cfg = next;
+      render();
+    }
+  } catch (_error) {
+    // Transient fetch failure: keep the current view, try again next tick.
+  } finally {
+    configPolling = false;
   }
 }
 
@@ -3287,9 +3336,14 @@ function excludeCountLabel(source) {
 }
 
 async function saveConfig() {
-  updateCfgFromForm();
-  cfg = await invoke("save_config_command", { cfg });
-  await loadStatus();
+  savingConfig = true;
+  try {
+    updateCfgFromForm();
+    cfg = await invoke("save_config_command", { cfg });
+    await loadStatus();
+  } finally {
+    savingConfig = false;
+  }
 }
 
 async function autoSaveConfig() {
@@ -3568,6 +3622,14 @@ window.addEventListener("error", (event) => {
 });
 window.addEventListener("unhandledrejection", (event) => {
   setMessage(String(event.reason || "Unhandled promise rejection"));
+});
+
+// Returning to the window (or a background tab becoming visible) is the moment
+// the user most expects to see current config; refresh right away, not just on
+// the next poll tick.
+window.addEventListener("focus", () => refreshConfigOnly());
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshConfigOnly();
 });
 
 loadAll().catch((error) => setMessage(String(error)));
