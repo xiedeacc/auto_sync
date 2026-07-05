@@ -1,6 +1,6 @@
 //! Cold-backup disk standby: gate sync/compare/full work so a pool's disks
-//! stay parked outside a scheduled wake window, and spin them down when the
-//! window closes.
+//! stay parked outside a scheduled wake window, and spin them down both when
+//! the window closes AND as soon as the window's backlog has drained.
 //!
 //! The engine calls [`gate_for_roots`] before touching a (source, dest) pair:
 //! if any [`StandbyPoolConfig`] whose `mount_roots` cover either root is
@@ -8,8 +8,15 @@
 //! awake, [`verify_pool_mounted`] guards against the catastrophic case where a
 //! pool root exists as a bare directory because the pool is not actually
 //! imported — syncing then would read an empty tree and mirror-delete the
-//! backup. The daemon drives [`StandbyManager`] each tick to open/close windows
-//! and issue `hdparm -Y` on close.
+//! backup.
+//!
+//! The daemon drives [`StandbyManager`] each tick with a `busy(pool)` predicate
+//! (a sync is running that touches the pool, or pending work whose every pool is
+//! in-window still needs it). A pool is parked when it is idle AND either
+//! outside its window or, inside the window, idle past a short grace — so a disk
+//! re-parks minutes after its backlog drains rather than idling out the whole
+//! window. A chained backup (e.g. `/zfs→/zfs_pool`) keeps `/zfs` awake via the
+//! same predicate for as long as that runnable pending work exists.
 //!
 //! Entirely dormant until [`AppConfig::standby_pools`] is non-empty.
 
@@ -243,11 +250,19 @@ pub fn spin_down_devices(pool: &StandbyPoolConfig) {
     }
 }
 
-/// Tracks each pool's awake/asleep state across ticks so the manager can fire a
-/// single spin-down on the awake→asleep transition.
+/// How long a pool must stay idle (no running or pending-runnable work) inside
+/// its wake window before it is parked early. Bridges the brief gaps between a
+/// window opening and the scheduler queuing the first sync, and between
+/// consecutive cycles, so a burst of work isn't split by a premature spin-down.
+const PARK_IDLE_GRACE_SECS: i64 = 90;
+
+/// Tracks each pool's awake/asleep state across ticks so the manager fires a
+/// single spin-down on the awake→asleep transition, plus when each pool most
+/// recently went idle (to park early once its backlog has drained).
 #[derive(Default)]
 pub struct StandbyManager {
     awake: HashMap<String, bool>,
+    idle_since: HashMap<String, DateTime<Local>>,
 }
 
 static MANAGER: OnceLock<Mutex<StandbyManager>> = OnceLock::new();
@@ -276,19 +291,37 @@ impl StandbyManager {
         for pool in pools.iter().filter(|p| p.enabled) {
             let open = is_within_wake_window(now, &pool.wake).unwrap_or(false);
             let prev = self.awake.get(&pool.name).copied();
-            if open {
+
+            // `busy` = a sync is running that touches this pool, OR there is
+            // pending work whose (source, dest) pools are ALL in their windows
+            // (so it can actually run now). A pool stays awake while busy — this
+            // is what keeps /zfs up for src_2 (/zfs→/zfs_pool) on the 4-weekly
+            // Saturday when /zfs_pool is also open, even after /zfs's own
+            // dest-side backlog (src_4/src_5) has drained.
+            if busy(&pool.name) {
+                self.idle_since.remove(&pool.name);
                 if prev != Some(true) {
-                    info!(pool = pool.name, "wake window opened");
+                    info!(pool = pool.name, open, "pool active; kept awake");
                     self.awake.insert(pool.name.clone(), true);
                 }
-            } else if prev != Some(false) {
-                // Outside the window and not already parked. `prev == None` on a
-                // fresh start (restart wakes the disk), so park it now rather than
-                // waiting for a transition that never comes. Never park mid-write.
-                if busy(&pool.name) {
-                    continue;
+                continue;
+            }
+
+            // Idle. Record when idleness began and park once it has persisted.
+            let idle_start = *self.idle_since.entry(pool.name.clone()).or_insert(now);
+            let idle_enough = now - idle_start >= Duration::seconds(PARK_IDLE_GRACE_SECS);
+            // Park when OUTSIDE the window (respect the schedule; `prev == None`
+            // on a fresh start parks immediately since the restart woke the disk),
+            // OR INSIDE the window once the backlog has drained and stayed idle
+            // past the grace — so the disk re-parks minutes after finishing, not
+            // at the far end of a 24h window.
+            let should_park = !open || idle_enough;
+            if should_park && prev != Some(false) {
+                if open {
+                    info!(pool = pool.name, "backlog drained; parking disk (still in window)");
+                } else {
+                    info!(pool = pool.name, "outside wake window; parking disk");
                 }
-                info!(pool = pool.name, "outside wake window; parking disk");
                 spin_down_devices(pool);
                 self.awake.insert(pool.name.clone(), false);
             }
@@ -379,6 +412,50 @@ mod tests {
         // A task entirely off the pool (/opt -> /opt) is never gated.
         assert!(gate_for_roots(&pools, &[Path::new("/opt/a"), Path::new("/opt/b")],
                                at(2026, 1, 5, 12, 0)).unwrap().is_none());
+    }
+
+    #[test]
+    fn parks_early_inside_window_once_backlog_drains() {
+        let pool = StandbyPoolConfig {
+            name: "zfs".into(),
+            mount_roots: vec![PathBuf::from("/zfs")],
+            enabled: true,
+            active_spindown: false, // don't shell out to hdparm in tests
+            wake: wake(1, "saturday", "10:00", "2026-01-03", 12 * 60),
+            ..Default::default()
+        };
+        let pools = vec![pool];
+        let mut mgr = StandbyManager::default();
+        // Saturday 11:00 inside window, busy (backlog draining) → stays awake.
+        let t0 = at(2026, 1, 10, 11, 0);
+        mgr.step(&pools, t0, &|_| true);
+        assert!(mgr.is_awake("zfs"));
+        // Drained; idle 30s < grace → still awake (bridges gaps between cycles).
+        mgr.step(&pools, t0 + Duration::seconds(30), &|_| false);
+        assert!(mgr.is_awake("zfs"));
+        // Idle past the grace, still inside window → parked early, not at 24h end.
+        mgr.step(&pools, t0 + Duration::seconds(120), &|_| false);
+        assert!(!mgr.is_awake("zfs"));
+        // New work arrives before the window closes → kept awake again.
+        mgr.step(&pools, t0 + Duration::seconds(150), &|_| true);
+        assert!(mgr.is_awake("zfs"));
+    }
+
+    #[test]
+    fn parks_immediately_outside_window_even_from_unknown_state() {
+        let pool = StandbyPoolConfig {
+            name: "zfs".into(),
+            mount_roots: vec![PathBuf::from("/zfs")],
+            enabled: true,
+            active_spindown: false,
+            wake: wake(1, "saturday", "10:00", "2026-01-03", 12 * 60),
+            ..Default::default()
+        };
+        let pools = vec![pool];
+        let mut mgr = StandbyManager::default();
+        // Monday (outside window), fresh start (prev == None), idle → park now.
+        mgr.step(&pools, at(2026, 1, 5, 12, 0), &|_| false);
+        assert!(!mgr.is_awake("zfs"));
     }
 
     #[test]

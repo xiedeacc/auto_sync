@@ -829,11 +829,51 @@ fn run_scheduler(
         }
 
         // Standby lifecycle: open/close each cold-backup pool's wake window and
-        // spin its disks down when it closes. Never park while any sync is in
-        // flight (coarse but safe: don't stop a disk mid-write).
+        // spin its disks down. A pool is kept awake while it is "busy": a sync
+        // is running (never park mid-write), OR pending work whose source+dest
+        // pools are ALL currently in their windows still needs it. Once that
+        // drains, the pool parks early rather than idling out the whole window.
         if !cfg.standby_pools.is_empty() {
+            use auto_sync::core::standby::{gate_for_roots, pool_covers_path};
+            let now = chrono::Local::now();
             let syncing = auto_sync::core::sync::sync_is_running();
-            auto_sync::core::standby::tick(&cfg.standby_pools, |_pool| syncing);
+            let busy = |pool_name: &str| -> bool {
+                if syncing {
+                    return true; // a sync is in flight — don't stop any disk mid-write
+                }
+                let Some(pool) = cfg.standby_pools.iter().find(|p| p.name == pool_name) else {
+                    return false;
+                };
+                for src in cfg.source_groups.iter().filter(|s| s.enabled) {
+                    for dst in src.destinations.iter().filter(|d| d.enabled && !d.paused) {
+                        let roots = [src.src.as_path(), dst.path.as_path()];
+                        if !roots.iter().any(|r| pool_covers_path(pool, r)) {
+                            continue;
+                        }
+                        // Only work that can actually run this window (every pool
+                        // it touches is awake) keeps this pool up; work gated on
+                        // another still-asleep pool does not.
+                        if !matches!(gate_for_roots(&cfg.standby_pools, &roots, now), Ok(None)) {
+                            continue;
+                        }
+                        // Pending due work = the destination's target cycle is
+                        // ahead of its last verified cycle. Unreadable → assume
+                        // busy (keep the disk awake rather than risk an early park).
+                        match state.destination_offset(&src.id, &dst.id) {
+                            Ok(off) => {
+                                if let Some(target) = off.target_cycle_id {
+                                    if off.last_verified_cycle_id < Some(target) {
+                                        return true;
+                                    }
+                                }
+                            }
+                            Err(_) => return true,
+                        }
+                    }
+                }
+                false
+            };
+            auto_sync::core::standby::tick(&cfg.standby_pools, busy);
         }
 
         if last_status_log.elapsed() >= Duration::from_secs(cfg.app.status_log_interval_secs) {
