@@ -2873,42 +2873,62 @@ function closeScanDiffModal() {
   el.scanDiffModal.hidden = true;
 }
 
+// saveConfig() reassigns `cfg` to the backend's response, so a cached source
+// object goes stale after the first save. Resolve the live source from the
+// current cfg by id on every access instead of caching a reference.
+function excludeEditorSource() {
+  if (!excludeEditor) {
+    return null;
+  }
+  return (cfg && cfg.source_groups ? cfg.source_groups : []).find(
+    (group) => group.id === excludeEditor.sourceId,
+  ) || null;
+}
+
 function openExcludeModal(source) {
   source.excludes = cleanExcludeList(source.excludes || []);
-  excludeEditor = { source };
+  excludeEditor = { sourceId: source.id };
   renderExcludeModal();
   el.excludeModal.hidden = false;
 }
 
 function renderExcludeModal() {
-  const source = excludeEditor && excludeEditor.source;
+  const source = excludeEditorSource();
   if (!source) {
     return;
   }
   el.excludeSource.textContent = `${source.id || "source"}: ${source.src || "-"}`;
-  if (!source.excludes.length) {
+  const excludes = cleanExcludeList(source.excludes || []);
+  if (!excludes.length) {
     el.excludeList.innerHTML = `<div class="empty">No excluded paths</div>`;
     return;
   }
-  el.excludeList.innerHTML = source.excludes.map((path, index) => `
+  el.excludeList.innerHTML = excludes.map((path) => `
     <div class="exclude-row">
       <div class="exclude-path">${escapeHtml(path)}</div>
-      <button class="danger icon" data-action="remove-exclude" data-index="${index}" title="Remove excluded path">x</button>
+      <button class="danger icon" data-action="remove-exclude" data-path="${escapeAttr(path)}" title="Remove excluded path">x</button>
     </div>
   `).join("");
   for (const button of el.excludeList.querySelectorAll('[data-action="remove-exclude"]')) {
-    button.onclick = async () => {
-      source.excludes.splice(Number(button.dataset.index), 1);
-      source.excludes = cleanExcludeList(source.excludes);
-      await autoSaveConfig();
+    const target = button.dataset.path;
+    // Queue so rapid consecutive deletes run one at a time. Each op re-resolves
+    // the source from the LATEST cfg (saveConfig swaps cfg for the backend
+    // response) and removes by value, so every click removes its own path.
+    button.onclick = () => queueConfigOp(async () => {
+      const live = excludeEditorSource();
+      if (!live) {
+        return;
+      }
+      live.excludes = cleanExcludeList((live.excludes || []).filter((p) => p !== target));
+      await saveConfig();
       renderExcludeModal();
       renderSourcePanel();
-    };
+    });
   }
 }
 
 async function addExcludePath() {
-  const source = excludeEditor && excludeEditor.source;
+  const source = excludeEditorSource();
   if (!source) {
     return;
   }
@@ -3361,6 +3381,16 @@ async function saveConfig() {
 async function autoSaveConfig() {
   await saveConfig();
   setMessage("");
+}
+
+// Serialize config mutations that each read-modify-write cfg. Because
+// saveConfig() replaces cfg with the backend response, two overlapping
+// mutations would race (the second reads a cfg the first already swapped).
+// Running them through this chain means each op sees the previous op's result.
+let configOpChain = Promise.resolve();
+function queueConfigOp(op) {
+  configOpChain = configOpChain.then(op).catch((error) => setMessage(String(error)));
+  return configOpChain;
 }
 
 async function syncAllNow() {
