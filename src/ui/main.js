@@ -502,12 +502,23 @@ function updateStatusUi() {
       const blocked = isSyncOrderBlocked(status);
       const activity = activityForSourceId(sourceId);
       const syncing = activityIsSyncing(activity);
-      syncSelect.disabled = busy || blocked || unavailable || syncing || paused;
+      // A compare for this destination also blocks a manual sync — the engine
+      // defers a same-target sync until the compare finishes — so grey the
+      // Sync control during a compare, not only during a sync.
+      const source = findSourceById(sourceId);
+      const dst = configDestination(sourceId, destinationId);
+      const dstAct = (source && dst)
+        ? dstActivity(source, dst)
+        : { active: false, scope: null };
+      const comparing = dstAct.active && dstAct.scope === "compare";
+      syncSelect.disabled = busy || blocked || unavailable || syncing || paused || comparing;
       syncSelect.title = paused
         ? "Paused — resume to sync"
         : (unavailable
           ? unavailableLabel(status)
-          : (blocked ? blockedByLabel(status) : (syncing ? activitySyncingLabel(activity) : "Sync")));
+          : (blocked ? blockedByLabel(status)
+            : (syncing ? activitySyncingLabel(activity)
+              : (comparing ? "Comparing — wait for it to finish" : "Sync"))));
     }
     const logButton = row.querySelector('[data-action="show-dst-log"]');
     if (logButton) {
@@ -2520,11 +2531,43 @@ function renderDestinationLogModal() {
   ];
   el.dstLogSummary.textContent = "";
   el.dstLogList.innerHTML = rows.map(([key, value]) => `
-    <div class="dst-log-row">
+    <div class="dst-log-row" data-copy="${escapeAttr(value || "-")}">
       <div class="dst-log-key">${escapeHtml(key)}</div>
       <div class="dst-log-value" title="${escapeAttr(value || "-")}">${escapeHtml(value || "-")}</div>
     </div>
   `).join("");
+  // Double-click any row to copy its value (paths, errors, cycle spans are
+  // often long and awkward to select by hand).
+  for (const rowEl of el.dstLogList.querySelectorAll(".dst-log-row")) {
+    rowEl.ondblclick = () => copyTextToClipboard(rowEl.dataset.copy || "");
+  }
+}
+
+// Copy text to the clipboard with a graceful fallback (older/embedded webviews
+// may not expose navigator.clipboard) and a brief confirmation.
+function copyTextToClipboard(text) {
+  const value = String(text == null ? "" : text);
+  const done = () => setTransientMessage("Copied to clipboard", 1500);
+  const fallback = () => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = value;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      done();
+    } catch (_e) {
+      setTransientMessage("Copy failed", 1500);
+    }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(value).then(done).catch(fallback);
+  } else {
+    fallback();
+  }
 }
 
 // Type: the running task's kind if one is active, else the last task's kind.
@@ -2635,7 +2678,16 @@ function infoSummaryLabel(source, dst, report, task, scan) {
     const total = (report.to_add || 0) + (report.to_update || 0) + (report.to_delete || 0)
       + (report.type_mismatch || 0) + (report.metadata || 0);
     const matched = Number(report.in_sync || 0);
+    // A zfs-diff compare only examines paths that changed since both sides'
+    // verified baseline snapshots (the rest were verified identical then), so
+    // its counts are the CHANGED subset, not the whole tree. Say so, or "699
+    // matched" reads as "the tree has only 699 files".
+    const scoped = report.method === "zfs_diff";
+    const checked = Number(report.source_entries || 0);
     if (total === 0) {
+      if (scoped && checked > 0) {
+        return `0 differences (${checked} changed paths checked)`;
+      }
       return matched > 0 ? `0 differences (${matched} matched)` : "0 differences";
     }
     const parts = [];
@@ -2644,8 +2696,10 @@ function infoSummaryLabel(source, dst, report, task, scan) {
     if (report.to_delete) parts.push(`−${report.to_delete}`);
     if (report.type_mismatch) parts.push(`!${report.type_mismatch}`);
     if (report.metadata) parts.push(`#${report.metadata}`);
-    const matchedNote = matched > 0 ? `, ${matched} matched` : "";
-    return `${total} difference${total === 1 ? "" : "s"} (${parts.join(" ")})${matchedNote}`;
+    const note = scoped
+      ? (checked > 0 ? ` of ${checked} changed paths` : "")
+      : (matched > 0 ? `, ${matched} matched` : "");
+    return `${total} difference${total === 1 ? "" : "s"} (${parts.join(" ")})${note}`;
   }
   if (task) {
     if (task.status === "running") {

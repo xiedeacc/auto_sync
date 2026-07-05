@@ -1244,6 +1244,8 @@ th {
   align-items: center;
   padding: 8px 0;
   border-bottom: 1px solid var(--line);
+  /* Double-click a row to copy its value. */
+  cursor: copy;
 }
 
 .dst-log-key {
