@@ -2595,8 +2595,8 @@ function infoSnapshotLabel(source, dst, transfer, scan) {
 }
 
 // Summary: final-result statistics of the current or last task.
-//  - Compare: how many entries differ (broken down by kind) and how many were
-//    in sync. Prefers the cached scan report (has the per-kind breakdown);
+//  - Compare: how many entries differ (broken down by kind) and how many
+//    matched. Prefers the cached scan report (has the per-kind breakdown);
 //    falls back to the task log's own differences/entries_scanned counters
 //    (e.g. a cross-machine compare with no report cached locally).
 //  - Sync: how many files were synced, and — since the task log's `differences`
@@ -2612,7 +2612,7 @@ function infoSummaryLabel(source, dst, report, task) {
       + (report.type_mismatch || 0) + (report.metadata || 0);
     const matched = Number(report.in_sync || 0);
     if (total === 0) {
-      return matched > 0 ? `0 differences (${matched} in sync)` : "0 differences";
+      return matched > 0 ? `0 differences (${matched} matched)` : "0 differences";
     }
     const parts = [];
     if (report.to_add) parts.push(`+${report.to_add}`);
@@ -2620,7 +2620,7 @@ function infoSummaryLabel(source, dst, report, task) {
     if (report.to_delete) parts.push(`−${report.to_delete}`);
     if (report.type_mismatch) parts.push(`!${report.type_mismatch}`);
     if (report.metadata) parts.push(`#${report.metadata}`);
-    const matchedNote = matched > 0 ? `, ${matched} in sync` : "";
+    const matchedNote = matched > 0 ? `, ${matched} matched` : "";
     return `${total} difference${total === 1 ? "" : "s"} (${parts.join(" ")})${matchedNote}`;
   }
   if (task) {
