@@ -441,8 +441,8 @@ fn commit_and_push(git_dir: &Path, state: &Arc<Mutex<CollectorRunState>>) -> Res
     Ok(())
 }
 
-/// Browse a remote directory over ssh (`ls -1Ap`) using the request's
-/// connection parameters.
+/// Browse a remote directory over ssh using the request's connection
+/// parameters.
 pub fn browse(req: &CollectorBrowseRequest) -> Result<CollectorBrowseResponse> {
     let conn = SshConn::from_request(req);
     if conn.hostname.is_empty() {
@@ -452,7 +452,21 @@ pub fn browse(req: &CollectorBrowseRequest) -> Result<CollectorBrowseResponse> {
         let trimmed = req.path.trim();
         if trimmed.is_empty() { "/" } else { trimmed }
     };
-    let remote_cmd = format!("ls -1Ap -- {}", shell_quote(path));
+    // List entries and mark directories with a trailing `/`. We use a `[ -d ]`
+    // test rather than `ls -p` because `ls -p` only flags *real* directories —
+    // a symlink pointing at a directory would otherwise show up as a file.
+    // `[ -d ]` follows the symlink, so those are classified correctly. POSIX
+    // sh, works under bash and busybox ash alike.
+    let remote_cmd = format!(
+        "cd -- {} 2>/dev/null || exit 0; \
+for f in * .*; do \
+[ \"$f\" = . ] && continue; \
+[ \"$f\" = .. ] && continue; \
+[ -e \"$f\" ] || [ -L \"$f\" ] || continue; \
+if [ -d \"$f\" ]; then printf '%s/\\n' \"$f\"; else printf '%s\\n' \"$f\"; fi; \
+done",
+        shell_quote(path)
+    );
     let out = ssh_capture(&conn, &remote_cmd)?;
     let mut entries = Vec::new();
     for line in out.lines() {
