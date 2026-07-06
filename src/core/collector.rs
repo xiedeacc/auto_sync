@@ -4,8 +4,11 @@
 //!
 //! Everything shells out to the system `ssh`/`scp`/`git` — there is no SSH
 //! client crate — so it works with the built-in OpenSSH on Windows and the
-//! stock tools on Linux. The whole feature is UI-driven (the "Collector"
-//! button): nothing here runs on a schedule.
+//! stock tools on Linux. Each host is described by structured fields
+//! (`HostName`/`User`/`Port`/`IdentityFile`), and the engine builds the
+//! `ssh`/`scp` commands with explicit `-i`/`-p` flags — no ssh config file.
+//! The whole feature is UI-driven (the "Collector" button): nothing here runs
+//! on a schedule.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -62,6 +65,59 @@ pub struct CollectorBrowseResponse {
     pub entries: Vec<CollectorBrowseEntry>,
 }
 
+/// The connection parameters a browse request carries (a subset of
+/// `CollectorHost`). Sent by the UI so it can browse a host before it is saved.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CollectorBrowseRequest {
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub identity_file: String,
+    #[serde(default)]
+    pub path: String,
+}
+
+/// SSH connection view shared by run and browse.
+struct SshConn<'a> {
+    hostname: &'a str,
+    user: &'a str,
+    port: u16,
+    identity_file: &'a str,
+}
+
+impl<'a> SshConn<'a> {
+    fn from_host(host: &'a CollectorHost) -> Self {
+        Self {
+            hostname: host.hostname.trim(),
+            user: host.user.trim(),
+            port: host.port,
+            identity_file: host.identity_file.trim(),
+        }
+    }
+
+    fn from_request(req: &'a CollectorBrowseRequest) -> Self {
+        Self {
+            hostname: req.hostname.trim(),
+            user: req.user.trim(),
+            port: req.port,
+            identity_file: req.identity_file.trim(),
+        }
+    }
+
+    /// `user@host` (or just `host` when no user is set).
+    fn dest(&self) -> String {
+        if self.user.is_empty() {
+            self.hostname.to_string()
+        } else {
+            format!("{}@{}", self.user, self.hostname)
+        }
+    }
+}
+
 fn command(program: &str) -> Command {
     let mut cmd = Command::new(program);
     #[cfg(windows)]
@@ -69,6 +125,47 @@ fn command(program: &str) -> Command {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
+    cmd
+}
+
+/// Expand a leading `~` / `~/` to the user's home directory (ssh does this for
+/// config files, but we pass identity paths as explicit `-i` args).
+fn expand_tilde(path: &str) -> String {
+    let path = path.trim();
+    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default();
+        if !home.is_empty() {
+            return format!("{}{}", home, &path[1..]);
+        }
+    }
+    path.to_string()
+}
+
+/// Build an `ssh` command for `conn` (port via `-p`, key via `-i`).
+fn ssh_command(conn: &SshConn) -> Command {
+    let mut cmd = command("ssh");
+    if conn.port != 0 {
+        cmd.arg("-p").arg(conn.port.to_string());
+    }
+    if !conn.identity_file.is_empty() {
+        cmd.arg("-i").arg(expand_tilde(conn.identity_file));
+    }
+    cmd.args(SSH_OPTS);
+    cmd
+}
+
+/// Build an `scp` command for `conn` (port via `-P`, key via `-i`).
+fn scp_command(conn: &SshConn) -> Command {
+    let mut cmd = command("scp");
+    if conn.port != 0 {
+        cmd.arg("-P").arg(conn.port.to_string());
+    }
+    if !conn.identity_file.is_empty() {
+        cmd.arg("-i").arg(expand_tilde(conn.identity_file));
+    }
+    cmd.args(SSH_OPTS);
     cmd
 }
 
@@ -119,11 +216,6 @@ fn run_inner(cfg: &CollectorConfig, state: &Arc<Mutex<CollectorRunState>>) -> Re
         run_git(&git_dir, &["init"], state)?;
     }
 
-    let ssh_config = write_ssh_config(cfg)?;
-    if let Some(path) = ssh_config.as_ref() {
-        log(state, format!("ssh config written: {}", path.display()));
-    }
-
     let enabled: Vec<&CollectorHost> = cfg.hosts.iter().filter(|h| h.enabled).collect();
     if enabled.is_empty() {
         bail!("no enabled hosts to pull from");
@@ -131,7 +223,7 @@ fn run_inner(cfg: &CollectorConfig, state: &Arc<Mutex<CollectorRunState>>) -> Re
 
     let mut failures = 0;
     for host in enabled {
-        failures += pull_host(host, ssh_config.as_deref(), state);
+        failures += pull_host(host, state);
     }
 
     if cfg.split_threshold_mb > 0 {
@@ -147,47 +239,27 @@ fn run_inner(cfg: &CollectorConfig, state: &Arc<Mutex<CollectorRunState>>) -> Re
     Ok(failures)
 }
 
-/// Materialize the ssh config from `cfg.ssh_config` onto disk so `-F` can point
-/// at it. Returns the path (or None when no config path is configured).
-pub fn write_ssh_config(cfg: &CollectorConfig) -> Result<Option<PathBuf>> {
-    if cfg.ssh_config_path.as_os_str().is_empty() {
-        return Ok(None);
-    }
-    let path = cfg.ssh_config_path.clone();
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).ok();
-        }
-    }
-    fs::write(&path, cfg.ssh_config.as_bytes())
-        .with_context(|| format!("writing ssh config {}", path.display()))?;
-    Ok(Some(path))
-}
-
 /// Pull every configured path for one host, returning the failure count. Host
 /// setup problems degrade to logged failures rather than aborting the run.
-fn pull_host(
-    host: &CollectorHost,
-    ssh_config: Option<&Path>,
-    state: &Arc<Mutex<CollectorRunState>>,
-) -> usize {
+fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usize {
     let label = if host.name.trim().is_empty() {
-        host.ssh.clone()
+        host.hostname.clone()
     } else {
         host.name.clone()
     };
-    if host.ssh.trim().is_empty() {
-        log(state, format!("host '{label}': no ssh destination, skipping"));
+    if host.hostname.trim().is_empty() {
+        log(state, format!("host '{label}': no hostname, skipping"));
         return host.paths.len();
     }
     if host.root.as_os_str().is_empty() {
         log(state, format!("host '{label}': no local root, skipping"));
         return host.paths.len();
     }
-    log(state, format!("=== host {label} ({}) ===", host.ssh));
+    let conn = SshConn::from_host(host);
+    log(state, format!("=== host {label} ({}) ===", conn.dest()));
 
     if !host.install_cmd.trim().is_empty() {
-        if let Err(err) = ensure_sftp_server(host, ssh_config, state) {
+        if let Err(err) = ensure_sftp_server(&conn, &host.install_cmd, state) {
             log(state, format!("  sftp-server check/install failed: {err:#} (continuing)"));
         }
     }
@@ -198,7 +270,7 @@ fn pull_host(
         if remote.is_empty() {
             continue;
         }
-        match pull_path(host, ssh_config, remote, state) {
+        match pull_path(host, &conn, remote, state) {
             Ok(()) => log(state, format!("  ok {remote}")),
             Err(err) => {
                 failures += 1;
@@ -213,21 +285,21 @@ fn pull_host(
 /// run it. New OpenSSH `scp` speaks the SFTP protocol, so a host without
 /// sftp-server (e.g. a fresh OpenWrt) cannot be pulled from until it is added.
 fn ensure_sftp_server(
-    host: &CollectorHost,
-    ssh_config: Option<&Path>,
+    conn: &SshConn,
+    install_cmd: &str,
     state: &Arc<Mutex<CollectorRunState>>,
 ) -> Result<()> {
     let probe = "for p in /usr/lib/openssh/sftp-server /usr/libexec/sftp-server \
 /usr/lib/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server; do \
 [ -x \"$p\" ] && { echo found; exit 0; }; done; \
 command -v sftp-server >/dev/null 2>&1 && echo found; true";
-    let out = ssh_capture(&host.ssh, ssh_config, probe)?;
+    let out = ssh_capture(conn, probe)?;
     if out.contains("found") {
         log(state, "  sftp-server present");
         return Ok(());
     }
-    log(state, format!("  sftp-server missing; installing: {}", host.install_cmd));
-    let (ok, output) = ssh_status(&host.ssh, ssh_config, &host.install_cmd)?;
+    log(state, format!("  sftp-server missing; installing: {install_cmd}"));
+    let (ok, output) = ssh_status(conn, install_cmd)?;
     for line in output.lines().take(40) {
         log(state, format!("    | {line}"));
     }
@@ -244,7 +316,7 @@ command -v sftp-server >/dev/null 2>&1 && echo found; true";
 /// `D:\share\linux\aws\usr\local\x`.
 fn pull_path(
     host: &CollectorHost,
-    ssh_config: Option<&Path>,
+    conn: &SshConn,
     remote: &str,
     state: &Arc<Mutex<CollectorRunState>>,
 ) -> Result<()> {
@@ -255,14 +327,11 @@ fn pull_path(
     }
     fs::create_dir_all(&local_parent)
         .with_context(|| format!("creating {}", local_parent.display()))?;
-    log(state, format!("  scp {}:{} -> {}", host.ssh, remote, local_parent.display()));
+    log(state, format!("  scp {}:{} -> {}", conn.dest(), remote, local_parent.display()));
 
-    let mut cmd = command("scp");
-    if let Some(cfg) = ssh_config {
-        cmd.arg("-F").arg(cfg);
-    }
-    cmd.arg("-r").arg("-p").args(SSH_OPTS);
-    cmd.arg(format!("{}:{}", host.ssh, remote));
+    let mut cmd = scp_command(conn);
+    cmd.arg("-r").arg("-p");
+    cmd.arg(format!("{}:{}", conn.dest(), remote));
     cmd.arg(&local_parent);
     let output = cmd.output().context("running scp")?;
     if !output.status.success() {
@@ -408,22 +477,19 @@ fn commit_and_push(git_dir: &Path, state: &Arc<Mutex<CollectorRunState>>) -> Res
     Ok(())
 }
 
-/// Browse a remote directory over ssh (`ls -1Ap`). `ssh_config` is the `-F`
-/// file, if any.
-pub fn browse(
-    host_ssh: &str,
-    ssh_config: Option<&Path>,
-    path: &str,
-) -> Result<CollectorBrowseResponse> {
-    if host_ssh.trim().is_empty() {
-        bail!("no ssh destination selected");
+/// Browse a remote directory over ssh (`ls -1Ap`) using the request's
+/// connection parameters.
+pub fn browse(req: &CollectorBrowseRequest) -> Result<CollectorBrowseResponse> {
+    let conn = SshConn::from_request(req);
+    if conn.hostname.is_empty() {
+        bail!("no hostname to connect to");
     }
     let path = {
-        let trimmed = path.trim();
+        let trimmed = req.path.trim();
         if trimmed.is_empty() { "/" } else { trimmed }
     };
     let remote_cmd = format!("ls -1Ap -- {}", shell_quote(path));
-    let out = ssh_capture(host_ssh, ssh_config, &remote_cmd)?;
+    let out = ssh_capture(&conn, &remote_cmd)?;
     let mut entries = Vec::new();
     for line in out.lines() {
         let line = line.trim_end_matches('\r');
@@ -445,12 +511,9 @@ pub fn browse(
 // --- ssh / git command helpers ------------------------------------------------
 
 /// Run a remote command over ssh, returning stdout (fails on non-zero exit).
-fn ssh_capture(host_ssh: &str, ssh_config: Option<&Path>, remote_cmd: &str) -> Result<String> {
-    let mut cmd = command("ssh");
-    if let Some(cfg) = ssh_config {
-        cmd.arg("-F").arg(cfg);
-    }
-    cmd.args(SSH_OPTS).arg(host_ssh).arg(remote_cmd);
+fn ssh_capture(conn: &SshConn, remote_cmd: &str) -> Result<String> {
+    let mut cmd = ssh_command(conn);
+    cmd.arg(conn.dest()).arg(remote_cmd);
     let output = cmd.output().context("running ssh")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -460,16 +523,9 @@ fn ssh_capture(host_ssh: &str, ssh_config: Option<&Path>, remote_cmd: &str) -> R
 }
 
 /// Run a remote command over ssh, returning (success, stdout+stderr combined).
-fn ssh_status(
-    host_ssh: &str,
-    ssh_config: Option<&Path>,
-    remote_cmd: &str,
-) -> Result<(bool, String)> {
-    let mut cmd = command("ssh");
-    if let Some(cfg) = ssh_config {
-        cmd.arg("-F").arg(cfg);
-    }
-    cmd.args(SSH_OPTS).arg(host_ssh).arg(remote_cmd);
+fn ssh_status(conn: &SshConn, remote_cmd: &str) -> Result<(bool, String)> {
+    let mut cmd = ssh_command(conn);
+    cmd.arg(conn.dest()).arg(remote_cmd);
     let output = cmd.output().context("running ssh")?;
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -626,6 +682,18 @@ mod tests {
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("/a b"), "'/a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn ssh_dest_builds_user_at_host() {
+        let host = CollectorHost {
+            hostname: "1.2.3.4".to_string(),
+            user: "root".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(SshConn::from_host(&host).dest(), "root@1.2.3.4");
+        let no_user = CollectorHost { hostname: "h".to_string(), ..Default::default() };
+        assert_eq!(SshConn::from_host(&no_user).dest(), "h");
     }
 
     #[test]

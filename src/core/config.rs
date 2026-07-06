@@ -206,13 +206,6 @@ pub struct CollectorConfig {
     /// Local git repository the pulled files are committed into. `git init` is
     /// run automatically if it is not yet a repo.
     pub git_dir: PathBuf,
-    /// Path to an `ssh_config(5)`-style file (like `~/.ssh/config`) passed to
-    /// `ssh`/`scp` with `-F`. Rewritten from `ssh_config` before every run so
-    /// the on-disk file always matches what the UI shows.
-    pub ssh_config_path: PathBuf,
-    /// Contents of the ssh config file, edited from the Collector modal. Host
-    /// aliases defined here can be referenced by `CollectorHost::ssh`.
-    pub ssh_config: String,
     /// Files at least this many MiB are split into `<name>.autosplit.NNN`
     /// parts; the original is added to `.gitignore` and the parts committed.
     /// Kept under GitHub's 100 MiB hard limit by default. 0 disables splitting.
@@ -226,8 +219,6 @@ impl Default for CollectorConfig {
     fn default() -> Self {
         Self {
             git_dir: PathBuf::new(),
-            ssh_config_path: PathBuf::new(),
-            ssh_config: String::new(),
             split_threshold_mb: 95,
             auto_commit_push: true,
             hosts: Vec::new(),
@@ -236,25 +227,30 @@ impl Default for CollectorConfig {
 }
 
 impl CollectorConfig {
-    /// True when nothing has been configured — used to keep an empty
-    /// `[collector]` table out of the serialized config.
+    /// True when nothing has been configured — used to reject a run when the
+    /// collector has not been set up.
     pub fn is_empty(&self) -> bool {
-        self.git_dir.as_os_str().is_empty()
-            && self.ssh_config_path.as_os_str().is_empty()
-            && self.ssh_config.trim().is_empty()
-            && self.hosts.is_empty()
+        self.git_dir.as_os_str().is_empty() && self.hosts.is_empty()
     }
 }
 
-/// One SSH host the collector pulls from.
+/// One SSH host the collector pulls from. The connection is described by
+/// structured fields (mirroring `ssh_config(5)` keywords) rather than a config
+/// file; the engine builds `ssh`/`scp` commands with explicit `-i`/`-p` flags.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CollectorHost {
-    /// Friendly label (defaults to `ssh` when blank).
+    /// Friendly label / `Host` alias (defaults to `hostname` when blank).
     pub name: String,
-    /// ssh destination: either an alias defined in the ssh config, or a plain
-    /// `user@host` / `host`.
-    pub ssh: String,
+    /// `HostName`: the address to connect to.
+    pub hostname: String,
+    /// `User` to log in as (blank = ssh default / current user).
+    pub user: String,
+    /// `Port` (0 or 22 = default ssh port).
+    pub port: u16,
+    /// `IdentityFile`: private key path; a leading `~` is expanded. Blank = ssh
+    /// default key lookup.
+    pub identity_file: String,
     /// Local root that every remote path is reconstructed under. e.g. root
     /// `D:\share\linux\aws` + remote `/usr/local/x` => `…\aws\usr\local\x`.
     pub root: PathBuf,
@@ -270,7 +266,10 @@ impl Default for CollectorHost {
     fn default() -> Self {
         Self {
             name: String::new(),
-            ssh: String::new(),
+            hostname: String::new(),
+            user: String::new(),
+            port: 22,
+            identity_file: String::new(),
             root: PathBuf::new(),
             paths: Vec::new(),
             install_cmd: String::new(),

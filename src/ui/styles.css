@@ -1440,9 +1440,13 @@ th {
   gap: 12px;
 }
 
+#collector-browse-modal {
+  z-index: 1100;
+}
+
 .collector-settings {
   display: grid;
-  grid-template-columns: 1fr 1fr auto auto;
+  grid-template-columns: 1fr auto auto;
   gap: 10px 12px;
   align-items: end;
 }
@@ -1482,18 +1486,6 @@ th {
   width: 34px;
 }
 
-.collector-ssh-config {
-  width: 100%;
-  min-height: 120px;
-  resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  padding: 8px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-}
-
 .collector-hosts-head {
   display: flex;
   align-items: center;
@@ -1509,46 +1501,64 @@ th {
 
 .collector-hosts {
   display: grid;
-  gap: 12px;
+  gap: 4px;
+  overflow-x: auto;
 }
 
-.collector-host {
+/* Columns: Host | HostName | User | Port | IdentityFile | Root | Files | on | x */
+.collector-host-row {
   display: grid;
-  gap: 8px;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: #f8fafc;
-}
-
-.collector-host-head {
-  display: flex;
-  gap: 8px;
+  grid-template-columns: 1fr 1.2fr 0.8fr 64px 1.4fr 1.6fr auto auto auto;
+  gap: 6px;
   align-items: center;
+  min-width: 720px;
 }
 
-.collector-host-head input[data-field="name"] {
-  flex: 0 0 160px;
+.collector-host-head-row {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 0 2px;
 }
 
-.collector-host-head input[data-field="ssh"] {
-  flex: 1 1 auto;
+.collector-host-row input {
+  min-width: 0;
+  font-size: 12px;
+}
+
+.collector-host-row .collector-path-row {
   min-width: 0;
 }
 
+.collector-host-extra {
+  min-width: 720px;
+  padding: 0 2px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.collector-host-extra input {
+  width: 100%;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 .collector-host-on {
-  flex: 0 0 auto;
+  height: auto;
+  font-size: 12px;
 }
 
 .collector-host-remove {
-  flex: 0 0 auto;
-  width: 32px;
+  width: 30px;
   color: var(--red);
 }
 
-.collector-paths {
+.collector-paths-btn {
+  white-space: nowrap;
+}
+
+.collector-paths-list {
   display: grid;
   gap: 6px;
+  margin-bottom: 10px;
 }
 
 .collector-path-item {
@@ -1573,6 +1583,13 @@ th {
 .collector-path-add-row {
   display: flex;
   gap: 8px;
+}
+
+.collector-paths-add input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
 }
 
 .collector-actions {

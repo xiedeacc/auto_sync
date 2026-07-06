@@ -226,12 +226,12 @@ impl Backend {
         Ok(self.collector_status())
     }
 
-    /// Browse a remote host over ssh for the Collector path picker. Writes the
-    /// saved ssh config to disk first so `-F` sees the current aliases.
-    pub fn collector_browse(&self, ssh: &str, path: &str) -> Result<CollectorBrowseResponse> {
-        let cfg = self.get_collector_config()?;
-        let ssh_config = collector::write_ssh_config(&cfg)?;
-        collector::browse(ssh, ssh_config.as_deref(), path)
+    /// Browse a remote host over ssh for the Collector path picker.
+    pub fn collector_browse(
+        &self,
+        req: collector::CollectorBrowseRequest,
+    ) -> Result<CollectorBrowseResponse> {
+        collector::browse(&req)
     }
 
     pub fn apply_delegated_source_groups(

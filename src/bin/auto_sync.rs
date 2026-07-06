@@ -1240,11 +1240,21 @@ async fn collector_status(backend: tauri::State<'_, Backend>) -> Result<Collecto
 #[tauri::command]
 async fn collector_browse(
     backend: tauri::State<'_, Backend>,
-    ssh: String,
+    hostname: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    identity_file: Option<String>,
     path: Option<String>,
 ) -> Result<CollectorBrowseResponse, String> {
     let backend = backend.inner().clone();
-    run_blocking(move || backend.collector_browse(&ssh, &path.unwrap_or_default())).await
+    let req = auto_sync::core::collector::CollectorBrowseRequest {
+        hostname: hostname.unwrap_or_default(),
+        user: user.unwrap_or_default(),
+        port: port.unwrap_or(0),
+        identity_file: identity_file.unwrap_or_default(),
+        path: path.unwrap_or_default(),
+    };
+    run_blocking(move || backend.collector_browse(req)).await
 }
 
 #[cfg(feature = "gui")]

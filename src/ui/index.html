@@ -334,22 +334,11 @@
               <button id="collector-git-dir-browse" type="button" title="Choose local folder">…</button>
             </div>
           </div>
-          <div class="collector-field">
-            <label for="collector-ssh-config-path">SSH config file</label>
-            <div class="collector-path-row">
-              <input id="collector-ssh-config-path" placeholder="D:\code\auto_sync\conf\collector_ssh_config">
-              <button id="collector-ssh-config-browse" type="button" title="Choose local file/folder">…</button>
-            </div>
-          </div>
           <div class="collector-field collector-field-narrow">
             <label for="collector-split-mb">Split at (MiB)</label>
             <input id="collector-split-mb" type="number" min="0" step="1" title="Files at least this size are split into parts (git-ignore the original). 0 disables. Keep under GitHub's 100 MiB limit.">
           </div>
           <label class="check-row collector-check"><input id="collector-auto-push" type="checkbox"> Auto commit &amp; push</label>
-        </div>
-        <div class="collector-field">
-          <label for="collector-ssh-config">SSH config (~/.ssh/config style — Host aliases referenced below)</label>
-          <textarea id="collector-ssh-config" class="collector-ssh-config" spellcheck="false" placeholder="Host aws&#10;  HostName 1.2.3.4&#10;  User root&#10;  IdentityFile D:\keys\aws.pem&#10;&#10;Host openwrt&#10;  HostName 192.168.2.1&#10;  User root"></textarea>
         </div>
         <div class="collector-hosts-head">
           <span>Hosts</span>
@@ -375,6 +364,22 @@
       </div>
       <div id="collector-config-path" class="subtle"></div>
       <pre id="collector-config-view" class="config-view"></pre>
+    </div>
+  </div>
+
+  <div id="collector-paths-modal" class="modal" hidden>
+    <div class="modal-panel exclude-modal-panel">
+      <div class="modal-head">
+        <h2 id="collector-paths-title">Files &amp; folders</h2>
+        <button id="collector-paths-close" class="icon" title="Close">x</button>
+      </div>
+      <div id="collector-paths-summary" class="issue-summary"></div>
+      <div id="collector-paths-list" class="collector-paths-list"></div>
+      <div class="collector-path-add-row collector-paths-add">
+        <input id="collector-paths-input" placeholder="/remote/absolute/path">
+        <button id="collector-paths-add" type="button">+ Add</button>
+        <button id="collector-paths-browse" type="button">Browse remote…</button>
+      </div>
     </div>
   </div>
 

@@ -737,18 +737,11 @@ async fn api_collector_status(
     blocking(move || Ok(Json(backend.collector_status()))).await
 }
 
-#[derive(Deserialize)]
-struct CollectorBrowseQuery {
-    ssh: String,
-    #[serde(default)]
-    path: String,
-}
-
 async fn api_collector_browse(
     AxumState(backend): AxumState<Backend>,
-    Json(query): Json<CollectorBrowseQuery>,
+    Json(req): Json<crate::core::collector::CollectorBrowseRequest>,
 ) -> Result<Json<CollectorBrowseResponse>, ApiError> {
-    blocking(move || Ok(Json(backend.collector_browse(&query.ssh, &query.path)?))).await
+    blocking(move || Ok(Json(backend.collector_browse(req)?))).await
 }
 
 async fn api_collector_get_config(

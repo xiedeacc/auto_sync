@@ -32,6 +32,8 @@ let excludeEditor = null;
 let collectorDraft = null;
 let collectorBrowse = null;
 let collectorLogTimer = null;
+// Index of the host whose files/folders are open in the paths editor modal.
+let collectorPathsIndex = null;
 let dstSyncEditor = null;
 let dstLogViewer = null;
 // The Info modal's "Type"/"Summary" rows come from the last task-log entry for
@@ -281,11 +283,8 @@ const el = {
   collectorClose: document.getElementById("collector-close"),
   collectorGitDir: document.getElementById("collector-git-dir"),
   collectorGitDirBrowse: document.getElementById("collector-git-dir-browse"),
-  collectorSshConfigPath: document.getElementById("collector-ssh-config-path"),
-  collectorSshConfigBrowse: document.getElementById("collector-ssh-config-browse"),
   collectorSplitMb: document.getElementById("collector-split-mb"),
   collectorAutoPush: document.getElementById("collector-auto-push"),
-  collectorSshConfig: document.getElementById("collector-ssh-config"),
   collectorAddHost: document.getElementById("collector-add-host"),
   collectorHosts: document.getElementById("collector-hosts"),
   collectorSave: document.getElementById("collector-save"),
@@ -297,6 +296,14 @@ const el = {
   collectorConfigClose: document.getElementById("collector-config-close"),
   collectorConfigPath: document.getElementById("collector-config-path"),
   collectorConfigView: document.getElementById("collector-config-view"),
+  collectorPathsModal: document.getElementById("collector-paths-modal"),
+  collectorPathsTitle: document.getElementById("collector-paths-title"),
+  collectorPathsClose: document.getElementById("collector-paths-close"),
+  collectorPathsSummary: document.getElementById("collector-paths-summary"),
+  collectorPathsList: document.getElementById("collector-paths-list"),
+  collectorPathsInput: document.getElementById("collector-paths-input"),
+  collectorPathsAdd: document.getElementById("collector-paths-add"),
+  collectorPathsBrowse: document.getElementById("collector-paths-browse"),
   collectorBrowseModal: document.getElementById("collector-browse-modal"),
   collectorBrowseTitle: document.getElementById("collector-browse-title"),
   collectorBrowseClose: document.getElementById("collector-browse-close"),
@@ -3297,8 +3304,6 @@ function bindButtonClick(button, handler) {
 function defaultCollector() {
   return {
     git_dir: "",
-    ssh_config_path: "",
-    ssh_config: "",
     split_threshold_mb: 95,
     auto_commit_push: true,
     hosts: [],
@@ -3308,24 +3313,25 @@ function defaultCollector() {
 function normalizeCollector(raw) {
   const base = defaultCollector();
   const src = raw && typeof raw === "object" ? raw : {};
-  const collector = {
+  return {
     git_dir: String(valueOr(src.git_dir, base.git_dir)),
-    ssh_config_path: String(valueOr(src.ssh_config_path, base.ssh_config_path)),
-    ssh_config: String(valueOr(src.ssh_config, base.ssh_config)),
     split_threshold_mb: Number.isFinite(Number(src.split_threshold_mb))
       ? Number(src.split_threshold_mb)
       : base.split_threshold_mb,
     auto_commit_push: src.auto_commit_push !== false,
     hosts: Array.isArray(src.hosts) ? src.hosts.map(normalizeCollectorHost) : [],
   };
-  return collector;
 }
 
 function normalizeCollectorHost(raw) {
   const src = raw && typeof raw === "object" ? raw : {};
+  const port = Number(src.port);
   return {
     name: String(valueOr(src.name, "")),
-    ssh: String(valueOr(src.ssh, "")),
+    hostname: String(valueOr(src.hostname, "")),
+    user: String(valueOr(src.user, "")),
+    port: Number.isFinite(port) ? port : 22,
+    identity_file: String(valueOr(src.identity_file, "")),
     root: String(valueOr(src.root, "")),
     install_cmd: String(valueOr(src.install_cmd, "")),
     paths: Array.isArray(src.paths) ? src.paths.map((p) => String(valueOr(p, ""))) : [],
@@ -3335,8 +3341,6 @@ function normalizeCollectorHost(raw) {
 
 function collectorPopulateForm() {
   el.collectorGitDir.value = collectorDraft.git_dir;
-  el.collectorSshConfigPath.value = collectorDraft.ssh_config_path;
-  el.collectorSshConfig.value = collectorDraft.ssh_config;
   el.collectorSplitMb.value = String(collectorDraft.split_threshold_mb);
   el.collectorAutoPush.checked = collectorDraft.auto_commit_push;
   renderCollectorHosts();
@@ -3379,34 +3383,40 @@ function renderCollectorHosts() {
     el.collectorHosts.innerHTML = '<div class="empty">No hosts yet — click "+ Add host".</div>';
     return;
   }
-  el.collectorHosts.innerHTML = hosts.map((host, i) => {
-    const paths = (host.paths || []).map((p, pi) => `
-      <div class="collector-path-item">
-        <input data-field="path" data-index="${i}" data-path="${pi}" value="${escapeAttr(p)}" placeholder="/remote/absolute/path">
-        <button type="button" data-action="remove-path" data-index="${i}" data-path="${pi}" title="Remove path">✕</button>
-      </div>`).join("");
+  const header = `
+    <div class="collector-host-row collector-host-head-row">
+      <span>Host</span>
+      <span>HostName</span>
+      <span>User</span>
+      <span>Port</span>
+      <span>IdentityFile</span>
+      <span>Root dir</span>
+      <span>Files</span>
+      <span></span>
+      <span></span>
+    </div>`;
+  const rows = hosts.map((host, i) => {
+    const pathCount = (host.paths || []).filter((p) => String(p).trim()).length;
     return `
-      <div class="collector-host" data-index="${i}">
-        <div class="collector-host-head">
-          <input data-field="name" data-index="${i}" value="${escapeAttr(host.name)}" placeholder="name">
-          <input data-field="ssh" data-index="${i}" value="${escapeAttr(host.ssh)}" placeholder="ssh alias or user@host">
-          <label class="check-row collector-host-on"><input type="checkbox" data-field="enabled" data-index="${i}" ${host.enabled ? "checked" : ""}> on</label>
-          <button type="button" data-action="remove-host" data-index="${i}" class="collector-host-remove" title="Remove host">✕</button>
-        </div>
+      <div class="collector-host-row" data-index="${i}">
+        <input data-field="name" data-index="${i}" value="${escapeAttr(host.name)}" placeholder="alias">
+        <input data-field="hostname" data-index="${i}" value="${escapeAttr(host.hostname)}" placeholder="1.2.3.4">
+        <input data-field="user" data-index="${i}" value="${escapeAttr(host.user)}" placeholder="root">
+        <input data-field="port" data-index="${i}" type="number" min="1" max="65535" value="${escapeAttr(host.port)}" placeholder="22">
+        <input data-field="identity_file" data-index="${i}" value="${escapeAttr(host.identity_file)}" placeholder="~/.ssh/id_ed25519">
         <div class="collector-path-row">
-          <input data-field="root" data-index="${i}" value="${escapeAttr(host.root)}" placeholder="local root e.g. D:\\share\\linux\\aws">
+          <input data-field="root" data-index="${i}" value="${escapeAttr(host.root)}" placeholder="D:\\share\\linux\\aws">
           <button type="button" data-action="browse-root" data-index="${i}" title="Choose local folder">…</button>
         </div>
+        <button type="button" data-action="edit-paths" data-index="${i}" class="collector-paths-btn">Files (${pathCount})</button>
+        <label class="check-row collector-host-on"><input type="checkbox" data-field="enabled" data-index="${i}" ${host.enabled ? "checked" : ""}> on</label>
+        <button type="button" data-action="remove-host" data-index="${i}" class="collector-host-remove" title="Remove host">✕</button>
+      </div>
+      <div class="collector-host-extra" data-index="${i}">
         <input data-field="install_cmd" data-index="${i}" value="${escapeAttr(host.install_cmd)}" placeholder="install sftp-server if missing (optional) e.g. apk add openssh-sftp-server">
-        <div class="collector-paths">
-          ${paths}
-          <div class="collector-path-add-row">
-            <button type="button" data-action="add-path" data-index="${i}">+ path</button>
-            <button type="button" data-action="browse-path" data-index="${i}">Browse remote…</button>
-          </div>
-        </div>
       </div>`;
   }).join("");
+  el.collectorHosts.innerHTML = header + rows;
 }
 
 function collectorHostAt(target) {
@@ -3422,9 +3432,8 @@ function onCollectorHostInput(event) {
   const field = t.dataset.field;
   if (field === "enabled") {
     ref.host.enabled = t.checked;
-  } else if (field === "path") {
-    const pi = Number(t.dataset.path);
-    if (Number.isInteger(pi)) ref.host.paths[pi] = t.value;
+  } else if (field === "port") {
+    ref.host.port = clampInteger(t.value, 0, 65535);
   } else if (field) {
     ref.host[field] = t.value;
   }
@@ -3440,18 +3449,10 @@ function onCollectorHostClick(event) {
   if (action === "remove-host") {
     collectorDraft.hosts.splice(ref.i, 1);
     renderCollectorHosts();
-  } else if (action === "add-path") {
-    ref.host.paths = ref.host.paths || [];
-    ref.host.paths.push("");
-    renderCollectorHosts();
-  } else if (action === "remove-path") {
-    const pi = Number(btn.dataset.path);
-    ref.host.paths.splice(pi, 1);
-    renderCollectorHosts();
   } else if (action === "browse-root") {
     collectorPickLocalInto(ref.i);
-  } else if (action === "browse-path") {
-    collectorBrowseRemote(ref.i);
+  } else if (action === "edit-paths") {
+    openCollectorPaths(ref.i);
   }
 }
 
@@ -3481,8 +3482,6 @@ async function collectorPickLocalField(inputEl, appendDefault) {
 
 function collectorReadTopFields() {
   collectorDraft.git_dir = el.collectorGitDir.value.trim();
-  collectorDraft.ssh_config_path = el.collectorSshConfigPath.value.trim();
-  collectorDraft.ssh_config = el.collectorSshConfig.value;
   collectorDraft.split_threshold_mb = clampInteger(el.collectorSplitMb.value, 0, 1000000);
   collectorDraft.auto_commit_push = el.collectorAutoPush.checked;
 }
@@ -3573,18 +3572,67 @@ function stopCollectorPolling() {
   }
 }
 
+// Per-host files/folders editor ------------------------------------------------
+
+function openCollectorPaths(hostIndex) {
+  const host = collectorDraft.hosts[hostIndex];
+  if (!host) return;
+  collectorPathsIndex = hostIndex;
+  const label = host.name.trim() || host.hostname.trim() || `host ${hostIndex + 1}`;
+  el.collectorPathsTitle.textContent = `Files & folders — ${label}`;
+  el.collectorPathsInput.value = "";
+  el.collectorPathsModal.hidden = false;
+  renderCollectorPaths();
+}
+
+function renderCollectorPaths() {
+  const host = collectorDraft.hosts[collectorPathsIndex];
+  if (!host) return;
+  const paths = host.paths || [];
+  el.collectorPathsSummary.textContent = `${paths.length} remote path(s) to pull`;
+  el.collectorPathsList.innerHTML = paths.length
+    ? paths.map((p, pi) => `
+      <div class="collector-path-item">
+        <input data-paths-index="${pi}" value="${escapeAttr(p)}" placeholder="/remote/absolute/path">
+        <button type="button" data-paths-remove="${pi}" title="Remove">✕</button>
+      </div>`).join("")
+    : '<div class="empty">No paths yet — add one or browse the remote host.</div>';
+}
+
+function collectorAddPath(value) {
+  const host = collectorDraft.hosts[collectorPathsIndex];
+  if (!host) return;
+  host.paths = host.paths || [];
+  const path = String(value || "").trim();
+  if (path && !host.paths.includes(path)) {
+    host.paths.push(path);
+  }
+  el.collectorPathsInput.value = "";
+  renderCollectorPaths();
+  renderCollectorHosts();
+}
+
 // Remote path picker (ssh ls) --------------------------------------------------
 
-async function collectorBrowseRemote(hostIndex) {
-  const host = collectorDraft.hosts[hostIndex];
-  if (!host || !host.ssh.trim()) {
-    setCollectorRunState("Set the host's ssh destination first.");
+function collectorConnFor(host) {
+  return {
+    hostname: host.hostname.trim(),
+    user: host.user.trim(),
+    port: host.port || 0,
+    identity_file: host.identity_file.trim(),
+  };
+}
+
+async function collectorBrowseRemote() {
+  const host = collectorDraft.hosts[collectorPathsIndex];
+  if (!host || !host.hostname.trim()) {
+    setCollectorBrowseError("Set the host's HostName first.");
+    el.collectorBrowseModal.hidden = false;
     return;
   }
-  // Persist first so the backend writes the ssh config the alias resolves against.
-  await saveCollector({ silent: true });
-  collectorBrowse = { hostIndex, ssh: host.ssh.trim(), path: "/", parent: null };
-  el.collectorBrowseTitle.textContent = `Remote path — ${host.ssh.trim()}`;
+  const conn = collectorConnFor(host);
+  collectorBrowse = { conn, path: "/", parent: null };
+  el.collectorBrowseTitle.textContent = `Remote path — ${host.user ? host.user + "@" : ""}${host.hostname}`;
   el.collectorBrowseModal.hidden = false;
   await collectorLoadRemote("/");
 }
@@ -3600,7 +3648,7 @@ async function collectorLoadRemote(path) {
   el.collectorBrowsePath.textContent = path;
   el.collectorBrowseList.innerHTML = '<div class="empty">Loading…</div>';
   try {
-    const res = await invoke("collector_browse", { ssh: collectorBrowse.ssh, path });
+    const res = await invoke("collector_browse", { ...collectorBrowse.conn, path });
     collectorBrowse.path = res.path;
     collectorBrowse.parent = res.parent;
     el.collectorBrowsePath.textContent = res.path;
@@ -3618,16 +3666,9 @@ async function collectorLoadRemote(path) {
 }
 
 function collectorSelectRemotePath(path) {
-  if (collectorBrowse) {
-    const host = collectorDraft.hosts[collectorBrowse.hostIndex];
-    if (host) {
-      host.paths = host.paths || [];
-      if (!host.paths.includes(path)) host.paths.push(path);
-    }
-  }
+  collectorAddPath(path);
   el.collectorBrowseModal.hidden = true;
   collectorBrowse = null;
-  renderCollectorHosts();
 }
 
 async function openCollectorConfigFile() {
@@ -3658,10 +3699,40 @@ el.collectorAddHost.onclick = () => {
   renderCollectorHosts();
 };
 el.collectorGitDirBrowse.onclick = () => collectorPickLocalField(el.collectorGitDir, "");
-el.collectorSshConfigBrowse.onclick = () => collectorPickLocalField(el.collectorSshConfigPath, "collector_ssh_config");
 el.collectorHosts.addEventListener("input", onCollectorHostInput);
 el.collectorHosts.addEventListener("change", onCollectorHostInput);
 el.collectorHosts.addEventListener("click", onCollectorHostClick);
+el.collectorPathsClose.onclick = () => {
+  el.collectorPathsModal.hidden = true;
+  collectorPathsIndex = null;
+  renderCollectorHosts();
+};
+el.collectorPathsAdd.onclick = () => collectorAddPath(el.collectorPathsInput.value);
+el.collectorPathsInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    collectorAddPath(el.collectorPathsInput.value);
+  }
+});
+el.collectorPathsBrowse.onclick = () => collectorBrowseRemote();
+el.collectorPathsList.addEventListener("input", (event) => {
+  const t = event.target;
+  const pi = Number(t.dataset.pathsIndex);
+  const host = collectorDraft && collectorDraft.hosts[collectorPathsIndex];
+  if (host && Number.isInteger(pi)) host.paths[pi] = t.value;
+});
+el.collectorPathsList.addEventListener("click", (event) => {
+  const btn = event.target.closest("button[data-paths-remove]");
+  if (!btn) return;
+  event.preventDefault();
+  const pi = Number(btn.dataset.pathsRemove);
+  const host = collectorDraft && collectorDraft.hosts[collectorPathsIndex];
+  if (host && Number.isInteger(pi)) {
+    host.paths.splice(pi, 1);
+    renderCollectorPaths();
+    renderCollectorHosts();
+  }
+});
 el.collectorBrowseClose.onclick = () => {
   el.collectorBrowseModal.hidden = true;
   collectorBrowse = null;
@@ -3844,7 +3915,13 @@ async function invokeWeb(command, payload = {}) {
     } else if (command === "collector_run") {
       options.body = JSON.stringify({});
     } else if (command === "collector_browse") {
-      options.body = JSON.stringify({ ssh: payload.ssh || "", path: payload.path || "" });
+      options.body = JSON.stringify({
+        hostname: payload.hostname || "",
+        user: payload.user || "",
+        port: Number(payload.port) || 0,
+        identity_file: payload.identity_file || "",
+        path: payload.path || "",
+      });
     } else if (command === "collector_save_config") {
       options.body = JSON.stringify(payload.cfg);
     } else {
