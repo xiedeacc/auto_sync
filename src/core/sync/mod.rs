@@ -22,7 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::core::cancel;
 use crate::core::config::{
     AppConfig, DEFAULT_MAX_PARALLEL_TRANSFERS, DEFAULT_TRANSFER_TIMEOUT_SECS, DestinationConfig,
-    NativeSyncConfig, SnapshotBackend, SourceGroupConfig, SyncTaskRef, machine_id_or_local,
+    NativeSyncConfig, SnapshotBackend, SourceGroupConfig, machine_id_or_local,
     machine_is_local,
 };
 use crate::core::machines::{
@@ -3027,19 +3027,6 @@ fn sync_cycle_for_source_inner(
             continue;
         }
 
-        if let Some(blocker) = sync_order_blocker(cfg, state, &source.id, &dst.id)? {
-            all_verified = false;
-            blocked_count += 1;
-            state.upsert_destination_status(
-                &source.id,
-                &dst.id,
-                None,
-                "red",
-                &format!("blocked_by_sync_order:{blocker}"),
-            )?;
-            continue;
-        }
-
         // Cold-backup standby: if this destination lives on a parked pool
         // (outside its wake window), hold the target so the work backlogs and
         // the disk stays asleep. A source on a *different* standby pool is woken
@@ -3554,59 +3541,6 @@ pub struct SyncCycleOutcome {
     pub blocked: bool,
 }
 
-fn sync_order_blocker(
-    cfg: &AppConfig,
-    state: &State,
-    source_id: &str,
-    destination_id: &str,
-) -> Result<Option<String>> {
-    let task = SyncTaskRef {
-        source_id: source_id.to_string(),
-        destination_id: destination_id.to_string(),
-    };
-    for predecessor in sync_order_predecessors(cfg, &task) {
-        if !sync_order_predecessor_satisfied(state, &predecessor)? {
-            return Ok(Some(sync_task_label(&predecessor)));
-        }
-    }
-    Ok(None)
-}
-
-fn sync_order_predecessor_satisfied(state: &State, task: &SyncTaskRef) -> Result<bool> {
-    let offset = state.destination_offset(&task.source_id, &task.destination_id)?;
-    if let Some(target) = offset.target_cycle_id {
-        return Ok(offset.last_verified_cycle_id >= Some(target) && offset.status == "green");
-    }
-    Ok(offset.last_verified_cycle_id.is_some() && offset.status == "green")
-}
-
-fn sync_order_predecessors(cfg: &AppConfig, task: &SyncTaskRef) -> Vec<SyncTaskRef> {
-    let mut out = Vec::new();
-    let mut stack: Vec<SyncTaskRef> = cfg
-        .sync_order
-        .iter()
-        .filter(|rule| rule.after == *task)
-        .map(|rule| rule.before.clone())
-        .collect();
-    while let Some(predecessor) = stack.pop() {
-        if out.contains(&predecessor) {
-            continue;
-        }
-        stack.extend(
-            cfg.sync_order
-                .iter()
-                .filter(|rule| rule.after == predecessor)
-                .map(|rule| rule.before.clone()),
-        );
-        out.push(predecessor);
-    }
-    out
-}
-
-fn sync_task_label(task: &SyncTaskRef) -> String {
-    format!("{}:{}", task.source_id, task.destination_id)
-}
-
 enum RealtimeIncrementalPlan {
     /// Per ready-destination accumulated event paths: `(dst_index, rel_paths)`.
     /// Realtime destinations track every cycle so their backlog is just the
@@ -3821,18 +3755,6 @@ fn sync_cycle_with_transfer(
                 None,
                 "yellow",
                 "waiting_for_compare",
-            )?;
-            continue;
-        }
-        if let Some(blocker) = sync_order_blocker(cfg, state, &source.id, &dst.id)? {
-            all_verified = false;
-            blocked_count += 1;
-            state.upsert_destination_status(
-                &source.id,
-                &dst.id,
-                None,
-                "red",
-                &format!("blocked_by_sync_order:{blocker}"),
             )?;
             continue;
         }
@@ -4635,18 +4557,6 @@ fn sync_cycle_file_with_transfer(
             all_verified = false;
             blocked_count += 1;
             state.upsert_destination_status(&source.id, &dst.id, None, "yellow", "paused")?;
-            continue;
-        }
-        if let Some(blocker) = sync_order_blocker(cfg, state, &source.id, &dst.id)? {
-            all_verified = false;
-            blocked_count += 1;
-            state.upsert_destination_status(
-                &source.id,
-                &dst.id,
-                None,
-                "red",
-                &format!("blocked_by_sync_order:{blocker}"),
-            )?;
             continue;
         }
         let dst_machine_id = machine_id_or_local(&dst.machine_id);
@@ -8865,7 +8775,7 @@ mod tests {
     use crate::core::config::ScheduleMode;
     use crate::core::config::{
         AppConfig, DestinationConfig, MachineConfig, ScheduleConfig, SnapshotBackend,
-        SnapshotConfig, SourceGroupConfig, SyncMode, SyncOrderRule, SyncTaskRef,
+        SnapshotConfig, SourceGroupConfig, SyncMode,
     };
     use crate::core::state::State;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -10757,113 +10667,6 @@ other /zfs_other zfs rw 0 0
             b"existing nested"
         );
         assert!(!eff.join(".auto_sync_trash").exists());
-
-        fs::remove_dir_all(temp).ok();
-    }
-
-    #[test]
-    fn sync_order_blocks_after_task_until_before_task_verifies() {
-        let temp = temp_dir("sync_order_blocks");
-        let before_src = temp.join("before_src");
-        let after_src = temp.join("after_src");
-        let before_dst = temp.join("before_dst_file");
-        let after_dst = temp.join("after_dst");
-        let db = temp.join("state.sqlite");
-        fs::create_dir_all(&before_src).unwrap();
-        fs::create_dir_all(&after_src).unwrap();
-        fs::create_dir_all(&after_dst).unwrap();
-        fs::write(before_src.join("before.txt"), b"before").unwrap();
-        fs::write(after_src.join("after.txt"), b"after").unwrap();
-        fs::write(&before_dst, b"not a directory").unwrap();
-
-        let mut cfg = AppConfig::default();
-        cfg.app.data_db = db.clone();
-        cfg.source_groups.push(SourceGroupConfig {
-            id: "after_src".to_string(),
-            machine_id: "local".to_string(),
-            src: after_src.clone(),
-            add_directory: true,
-            managed_by: String::new(),
-            excludes: Vec::new(),
-            enabled: true,
-            order: 0,
-            mode: SyncMode::Mirror,
-            snapshot: SnapshotConfig {
-                backend: SnapshotBackend::Manifest,
-                ..SnapshotConfig::default()
-            },
-            destinations: vec![DestinationConfig {
-                id: "after_dst".to_string(),
-                machine_id: "local".to_string(),
-                path: after_dst.clone(),
-                enabled: true,
-                schedule: ScheduleConfig::default(),
-                paused: false,
-                sync: None,
-            }],
-        });
-        cfg.source_groups.push(SourceGroupConfig {
-            id: "before_src".to_string(),
-            machine_id: "local".to_string(),
-            src: before_src.clone(),
-            add_directory: true,
-            managed_by: String::new(),
-            excludes: Vec::new(),
-            enabled: true,
-            order: 0,
-            mode: SyncMode::Mirror,
-            snapshot: SnapshotConfig {
-                backend: SnapshotBackend::Manifest,
-                ..SnapshotConfig::default()
-            },
-            destinations: vec![DestinationConfig {
-                id: "before_dst".to_string(),
-                machine_id: "local".to_string(),
-                path: before_dst.clone(),
-                enabled: true,
-                schedule: ScheduleConfig::default(),
-                paused: false,
-                sync: None,
-            }],
-        });
-        cfg.sync_order.push(SyncOrderRule {
-            before: SyncTaskRef {
-                source_id: "before_src".to_string(),
-                destination_id: "before_dst".to_string(),
-            },
-            after: SyncTaskRef {
-                source_id: "after_src".to_string(),
-                destination_id: "after_dst".to_string(),
-            },
-        });
-
-        let mut state = State::open(&db).unwrap();
-        sync_all_now(&cfg, &mut state).unwrap();
-
-        assert!(!after_dst.join("after_src").join("after.txt").exists());
-        let views = state.destination_views(&cfg).unwrap();
-        let after_view = views
-            .iter()
-            .find(|view| view.source_id == "after_src")
-            .unwrap();
-        assert!(
-            after_view
-                .status_reason
-                .starts_with("blocked_by_sync_order")
-        );
-
-        fs::remove_file(&before_dst).unwrap();
-        fs::create_dir_all(&before_dst).unwrap();
-        sync_all_now(&cfg, &mut state).unwrap();
-
-        assert_eq!(
-            fs::read(before_dst.join("before_src").join("before.txt")).unwrap(),
-            b"before"
-        );
-        assert_eq!(
-            fs::read(after_dst.join("after_src").join("after.txt")).unwrap(),
-            b"after"
-        );
 
         fs::remove_dir_all(temp).ok();
     }

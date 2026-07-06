@@ -176,7 +176,6 @@ async function checkPendingScans() {
   }
 }
 let latestDestinationSchedule = defaultDestinationSchedule();
-let activeSourceTab = "sources";
 let machineHostLocked = false;
 
 const el = {
@@ -506,13 +505,12 @@ function updateStatusUi() {
     const sourceSync = group.querySelector('[data-action="sync-source"]');
     if (sourceSync) {
       const unavailable = sourceHasUnavailableDestination(sourceId);
-      const blocked = sourceHasBlockedDestination(sourceId);
       const activity = activityForSourceId(sourceId);
       const syncing = activityIsSyncing(activity);
-      sourceSync.disabled = busy || blocked || unavailable || syncing;
+      sourceSync.disabled = busy || unavailable || syncing;
       sourceSync.title = unavailable
         ? "Destination unavailable"
-        : (blocked ? "Blocked by sync order" : (syncing ? activitySyncingLabel(activity) : "Sync source"));
+        : (syncing ? activitySyncingLabel(activity) : "Sync source");
     }
     const removeSource = group.querySelector('[data-action="remove-source"]');
     if (removeSource) {
@@ -555,7 +553,6 @@ function updateStatusUi() {
     }
     const syncSelect = row.querySelector('[data-action="sync-dst"]');
     if (syncSelect) {
-      const blocked = isSyncOrderBlocked(status);
       const activity = activityForSourceId(sourceId);
       const syncing = activityIsSyncing(activity);
       // A compare for this destination also blocks a manual sync — the engine
@@ -567,14 +564,13 @@ function updateStatusUi() {
         ? dstActivity(source, dst)
         : { active: false, scope: null };
       const comparing = dstAct.active && dstAct.scope === "compare";
-      syncSelect.disabled = busy || blocked || unavailable || syncing || paused || comparing;
+      syncSelect.disabled = busy || unavailable || syncing || paused || comparing;
       syncSelect.title = paused
         ? "Paused — resume to sync"
         : (unavailable
           ? unavailableLabel(status)
-          : (blocked ? blockedByLabel(status)
-            : (syncing ? activitySyncingLabel(activity)
-              : (comparing ? "Comparing — wait for it to finish" : "Sync"))));
+          : (syncing ? activitySyncingLabel(activity)
+            : (comparing ? "Comparing — wait for it to finish" : "Sync")));
     }
     const logButton = row.querySelector('[data-action="show-dst-log"]');
     if (logButton) {
@@ -975,26 +971,11 @@ function renderSourcePanel() {
         <button data-action="add-source">Add Source</button>
       </div>
     </div>
-    <div class="panel-tabs" role="tablist" aria-label="Source settings">
-      <button class="${activeSourceTab === "sources" ? "active" : ""}" data-tab="sources" role="tab">Sources</button>
-      <button class="${activeSourceTab === "order" ? "active" : ""}" data-tab="order" role="tab">Order</button>
-    </div>
     <div id="source-tab-body"></div>
   `;
 
   el.sourcePanel.querySelector('[data-action="add-source"]').onclick = addSource;
   el.sourcePanel.querySelector('[data-action="sync-all"]').onclick = syncAllNow;
-  for (const tab of el.sourcePanel.querySelectorAll("[data-tab]")) {
-    tab.onclick = () => {
-      activeSourceTab = tab.dataset.tab;
-      renderSourcePanel();
-    };
-  }
-
-  if (activeSourceTab === "order") {
-    renderSyncOrderPanel(el.sourcePanel.querySelector("#source-tab-body"));
-    return;
-  }
 
   const body = el.sourcePanel.querySelector("#source-tab-body");
   if (!cfg.source_groups.length) {
@@ -1118,116 +1099,6 @@ async function reorderSource(movedId, targetId, before) {
   render();
 }
 
-function renderSyncOrderPanel(container) {
-  normalizeConfig(cfg);
-  const tasks = syncTaskOptions();
-  const analysis = analyzeSyncOrderGraph();
-  const optionsHtml = tasks.map((task) =>
-    `<option value="${escapeAttr(task.key)}">${escapeHtml(task.label)}</option>`
-  ).join("");
-  const statusClass = analysis.cycle.length ? "order-status error" : "order-status ok";
-  const statusText = analysis.cycle.length
-    ? `Cycle detected: ${analysis.cycle.join(" > ")}`
-    : "DAG valid";
-
-  if (tasks.length < 2) {
-    container.innerHTML = `
-      <div class="order-panel">
-        <div class="empty">Add at least two sync destinations to configure order</div>
-      </div>
-    `;
-    return;
-  }
-
-  container.innerHTML = `
-    <div class="order-panel">
-      <div class="order-add sync-row">
-        <div class="order-selects">
-          <label>Before</label>
-          <label>After</label>
-          <select data-field="new-before">${optionsHtml}</select>
-          <select data-field="new-after">${optionsHtml}</select>
-        </div>
-        <button data-action="add-order" class="primary">Add</button>
-      </div>
-      <div class="${statusClass}">${escapeHtml(statusText)}</div>
-      <div class="order-list"></div>
-      <div class="dag-wrap">${renderDagSvg(analysis)}</div>
-    </div>
-  `;
-
-  const beforeSelect = container.querySelector('[data-field="new-before"]');
-  const afterSelect = container.querySelector('[data-field="new-after"]');
-  if (tasks[1]) {
-    afterSelect.value = tasks[1].key;
-  }
-  container.querySelector('[data-action="add-order"]').onclick = async () => {
-    const before = beforeSelect.value;
-    const after = afterSelect.value;
-    if (!before || !after || before === after) {
-      setMessage("Choose two different sync tasks");
-      return;
-    }
-    cfg.sync_order = cleanSyncOrder([
-      ...(cfg.sync_order || []),
-      { before: keyToTaskRef(before), after: keyToTaskRef(after) },
-    ]);
-    await saveSyncOrderDraft();
-  };
-  renderSyncOrderRows(container.querySelector(".order-list"), optionsHtml);
-}
-
-function renderSyncOrderRows(container, optionsHtml) {
-  if (!cfg.sync_order.length) {
-    container.innerHTML = `<div class="empty">No sync order rules</div>`;
-    return;
-  }
-  container.innerHTML = cfg.sync_order.map((rule, index) => `
-    <div class="order-rule">
-      <select data-field="rule-before" data-index="${index}">${optionsHtml}</select>
-      <span class="order-arrow">&gt;</span>
-      <select data-field="rule-after" data-index="${index}">${optionsHtml}</select>
-      <button class="danger icon" data-action="remove-order" data-index="${index}" title="Remove order">x</button>
-    </div>
-  `).join("");
-
-  cfg.sync_order.forEach((rule, index) => {
-    container.querySelector(`[data-field="rule-before"][data-index="${index}"]`).value = ruleEndpointToKey(rule.before);
-    container.querySelector(`[data-field="rule-after"][data-index="${index}"]`).value = ruleEndpointToKey(rule.after);
-  });
-
-  for (const select of container.querySelectorAll("select")) {
-    select.onchange = async () => {
-      const rule = cfg.sync_order[Number(select.dataset.index)];
-      rule.before = keyToTaskRef(container.querySelector(`[data-field="rule-before"][data-index="${select.dataset.index}"]`).value);
-      rule.after = keyToTaskRef(container.querySelector(`[data-field="rule-after"][data-index="${select.dataset.index}"]`).value);
-      cfg.sync_order = cleanSyncOrder(cfg.sync_order || []);
-      await saveSyncOrderDraft();
-    };
-  }
-  for (const button of container.querySelectorAll('[data-action="remove-order"]')) {
-    button.onclick = async () => {
-      cfg.sync_order.splice(Number(button.dataset.index), 1);
-      await saveSyncOrderDraft();
-    };
-  }
-}
-
-async function saveSyncOrderDraft() {
-  const analysis = analyzeSyncOrderGraph();
-  if (analysis.cycle.length) {
-    setMessage(`Cycle detected: ${analysis.cycle.join(" > ")}`);
-    renderSourcePanel();
-    return;
-  }
-  try {
-    await autoSaveConfig();
-  } catch (error) {
-    setMessage(String(error));
-  }
-  renderSourcePanel();
-}
-
 function bindSourceControls(source, sourceIndex, group) {
   const srcInput = group.querySelector('[data-field="source-src"]');
   srcInput.onclick = async () => {
@@ -1296,11 +1167,6 @@ function bindSourceControls(source, sourceIndex, group) {
   group.querySelector('[data-action="sync-source"]').onclick = () => {
     if (sourceHasUnavailableDestination(source.id)) {
       setMessage("Source sync is disabled because a destination is unavailable");
-      updateStatusUi();
-      return;
-    }
-    if (sourceHasBlockedDestination(source.id)) {
-      setMessage("Source sync is blocked by sync order");
       updateStatusUi();
       return;
     }
@@ -1474,11 +1340,6 @@ function renderSyncRows(source, group) {
         updateStatusUi();
         return;
       }
-      if (isSyncOrderBlocked(latestStatus)) {
-        setMessage(blockedByLabel(latestStatus));
-        updateStatusUi();
-        return;
-      }
       // A sync already in flight is fine: the backend queues the request and
       // the engine picks it up right after the current pass.
       if (mode === "scan") {
@@ -1631,7 +1492,6 @@ function normalizeConfig(nextCfg) {
       latestDestinationSchedule = cloneSchedule(dst.schedule);
     }
   }
-  nextCfg.sync_order = cleanSyncOrder(nextCfg.sync_order || []);
 }
 
 function normalizeAppConfig(app) {
@@ -1830,194 +1690,6 @@ function findDestinationEndpoint(destinationId) {
     }
   }
   return null;
-}
-
-function syncTaskOptions() {
-  const tasks = [];
-  for (const source of cfg.source_groups || []) {
-    for (const dst of source.destinations || []) {
-      const key = makeTaskKey(source.id, dst.id);
-      tasks.push({
-        key,
-        label: key,
-        source,
-        destination: dst,
-      });
-    }
-  }
-  return tasks;
-}
-
-function cleanSyncOrder(rules) {
-  const taskKeys = new Set(syncTaskOptions().map((task) => task.key));
-  const seen = new Set();
-  const cleaned = [];
-  for (const rule of rules || []) {
-    const before = ruleEndpointToKey(rule.before);
-    const after = ruleEndpointToKey(rule.after);
-    const edge = `${before}>${after}`;
-    if (!before || !after || before === after || !taskKeys.has(before) || !taskKeys.has(after) || seen.has(edge)) {
-      continue;
-    }
-    seen.add(edge);
-    cleaned.push({
-      before: keyToTaskRef(before),
-      after: keyToTaskRef(after),
-    });
-  }
-  return cleaned;
-}
-
-function analyzeSyncOrderGraph() {
-  const tasks = syncTaskOptions();
-  const taskKeys = tasks.map((task) => task.key);
-  const graph = new Map(taskKeys.map((key) => [key, []]));
-  const indegree = new Map(taskKeys.map((key) => [key, 0]));
-  const edges = [];
-
-  for (const rule of cleanSyncOrder(cfg.sync_order || [])) {
-    const before = ruleEndpointToKey(rule.before);
-    const after = ruleEndpointToKey(rule.after);
-    graph.get(before).push(after);
-    indegree.set(after, indegree.get(after) + 1);
-    edges.push([before, after]);
-  }
-
-  const levels = new Map(taskKeys.map((key) => [key, 0]));
-  const queue = taskKeys.filter((key) => indegree.get(key) === 0);
-  let visited = 0;
-  for (let index = 0; index < queue.length; index += 1) {
-    const key = queue[index];
-    visited += 1;
-    for (const next of graph.get(key)) {
-      levels.set(next, Math.max(levels.get(next), levels.get(key) + 1));
-      indegree.set(next, indegree.get(next) - 1);
-      if (indegree.get(next) === 0) {
-        queue.push(next);
-      }
-    }
-  }
-
-  const cycle = visited === taskKeys.length ? [] : detectSyncOrderCycle(graph, taskKeys);
-  if (cycle.length) {
-    taskKeys.forEach((key, index) => levels.set(key, index % 3));
-  }
-
-  return { tasks, edges, levels, cycle };
-}
-
-function detectSyncOrderCycle(graph, taskKeys) {
-  const visiting = new Set();
-  const visited = new Set();
-  const stack = [];
-
-  function visit(key) {
-    if (visiting.has(key)) {
-      const start = stack.indexOf(key);
-      return [...stack.slice(start), key];
-    }
-    if (visited.has(key)) {
-      return [];
-    }
-    visiting.add(key);
-    stack.push(key);
-    for (const next of graph.get(key) || []) {
-      const cycle = visit(next);
-      if (cycle.length) {
-        return cycle;
-      }
-    }
-    stack.pop();
-    visiting.delete(key);
-    visited.add(key);
-    return [];
-  }
-
-  for (const key of taskKeys) {
-    const cycle = visit(key);
-    if (cycle.length) {
-      return cycle;
-    }
-  }
-  return [];
-}
-
-function renderDagSvg(analysis) {
-  const nodeWidth = 132;
-  const nodeHeight = 34;
-  const columnGap = 72;
-  const rowGap = 18;
-  const grouped = new Map();
-  for (const task of analysis.tasks) {
-    const level = analysis.levels.get(task.key) || 0;
-    if (!grouped.has(level)) {
-      grouped.set(level, []);
-    }
-    grouped.get(level).push(task);
-  }
-  const maxLevel = Math.max(0, ...grouped.keys());
-  const maxRows = Math.max(1, ...[...grouped.values()].map((items) => items.length));
-  const width = Math.max(360, (maxLevel + 1) * nodeWidth + maxLevel * columnGap + 32);
-  const height = Math.max(96, maxRows * nodeHeight + (maxRows - 1) * rowGap + 32);
-  const positions = new Map();
-  for (const [level, items] of grouped) {
-    items.forEach((task, index) => {
-      positions.set(task.key, {
-        x: 16 + level * (nodeWidth + columnGap),
-        y: 16 + index * (nodeHeight + rowGap),
-      });
-    });
-  }
-
-  const lines = analysis.edges.map(([from, to]) => {
-    const a = positions.get(from);
-    const b = positions.get(to);
-    if (!a || !b) {
-      return "";
-    }
-    return `<line x1="${a.x + nodeWidth}" y1="${a.y + nodeHeight / 2}" x2="${b.x}" y2="${b.y + nodeHeight / 2}" marker-end="url(#dag-arrow)" />`;
-  }).join("");
-  const nodes = analysis.tasks.map((task) => {
-    const pos = positions.get(task.key);
-    const cycleClass = analysis.cycle.includes(task.key) ? " cycle" : "";
-    return `
-      <g class="dag-node${cycleClass}" transform="translate(${pos.x} ${pos.y})">
-        <rect width="${nodeWidth}" height="${nodeHeight}" rx="6"></rect>
-        <text x="10" y="22">${escapeHtml(task.label)}</text>
-      </g>
-    `;
-  }).join("");
-
-  return `
-    <svg class="dag-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Sync order DAG">
-      <defs>
-        <marker id="dag-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-          <path d="M 0 0 L 8 4 L 0 8 z"></path>
-        </marker>
-      </defs>
-      <g class="dag-lines">${lines}</g>
-      <g>${nodes}</g>
-    </svg>
-  `;
-}
-
-function makeTaskKey(sourceId, destinationId) {
-  return `${sourceId || ""}:${destinationId || ""}`;
-}
-
-function ruleEndpointToKey(endpoint) {
-  if (!endpoint) {
-    return "";
-  }
-  if (typeof endpoint === "string") {
-    return endpoint;
-  }
-  return makeTaskKey(endpoint.source_id, endpoint.destination_id);
-}
-
-function keyToTaskRef(key) {
-  const [source_id, destination_id] = String(key || "").split(":");
-  return { source_id: source_id || "", destination_id: destination_id || "" };
 }
 
 function defaultDestinationSchedule() {
@@ -3059,26 +2731,10 @@ function runtimeSyncLabel(runtime) {
   return kind ? `syncing (${kind})` : "syncing";
 }
 
-function sourceHasBlockedDestination(sourceId) {
-  return statuses.some((status) =>
-    normalizeSourceId(status.source_id) === sourceId && isSyncOrderBlocked(status)
-  );
-}
-
 function sourceHasUnavailableDestination(sourceId) {
   return statuses.some((status) =>
     normalizeSourceId(status.source_id) === sourceId && isDestinationUnavailable(status)
   );
-}
-
-function isSyncOrderBlocked(status) {
-  return String((status && status.status_reason) || "").startsWith("blocked_by_sync_order:");
-}
-
-function blockedByLabel(status) {
-  const reason = String((status && status.status_reason) || "");
-  const blocker = reason.slice("blocked_by_sync_order:".length);
-  return blocker ? `Blocked by ${blocker}` : "Blocked by sync order";
 }
 
 function isDestinationUnavailable(status) {
@@ -3291,7 +2947,6 @@ function updateCfgFromForm() {
   });
   cfg.source_groups.sort((a, b) => a.order - b.order);
   cfg.source_groups.forEach((source, index) => { source.order = index; });
-  cfg.sync_order = cleanSyncOrder(cfg.sync_order || []);
 }
 
 function dedupeDestinationsByPath(destinations) {
@@ -3549,7 +3204,6 @@ function defaultUiConfig() {
     app: normalizeAppConfig({}),
     machines: [],
     source_groups: [],
-    sync_order: [],
   };
 }
 

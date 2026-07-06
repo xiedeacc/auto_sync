@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 #[cfg(windows)]
@@ -22,8 +22,6 @@ pub struct AppConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub machines: Vec<MachineConfig>,
     pub source_groups: Vec<SourceGroupConfig>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub sync_order: Vec<SyncOrderRule>,
     /// Disks that should spin up only on a schedule (cold-backup HDDs). Any
     /// sync/compare/full touching one of a pool's `mount_roots` is deferred
     /// while that pool is outside its wake window, so the disk stays parked.
@@ -289,20 +287,6 @@ pub struct MachineConfig {
     pub manual: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
-#[serde(default)]
-pub struct SyncTaskRef {
-    pub source_id: String,
-    pub destination_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct SyncOrderRule {
-    pub before: SyncTaskRef,
-    pub after: SyncTaskRef,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct DeployConfig {
@@ -325,7 +309,6 @@ impl Default for AppConfig {
             app: AppSection::default(),
             machines: vec![MachineConfig::local()],
             source_groups: Vec::new(),
-            sync_order: Vec::new(),
             standby_pools: Vec::new(),
             deploy: DeployConfig::default(),
         }
@@ -594,16 +577,6 @@ pub fn clean_config_for_save(cfg: &AppConfig) -> AppConfig {
     }
     cfg.source_groups
         .retain(|source| !source.src.as_os_str().is_empty());
-    let task_ids = sync_task_ids(&cfg);
-    let mut order_edges = HashSet::new();
-    cfg.sync_order.retain(|rule| {
-        let before = sync_task_key(&rule.before);
-        let after = sync_task_key(&rule.after);
-        before != after
-            && task_ids.contains(&before)
-            && task_ids.contains(&after)
-            && order_edges.insert((before, after))
-    });
     cfg
 }
 
@@ -848,7 +821,6 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         validate_unique_machine_ids(&self.machines)?;
         let mut source_ids = HashSet::new();
-        let mut task_ids = HashSet::new();
         let machines = clean_machines(&self.machines);
         let machine_ids = machine_reference_set(&machines);
         for source in &self.source_groups {
@@ -920,10 +892,8 @@ impl AppConfig {
                         source.src.display()
                     );
                 }
-                task_ids.insert(sync_task_key_parts(&source.id, &dst.id));
             }
         }
-        validate_sync_order(&self.sync_order, &task_ids)?;
         Ok(())
     }
 }
@@ -1205,76 +1175,6 @@ fn detect_local_ip_for(peer: Ipv4Addr) -> Option<Ipv4Addr> {
         IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
         _ => None,
     }
-}
-
-fn sync_task_ids(cfg: &AppConfig) -> HashSet<String> {
-    cfg.source_groups
-        .iter()
-        .flat_map(|source| {
-            source
-                .destinations
-                .iter()
-                .map(|dst| sync_task_key_parts(&source.id, &dst.id))
-        })
-        .collect()
-}
-
-fn sync_task_key(task: &SyncTaskRef) -> String {
-    sync_task_key_parts(&task.source_id, &task.destination_id)
-}
-
-fn sync_task_key_parts(source_id: &str, destination_id: &str) -> String {
-    format!("{source_id}:{destination_id}")
-}
-
-fn validate_sync_order(rules: &[SyncOrderRule], task_ids: &HashSet<String>) -> Result<()> {
-    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
-    let mut indegree: HashMap<String, usize> = HashMap::new();
-    let mut edges = HashSet::new();
-
-    for rule in rules {
-        let before = sync_task_key(&rule.before);
-        let after = sync_task_key(&rule.after);
-        if !task_ids.contains(&before) {
-            bail!("sync order references unknown task: {before}");
-        }
-        if !task_ids.contains(&after) {
-            bail!("sync order references unknown task: {after}");
-        }
-        if before == after {
-            bail!("sync order task cannot depend on itself: {before}");
-        }
-        if !edges.insert((before.clone(), after.clone())) {
-            continue;
-        }
-        graph.entry(before.clone()).or_default().push(after.clone());
-        graph.entry(after.clone()).or_default();
-        indegree.entry(before).or_insert(0);
-        *indegree.entry(after).or_insert(0) += 1;
-    }
-
-    let mut queue: VecDeque<String> = indegree
-        .iter()
-        .filter_map(|(task, count)| (*count == 0).then(|| task.clone()))
-        .collect();
-    let mut visited = 0_usize;
-    while let Some(task) = queue.pop_front() {
-        visited += 1;
-        for next in graph.get(&task).into_iter().flatten() {
-            let Some(count) = indegree.get_mut(next) else {
-                continue;
-            };
-            *count -= 1;
-            if *count == 0 {
-                queue.push_back(next.clone());
-            }
-        }
-    }
-
-    if visited != indegree.len() {
-        bail!("sync order contains a cycle");
-    }
-    Ok(())
 }
 
 fn validate_exclude_path(source_id: &str, path: &Path) -> Result<()> {
@@ -1646,128 +1546,6 @@ src = "/zfs"
         let err = save_config(&path, &cfg).unwrap_err();
         assert!(err.to_string().contains("duplicate machine id: local"));
         fs::remove_dir_all(temp).ok();
-    }
-
-    #[test]
-    fn validates_sync_order_dag() {
-        let mut cfg = config_with_two_tasks();
-        cfg.sync_order.push(SyncOrderRule {
-            before: SyncTaskRef {
-                source_id: "src_1".to_string(),
-                destination_id: "dst_1".to_string(),
-            },
-            after: SyncTaskRef {
-                source_id: "src_2".to_string(),
-                destination_id: "dst_1".to_string(),
-            },
-        });
-
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn rejects_sync_order_cycle() {
-        let mut cfg = config_with_two_tasks();
-        cfg.sync_order.push(SyncOrderRule {
-            before: SyncTaskRef {
-                source_id: "src_1".to_string(),
-                destination_id: "dst_1".to_string(),
-            },
-            after: SyncTaskRef {
-                source_id: "src_2".to_string(),
-                destination_id: "dst_1".to_string(),
-            },
-        });
-        cfg.sync_order.push(SyncOrderRule {
-            before: SyncTaskRef {
-                source_id: "src_2".to_string(),
-                destination_id: "dst_1".to_string(),
-            },
-            after: SyncTaskRef {
-                source_id: "src_1".to_string(),
-                destination_id: "dst_1".to_string(),
-            },
-        });
-
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn clean_config_for_save_drops_stale_sync_order_rules() {
-        let mut cfg = config_with_two_tasks();
-        cfg.sync_order.push(SyncOrderRule {
-            before: SyncTaskRef {
-                source_id: "src_1".to_string(),
-                destination_id: "dst_1".to_string(),
-            },
-            after: SyncTaskRef {
-                source_id: "missing".to_string(),
-                destination_id: "dst_1".to_string(),
-            },
-        });
-        cfg.sync_order.push(SyncOrderRule {
-            before: SyncTaskRef {
-                source_id: "src_1".to_string(),
-                destination_id: "dst_1".to_string(),
-            },
-            after: SyncTaskRef {
-                source_id: "src_2".to_string(),
-                destination_id: "dst_1".to_string(),
-            },
-        });
-
-        let cleaned = clean_config_for_save(&cfg);
-
-        assert_eq!(cleaned.sync_order.len(), 1);
-        assert_eq!(cleaned.sync_order[0].before.source_id, "src_1");
-        assert_eq!(cleaned.sync_order[0].after.source_id, "src_2");
-    }
-
-    fn config_with_two_tasks() -> AppConfig {
-        let mut cfg = AppConfig::default();
-        cfg.source_groups.push(SourceGroupConfig {
-            id: "src_1".to_string(),
-            machine_id: "local".to_string(),
-            src: PathBuf::from("/data/src_1"),
-            add_directory: true,
-            managed_by: String::new(),
-            excludes: Vec::new(),
-            enabled: true,
-            order: 0,
-            mode: SyncMode::Mirror,
-            snapshot: SnapshotConfig::default(),
-            destinations: vec![DestinationConfig {
-                id: "dst_1".to_string(),
-                machine_id: "local".to_string(),
-                path: PathBuf::from("/data/dst_1"),
-                enabled: true,
-                schedule: ScheduleConfig::default(),
-                paused: false,
-                sync: None,
-            }],
-        });
-        cfg.source_groups.push(SourceGroupConfig {
-            id: "src_2".to_string(),
-            machine_id: "local".to_string(),
-            src: PathBuf::from("/data/src_2"),
-            add_directory: true,
-            managed_by: String::new(),
-            excludes: Vec::new(),
-            enabled: true,
-            order: 0,
-            mode: SyncMode::Mirror,
-            snapshot: SnapshotConfig::default(),
-            destinations: vec![DestinationConfig {
-                id: "dst_1".to_string(),
-                machine_id: "local".to_string(),
-                path: PathBuf::from("/data/dst_2"),
-                enabled: true,
-                schedule: ScheduleConfig::default(),
-                paused: false,
-                sync: None,
-            }],
-        });
-        cfg
     }
 
     fn temp_dir(name: &str) -> PathBuf {

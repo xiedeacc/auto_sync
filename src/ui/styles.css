@@ -207,26 +207,6 @@ th {
   margin-left: -16px;
 }
 
-.panel-tabs {
-  display: flex;
-  gap: 4px;
-  margin: -4px 0 14px;
-  border-bottom: 1px solid var(--line);
-}
-
-.panel-tabs button {
-  border: 0;
-  border-bottom: 2px solid transparent;
-  border-radius: 0;
-  background: transparent;
-  color: var(--muted);
-}
-
-.panel-tabs button.active {
-  border-bottom-color: var(--accent);
-  color: var(--accent);
-}
-
 .subtle {
   display: block;
   overflow: hidden;
@@ -676,105 +656,6 @@ th {
 
 .destination-readonly {
   width: 100%;
-}
-
-.order-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.order-add {
-  align-items: flex-end;
-}
-
-.order-selects {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 4px var(--control-gap);
-  flex: 1;
-}
-
-.order-selects label {
-  margin-bottom: 0;
-}
-
-.order-status {
-  min-height: 30px;
-  display: flex;
-  align-items: center;
-  padding: 6px 9px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  font-size: 13px;
-}
-
-.order-status.ok {
-  color: var(--green);
-  background: #f0faf6;
-}
-
-.order-status.error {
-  color: var(--red);
-  background: #fff4f2;
-  border-color: #f2b8ae;
-}
-
-.order-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.order-rule {
-  display: grid;
-  grid-template-columns: 1fr 22px 1fr 34px;
-  gap: var(--control-gap);
-  align-items: center;
-}
-
-.order-arrow {
-  color: var(--muted);
-  font-weight: 750;
-  text-align: center;
-}
-
-.dag-wrap {
-  overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: #f8fafc;
-}
-
-.dag-svg {
-  display: block;
-  min-width: 100%;
-  height: auto;
-}
-
-.dag-lines line {
-  stroke: #8896a8;
-  stroke-width: 1.5;
-}
-
-.dag-svg marker path {
-  fill: #8896a8;
-}
-
-.dag-node rect {
-  fill: #fff;
-  stroke: var(--line);
-}
-
-.dag-node.cycle rect {
-  stroke: var(--red);
-  stroke-width: 2;
-}
-
-.dag-node text {
-  fill: var(--text);
-  font-size: 12px;
-  font-weight: 650;
 }
 
 .path-picker {
@@ -1495,10 +1376,6 @@ th {
 
   .sync-row {
     flex-wrap: wrap;
-  }
-
-  .order-rule {
-    grid-template-columns: 1fr;
   }
 
   .machine-form,
