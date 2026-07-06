@@ -308,7 +308,6 @@ const el = {
   collectorBrowseClose: document.getElementById("collector-browse-close"),
   collectorBrowsePath: document.getElementById("collector-browse-path"),
   collectorBrowseUp: document.getElementById("collector-browse-up"),
-  collectorBrowseSelect: document.getElementById("collector-browse-select"),
   collectorBrowseError: document.getElementById("collector-browse-error"),
   collectorBrowseList: document.getElementById("collector-browse-list"),
 };
@@ -3634,10 +3633,9 @@ async function collectorBrowseRemote() {
   const conn = collectorConnFor(host);
   // Reopen at the directory last browsed on this host.
   const start = collectorLastRemotePath[conn.hostname] || "/";
-  collectorBrowse = { conn, path: start, parent: null, selected: new Set() };
+  collectorBrowse = { conn, path: start, parent: null };
   el.collectorBrowseTitle.textContent = `Remote path — ${host.user ? host.user + "@" : ""}${host.hostname}`;
   el.collectorBrowseModal.hidden = false;
-  updateCollectorBrowseSelectLabel();
   await collectorLoadRemote(start);
 }
 
@@ -3646,10 +3644,8 @@ function setCollectorBrowseError(text) {
   el.collectorBrowseError.hidden = !text;
 }
 
-function updateCollectorBrowseSelectLabel() {
-  const n = collectorBrowse ? collectorBrowse.selected.size : 0;
-  el.collectorBrowseSelect.textContent = `Add selected (${n})`;
-  el.collectorBrowseSelect.disabled = n === 0;
+function collectorBrowseHost() {
+  return collectorDraft && collectorDraft.hosts[collectorPathsIndex];
 }
 
 async function collectorLoadRemote(path) {
@@ -3676,8 +3672,11 @@ function renderCollectorBrowseList(entries) {
     el.collectorBrowseList.innerHTML = '<div class="empty">(empty)</div>';
     return;
   }
+  // Checkbox state mirrors the host's paths directly — ticking one adds it
+  // (and auto-saves), unticking removes it. No separate "Add selected" step.
+  const paths = (collectorBrowseHost()?.paths) || [];
   el.collectorBrowseList.innerHTML = entries.map((e) => {
-    const checked = collectorBrowse.selected.has(e.path) ? "checked" : "";
+    const checked = paths.includes(e.path) ? "checked" : "";
     return `
       <div class="folder-item-row">
         <input type="checkbox" class="folder-item-check" data-path="${escapeAttr(e.path)}" ${checked}>
@@ -3688,27 +3687,16 @@ function renderCollectorBrowseList(entries) {
   }).join("");
 }
 
-function collectorToggleSelected(path, on) {
-  if (!collectorBrowse) return;
-  if (on) {
-    collectorBrowse.selected.add(path);
-  } else {
-    collectorBrowse.selected.delete(path);
+function collectorToggleRemotePath(path, on) {
+  const host = collectorBrowseHost();
+  if (!host) return;
+  host.paths = host.paths || [];
+  const idx = host.paths.indexOf(path);
+  if (on && idx < 0) {
+    host.paths.push(path);
+  } else if (!on && idx >= 0) {
+    host.paths.splice(idx, 1);
   }
-  updateCollectorBrowseSelectLabel();
-}
-
-function collectorAddSelectedRemotePaths() {
-  if (!collectorBrowse) return;
-  const host = collectorDraft.hosts[collectorPathsIndex];
-  if (host) {
-    host.paths = host.paths || [];
-    for (const p of collectorBrowse.selected) {
-      if (!host.paths.includes(p)) host.paths.push(p);
-    }
-  }
-  el.collectorBrowseModal.hidden = true;
-  collectorBrowse = null;
   renderCollectorPaths();
   renderCollectorHosts();
   collectorAutoSave();
@@ -3783,11 +3771,10 @@ el.collectorBrowseClose.onclick = () => {
 el.collectorBrowseUp.onclick = () => {
   if (collectorBrowse && collectorBrowse.parent != null) collectorLoadRemote(collectorBrowse.parent);
 };
-el.collectorBrowseSelect.onclick = () => collectorAddSelectedRemotePaths();
 el.collectorBrowseList.addEventListener("change", (event) => {
   const cb = event.target.closest("input.folder-item-check");
   if (!cb) return;
-  collectorToggleSelected(cb.dataset.path, cb.checked);
+  collectorToggleRemotePath(cb.dataset.path, cb.checked);
 });
 el.collectorBrowseList.addEventListener("click", (event) => {
   const btn = event.target.closest("button[data-path]");
@@ -3797,11 +3784,11 @@ el.collectorBrowseList.addEventListener("click", (event) => {
   if (btn.dataset.dir === "1") {
     collectorLoadRemote(path); // navigate into the folder
   } else {
-    // File: clicking the row toggles its checkbox / selection.
+    // File: clicking the row toggles its checkbox (add/remove the path).
     const cb = btn.parentElement.querySelector("input.folder-item-check");
     if (cb) {
       cb.checked = !cb.checked;
-      collectorToggleSelected(path, cb.checked);
+      collectorToggleRemotePath(path, cb.checked);
     }
   }
 });
