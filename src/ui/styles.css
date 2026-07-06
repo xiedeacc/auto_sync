@@ -1556,6 +1556,11 @@ th {
   display: grid;
   gap: 6px;
   margin-bottom: 10px;
+  /* Scroll the list inside the capped modal so a long path set never pushes
+     the Browse row out of the panel. */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .collector-path-item {
@@ -1580,6 +1585,10 @@ th {
 .collector-path-add-row {
   display: flex;
   gap: 8px;
+}
+
+.collector-paths-add {
+  flex: 0 0 auto;
 }
 
 
