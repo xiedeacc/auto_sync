@@ -1425,3 +1425,205 @@ th {
     display: none;
   }
 }
+
+/* --- Collector -------------------------------------------------------------- */
+
+.collector-modal-panel {
+  width: min(900px, calc(100vw - 48px));
+  max-height: min(860px, calc(100vh - 48px));
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.collector-body {
+  display: grid;
+  gap: 12px;
+}
+
+.collector-settings {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto auto;
+  gap: 10px 12px;
+  align-items: end;
+}
+
+.collector-field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.collector-field-narrow {
+  width: 120px;
+}
+
+.collector-field label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.collector-check {
+  height: 34px;
+}
+
+.collector-path-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.collector-path-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.collector-path-row button {
+  flex: 0 0 auto;
+  width: 34px;
+}
+
+.collector-ssh-config {
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.collector-hosts-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.collector-add {
+  font-size: 13px;
+}
+
+.collector-hosts {
+  display: grid;
+  gap: 12px;
+}
+
+.collector-host {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.collector-host-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.collector-host-head input[data-field="name"] {
+  flex: 0 0 160px;
+}
+
+.collector-host-head input[data-field="ssh"] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.collector-host-on {
+  flex: 0 0 auto;
+}
+
+.collector-host-remove {
+  flex: 0 0 auto;
+  width: 32px;
+  color: var(--red);
+}
+
+.collector-paths {
+  display: grid;
+  gap: 6px;
+}
+
+.collector-path-item {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.collector-path-item input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.collector-path-item button {
+  flex: 0 0 auto;
+  width: 32px;
+  color: var(--red);
+}
+
+.collector-path-add-row {
+  display: flex;
+  gap: 8px;
+}
+
+.collector-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.collector-run-state {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.collector-log {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.folder-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.folder-item:hover {
+  background: #eef2f7;
+}
+
+.folder-item-icon {
+  flex: 0 0 auto;
+}

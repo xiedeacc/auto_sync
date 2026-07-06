@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::core::cancel;
+use crate::core::collector::{self, CollectorBrowseResponse, CollectorRunState};
 use crate::core::config::{
     AppConfig, MachineConfig, SourceGroupConfig, clean_config_for_save, config_warnings,
     load_config, load_or_create_config, machine_id_or_local, machine_is_local, machine_is_self,
@@ -35,6 +36,7 @@ pub struct Backend {
     config_path: Arc<PathBuf>,
     port: u16,
     machine_cache: Arc<Mutex<MachineCache>>,
+    collector_run: Arc<Mutex<CollectorRunState>>,
 }
 
 #[derive(Default)]
@@ -78,6 +80,7 @@ impl Backend {
             config_path: Arc::new(config_path),
             port,
             machine_cache: Arc::new(Mutex::new(MachineCache::default())),
+            collector_run: Arc::new(Mutex::new(CollectorRunState::default())),
         };
         backend.spawn_machine_discovery_worker();
         backend
@@ -137,6 +140,51 @@ impl Backend {
         }
         self.clear_machine_cache();
         Ok(cfg)
+    }
+
+    /// Current collector run state (running flag + accumulated log), polled by
+    /// the UI while a collection is in progress.
+    pub fn collector_status(&self) -> CollectorRunState {
+        self.collector_run
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Start a collector run in a background thread. Refuses to start a second
+    /// run while one is in flight; returns the (reset) run state either way.
+    pub fn collector_run(&self) -> Result<CollectorRunState> {
+        let cfg = load_or_create_config(&self.config_path)?.collector;
+        if cfg.is_empty() {
+            anyhow::bail!("collector is not configured");
+        }
+        {
+            let mut guard = self
+                .collector_run
+                .lock()
+                .map_err(|_| anyhow::anyhow!("collector state poisoned"))?;
+            if guard.running {
+                anyhow::bail!("a collector run is already in progress");
+            }
+            *guard = CollectorRunState {
+                running: true,
+                started_at: Some(
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                ),
+                ..Default::default()
+            };
+        }
+        let state = self.collector_run.clone();
+        thread::spawn(move || collector::run(cfg, state));
+        Ok(self.collector_status())
+    }
+
+    /// Browse a remote host over ssh for the Collector path picker. Writes the
+    /// saved ssh config to disk first so `-F` sees the current aliases.
+    pub fn collector_browse(&self, ssh: &str, path: &str) -> Result<CollectorBrowseResponse> {
+        let cfg = load_or_create_config(&self.config_path)?.collector;
+        let ssh_config = collector::write_ssh_config(&cfg)?;
+        collector::browse(ssh, ssh_config.as_deref(), path)
     }
 
     pub fn apply_delegated_source_groups(

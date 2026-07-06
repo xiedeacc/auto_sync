@@ -24,6 +24,8 @@
   - [调度与 cycle](#调度与-cycle)
   - [一致性与校验](#一致性与校验)
   - [局域网多机与配置委托](#局域网多机与配置委托)
+  - [磁盘 standby（冷备盘定时唤醒）](#磁盘-standby冷备盘定时唤醒)
+  - [Collector（从 SSH 主机采集文件到 git 仓库）](#collector从-ssh-主机采集文件到-git-仓库)
   - [暂停继续、取消与任务历史](#暂停继续取消与任务历史)
   - [状态与 UI](#状态与-ui)
 - [配置文件](#配置文件)
@@ -47,6 +49,7 @@
 - **桌面 + Web 双端 UI**：同一份 `src/ui` 前端，桌面用 Tauri，无头机器用浏览器访问 Web UI，共享同一后台状态。
 - **断点与并发友好**：大文件按 rsync 式 block delta 只传差异块；小文件成批打包传输；暂停/继续、跨机取消、任务历史一应俱全。
 - **跨平台**：Linux 用 fanotify 监听，Windows 用 NTFS USN Journal（并在需要时自动提权），无头 Linux 走 systemd，OpenWrt 走 procd。
+- **Collector（文件采集）**：从任意 SSH 主机（`ssh`/`scp`）把配置好的文件/目录拉到一个本地 git 仓库，自动切割超大文件、`commit` 并 `push`。见「系统设计 → Collector」。
 
 ---
 
@@ -243,6 +246,27 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 | 第 4 周六 | 开 | 先批量 drain 到 `/zfs` | `/zfs_pool` 开 → 放行,**按需拉醒 `/zfs`** 读取 → 批量 drain | 被 src_2 按需保持唤醒,直到 src_2 也 drain 完再停转 | 唤醒→drain→空闲 90s→停转 |
 
 关键：src_2 只由**目标盘 `/zfs_pool`** 的窗口触发(每 4 周),`/zfs` 作为源被**按需拉醒**,两池窗口无需人为对齐;各盘在自己那趟积压 drain 完后才停转,`/zfs` 在第 4 周六会多撑到 src_2 结束。
+
+### Collector（从 SSH 主机采集文件到 git 仓库）
+
+与同步引擎完全独立的一个功能：把散落在各台机器上的配置/数据，按需拉到 Windows 本机的一个 git 仓库里做版本化冷备。通过顶栏 **Collector** 按钮打开弹窗配置和触发，**只在点击时运行，不参与任何调度**。实现见 `src/core/collector.rs`，全部通过系统自带的 `ssh`/`scp`/`git` 命令完成（无第三方 SSH 库，Windows 内置 OpenSSH 即可）。
+
+**配置**（全局 `[collector]`，UI 弹窗读写，经 `POST /api/config` 落盘）：
+
+- `git_dir`：本地 git 仓库目录（不是 git 仓库时自动 `git init`）。
+- `ssh_config_path` + `ssh_config`：一个 `~/.ssh/config` 风格的文件路径和内容。内容在 UI 里编辑，每次运行/浏览前写到该路径，`ssh`/`scp` 用 `-F` 引用；下面每个 host 的 `ssh` 字段可直接写这里定义的 `Host` 别名。
+- `split_threshold_mb`：文件 ≥ 该大小（MiB）就切割成 `<名字>.autosplit.NNN`，原文件加入 `.gitignore`、只提交分片。默认 95，留在 GitHub 100 MiB 硬上限之下；0 关闭切割。
+- `auto_commit_push`：拉取成功后自动 `git add -A && git commit && git push`。
+- `hosts[]`：每个目标主机一条：
+  - `ssh`：别名或 `user@host`；`root`：本地根目录；`paths[]`：要拉取的远端绝对路径（文件或目录）。
+  - `install_cmd`（可选）：远端没有 sftp-server 时执行的安装命令（新版 `scp` 走 SFTP 协议，像全新 OpenWrt 没有 `sftp-server` 就拉不动）。运行时先探测，缺失才执行，例如 `apk add openssh-sftp-server`。
+  - `enabled`：关掉则跳过该 host。
+
+**路径重建规则**：远端路径的目录结构原样保留在 host `root` 之下。root=`D:\share\linux\aws`、远端 `/usr/local/shadowsocks` ⇒ 落到 `D:\share\linux\aws\usr\local\shadowsocks`（`scp -r -p` 把叶子拷进重建出来的父目录；`..` 和裸 `/` 会被拒绝，防止逃出 root）。
+
+**UI（全部在 Collector 弹窗内）**：本地路径（git 目录、ssh 配置文件、host root）用已有的文件夹选择器；远端路径可点 **Browse remote…** 通过 `ssh ls` 逐级浏览选取（`POST /api/collector/browse`）。**Save & Run** 先存配置再后台起线程执行，弹窗底部实时刷新运行日志（`GET /api/collector/status` 每秒轮询）；同一时刻只允许一个采集在跑。
+
+**运行流程**：写 ssh 配置 → 逐 host 逐 path：探测/安装 sftp-server → `scp -r -p` 拉取 → 切割超大文件、更新 `.gitignore` → 若开启则 `commit`/`push`。单个 path 失败只记日志不中断，最后汇总失败数;切割是幂等的（重跑先删旧分片再切）。要还原原文件，把分片按序拼接即可（`cat *.autosplit.* > 原名`）。
 
 ### 任务类型与并发
 
@@ -494,6 +518,14 @@ curl -s -X POST http://127.0.0.1:18765/api/sync-destination-now \
 ### 机器管理
 
 - `POST /api/machines`（加手动机器）、`DELETE /api/machines/:machine_id`（删）
+
+### Collector
+
+| 接口 | body | 说明 |
+| --- | --- | --- |
+| `POST /api/collector/run` | — | 后台起一次采集（配置取自 `[collector]`）；已有采集在跑时报错。返回初始运行状态 |
+| `GET /api/collector/status` | — | 当前采集状态：`running` / `ok` / `log[]`，UI 每秒轮询 |
+| `POST /api/collector/browse` | `{ssh, path}` | 用 `ssh ls` 浏览远端目录，供 UI 选路径 |
 
 ### 说明
 

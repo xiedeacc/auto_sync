@@ -29,6 +29,12 @@ pub struct AppConfig {
     /// entirely dormant until a pool is configured.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub standby_pools: Vec<StandbyPoolConfig>,
+    /// File-collector: pull files from arbitrary SSH hosts into a local git
+    /// repo, auto-split big files, and commit/push. Entirely UI-driven (the
+    /// "Collector" button) and dormant until configured — nothing runs on a
+    /// schedule. See [`CollectorConfig`].
+    #[serde(default, skip_serializing_if = "CollectorConfig::is_empty")]
+    pub collector: CollectorConfig,
     #[serde(default, skip_serializing)]
     pub deploy: DeployConfig,
 }
@@ -196,6 +202,89 @@ impl Default for WakeSchedule {
     }
 }
 
+/// File-collector configuration. Pulls files/directories from SSH hosts (via
+/// the system `ssh`/`scp`) into a single local git repository, preserving each
+/// remote path under a per-host local root, splitting oversized files so they
+/// fit git hosting limits, and committing/pushing the result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CollectorConfig {
+    /// Local git repository the pulled files are committed into. `git init` is
+    /// run automatically if it is not yet a repo.
+    pub git_dir: PathBuf,
+    /// Path to an `ssh_config(5)`-style file (like `~/.ssh/config`) passed to
+    /// `ssh`/`scp` with `-F`. Rewritten from `ssh_config` before every run so
+    /// the on-disk file always matches what the UI shows.
+    pub ssh_config_path: PathBuf,
+    /// Contents of the ssh config file, edited from the Collector modal. Host
+    /// aliases defined here can be referenced by `CollectorHost::ssh`.
+    pub ssh_config: String,
+    /// Files at least this many MiB are split into `<name>.autosplit.NNN`
+    /// parts; the original is added to `.gitignore` and the parts committed.
+    /// Kept under GitHub's 100 MiB hard limit by default. 0 disables splitting.
+    pub split_threshold_mb: u64,
+    /// Run `git add -A && git commit && git push` after a successful pull.
+    pub auto_commit_push: bool,
+    pub hosts: Vec<CollectorHost>,
+}
+
+impl Default for CollectorConfig {
+    fn default() -> Self {
+        Self {
+            git_dir: PathBuf::new(),
+            ssh_config_path: PathBuf::new(),
+            ssh_config: String::new(),
+            split_threshold_mb: 95,
+            auto_commit_push: true,
+            hosts: Vec::new(),
+        }
+    }
+}
+
+impl CollectorConfig {
+    /// True when nothing has been configured — used to keep an empty
+    /// `[collector]` table out of the serialized config.
+    pub fn is_empty(&self) -> bool {
+        self.git_dir.as_os_str().is_empty()
+            && self.ssh_config_path.as_os_str().is_empty()
+            && self.ssh_config.trim().is_empty()
+            && self.hosts.is_empty()
+    }
+}
+
+/// One SSH host the collector pulls from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CollectorHost {
+    /// Friendly label (defaults to `ssh` when blank).
+    pub name: String,
+    /// ssh destination: either an alias defined in the ssh config, or a plain
+    /// `user@host` / `host`.
+    pub ssh: String,
+    /// Local root that every remote path is reconstructed under. e.g. root
+    /// `D:\share\linux\aws` + remote `/usr/local/x` => `…\aws\usr\local\x`.
+    pub root: PathBuf,
+    /// Absolute remote paths (files or directories) to pull.
+    pub paths: Vec<String>,
+    /// Optional shell command run over ssh to install the sftp-server when the
+    /// remote lacks it (e.g. `apk add openssh-sftp-server`). Blank = skip.
+    pub install_cmd: String,
+    pub enabled: bool,
+}
+
+impl Default for CollectorHost {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            ssh: String::new(),
+            root: PathBuf::new(),
+            paths: Vec::new(),
+            install_cmd: String::new(),
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SourceGroupConfig {
@@ -310,6 +399,7 @@ impl Default for AppConfig {
             machines: vec![MachineConfig::local()],
             source_groups: Vec::new(),
             standby_pools: Vec::new(),
+            collector: CollectorConfig::default(),
             deploy: DeployConfig::default(),
         }
     }

@@ -19,6 +19,7 @@ use crate::core::backend::{
     Backend, BrowseResponse, CancelActivityRequest, CancelOutcome, DelegatedSourceGroupsRequest,
     RuntimeStatus, SyncActivityStatus,
 };
+use crate::core::collector::{CollectorBrowseResponse, CollectorRunState};
 use crate::core::config::{AppConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
 use crate::core::state::{DestinationView, ScanReport, SnapshotEntry};
@@ -158,6 +159,9 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/transfer/push-file", post(api_transfer_push_file))
         .route("/api/browse-dirs", get(api_browse_paths))
         .route("/api/browse-paths", get(api_browse_paths))
+        .route("/api/collector/run", post(api_collector_run))
+        .route("/api/collector/status", get(api_collector_status))
+        .route("/api/collector/browse", post(api_collector_browse))
         .layer(middleware::from_fn(require_peer_token))
         // Bounded instead of disabled: the largest legitimate request bodies
         // are 16MiB transfer chunks and (worst case) a whole-file delta.
@@ -714,6 +718,32 @@ async fn api_browse_paths(
     Query(query): Query<BrowseQuery>,
 ) -> Result<Json<BrowseResponse>, ApiError> {
     blocking(move || Ok(Json(backend.browse_paths(query.path, query.machine_id)?))).await
+}
+
+async fn api_collector_run(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<CollectorRunState>, ApiError> {
+    blocking(move || Ok(Json(backend.collector_run()?))).await
+}
+
+async fn api_collector_status(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<CollectorRunState>, ApiError> {
+    blocking(move || Ok(Json(backend.collector_status()))).await
+}
+
+#[derive(Deserialize)]
+struct CollectorBrowseQuery {
+    ssh: String,
+    #[serde(default)]
+    path: String,
+}
+
+async fn api_collector_browse(
+    AxumState(backend): AxumState<Backend>,
+    Json(query): Json<CollectorBrowseQuery>,
+) -> Result<Json<CollectorBrowseResponse>, ApiError> {
+    blocking(move || Ok(Json(backend.collector_browse(&query.ssh, &query.path)?))).await
 }
 
 struct ApiError(anyhow::Error);

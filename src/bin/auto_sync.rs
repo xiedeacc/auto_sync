@@ -37,6 +37,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 #[cfg(feature = "gui")]
 use auto_sync::core::backend::{BrowseResponse, RuntimeStatus, SyncActivityStatus};
 #[cfg(feature = "gui")]
+use auto_sync::core::collector::{CollectorBrowseResponse, CollectorRunState};
+#[cfg(feature = "gui")]
 use auto_sync::core::config::MachineConfig;
 #[cfg(feature = "gui")]
 use auto_sync::core::machines::MachineStatus;
@@ -730,7 +732,10 @@ fn run_with_desktop(backend: Backend, port: u16, start_hidden: bool) {
             scan_report,
             dismiss_restart_notice,
             get_all_tasks,
-            browse_paths
+            browse_paths,
+            collector_run,
+            collector_status,
+            collector_browse
         ])
         .run(tauri::generate_context!());
     if let Err(err) = result {
@@ -1210,4 +1215,29 @@ async fn browse_paths(
 ) -> Result<BrowseResponse, String> {
     let backend = backend.inner().clone();
     run_blocking(move || backend.browse_paths(path, machine_id)).await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn collector_run(backend: tauri::State<'_, Backend>) -> Result<CollectorRunState, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.collector_run()).await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn collector_status(backend: tauri::State<'_, Backend>) -> Result<CollectorRunState, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || Ok(backend.collector_status())).await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn collector_browse(
+    backend: tauri::State<'_, Backend>,
+    ssh: String,
+    path: Option<String>,
+) -> Result<CollectorBrowseResponse, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.collector_browse(&ssh, &path.unwrap_or_default())).await
 }
