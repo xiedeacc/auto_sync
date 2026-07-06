@@ -360,9 +360,21 @@
           <button id="collector-save">Save</button>
           <button id="collector-run" class="primary">Save &amp; Run</button>
           <span id="collector-run-state" class="collector-run-state"></span>
+          <button id="collector-config" type="button" class="collector-config-btn" title="Show the collector config file">Config</button>
         </div>
         <pre id="collector-log" class="collector-log" hidden></pre>
       </div>
+    </div>
+  </div>
+
+  <div id="collector-config-modal" class="modal" hidden>
+    <div class="modal-panel config-modal-panel">
+      <div class="modal-head">
+        <h2>Collector Config</h2>
+        <button id="collector-config-close" class="icon" title="Close">x</button>
+      </div>
+      <div id="collector-config-path" class="subtle"></div>
+      <pre id="collector-config-view" class="config-view"></pre>
     </div>
   </div>
 

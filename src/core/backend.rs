@@ -9,6 +9,7 @@ use tracing::{info, warn};
 
 use crate::core::cancel;
 use crate::core::collector::{self, CollectorBrowseResponse, CollectorRunState};
+use crate::core::config::CollectorConfig;
 use crate::core::config::{
     AppConfig, MachineConfig, SourceGroupConfig, clean_config_for_save, config_warnings,
     load_config, load_or_create_config, machine_id_or_local, machine_is_local, machine_is_self,
@@ -151,10 +152,56 @@ impl Backend {
             .unwrap_or_default()
     }
 
+    /// Path of the collector's own config file — a `collector.toml` next to the
+    /// main `auto_sync.toml`, kept separate so the collector setup lives in its
+    /// own file rather than inside the sync config.
+    pub fn collector_config_path(&self) -> PathBuf {
+        self.config_path
+            .parent()
+            .map(|dir| dir.join("collector.toml"))
+            .unwrap_or_else(|| PathBuf::from("collector.toml"))
+    }
+
+    /// Load the collector config from its file (default when absent).
+    pub fn get_collector_config(&self) -> Result<CollectorConfig> {
+        let path = self.collector_config_path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => toml::from_str(&text)
+                .with_context(|| format!("parsing {}", path.display())),
+            _ => Ok(CollectorConfig::default()),
+        }
+    }
+
+    /// Persist the collector config to its file and return it.
+    pub fn save_collector_config(&self, cfg: &CollectorConfig) -> Result<CollectorConfig> {
+        let path = self.collector_config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let text = toml::to_string_pretty(cfg)
+            .with_context(|| "serializing collector config")?;
+        std::fs::write(&path, text)
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(cfg.clone())
+    }
+
+    /// Path + raw text of the collector config file, for the UI's Config view.
+    pub fn collector_config_file(&self) -> Result<CollectorConfigFile> {
+        let path = self.collector_config_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => text,
+            _ => toml::to_string_pretty(&CollectorConfig::default())?,
+        };
+        Ok(CollectorConfigFile {
+            path: path.to_string_lossy().to_string(),
+            toml: text,
+        })
+    }
+
     /// Start a collector run in a background thread. Refuses to start a second
     /// run while one is in flight; returns the (reset) run state either way.
     pub fn collector_run(&self) -> Result<CollectorRunState> {
-        let cfg = load_or_create_config(&self.config_path)?.collector;
+        let cfg = self.get_collector_config()?;
         if cfg.is_empty() {
             anyhow::bail!("collector is not configured");
         }
@@ -182,7 +229,7 @@ impl Backend {
     /// Browse a remote host over ssh for the Collector path picker. Writes the
     /// saved ssh config to disk first so `-F` sees the current aliases.
     pub fn collector_browse(&self, ssh: &str, path: &str) -> Result<CollectorBrowseResponse> {
-        let cfg = load_or_create_config(&self.config_path)?.collector;
+        let cfg = self.get_collector_config()?;
         let ssh_config = collector::write_ssh_config(&cfg)?;
         collector::browse(ssh, ssh_config.as_deref(), path)
     }
@@ -1722,6 +1769,13 @@ pub struct BrowseResponse {
     pub entries: Vec<BrowseEntry>,
 }
 
+/// Path and raw text of the collector config file (for the UI's Config view).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CollectorConfigFile {
+    pub path: String,
+    pub toml: String,
+}
+
 pub fn default_path_for_os(os: &str) -> PathBuf {
     if os.eq_ignore_ascii_case("windows") {
         PathBuf::from("C:\\")
@@ -1730,11 +1784,56 @@ pub fn default_path_for_os(os: &str) -> PathBuf {
     }
 }
 
+/// On Windows the picker needs a synthetic top level listing the drive letters
+/// (`C:\`, `D:\`, …): a real drive root like `C:\` has no `Path::parent()`, so
+/// without this the user is stuck on whichever drive they landed on and can
+/// never reach another one. This sentinel is what "Up" from a drive root
+/// returns, and requesting it yields the drive list.
+#[cfg(windows)]
+const WINDOWS_DRIVES_ROOT: &str = "/";
+
+#[cfg(windows)]
+fn is_windows_drives_root(path: &Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return true;
+    }
+    let text = path.to_string_lossy();
+    matches!(text.as_ref(), "/" | "\\" | "\\\\")
+}
+
+#[cfg(windows)]
+fn windows_drives_response() -> BrowseResponse {
+    let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+    let mut entries = Vec::new();
+    for index in 0..26u32 {
+        if mask & (1 << index) != 0 {
+            let letter = (b'A' + index as u8) as char;
+            entries.push(BrowseEntry {
+                name: format!("{letter}:"),
+                path: format!("{letter}:\\"),
+                kind: "dir".to_string(),
+            });
+        }
+    }
+    BrowseResponse {
+        path: WINDOWS_DRIVES_ROOT.to_string(),
+        parent: None,
+        entries,
+    }
+}
+
 fn browse_paths_inner(requested: PathBuf) -> Result<BrowseResponse> {
+    #[cfg(windows)]
+    if is_windows_drives_root(&requested) {
+        return Ok(windows_drives_response());
+    }
     let path = normalize_browse_dir(&requested)?;
     let parent = path
         .parent()
         .map(|parent| parent.to_string_lossy().to_string());
+    // At a Windows drive root (parent is None) send "Up" to the drive list.
+    #[cfg(windows)]
+    let parent = parent.or_else(|| Some(WINDOWS_DRIVES_ROOT.to_string()));
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&path)? {
         let entry = entry?;

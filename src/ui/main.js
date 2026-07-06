@@ -26,9 +26,9 @@ let savingConfig = false;
 let folderPicker = null;
 let scheduleEditor = null;
 let excludeEditor = null;
-// Working copy of cfg.collector while the Collector modal is open, plus the
-// remote-browse picker state. Editing a draft (not cfg) keeps the 4s config
-// poll from clobbering half-entered hosts.
+// Working copy of the collector config (loaded from its own file) while the
+// Collector modal is open, plus the remote-browse picker state. A non-null
+// draft also parks the 4s main-config poll so it can't re-render mid-edit.
 let collectorDraft = null;
 let collectorBrowse = null;
 let collectorLogTimer = null;
@@ -291,7 +291,12 @@ const el = {
   collectorSave: document.getElementById("collector-save"),
   collectorRun: document.getElementById("collector-run"),
   collectorRunState: document.getElementById("collector-run-state"),
+  collectorConfig: document.getElementById("collector-config"),
   collectorLog: document.getElementById("collector-log"),
+  collectorConfigModal: document.getElementById("collector-config-modal"),
+  collectorConfigClose: document.getElementById("collector-config-close"),
+  collectorConfigPath: document.getElementById("collector-config-path"),
+  collectorConfigView: document.getElementById("collector-config-view"),
   collectorBrowseModal: document.getElementById("collector-browse-modal"),
   collectorBrowseTitle: document.getElementById("collector-browse-title"),
   collectorBrowseClose: document.getElementById("collector-browse-close"),
@@ -3328,19 +3333,33 @@ function normalizeCollectorHost(raw) {
   };
 }
 
-function openCollectorModal(event) {
-  preventDefault(event);
-  collectorDraft = normalizeCollector(cfg && cfg.collector);
+function collectorPopulateForm() {
   el.collectorGitDir.value = collectorDraft.git_dir;
   el.collectorSshConfigPath.value = collectorDraft.ssh_config_path;
   el.collectorSshConfig.value = collectorDraft.ssh_config;
   el.collectorSplitMb.value = String(collectorDraft.split_threshold_mb);
   el.collectorAutoPush.checked = collectorDraft.auto_commit_push;
   renderCollectorHosts();
+}
+
+async function openCollectorModal(event) {
+  preventDefault(event);
+  // Set a draft immediately so the config poll won't clobber the main cfg
+  // while the modal is open; then load the collector's own config file.
+  collectorDraft = defaultCollector();
+  collectorPopulateForm();
   el.collectorLog.hidden = true;
   el.collectorLog.textContent = "";
-  setCollectorRunState("");
+  setCollectorRunState("Loading…");
   el.collectorModal.hidden = false;
+  try {
+    const loaded = await invoke("collector_get_config");
+    collectorDraft = normalizeCollector(loaded);
+    collectorPopulateForm();
+    setCollectorRunState("");
+  } catch (error) {
+    setCollectorRunState(String(error));
+  }
   refreshCollectorStatus();
 }
 
@@ -3437,7 +3456,9 @@ function onCollectorHostClick(event) {
 }
 
 async function collectorPickLocalInto(hostIndex) {
-  const start = collectorDraft.hosts[hostIndex].root || defaultPathForMachine("local");
+  // Empty field starts at the drive list ("/" lists drives on Windows) so any
+  // drive is one click away.
+  const start = collectorDraft.hosts[hostIndex].root || "/";
   const picked = await pickPath(start, { machineId: "local" });
   if (picked && picked.path) {
     collectorDraft.hosts[hostIndex].root = picked.path;
@@ -3446,7 +3467,7 @@ async function collectorPickLocalInto(hostIndex) {
 }
 
 async function collectorPickLocalField(inputEl, appendDefault) {
-  const start = inputEl.value.trim() || defaultPathForMachine("local");
+  const start = inputEl.value.trim() || "/";
   const picked = await pickPath(start, { machineId: "local" });
   if (!picked || !picked.path) return;
   let next = picked.path;
@@ -3473,10 +3494,9 @@ async function saveCollector(options = {}) {
     ...h,
     paths: (h.paths || []).map((p) => p.trim()).filter(Boolean),
   }));
-  // The draft must survive saveConfig() swapping cfg; keep editing the draft.
-  cfg.collector = clean;
-  await autoSaveConfig();
-  collectorDraft = normalizeCollector(cfg.collector);
+  // Persist to the collector's own config file (separate from auto_sync.toml).
+  const saved = await invoke("collector_save_config", { cfg: clean });
+  collectorDraft = normalizeCollector(saved);
   if (!options.silent) {
     renderCollectorHosts();
     setCollectorRunState("Saved.");
@@ -3610,9 +3630,26 @@ function collectorSelectRemotePath(path) {
   renderCollectorHosts();
 }
 
+async function openCollectorConfigFile() {
+  el.collectorConfigPath.textContent = "";
+  el.collectorConfigView.textContent = "Loading…";
+  el.collectorConfigModal.hidden = false;
+  try {
+    // Persist the current form first so the file reflects what's on screen.
+    await saveCollector({ silent: true });
+    const info = await invoke("collector_config_file");
+    el.collectorConfigPath.textContent = info.path || "";
+    el.collectorConfigView.textContent = info.toml || "";
+  } catch (error) {
+    el.collectorConfigView.textContent = String(error);
+  }
+}
+
 bindButtonClick(el.readme, openReadmeModal);
 bindButtonClick(el.collector, openCollectorModal);
 el.collectorClose.onclick = closeCollectorModal;
+el.collectorConfig.onclick = () => openCollectorConfigFile();
+el.collectorConfigClose.onclick = () => { el.collectorConfigModal.hidden = true; };
 el.collectorSave.onclick = () => saveCollector().catch((error) => setCollectorRunState(String(error)));
 el.collectorRun.onclick = () => runCollector();
 el.collectorAddHost.onclick = () => {
@@ -3750,6 +3787,9 @@ async function invokeWeb(command, payload = {}) {
     collector_run: ["POST", "/api/collector/run"],
     collector_status: ["GET", "/api/collector/status"],
     collector_browse: ["POST", "/api/collector/browse"],
+    collector_get_config: ["GET", "/api/collector/config"],
+    collector_save_config: ["POST", "/api/collector/config"],
+    collector_config_file: ["GET", "/api/collector/config-file"],
   };
   const route = routes[command];
   if (!route) {
@@ -3805,6 +3845,8 @@ async function invokeWeb(command, payload = {}) {
       options.body = JSON.stringify({});
     } else if (command === "collector_browse") {
       options.body = JSON.stringify({ ssh: payload.ssh || "", path: payload.path || "" });
+    } else if (command === "collector_save_config") {
+      options.body = JSON.stringify(payload.cfg);
     } else {
       options.body = JSON.stringify(payload);
     }

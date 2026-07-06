@@ -16,11 +16,11 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::core::backend::{
-    Backend, BrowseResponse, CancelActivityRequest, CancelOutcome, DelegatedSourceGroupsRequest,
-    RuntimeStatus, SyncActivityStatus,
+    Backend, BrowseResponse, CancelActivityRequest, CancelOutcome, CollectorConfigFile,
+    DelegatedSourceGroupsRequest, RuntimeStatus, SyncActivityStatus,
 };
 use crate::core::collector::{CollectorBrowseResponse, CollectorRunState};
-use crate::core::config::{AppConfig, MachineConfig};
+use crate::core::config::{AppConfig, CollectorConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
 use crate::core::state::{DestinationView, ScanReport, SnapshotEntry};
 use crate::core::sync::{
@@ -162,6 +162,11 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/collector/run", post(api_collector_run))
         .route("/api/collector/status", get(api_collector_status))
         .route("/api/collector/browse", post(api_collector_browse))
+        .route(
+            "/api/collector/config",
+            get(api_collector_get_config).post(api_collector_save_config),
+        )
+        .route("/api/collector/config-file", get(api_collector_config_file))
         .layer(middleware::from_fn(require_peer_token))
         // Bounded instead of disabled: the largest legitimate request bodies
         // are 16MiB transfer chunks and (worst case) a whole-file delta.
@@ -744,6 +749,25 @@ async fn api_collector_browse(
     Json(query): Json<CollectorBrowseQuery>,
 ) -> Result<Json<CollectorBrowseResponse>, ApiError> {
     blocking(move || Ok(Json(backend.collector_browse(&query.ssh, &query.path)?))).await
+}
+
+async fn api_collector_get_config(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<CollectorConfig>, ApiError> {
+    blocking(move || Ok(Json(backend.get_collector_config()?))).await
+}
+
+async fn api_collector_save_config(
+    AxumState(backend): AxumState<Backend>,
+    Json(cfg): Json<CollectorConfig>,
+) -> Result<Json<CollectorConfig>, ApiError> {
+    blocking(move || Ok(Json(backend.save_collector_config(&cfg)?))).await
+}
+
+async fn api_collector_config_file(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<CollectorConfigFile>, ApiError> {
+    blocking(move || Ok(Json(backend.collector_config_file()?))).await
 }
 
 struct ApiError(anyhow::Error);

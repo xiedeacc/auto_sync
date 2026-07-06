@@ -251,7 +251,7 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 与同步引擎完全独立的一个功能：把散落在各台机器上的配置/数据，按需拉到 Windows 本机的一个 git 仓库里做版本化冷备。通过顶栏 **Collector** 按钮打开弹窗配置和触发，**只在点击时运行，不参与任何调度**。实现见 `src/core/collector.rs`，全部通过系统自带的 `ssh`/`scp`/`git` 命令完成（无第三方 SSH 库，Windows 内置 OpenSSH 即可）。
 
-**配置**（全局 `[collector]`，UI 弹窗读写，经 `POST /api/config` 落盘）：
+**配置**：独立配置文件 `collector.toml`（与 `auto_sync.toml` 同目录，**不写进主配置**），UI 弹窗读写（`GET`/`POST /api/collector/config`）。弹窗底部 **Config** 按钮显示该文件的路径和内容。字段：
 
 - `git_dir`：本地 git 仓库目录（不是 git 仓库时自动 `git init`）。
 - `ssh_config_path` + `ssh_config`：一个 `~/.ssh/config` 风格的文件路径和内容。内容在 UI 里编辑，每次运行/浏览前写到该路径，`ssh`/`scp` 用 `-F` 引用；下面每个 host 的 `ssh` 字段可直接写这里定义的 `Host` 别名。
@@ -523,7 +523,9 @@ curl -s -X POST http://127.0.0.1:18765/api/sync-destination-now \
 
 | 接口 | body | 说明 |
 | --- | --- | --- |
-| `POST /api/collector/run` | — | 后台起一次采集（配置取自 `[collector]`）；已有采集在跑时报错。返回初始运行状态 |
+| `GET /api/collector/config` · `POST /api/collector/config` | —·`CollectorConfig` | 读/写独立的 `collector.toml`（不进主配置） |
+| `GET /api/collector/config-file` | — | 返回 `collector.toml` 的路径与原文，供弹窗 Config 视图 |
+| `POST /api/collector/run` | — | 后台起一次采集（配置取自 `collector.toml`）；已有采集在跑时报错。返回初始运行状态 |
 | `GET /api/collector/status` | — | 当前采集状态：`running` / `ok` / `log[]`，UI 每秒轮询 |
 | `POST /api/collector/browse` | `{ssh, path}` | 用 `ssh ls` 浏览远端目录，供 UI 选路径 |
 

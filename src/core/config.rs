@@ -29,12 +29,6 @@ pub struct AppConfig {
     /// entirely dormant until a pool is configured.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub standby_pools: Vec<StandbyPoolConfig>,
-    /// File-collector: pull files from arbitrary SSH hosts into a local git
-    /// repo, auto-split big files, and commit/push. Entirely UI-driven (the
-    /// "Collector" button) and dormant until configured — nothing runs on a
-    /// schedule. See [`CollectorConfig`].
-    #[serde(default, skip_serializing_if = "CollectorConfig::is_empty")]
-    pub collector: CollectorConfig,
     #[serde(default, skip_serializing)]
     pub deploy: DeployConfig,
 }
@@ -399,7 +393,6 @@ impl Default for AppConfig {
             machines: vec![MachineConfig::local()],
             source_groups: Vec::new(),
             standby_pools: Vec::new(),
-            collector: CollectorConfig::default(),
             deploy: DeployConfig::default(),
         }
     }

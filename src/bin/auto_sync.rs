@@ -35,11 +35,13 @@ use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 #[cfg(feature = "gui")]
-use auto_sync::core::backend::{BrowseResponse, RuntimeStatus, SyncActivityStatus};
+use auto_sync::core::backend::{
+    BrowseResponse, CollectorConfigFile, RuntimeStatus, SyncActivityStatus,
+};
 #[cfg(feature = "gui")]
 use auto_sync::core::collector::{CollectorBrowseResponse, CollectorRunState};
 #[cfg(feature = "gui")]
-use auto_sync::core::config::MachineConfig;
+use auto_sync::core::config::{CollectorConfig, MachineConfig};
 #[cfg(feature = "gui")]
 use auto_sync::core::machines::MachineStatus;
 #[cfg(feature = "gui")]
@@ -735,7 +737,10 @@ fn run_with_desktop(backend: Backend, port: u16, start_hidden: bool) {
             browse_paths,
             collector_run,
             collector_status,
-            collector_browse
+            collector_browse,
+            collector_get_config,
+            collector_save_config,
+            collector_config_file
         ])
         .run(tauri::generate_context!());
     if let Err(err) = result {
@@ -1240,4 +1245,32 @@ async fn collector_browse(
 ) -> Result<CollectorBrowseResponse, String> {
     let backend = backend.inner().clone();
     run_blocking(move || backend.collector_browse(&ssh, &path.unwrap_or_default())).await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn collector_get_config(
+    backend: tauri::State<'_, Backend>,
+) -> Result<CollectorConfig, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.get_collector_config()).await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn collector_save_config(
+    backend: tauri::State<'_, Backend>,
+    cfg: CollectorConfig,
+) -> Result<CollectorConfig, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.save_collector_config(&cfg)).await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn collector_config_file(
+    backend: tauri::State<'_, Backend>,
+) -> Result<CollectorConfigFile, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.collector_config_file()).await
 }
