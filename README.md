@@ -218,11 +218,10 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 - **门控（目标驱动 + 源盘按需唤醒）**：`sync_cycle_for_source` 处理每个目标前调用 `standby::gate_for_sync(源根, 目标根)`。**门控只看目标所在池的唤醒窗口**（备份落在目标盘，其唤醒计划就是这条备份的节奏）：目标池不在窗口 → 目标置 `yellow`（原因 `disk <pool> in standby until <下次唤醒>`），不执行不失败，等目标池下个窗口批量补齐。**若源在另一块 standby 盘上（链式备份），源盘不受自己窗口门控，而是按需唤醒**——目标池开窗即放行，读源盘的 I/O 自动把它转起来，`busy()` 在同步期间保持它唤醒。若目标盘非 standby、源盘是 standby，则改由源盘窗口门控（冷源读取仍批量化）。
 - **链式依赖免配置对齐**：`/zfs→/zfs_pool`（src_2）由 `/zfs_pool` 每 4 周开窗触发，`/zfs` 被按需拉醒来读，**无需人为对齐两池窗口**——`/zfs` 自己的每周计划与 src_2 无关。其余周 `/zfs` 开窗只跑写入 `/zfs` 的 src_4/src_5，`/zfs_pool` 不被触及、保持停转。
 - **挂载安全（源和目标都校验）**：任务放行前校验它触及的**每个**池（源池 + 目标池）的 `mount_roots` 确实是挂载点（`st_dev` 与父目录不同）。若某池未导入、`/zfs` 只是根文件系统上的空壳目录 → 置 `red: disk <pool> not mounted`，**拒绝同步**。源盘同样校验：读到空的源树会和空目标一样把整份备份镜像删光。
-- **停转时机(drain-based re-park)**:调度循环每 tick 驱动 `standby::tick(pools, busy)`。`busy(pool)` = 有 sync 正在跑且触及该池,**或**有"待办且可运行"的工作触及它(该工作用 `gate_for_sync` 放行,且目标 `target_cycle_id > last_verified`)。`StandbyManager` 对每个池:
-  - **busy** → 保持唤醒(绝不在写入中途停盘);
-  - **idle** 且(**窗口外** 或 **窗口内但已空闲超过 `PARK_IDLE_GRACE_SECS`=90s**)→ `hdparm -y`(STANDBY,I/O 自动唤醒)停转。
-  这样盘在**积压 drain 完几分钟后就重新 standby**,而不是干等到 24h 窗口末尾。链式依赖天然正确:`/zfs` 自己的 src_4/src_5 drain 完后,只要 src_2 仍"可运行且未完成"(即 `/zfs_pool` 开着窗——src_2 的门控盘),`busy(/zfs)` 仍为真、`/zfs` 被按需保持唤醒直到 src_2 也 drain 完;`/zfs_pool` 关窗时 src_2 被门控挡住、不计入 `busy(/zfs)`,故 `/zfs` drain 完即停转。开机时若在窗口外,首 tick 直接停转(重启会把盘转起来)。
-  - 单纯"这一窗口无任何积压"时,空闲超过 grace 也会停转,不会为空窗白转 24h。
+- **停转时机(基于 cycle 完结,非空闲计时)**:调度循环每 tick 驱动 `standby::tick(pools, busy)`。**完结判定的核心是 `busy(pool)`**:有 sync 正在跑且触及该池,**或**有"待办且可运行"的工作触及它(该工作用 `gate_for_sync` 放行,且目标 `target_cycle_id > last_verified` —— 即**该池上还有已锁定但未校验完的 cycle**)。只要还有 cycle 没跑完,`busy` 恒为真、盘保持唤醒。`busy` 转假的**唯一条件**是所有触及该池的目标都 `verified == target`(积压 cycle 全部完结)。
+  - **target 是快照,不追新**:`advance_due_destination_targets`(state.rs:543-546)在 `verified < target` 期间**跳过该目标不再前移** —— 窗口内 target 只在调度边界锁定一次(到当时最新 closed cycle),reconcile 一趟批量补齐 `verified→target` 的事件并集。drain 完后新开的 cycle 其调度边界落在**下个窗口**,故本窗口不追。这正是"把时间点前触发的 cycle 全部跑完、之后触发的等下轮"。
+  - **90s 是完结后的防抖 settle,不是空闲计时**:`busy` 转假(cycle 已完结)后再等 `PARK_IDLE_GRACE_SECS`=90s 才 `hdparm -y` 停转,用于抹平"standby 窗口 09:00 先于同步调度边界 10:00 开"这类空档、以及多目标/多源收尾的瞬时抖动,避免刚停又被唤醒。
+  - 停转条件 = `busy` 假 且(**窗口外** 或 **窗口内已 settle 满 90s**)。链式依赖天然正确:`/zfs` 自己的 src_4/src_5 完结后,只要 src_2 仍"可运行且 target>verified"(即 `/zfs_pool` 开着窗——src_2 的门控盘),`busy(/zfs)` 仍为真、`/zfs` 被按需保持唤醒直到 src_2 也完结;`/zfs_pool` 关窗时 src_2 被门控挡住、不计入 `busy(/zfs)`,故 `/zfs` 完结即停转。开机时若在窗口外,首 tick 直接停转。
 - **积压如何 drain（批量补齐,非逐 cycle）**：窗口外事件持续累积成一个个 closed cycle,但目标不 sync（门控推迟）。窗口打开后 `advance_due_destination_targets` 把该目标的 `target_cycle_id` 一次推进到**最新 closed cycle**,然后**一次 reconcile**：`events_between_cycles(last_verified, target)` 取从上次已校验到目标之间**所有 cycle 的事件并集**,合并去重后一次性同步,`last_verified` 直接从旧值跳到 target(如 103→133),**不是逐个 cycle 分别同步**。所以"一周/四周积压"是一趟批量补齐,drain 完 `target==verified`,`busy` 转假,盘按上面的规则停转。
 
 **端到端时序(以 `/zfs` 每周六、`/zfs_pool` 每 4 周六为例)：**

@@ -275,10 +275,13 @@ pub fn spin_down_devices(pool: &StandbyPoolConfig) {
     }
 }
 
-/// How long a pool must stay idle (no running or pending-runnable work) inside
-/// its wake window before it is parked early. Bridges the brief gaps between a
-/// window opening and the scheduler queuing the first sync, and between
-/// consecutive cycles, so a burst of work isn't split by a premature spin-down.
+/// Settle buffer applied AFTER a pool's backlog is complete, before parking it
+/// early inside its window. Completion itself is judged by `busy(pool)` going
+/// false — i.e. every target touching the pool reached `verified == target`, so
+/// all queued cycles are done; this grace is NOT a raw idle timer. It only
+/// bridges thrashy gaps: the standby window opening before the sync schedule
+/// boundary (e.g. window 09:00, schedule 10:00), and multi-destination/source
+/// sequencing, so a disk isn't parked then immediately woken.
 const PARK_IDLE_GRACE_SECS: i64 = 90;
 
 /// Tracks each pool's awake/asleep state across ticks so the manager fires a
