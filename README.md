@@ -223,6 +223,17 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
   - **idle** 且(**窗口外** 或 **窗口内但已空闲超过 `PARK_IDLE_GRACE_SECS`=90s**)→ `hdparm -y`(STANDBY,I/O 自动唤醒)停转。
   这样盘在**积压 drain 完几分钟后就重新 standby**,而不是干等到 24h 窗口末尾。链式依赖天然正确:`/zfs` 自己的 src_4/src_5 drain 完后,只要 src_2 仍"可运行且未完成"(即 `/zfs_pool` 开着窗——src_2 的门控盘),`busy(/zfs)` 仍为真、`/zfs` 被按需保持唤醒直到 src_2 也 drain 完;`/zfs_pool` 关窗时 src_2 被门控挡住、不计入 `busy(/zfs)`,故 `/zfs` drain 完即停转。开机时若在窗口外,首 tick 直接停转(重启会把盘转起来)。
   - 单纯"这一窗口无任何积压"时,空闲超过 grace 也会停转,不会为空窗白转 24h。
+- **积压如何 drain（批量补齐,非逐 cycle）**：窗口外事件持续累积成一个个 closed cycle,但目标不 sync（门控推迟）。窗口打开后 `advance_due_destination_targets` 把该目标的 `target_cycle_id` 一次推进到**最新 closed cycle**,然后**一次 reconcile**：`events_between_cycles(last_verified, target)` 取从上次已校验到目标之间**所有 cycle 的事件并集**,合并去重后一次性同步,`last_verified` 直接从旧值跳到 target(如 103→133),**不是逐个 cycle 分别同步**。所以"一周/四周积压"是一趟批量补齐,drain 完 `target==verified`,`busy` 转假,盘按上面的规则停转。
+
+**端到端时序(以 `/zfs` 每周六、`/zfs_pool` 每 4 周六为例)：**
+
+| 时机 | `/zfs_pool` 窗口 | src_4/src_5(→`/zfs`) | src_2(`/zfs`→`/zfs_pool`) | `/zfs` 盘 | `/zfs_pool` 盘 |
+| --- | --- | --- | --- | --- | --- |
+| 平日 | 关 | 门控推迟,积压 | 门控推迟,积压 | standby | standby |
+| 非第 4 周六 | 关 | `/zfs` 开窗 → 批量 drain | 目标 `/zfs_pool` 关 → 仍推迟 | 唤醒→drain→空闲 90s→停转 | 保持 standby |
+| 第 4 周六 | 开 | 先批量 drain 到 `/zfs` | `/zfs_pool` 开 → 放行,**按需拉醒 `/zfs`** 读取 → 批量 drain | 被 src_2 按需保持唤醒,直到 src_2 也 drain 完再停转 | 唤醒→drain→空闲 90s→停转 |
+
+关键：src_2 只由**目标盘 `/zfs_pool`** 的窗口触发(每 4 周),`/zfs` 作为源被**按需拉醒**,两池窗口无需人为对齐;各盘在自己那趟积压 drain 完后才停转,`/zfs` 在第 4 周六会多撑到 src_2 结束。
 
 ### 任务类型与并发
 
