@@ -302,7 +302,6 @@ const el = {
   collectorPathsModal: document.getElementById("collector-paths-modal"),
   collectorPathsTitle: document.getElementById("collector-paths-title"),
   collectorPathsClose: document.getElementById("collector-paths-close"),
-  collectorPathsSummary: document.getElementById("collector-paths-summary"),
   collectorPathsList: document.getElementById("collector-paths-list"),
   collectorPathsInput: document.getElementById("collector-paths-input"),
   collectorPathsAdd: document.getElementById("collector-paths-add"),
@@ -3588,14 +3587,11 @@ function renderCollectorPaths() {
   const host = collectorDraft.hosts[collectorPathsIndex];
   if (!host) return;
   const paths = host.paths || [];
-  el.collectorPathsSummary.textContent = `${paths.length} remote path(s) to pull`;
-  el.collectorPathsList.innerHTML = paths.length
-    ? paths.map((p, pi) => `
+  el.collectorPathsList.innerHTML = paths.map((p, pi) => `
       <div class="collector-path-item">
         <input data-paths-index="${pi}" value="${escapeAttr(p)}" placeholder="/remote/absolute/path">
         <button type="button" data-paths-remove="${pi}" title="Remove">✕</button>
-      </div>`).join("")
-    : '<div class="empty">No paths yet — add one or browse the remote host.</div>';
+      </div>`).join("");
 }
 
 function collectorAddPath(value) {
