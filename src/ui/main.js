@@ -34,6 +34,9 @@ let collectorBrowse = null;
 let collectorLogTimer = null;
 // Index of the host whose files/folders are open in the paths editor modal.
 let collectorPathsIndex = null;
+// Remember the last remote directory browsed per host (keyed by hostname) so
+// the remote picker reopens there — handy for adding several files from one dir.
+let collectorLastRemotePath = {};
 let dstSyncEditor = null;
 let dstLogViewer = null;
 // The Info modal's "Type"/"Summary" rows come from the last task-log entry for
@@ -3627,15 +3630,24 @@ async function collectorBrowseRemote() {
     return;
   }
   const conn = collectorConnFor(host);
-  collectorBrowse = { conn, path: "/", parent: null };
+  // Reopen at the directory last browsed on this host.
+  const start = collectorLastRemotePath[conn.hostname] || "/";
+  collectorBrowse = { conn, path: start, parent: null, selected: new Set() };
   el.collectorBrowseTitle.textContent = `Remote path — ${host.user ? host.user + "@" : ""}${host.hostname}`;
   el.collectorBrowseModal.hidden = false;
-  await collectorLoadRemote("/");
+  updateCollectorBrowseSelectLabel();
+  await collectorLoadRemote(start);
 }
 
 function setCollectorBrowseError(text) {
   el.collectorBrowseError.textContent = text || "";
   el.collectorBrowseError.hidden = !text;
+}
+
+function updateCollectorBrowseSelectLabel() {
+  const n = collectorBrowse ? collectorBrowse.selected.size : 0;
+  el.collectorBrowseSelect.textContent = `Add selected (${n})`;
+  el.collectorBrowseSelect.disabled = n === 0;
 }
 
 async function collectorLoadRemote(path) {
@@ -3647,24 +3659,56 @@ async function collectorLoadRemote(path) {
     const res = await invoke("collector_browse", { ...collectorBrowse.conn, path });
     collectorBrowse.path = res.path;
     collectorBrowse.parent = res.parent;
+    // Remember where we are so the next Browse for this host starts here.
+    collectorLastRemotePath[collectorBrowse.conn.hostname] = res.path;
     el.collectorBrowsePath.textContent = res.path;
-    const entries = res.entries || [];
-    el.collectorBrowseList.innerHTML = entries.length
-      ? entries.map((e) => `
-        <button type="button" class="folder-item" data-path="${escapeAttr(e.path)}" data-dir="${e.is_dir ? 1 : 0}">
-          <span class="folder-item-icon">${e.is_dir ? "📁" : "📄"}</span>${escapeHtml(e.name)}
-        </button>`).join("")
-      : '<div class="empty">(empty)</div>';
+    renderCollectorBrowseList(res.entries || []);
   } catch (error) {
     el.collectorBrowseList.innerHTML = "";
     setCollectorBrowseError(String(error));
   }
 }
 
-function collectorSelectRemotePath(path) {
-  collectorAddPath(path);
+function renderCollectorBrowseList(entries) {
+  if (!entries.length) {
+    el.collectorBrowseList.innerHTML = '<div class="empty">(empty)</div>';
+    return;
+  }
+  el.collectorBrowseList.innerHTML = entries.map((e) => {
+    const checked = collectorBrowse.selected.has(e.path) ? "checked" : "";
+    return `
+      <div class="folder-item-row">
+        <input type="checkbox" class="folder-item-check" data-path="${escapeAttr(e.path)}" ${checked}>
+        <button type="button" class="folder-item" data-path="${escapeAttr(e.path)}" data-dir="${e.is_dir ? 1 : 0}">
+          <span class="folder-item-icon">${e.is_dir ? "📁" : "📄"}</span>${escapeHtml(e.name)}
+        </button>
+      </div>`;
+  }).join("");
+}
+
+function collectorToggleSelected(path, on) {
+  if (!collectorBrowse) return;
+  if (on) {
+    collectorBrowse.selected.add(path);
+  } else {
+    collectorBrowse.selected.delete(path);
+  }
+  updateCollectorBrowseSelectLabel();
+}
+
+function collectorAddSelectedRemotePaths() {
+  if (!collectorBrowse) return;
+  const host = collectorDraft.hosts[collectorPathsIndex];
+  if (host) {
+    host.paths = host.paths || [];
+    for (const p of collectorBrowse.selected) {
+      if (!host.paths.includes(p)) host.paths.push(p);
+    }
+  }
   el.collectorBrowseModal.hidden = true;
   collectorBrowse = null;
+  renderCollectorPaths();
+  renderCollectorHosts();
 }
 
 async function openCollectorConfigFile() {
@@ -3736,18 +3780,26 @@ el.collectorBrowseClose.onclick = () => {
 el.collectorBrowseUp.onclick = () => {
   if (collectorBrowse && collectorBrowse.parent != null) collectorLoadRemote(collectorBrowse.parent);
 };
-el.collectorBrowseSelect.onclick = () => {
-  if (collectorBrowse) collectorSelectRemotePath(collectorBrowse.path);
-};
+el.collectorBrowseSelect.onclick = () => collectorAddSelectedRemotePaths();
+el.collectorBrowseList.addEventListener("change", (event) => {
+  const cb = event.target.closest("input.folder-item-check");
+  if (!cb) return;
+  collectorToggleSelected(cb.dataset.path, cb.checked);
+});
 el.collectorBrowseList.addEventListener("click", (event) => {
   const btn = event.target.closest("button[data-path]");
   if (!btn) return;
   event.preventDefault();
   const path = btn.dataset.path;
   if (btn.dataset.dir === "1") {
-    collectorLoadRemote(path);
+    collectorLoadRemote(path); // navigate into the folder
   } else {
-    collectorSelectRemotePath(path);
+    // File: clicking the row toggles its checkbox / selection.
+    const cb = btn.parentElement.querySelector("input.folder-item-check");
+    if (cb) {
+      cb.checked = !cb.checked;
+      collectorToggleSelected(path, cb.checked);
+    }
   }
 });
 
