@@ -378,6 +378,58 @@ fn deploy_inner(
     }
 }
 
+/// True if `s` looks like a dotted IPv4 literal (four 0-255 octets).
+fn is_ipv4(s: &str) -> bool {
+    let parts: Vec<&str> = s.trim().split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 3
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
+        })
+}
+
+/// Rewrite a shadowsocks-rust client config so the `server` field of the entry
+/// matching `new_server`'s address family is set to `new_server`: an IPv4
+/// hostname updates the IPv4 server entry, an IPv6 hostname the IPv6 one. The
+/// file is parsed as JSON and re-serialized, so no brittle text munging is
+/// involved. Returns the new JSON text; errs if the family has no server entry.
+fn substitute_ss_server(conf_text: &str, new_server: &str) -> Result<String> {
+    let new_server = new_server.trim();
+    let want_v4 = is_ipv4(new_server);
+    let want_v6 = !want_v4 && new_server.contains(':');
+    if !want_v4 && !want_v6 {
+        bail!("aws hostname '{new_server}' is neither IPv4 nor IPv6; not substituting");
+    }
+    let mut root: serde_json::Value =
+        serde_json::from_str(conf_text).context("parsing shadowsocks client json")?;
+    let mut changed = 0usize;
+    if let Some(servers) = root.get_mut("servers").and_then(|v| v.as_array_mut()) {
+        for entry in servers.iter_mut() {
+            let Some(cur) = entry.get("server").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let entry_v4 = is_ipv4(cur);
+            let entry_v6 = !entry_v4 && cur.contains(':');
+            let matches = (want_v4 && entry_v4) || (want_v6 && entry_v6);
+            if matches && cur != new_server {
+                entry["server"] = serde_json::Value::String(new_server.to_string());
+                changed += 1;
+            } else if matches {
+                changed += 1; // already correct, but the family entry exists
+            }
+        }
+    }
+    if changed == 0 {
+        bail!(
+            "no {} server entry found in the shadowsocks config",
+            if want_v4 { "IPv4" } else { "IPv6" }
+        );
+    }
+    serde_json::to_string_pretty(&root).context("serializing shadowsocks client json")
+}
+
 /// Prefer a bundled OpenSSH binary shipped next to the running executable
 /// (`<exe dir>\windows\openssh\OpenSSH-Win64\<tool>.exe`), falling back to the
 /// system tool on PATH.
@@ -454,6 +506,15 @@ fn run_local_deploy_script(
         cmd.env(format!("AS_HOST_{}", env_host_suffix(&other.name)), other.hostname.trim());
     }
 
+    // If this host collected a shadowsocks client config, rewrite its server
+    // address (family-matched to the `aws` host's hostname) here in Rust and
+    // hand the script the substituted file via AS_SS_CLIENT_CONF — the JSON
+    // rewrite is far safer done here than with string munging in the script.
+    let ss_conf_temp = prepare_ss_client_conf(host, all_hosts, &file_tag, state);
+    if let Some(ref temp) = ss_conf_temp {
+        cmd.env("AS_SS_CLIENT_CONF", temp.as_os_str());
+    }
+
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let output = cmd.output().context("running deploy script (powershell)")?;
     for line in String::from_utf8_lossy(&output.stdout).lines().take(400) {
@@ -463,7 +524,64 @@ fn run_local_deploy_script(
         log(state, format!("  ! {line}"));
     }
     let _ = fs::remove_file(&script_path);
+    if let Some(temp) = ss_conf_temp {
+        let _ = fs::remove_file(&temp);
+    }
     Ok(output.status.success())
+}
+
+/// If `host` collected `usr/local/shadowsocks/conf/shadowsocks-client.json` and
+/// a host named `aws` exists, write a server-substituted copy to a temp file and
+/// return its path (for the deploy script to scp up). Returns None (and logs)
+/// when nothing needs doing; a substitution error is logged and yields None.
+fn prepare_ss_client_conf(
+    host: &CollectorHost,
+    all_hosts: &[CollectorHost],
+    file_tag: &str,
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Option<PathBuf> {
+    let conf_local = host
+        .root
+        .join("usr")
+        .join("local")
+        .join("shadowsocks")
+        .join("conf")
+        .join("shadowsocks-client.json");
+    if !conf_local.exists() {
+        return None;
+    }
+    let Some(aws) = all_hosts
+        .iter()
+        .find(|h| h.name.trim().eq_ignore_ascii_case("aws"))
+        .map(|h| h.hostname.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        log(state, "shadowsocks conf present but no 'aws' host — leaving server address unchanged");
+        return None;
+    };
+    let text = match fs::read_to_string(&conf_local) {
+        Ok(text) => text,
+        Err(err) => {
+            log(state, format!("could not read {}: {err}", conf_local.display()));
+            return None;
+        }
+    };
+    match substitute_ss_server(&text, &aws) {
+        Ok(new_text) => {
+            let temp = std::env::temp_dir().join(format!("auto_sync_ss_client_{file_tag}.json"));
+            if let Err(err) = fs::write(&temp, new_text) {
+                log(state, format!("could not write substituted conf: {err}"));
+                return None;
+            }
+            let family = if is_ipv4(&aws) { "IPv4" } else { "IPv6" };
+            log(state, format!("shadowsocks server address -> {aws} ({family})"));
+            Some(temp)
+        }
+        Err(err) => {
+            log(state, format!("shadowsocks server substitution skipped: {err:#}"));
+            None
+        }
+    }
 }
 
 /// Split every file at or above `threshold_mb` MiB under `git_dir` into
@@ -804,6 +922,32 @@ mod tests {
         assert_eq!(remote_parent("/"), None);
         assert_eq!(remote_parent("/etc"), Some("/".to_string()));
         assert_eq!(remote_parent("/usr/local/bin"), Some("/usr/local".to_string()));
+    }
+
+    #[test]
+    fn ss_server_substitution_is_family_matched() {
+        let conf = r#"{
+  "servers": [
+    { "server": "2406:da18:c4a:2281::1", "server_port": 443, "disabled": true },
+    { "server": "54.179.191.126", "server_port": 443, "disabled": false }
+  ]
+}"#;
+        // IPv4 aws -> only the IPv4 entry changes.
+        let out = substitute_ss_server(conf, "203.0.113.9").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["servers"][0]["server"], "2406:da18:c4a:2281::1");
+        assert_eq!(v["servers"][1]["server"], "203.0.113.9");
+
+        // IPv6 aws -> only the IPv6 entry changes.
+        let out6 = substitute_ss_server(conf, "2001:db8::2").unwrap();
+        let v6: serde_json::Value = serde_json::from_str(&out6).unwrap();
+        assert_eq!(v6["servers"][0]["server"], "2001:db8::2");
+        assert_eq!(v6["servers"][1]["server"], "54.179.191.126");
+
+        assert!(is_ipv4("54.179.191.126"));
+        assert!(!is_ipv4("2001:db8::2"));
+        assert!(!is_ipv4("256.1.1.1"));
+        assert!(!is_ipv4("example.com"));
     }
 
     #[test]

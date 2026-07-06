@@ -271,7 +271,9 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 **Deploy（回灌 + 起服务，反向操作）**：每个 host 行的 📝 图标打开该 host 的 **deploy 脚本**（每 host 独立、可编辑、自动存进 `collector.toml` 的 `deploy_script`），▶ 图标 **在本机（Windows）运行**该脚本（需二次确认，因为会写目标机）。脚本**运行在 Windows 上**（PowerShell），自己用捆绑的 `ssh`/`scp` 推文件、改权限、起服务；引擎只注入一套环境变量供脚本使用：`AS_SSH`/`AS_SCP`（优先用随程序附带的 OpenSSH，否则走 PATH）、`AS_HOSTNAME`/`AS_USER`/`AS_DEST`/`AS_PORT`/`AS_KEY`（本 host 连接参数）、`AS_ROOT`（本地收集根，如 `D:\share\openwrt`）、`AS_HOST_<名字大写>`（每个 collector host 的 hostname，脚本可据此替换配置里的服务器地址，如 `AS_HOST_AWS`）。后台线程执行、弹窗实时刷日志（`POST /api/collector/deploy` + `GET /api/collector/deploy-status`），同一时刻只允许一个 deploy。⚠️ 会覆盖目标机上的系统文件并重启服务，务必确认脚本正确。
 
-> 附带的 OpenWrt deploy 脚本示例（`collector.toml` 里 openwrt 的 `deploy_script`）：把 `D:\share\openwrt` 下收集到的树 `scp` 回路由器对应目录并修正权限（init 脚本/二进制 0755、配置 0644）→ 用 `AS_HOST_AWS` 替换 `shadowsocks-client.json` 里的服务器地址（两个 server 段，aws 是 IPv4 就改 IPv4 那段，否则改 IPv6 段）→ `sysctl -p`、重启 dnsmasq/odhcpd、`network reload` 让配置生效 → `enable`+`restart` shadowsocks（`sslocal`），并 `disable`+`stop` shadowsocks-rust（`sslocal-master`）避免 procd NAME 冲突。
+服务器地址替换在 **Rust 侧**完成（不用脚本做字符串替换，避免出错）：deploy 前若该 host 收集了 `usr/local/shadowsocks/conf/shadowsocks-client.json` 且存在名为 `aws` 的 host，引擎会用 serde_json 解析该配置，按**地址族匹配**改写 `servers[]` 里的 `server`——aws 的 hostname 是 IPv4 就改 IPv4 那段、是 IPv6 就改 IPv6 段——把结果写到临时文件，通过 `AS_SS_CLIENT_CONF` 交给脚本 `scp` 上去。
+
+> 附带的 OpenWrt deploy 脚本示例（`collector.toml` 里 openwrt 的 `deploy_script`）：把 `D:\share\openwrt` 下收集到的树 `scp` 回路由器对应目录并修正权限（init 脚本/二进制 0755、配置 0644）→ 用引擎备好的 `AS_SS_CLIENT_CONF`（已按族替换好 server 地址）覆盖远端 `shadowsocks-client.json` → `sysctl -p`、重启 dnsmasq/odhcpd、`network reload` 让配置生效 → `enable`+`restart` shadowsocks（`sslocal`），并 `disable`+`stop` shadowsocks-rust（`sslocal-master`）避免 procd NAME 冲突。
 
 ### 任务类型与并发
 
