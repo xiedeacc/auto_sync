@@ -215,13 +215,13 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 每个池：`name`、`mount_roots`（该池的挂载根，任务的源或目标落在其下即受门控）、`devices`（`/dev/disk/by-id/...`，用于 `hdparm -Y` 停转）、`active_spindown`（true 才主动停转，否则只推迟任务、停转交给系统 `hdparm -S`）、`wake`（`every_weeks` 周期 + `weekday` + `time` + `anchor_date` 计数锚点 + `max_window_minutes` 窗口上限）。
 
-- **门控**：`sync_cycle_for_source` 在处理每个目标前调用 `standby::gate_for_roots`；池不在唤醒窗口 → 目标置 `yellow` 并附原因 `disk <pool> in standby until <下次唤醒>`，不执行、不失败，等下个窗口批量补齐（与 paused / waiting_for_compare 同一套"挂起"机制）。
-- **挂载安全**：池处于唤醒窗口时，还会校验其 `mount_roots` 确实是挂载点（`st_dev` 与父目录不同）。若池未导入、`/zfs` 只是根文件系统上的空壳目录 → 置 `red: disk <pool> not mounted`，**拒绝同步**，杜绝"读到空树把整份备份镜像删光"。
-- **多池依赖免特判**：`/zfs→/zfs_pool`（src_2）同时触及两个池,门控检查"源根 + 目标根"两者,只有都在窗口内才跑。让 `/zfs` 每周唤醒、`/zfs_pool` 每 4 周**在同一 anchor 的周六**唤醒,则每 4 周两窗口重叠时 src_2 才执行,其余周只跑写入 `/zfs` 的任务(src_4/src_5)。**注意:链式备份 A→B 的两个池窗口必须重叠,否则门控永远推迟——`/zfs_pool` 的唤醒日必须也是 `/zfs` 的唤醒日。**
-- **停转时机(drain-based re-park)**:调度循环每 tick 驱动 `standby::tick(pools, busy)`。`busy(pool)` = 有 sync 正在跑且触及该池,**或**有"待办且可运行"的工作触及它(该工作的源池+目标池此刻都在窗口内,即 `gate_for_roots` 放行,且目标 `target_cycle_id > last_verified`)。`StandbyManager` 对每个池:
+- **门控（目标驱动 + 源盘按需唤醒）**：`sync_cycle_for_source` 处理每个目标前调用 `standby::gate_for_sync(源根, 目标根)`。**门控只看目标所在池的唤醒窗口**（备份落在目标盘，其唤醒计划就是这条备份的节奏）：目标池不在窗口 → 目标置 `yellow`（原因 `disk <pool> in standby until <下次唤醒>`），不执行不失败，等目标池下个窗口批量补齐。**若源在另一块 standby 盘上（链式备份），源盘不受自己窗口门控，而是按需唤醒**——目标池开窗即放行，读源盘的 I/O 自动把它转起来，`busy()` 在同步期间保持它唤醒。若目标盘非 standby、源盘是 standby，则改由源盘窗口门控（冷源读取仍批量化）。
+- **链式依赖免配置对齐**：`/zfs→/zfs_pool`（src_2）由 `/zfs_pool` 每 4 周开窗触发，`/zfs` 被按需拉醒来读，**无需人为对齐两池窗口**——`/zfs` 自己的每周计划与 src_2 无关。其余周 `/zfs` 开窗只跑写入 `/zfs` 的 src_4/src_5，`/zfs_pool` 不被触及、保持停转。
+- **挂载安全（源和目标都校验）**：任务放行前校验它触及的**每个**池（源池 + 目标池）的 `mount_roots` 确实是挂载点（`st_dev` 与父目录不同）。若某池未导入、`/zfs` 只是根文件系统上的空壳目录 → 置 `red: disk <pool> not mounted`，**拒绝同步**。源盘同样校验：读到空的源树会和空目标一样把整份备份镜像删光。
+- **停转时机(drain-based re-park)**:调度循环每 tick 驱动 `standby::tick(pools, busy)`。`busy(pool)` = 有 sync 正在跑且触及该池,**或**有"待办且可运行"的工作触及它(该工作用 `gate_for_sync` 放行,且目标 `target_cycle_id > last_verified`)。`StandbyManager` 对每个池:
   - **busy** → 保持唤醒(绝不在写入中途停盘);
   - **idle** 且(**窗口外** 或 **窗口内但已空闲超过 `PARK_IDLE_GRACE_SECS`=90s**)→ `hdparm -y`(STANDBY,I/O 自动唤醒)停转。
-  这样盘在**积压 drain 完几分钟后就重新 standby**,而不是干等到 24h 窗口末尾。链式依赖天然正确:`/zfs` 自己的 src_4/src_5 drain 完后,只要 src_2 仍"可运行且未完成"(仅发生在 `/zfs_pool` 也开窗的第 4 周六),`busy(/zfs)` 仍为真、`/zfs` 保持唤醒直到 src_2 也 drain 完;非第 4 周六时 src_2 被 `/zfs_pool` 门控挡住、不计入 `busy(/zfs)`,故 `/zfs` drain 完即停转。开机时若在窗口外,首 tick 直接停转(重启会把盘转起来)。
+  这样盘在**积压 drain 完几分钟后就重新 standby**,而不是干等到 24h 窗口末尾。链式依赖天然正确:`/zfs` 自己的 src_4/src_5 drain 完后,只要 src_2 仍"可运行且未完成"(即 `/zfs_pool` 开着窗——src_2 的门控盘),`busy(/zfs)` 仍为真、`/zfs` 被按需保持唤醒直到 src_2 也 drain 完;`/zfs_pool` 关窗时 src_2 被门控挡住、不计入 `busy(/zfs)`,故 `/zfs` drain 完即停转。开机时若在窗口外,首 tick 直接停转(重启会把盘转起来)。
   - 单纯"这一窗口无任何积压"时,空闲超过 grace 也会停转,不会为空窗白转 24h。
 
 ### 任务类型与并发

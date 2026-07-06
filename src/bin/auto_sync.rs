@@ -834,7 +834,7 @@ fn run_scheduler(
         // pools are ALL currently in their windows still needs it. Once that
         // drains, the pool parks early rather than idling out the whole window.
         if !cfg.standby_pools.is_empty() {
-            use auto_sync::core::standby::{gate_for_roots, pool_covers_path};
+            use auto_sync::core::standby::{gate_for_sync, pool_covers_path};
             let now = chrono::Local::now();
             let syncing = auto_sync::core::sync::sync_is_running();
             let busy = |pool_name: &str| -> bool {
@@ -846,14 +846,18 @@ fn run_scheduler(
                 };
                 for src in cfg.source_groups.iter().filter(|s| s.enabled) {
                     for dst in src.destinations.iter().filter(|d| d.enabled && !d.paused) {
-                        let roots = [src.src.as_path(), dst.path.as_path()];
-                        if !roots.iter().any(|r| pool_covers_path(pool, r)) {
+                        let (src_root, dst_root) = (src.src.as_path(), dst.path.as_path());
+                        if !pool_covers_path(pool, src_root) && !pool_covers_path(pool, dst_root) {
                             continue;
                         }
-                        // Only work that can actually run this window (every pool
-                        // it touches is awake) keeps this pool up; work gated on
-                        // another still-asleep pool does not.
-                        if !matches!(gate_for_roots(&cfg.standby_pools, &roots, now), Ok(None)) {
+                        // Only work that can actually run now (its gating pool is
+                        // in-window) keeps this pool up — including a source pool
+                        // pulled awake on demand for a chained backup. Work whose
+                        // gating destination is still parked does not.
+                        if !matches!(
+                            gate_for_sync(&cfg.standby_pools, src_root, dst_root, now),
+                            Ok(None)
+                        ) {
                             continue;
                         }
                         // Pending due work = the destination's target cycle is

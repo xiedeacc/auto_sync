@@ -2,13 +2,14 @@
 //! stay parked outside a scheduled wake window, and spin them down both when
 //! the window closes AND as soon as the window's backlog has drained.
 //!
-//! The engine calls [`gate_for_roots`] before touching a (source, dest) pair:
-//! if any [`StandbyPoolConfig`] whose `mount_roots` cover either root is
-//! outside its wake window, the task is deferred with a reason. When a pool IS
-//! awake, [`verify_pool_mounted`] guards against the catastrophic case where a
-//! pool root exists as a bare directory because the pool is not actually
-//! imported — syncing then would read an empty tree and mirror-delete the
-//! backup.
+//! The engine calls [`gate_for_sync`] before touching a (source, dest) pair.
+//! The gate defers on the DESTINATION pool's wake window (that's where the
+//! backup lands); a source on a different standby pool is woken on demand
+//! rather than gated, so a chained backup needs no configured window overlap.
+//! Either way [`verify_pool_mounted`] guards against the catastrophic case
+//! where a pool root exists as a bare directory because the pool is not
+//! actually imported — syncing then would read an empty tree and mirror-delete
+//! the backup.
 //!
 //! The daemon drives [`StandbyManager`] each tick with a `busy(pool)` predicate
 //! (a sync is running that touches the pool, or pending work whose every pool is
@@ -65,21 +66,42 @@ pub fn pool_covers_path(pool: &StandbyPoolConfig, path: &Path) -> bool {
     pool.mount_roots.iter().any(|root| path_under(root, path))
 }
 
-/// Evaluate standby for a task touching `roots` (source root + dest root, plus
-/// any others). Returns the first blocking [`Gate`], or `None` to proceed.
+/// Evaluate standby for a sync from `src_root` to `dst_root`. Returns the first
+/// blocking [`Gate`], or `None` to proceed. `now` is injected for testability.
 ///
-/// `now` is injected so this is deterministic and unit-testable.
-pub fn gate_for_roots(
+/// The GATING side is the DESTINATION's pools when the destination is on a
+/// standby pool — that's where the backup lands, and its wake schedule is the
+/// intended cadence for this backup. A source that lives on a *different*
+/// standby pool is NOT gated on its own window: it is woken on demand (the read
+/// spins the disk up; `busy()` keeps it awake for the duration). This is what
+/// makes a chained backup (`/zfs → /zfs_pool`) work with NO configured window
+/// overlap — when `/zfs_pool`'s window opens, `/zfs` is pulled awake to be read,
+/// whatever `/zfs`'s own schedule says. If the destination is NOT on a standby
+/// pool but the source is, the source's window gates (so cold-source reads still
+/// batch instead of waking the disk on every change).
+///
+/// Whichever side proceeds, EVERY touched pool (source and destination) is
+/// mount-verified: reading a source from an unimported pool's empty stub would
+/// mirror-delete the whole backup just as surely as an unmounted destination.
+pub fn gate_for_sync(
     pools: &[StandbyPoolConfig],
-    roots: &[&Path],
+    src_root: &Path,
+    dst_root: &Path,
     now: DateTime<Local>,
 ) -> Result<Option<Gate>> {
+    let dest_on_standby = pools
+        .iter()
+        .filter(|p| p.enabled)
+        .any(|p| pool_covers_path(p, dst_root));
     for pool in pools.iter().filter(|p| p.enabled) {
-        let touched = roots.iter().any(|r| pool_covers_path(pool, r));
-        if !touched {
-            continue;
-        }
-        if !is_within_wake_window(now, &pool.wake)? {
+        // The dest's pools gate when the dest is on standby; otherwise the
+        // source's pools gate. The non-gating (pulled) side is woken on demand.
+        let gates = if dest_on_standby {
+            pool_covers_path(pool, dst_root)
+        } else {
+            pool_covers_path(pool, src_root)
+        };
+        if gates && !is_within_wake_window(now, &pool.wake)? {
             let next = next_wake_start_after(now, &pool.wake)
                 .map(|t| t.format("%a %Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|_| "?".to_string());
@@ -88,13 +110,16 @@ pub fn gate_for_roots(
                 reason: format!("disk {} in standby until {next}", pool.name),
             }));
         }
-        // Awake: the pool's disks must genuinely be mounted, or a "sync" would
-        // read an empty tree and delete the whole backup.
-        if let Err(err) = verify_pool_mounted(pool) {
-            return Ok(Some(Gate::NotMounted {
-                pool: pool.name.clone(),
-                reason: format!("disk {} not mounted: {err}", pool.name),
-            }));
+    }
+    // Proceeding: every pool this sync touches must be genuinely mounted.
+    for pool in pools.iter().filter(|p| p.enabled) {
+        if pool_covers_path(pool, src_root) || pool_covers_path(pool, dst_root) {
+            if let Err(err) = verify_pool_mounted(pool) {
+                return Ok(Some(Gate::NotMounted {
+                    pool: pool.name.clone(),
+                    reason: format!("disk {} not mounted: {err}", pool.name),
+                }));
+            }
         }
     }
     Ok(None)
@@ -393,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_defers_when_pool_asleep_and_passes_when_no_pool_touched() {
+    fn gate_defers_when_dest_pool_asleep_and_passes_when_no_pool_touched() {
         let pool = StandbyPoolConfig {
             name: "zfs".into(),
             mount_roots: vec![PathBuf::from("/zfs")],
@@ -402,16 +427,55 @@ mod tests {
             ..Default::default()
         };
         let pools = vec![pool];
-        // Monday → asleep; a task writing /zfs/wx is gated.
-        let g = gate_for_roots(&pools, &[Path::new("/opt/wx"), Path::new("/zfs/wx")],
-                               at(2026, 1, 5, 12, 0)).unwrap();
+        // Monday → asleep; a sync writing /zfs/wx is gated on its dest pool.
+        let g = gate_for_sync(&pools, Path::new("/opt/wx"), Path::new("/zfs/wx"),
+                              at(2026, 1, 5, 12, 0)).unwrap();
         match g {
             Some(Gate::Asleep { pool, .. }) => assert_eq!(pool, "zfs"),
             other => panic!("expected Asleep, got {other:?}"),
         }
-        // A task entirely off the pool (/opt -> /opt) is never gated.
-        assert!(gate_for_roots(&pools, &[Path::new("/opt/a"), Path::new("/opt/b")],
-                               at(2026, 1, 5, 12, 0)).unwrap().is_none());
+        // A sync entirely off the pool (/opt -> /opt) is never gated.
+        assert!(gate_for_sync(&pools, Path::new("/opt/a"), Path::new("/opt/b"),
+                              at(2026, 1, 5, 12, 0)).unwrap().is_none());
+    }
+
+    #[test]
+    fn chained_backup_gates_on_dest_not_source_window() {
+        // /zfs weekly, /zfs_pool every 4 weeks — DIFFERENT cadences, NOT aligned
+        // beyond the anchor. src_2 = /zfs -> /zfs_pool.
+        let zfs = StandbyPoolConfig {
+            name: "zfs".into(),
+            mount_roots: vec![PathBuf::from("/zfs")],
+            enabled: true,
+            wake: wake(1, "saturday", "10:00", "2026-01-03", 12 * 60),
+            ..Default::default()
+        };
+        let zfs_pool = StandbyPoolConfig {
+            name: "zfs_pool".into(),
+            mount_roots: vec![PathBuf::from("/zfs_pool")],
+            enabled: true,
+            wake: wake(4, "saturday", "10:00", "2026-01-03", 12 * 60),
+            ..Default::default()
+        };
+        let pools = vec![zfs, zfs_pool];
+        // Week-1 Saturday: /zfs open, /zfs_pool CLOSED. src_2 gated on the DEST
+        // (/zfs_pool), never on the in-window source — proving the dest drives it.
+        let g = gate_for_sync(&pools, Path::new("/zfs"), Path::new("/zfs_pool"),
+                              at(2026, 1, 10, 11, 0)).unwrap();
+        match g {
+            Some(Gate::Asleep { pool, .. }) => assert_eq!(pool, "zfs_pool"),
+            other => panic!("expected Asleep(zfs_pool), got {other:?}"),
+        }
+        // Week-4 Saturday: /zfs_pool open, /zfs also happens to be open. The
+        // source's OWN window is irrelevant now — the gate does not defer on it.
+        // (Proceeds to the mount check, which fails on these non-existent test
+        //  paths — the point is only that it is NOT Asleep on the source.)
+        let g = gate_for_sync(&pools, Path::new("/zfs"), Path::new("/zfs_pool"),
+                              at(2026, 1, 31, 11, 0)).unwrap();
+        assert!(
+            !matches!(g, Some(Gate::Asleep { .. })),
+            "dest in-window must not be deferred by the source's schedule; got {g:?}"
+        );
     }
 
     #[test]

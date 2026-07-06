@@ -3040,16 +3040,17 @@ fn sync_cycle_for_source_inner(
             continue;
         }
 
-        // Cold-backup standby: if this source or destination lives on a pool
-        // that is parked (outside its wake window), hold the target so the work
-        // backlogs and the disk stays asleep. When the pool IS awake this also
-        // refuses to run if the pool root is not a real mount — otherwise a
-        // "sync" would read an empty tree and mirror-delete the whole backup.
+        // Cold-backup standby: if this destination lives on a parked pool
+        // (outside its wake window), hold the target so the work backlogs and
+        // the disk stays asleep. A source on a *different* standby pool is woken
+        // on demand (not gated). Either way, refuse to run if a touched pool
+        // root is not a real mount — a "sync" reading an empty tree would
+        // mirror-delete the whole backup.
         if !cfg.standby_pools.is_empty() {
-            let roots = [source.src.as_path(), dst.path.as_path()];
-            match crate::core::standby::gate_for_roots(
+            match crate::core::standby::gate_for_sync(
                 &cfg.standby_pools,
-                &roots,
+                source.src.as_path(),
+                dst.path.as_path(),
                 chrono::Local::now(),
             ) {
                 Ok(Some(gate)) => {
