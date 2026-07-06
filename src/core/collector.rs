@@ -452,16 +452,15 @@ pub fn browse(req: &CollectorBrowseRequest) -> Result<CollectorBrowseResponse> {
         let trimmed = req.path.trim();
         if trimmed.is_empty() { "/" } else { trimmed }
     };
-    // List entries and mark directories with a trailing `/`. We use a `[ -d ]`
-    // test rather than `ls -p` because `ls -p` only flags *real* directories —
-    // a symlink pointing at a directory would otherwise show up as a file.
-    // `[ -d ]` follows the symlink, so those are classified correctly. POSIX
-    // sh, works under bash and busybox ash alike.
+    // List entries and mark directories with a trailing `/`, using a `[ -d ]`
+    // test (which follows symlinks, so a symlink-to-dir is flagged correctly).
+    // We iterate `ls -A1` output rather than a shell glob because an unmatched
+    // glob is a fatal error under zsh (`no matches found`) whereas it stays
+    // literal in sh — the `ls | while read` form behaves the same in zsh, bash,
+    // ash and busybox.
     let remote_cmd = format!(
         "cd -- {} 2>/dev/null || exit 0; \
-for f in * .*; do \
-[ \"$f\" = . ] && continue; \
-[ \"$f\" = .. ] && continue; \
+ls -A1 2>/dev/null | while IFS= read -r f; do \
 [ -e \"$f\" ] || [ -L \"$f\" ] || continue; \
 if [ -d \"$f\" ]; then printf '%s/\\n' \"$f\"; else printf '%s\\n' \"$f\"; fi; \
 done",
