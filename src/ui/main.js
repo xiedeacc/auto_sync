@@ -3604,7 +3604,10 @@ function openCollectorPaths(hostIndex) {
 function renderCollectorPaths() {
   const host = collectorDraft.hosts[collectorPathsIndex];
   if (!host) return;
-  const paths = host.paths || [];
+  // Show paths in ascending alphabetical order. Sort the underlying array (not
+  // just the view) so the row indices used for edit/remove stay aligned.
+  host.paths = (host.paths || []).sort((a, b) => String(a).localeCompare(String(b)));
+  const paths = host.paths;
   el.collectorPathsList.innerHTML = paths.map((p, pi) => `
       <div class="collector-path-item">
         <input data-paths-index="${pi}" value="${escapeAttr(p)}" placeholder="/remote/absolute/path">
