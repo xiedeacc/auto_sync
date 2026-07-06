@@ -308,6 +308,7 @@ const el = {
   collectorBrowseClose: document.getElementById("collector-browse-close"),
   collectorBrowsePath: document.getElementById("collector-browse-path"),
   collectorBrowseUp: document.getElementById("collector-browse-up"),
+  collectorBrowseSelf: document.getElementById("collector-browse-self"),
   collectorBrowseError: document.getElementById("collector-browse-error"),
   collectorBrowseList: document.getElementById("collector-browse-list"),
 };
@@ -3661,10 +3662,23 @@ async function collectorLoadRemote(path) {
     collectorLastRemotePath[collectorBrowse.conn.hostname] = res.path;
     el.collectorBrowsePath.textContent = res.path;
     renderCollectorBrowseList(res.entries || []);
+    updateCollectorBrowseSelf();
   } catch (error) {
     el.collectorBrowseList.innerHTML = "";
     setCollectorBrowseError(String(error));
   }
+}
+
+// The "Add this folder" button toggles the current directory itself in the
+// host's paths. Disabled at the remote root ("/" can't be collected).
+function updateCollectorBrowseSelf() {
+  if (!collectorBrowse) return;
+  const path = collectorBrowse.path;
+  const atRoot = !path || path === "/";
+  const added = ((collectorBrowseHost()?.paths) || []).includes(path);
+  el.collectorBrowseSelf.disabled = atRoot;
+  el.collectorBrowseSelf.textContent = added ? "✓ This folder added — remove" : "Add this folder";
+  el.collectorBrowseSelf.classList.toggle("primary", !added && !atRoot);
 }
 
 function renderCollectorBrowseList(entries) {
@@ -3770,6 +3784,14 @@ el.collectorBrowseClose.onclick = () => {
 };
 el.collectorBrowseUp.onclick = () => {
   if (collectorBrowse && collectorBrowse.parent != null) collectorLoadRemote(collectorBrowse.parent);
+};
+el.collectorBrowseSelf.onclick = () => {
+  if (!collectorBrowse) return;
+  const path = collectorBrowse.path;
+  if (!path || path === "/") return;
+  const added = ((collectorBrowseHost()?.paths) || []).includes(path);
+  collectorToggleRemotePath(path, !added);
+  updateCollectorBrowseSelf();
 };
 el.collectorBrowseList.addEventListener("change", (event) => {
   const cb = event.target.closest("input.folder-item-check");
