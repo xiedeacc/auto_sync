@@ -261,7 +261,8 @@ impl Backend {
             };
         }
         let state = self.collector_deploy.clone();
-        thread::spawn(move || collector::deploy(host, state));
+        let all_hosts = cfg.hosts.clone();
+        thread::spawn(move || collector::deploy(host, all_hosts, state));
         Ok(self.collector_deploy_status())
     }
 

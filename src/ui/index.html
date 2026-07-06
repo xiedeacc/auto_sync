@@ -373,8 +373,8 @@
         <button id="collector-deploy-close" class="icon" title="Close">x</button>
       </div>
       <div class="collector-deploy-body">
-        <div class="subtle collector-deploy-note">Deploy copies this host's collected files back to their original paths, then runs the script below <strong>on the host</strong> (over ssh) — use host-native commands.</div>
-        <textarea id="collector-deploy-script" class="collector-ssh-config collector-deploy-script" spellcheck="false" placeholder="# runs on the host after files are copied back&#10;# OpenWrt example (procd):&#10;/etc/init.d/shadowsocks enable&#10;/etc/init.d/shadowsocks restart&#10;# leave shadowsocks-rust stopped&#10;uci commit"></textarea>
+        <div class="subtle collector-deploy-note">This script runs <strong>on this machine (Windows, PowerShell)</strong> and drives the bundled ssh/scp itself. Env: <code>AS_SSH</code>/<code>AS_SCP</code>, <code>AS_DEST</code>/<code>AS_HOSTNAME</code>/<code>AS_USER</code>/<code>AS_PORT</code>/<code>AS_KEY</code>, <code>AS_ROOT</code> (local collected root), and <code>AS_HOST_&lt;NAME&gt;</code> for every host's hostname (e.g. <code>AS_HOST_AWS</code>).</div>
+        <textarea id="collector-deploy-script" class="collector-ssh-config collector-deploy-script" spellcheck="false" placeholder="# PowerShell, runs on Windows: push files + fix perms + restart services&#10;$scpArgs = @('-r','-p','-P',$env:AS_PORT,'-i',$env:AS_KEY)&#10;& $env:AS_SCP @scpArgs (Join-Path $env:AS_ROOT 'etc\config\network') (&quot;$($env:AS_DEST):/etc/config/&quot;)&#10;'/etc/init.d/network reload' | & $env:AS_SSH -p $env:AS_PORT -i $env:AS_KEY $env:AS_DEST 'sh -s'"></textarea>
         <div class="collector-deploy-hint subtle">Edit here; press the ▶ run icon on the host row to deploy.</div>
         <div id="collector-deploy-state" class="collector-run-state"></div>
         <pre id="collector-deploy-log" class="collector-log" hidden></pre>

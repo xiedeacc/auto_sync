@@ -305,13 +305,19 @@ fn pull_path(
     Ok(())
 }
 
-// --- deploy (push files back + run host script) -------------------------------
+// --- deploy (run the host's deploy script on Windows) -------------------------
 
-/// Deploy a single host: push its collected files back to their original remote
-/// paths, then run its host-native deploy script on the host over ssh. Returns
-/// the number of steps that failed.
-pub fn deploy(host: CollectorHost, state: Arc<Mutex<CollectorRunState>>) {
-    let ok = match deploy_inner(&host, &state) {
+/// Deploy a single host by running its deploy script **on this machine**
+/// (Windows), not on the remote host. The script drives the bundled `ssh`/`scp`
+/// itself — it decides what to push, how to fix permissions, how to restart
+/// services. The engine only hands it a ready-made environment:
+///   AS_SSH / AS_SCP        the ssh/scp binaries to use (bundled, else PATH)
+///   AS_HOSTNAME / AS_USER / AS_DEST / AS_PORT / AS_KEY   this host's connection
+///   AS_ROOT                the host's local collected root (e.g. D:\share\openwrt)
+///   AS_HOST_<NAME>         every collector host's hostname (so a script can, e.g.,
+///                          read AS_HOST_AWS to substitute a server address)
+pub fn deploy(host: CollectorHost, all_hosts: Vec<CollectorHost>, state: Arc<Mutex<CollectorRunState>>) {
+    let ok = match deploy_inner(&host, &all_hosts, &state) {
         Ok(0) => {
             log(&state, "Deploy finished.");
             true
@@ -332,7 +338,11 @@ pub fn deploy(host: CollectorHost, state: Arc<Mutex<CollectorRunState>>) {
     }
 }
 
-fn deploy_inner(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> Result<usize> {
+fn deploy_inner(
+    host: &CollectorHost,
+    all_hosts: &[CollectorHost],
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<usize> {
     if host.hostname.trim().is_empty() {
         bail!("host has no hostname");
     }
@@ -345,121 +355,114 @@ fn deploy_inner(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> 
     } else {
         host.name.clone()
     };
-    log(state, format!("=== deploy {label} ({}) ===", conn.dest()));
+    log(state, format!("=== deploy {label} ({}) — running on this machine ===", conn.dest()));
 
-    let mut errors = 0;
-    // Phase 1: push each collected path back to its original remote location.
-    for path in &host.paths {
-        let remote = path.trim();
-        if remote.is_empty() {
-            continue;
-        }
-        match push_path(host, &conn, remote, state) {
-            Ok(()) => log(state, format!("  pushed {remote}")),
-            Err(err) => {
-                errors += 1;
-                log(state, format!("  FAILED push {remote}: {err:#}"));
-            }
-        }
-    }
-
-    // Phase 2: run the host-native deploy script on the host.
     if host.deploy_script.trim().is_empty() {
-        log(state, "no deploy script — files pushed only");
-    } else {
-        log(state, "--- running deploy script on host ---");
-        match run_remote_script(&conn, &host.deploy_script, state) {
-            Ok(true) => log(state, "deploy script ok"),
-            Ok(false) => {
-                errors += 1;
-                log(state, "deploy script exited non-zero");
-            }
-            Err(err) => {
-                errors += 1;
-                log(state, format!("deploy script error: {err:#}"));
+        log(state, "no deploy script for this host — nothing to do");
+        return Ok(0);
+    }
+
+    match run_local_deploy_script(host, &conn, all_hosts, &host.deploy_script, state) {
+        Ok(true) => {
+            log(state, "deploy script ok");
+            Ok(0)
+        }
+        Ok(false) => {
+            log(state, "deploy script exited non-zero");
+            Ok(1)
+        }
+        Err(err) => {
+            log(state, format!("deploy script error: {err:#}"));
+            Ok(1)
+        }
+    }
+}
+
+/// Prefer a bundled OpenSSH binary shipped next to the running executable
+/// (`<exe dir>\windows\openssh\OpenSSH-Win64\<tool>.exe`), falling back to the
+/// system tool on PATH.
+fn resolve_ssh_tool(tool: &str) -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let exe_name = format!("{tool}.exe");
+            let candidates = [
+                dir.join("windows").join("openssh").join("OpenSSH-Win64").join(&exe_name),
+                dir.join("openssh").join("OpenSSH-Win64").join(&exe_name),
+                dir.join(&exe_name),
+            ];
+            for cand in candidates {
+                if cand.exists() {
+                    return cand.to_string_lossy().into_owned();
+                }
             }
         }
     }
-    Ok(errors)
+    tool.to_string()
 }
 
-/// Split a remote absolute path into (parent components, leaf), sanitized.
-fn remote_split(remote: &str) -> Result<(Vec<String>, String)> {
-    let comps: Vec<String> = remote
+/// Turn a host name into an env-var-safe suffix: `AS_HOST_<UPPER>` where every
+/// non-alphanumeric character becomes `_`.
+fn env_host_suffix(name: &str) -> String {
+    let mut s: String = name
         .trim()
-        .trim_end_matches('/')
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .map(|c| c.to_string())
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
         .collect();
-    if comps.is_empty() {
-        bail!("refusing the remote root '/'");
+    if s.is_empty() {
+        s.push('_');
     }
-    if comps.iter().any(|c| c == "..") {
-        bail!("remote path must not contain '..'");
-    }
-    let leaf = comps.last().cloned().unwrap();
-    let parent = comps[..comps.len() - 1].to_vec();
-    Ok((parent, leaf))
+    s
 }
 
-/// Push one locally-collected path back to its original remote location.
-fn push_path(
+/// Write the deploy script to a temp file and run it locally (PowerShell on
+/// Windows), streaming its output into the run log.
+fn run_local_deploy_script(
     host: &CollectorHost,
     conn: &SshConn,
-    remote: &str,
-    state: &Arc<Mutex<CollectorRunState>>,
-) -> Result<()> {
-    let (parent, leaf) = remote_split(remote)?;
-    let mut local_src = host.root.clone();
-    for component in &parent {
-        local_src.push(component);
-    }
-    local_src.push(&leaf);
-    if !local_src.exists() {
-        bail!("not collected locally: {}", local_src.display());
-    }
-    let remote_parent = if parent.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", parent.join("/"))
-    };
-    // Ensure the remote parent exists (best effort).
-    let _ = ssh_capture(conn, &format!("mkdir -p {}", shell_quote(&remote_parent)));
-
-    log(state, format!("  scp {} -> {}:{}", local_src.display(), conn.dest(), remote));
-    let mut cmd = scp_command(conn);
-    cmd.arg("-r").arg("-p");
-    cmd.arg(&local_src);
-    cmd.arg(format!("{}:{}", conn.dest(), remote_parent));
-    let output = cmd.output().context("running scp")?;
-    if !output.status.success() {
-        bail!("scp failed: {}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(())
-}
-
-/// Pipe a script to the host's shell over ssh (`sh -s`), logging its output.
-fn run_remote_script(
-    conn: &SshConn,
+    all_hosts: &[CollectorHost],
     script: &str,
     state: &Arc<Mutex<CollectorRunState>>,
 ) -> Result<bool> {
-    let mut cmd = ssh_command(conn);
-    cmd.arg(conn.dest()).arg("sh -s");
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("spawning ssh")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(script.as_bytes())?;
-        stdin.write_all(b"\n")?;
+    let file_tag = env_host_suffix(&host.name).to_lowercase();
+    let script_path = std::env::temp_dir().join(format!("auto_sync_deploy_{file_tag}.ps1"));
+    fs::write(&script_path, script)
+        .with_context(|| format!("writing {}", script_path.display()))?;
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = command("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = command("pwsh");
+        c.args(["-NoProfile", "-NonInteractive", "-File"]);
+        c
+    };
+    cmd.arg(&script_path);
+
+    cmd.env("AS_SSH", resolve_ssh_tool("ssh"));
+    cmd.env("AS_SCP", resolve_ssh_tool("scp"));
+    cmd.env("AS_HOSTNAME", conn.hostname);
+    cmd.env("AS_USER", conn.user);
+    cmd.env("AS_DEST", conn.dest());
+    cmd.env("AS_PORT", if conn.port == 0 { String::new() } else { conn.port.to_string() });
+    cmd.env("AS_KEY", if conn.identity_file.is_empty() { String::new() } else { expand_tilde(conn.identity_file) });
+    cmd.env("AS_ROOT", host.root.as_os_str());
+    for other in all_hosts {
+        cmd.env(format!("AS_HOST_{}", env_host_suffix(&other.name)), other.hostname.trim());
     }
-    let output = child.wait_with_output().context("running deploy script")?;
-    for line in String::from_utf8_lossy(&output.stdout).lines().take(200) {
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = cmd.output().context("running deploy script (powershell)")?;
+    for line in String::from_utf8_lossy(&output.stdout).lines().take(400) {
         log(state, format!("  | {line}"));
     }
     for line in String::from_utf8_lossy(&output.stderr).lines().take(200) {
         log(state, format!("  ! {line}"));
     }
+    let _ = fs::remove_file(&script_path);
     Ok(output.status.success())
 }
 
