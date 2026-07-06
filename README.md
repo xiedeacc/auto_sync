@@ -222,6 +222,16 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
   - **target 是快照,不追新**:`advance_due_destination_targets`(state.rs:543-546)在 `verified < target` 期间**跳过该目标不再前移** —— 窗口内 target 只在调度边界锁定一次(到当时最新 closed cycle),reconcile 一趟批量补齐 `verified→target` 的事件并集。drain 完后新开的 cycle 其调度边界落在**下个窗口**,故本窗口不追。这正是"把时间点前触发的 cycle 全部跑完、之后触发的等下轮"。
   - **90s 是完结后的防抖 settle,不是空闲计时**:`busy` 转假(cycle 已完结)后再等 `PARK_IDLE_GRACE_SECS`=90s 才 `hdparm -y` 停转,用于抹平"standby 窗口 09:00 先于同步调度边界 10:00 开"这类空档、以及多目标/多源收尾的瞬时抖动,避免刚停又被唤醒。
   - 停转条件 = `busy` 假 且(**窗口外** 或 **窗口内已 settle 满 90s**)。链式依赖天然正确:`/zfs` 自己的 src_4/src_5 完结后,只要 src_2 仍"可运行且 target>verified"(即 `/zfs_pool` 开着窗——src_2 的门控盘),`busy(/zfs)` 仍为真、`/zfs` 被按需保持唤醒直到 src_2 也完结;`/zfs_pool` 关窗时 src_2 被门控挡住、不计入 `busy(/zfs)`,故 `/zfs` 完结即停转。开机时若在窗口外,首 tick 直接停转。
+
+  三个判定各司其职(**别把 90s 当成完结信号**):
+
+  | 判定 | 依据 | 作用 |
+  | --- | --- | --- |
+  | cycle 是否完结 | `busy = 有 sync 在跑 或 target > verified` | 只要没完结,盘恒唤醒 |
+  | target 是否追新 | 不追 —— `verified<target` 期间跳过前移,边界内只锁一次 | 时间点前触发的 cycle 全 drain,之后的等下轮 |
+  | 90s | 仅在 `verified==target`(已完结)之后起算 | 完结后的防抖 settle,非空闲计时 |
+
+  即:**到点 → 锁定当时全部积压为 target → 一趟批量 drain 到 `verified==target`(cycle 完结)→ 才起 90s settle → 停转**。settle 期间若又有"本窗口该做"的 cycle 被锁定(`target>verified` 复真),`busy` 立刻转真、重新保持唤醒,不会误停。
 - **积压如何 drain（批量补齐,非逐 cycle）**：窗口外事件持续累积成一个个 closed cycle,但目标不 sync（门控推迟）。窗口打开后 `advance_due_destination_targets` 把该目标的 `target_cycle_id` 一次推进到**最新 closed cycle**,然后**一次 reconcile**：`events_between_cycles(last_verified, target)` 取从上次已校验到目标之间**所有 cycle 的事件并集**,合并去重后一次性同步,`last_verified` 直接从旧值跳到 target(如 103→133),**不是逐个 cycle 分别同步**。所以"一周/四周积压"是一趟批量补齐,drain 完 `target==verified`,`busy` 转假,盘按上面的规则停转。
 
 **端到端时序(以 `/zfs` 每周六、`/zfs_pool` 每 4 周六为例)：**
