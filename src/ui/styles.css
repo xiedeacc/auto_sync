@@ -1582,12 +1582,6 @@ th {
   gap: 8px;
 }
 
-.collector-paths-add input {
-  flex: 1 1 auto;
-  min-width: 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
-}
 
 .collector-actions {
   display: flex;

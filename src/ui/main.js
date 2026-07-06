@@ -302,8 +302,6 @@ const el = {
   collectorPathsTitle: document.getElementById("collector-paths-title"),
   collectorPathsClose: document.getElementById("collector-paths-close"),
   collectorPathsList: document.getElementById("collector-paths-list"),
-  collectorPathsInput: document.getElementById("collector-paths-input"),
-  collectorPathsAdd: document.getElementById("collector-paths-add"),
   collectorPathsBrowse: document.getElementById("collector-paths-browse"),
   collectorBrowseModal: document.getElementById("collector-browse-modal"),
   collectorBrowseTitle: document.getElementById("collector-browse-title"),
@@ -3600,7 +3598,6 @@ function openCollectorPaths(hostIndex) {
   collectorPathsIndex = hostIndex;
   const label = host.name.trim() || host.hostname.trim() || `host ${hostIndex + 1}`;
   el.collectorPathsTitle.textContent = `Files & folders — ${label}`;
-  el.collectorPathsInput.value = "";
   el.collectorPathsModal.hidden = false;
   renderCollectorPaths();
 }
@@ -3614,20 +3611,6 @@ function renderCollectorPaths() {
         <input data-paths-index="${pi}" value="${escapeAttr(p)}" placeholder="/remote/absolute/path">
         <button type="button" data-paths-remove="${pi}" title="Remove">✕</button>
       </div>`).join("");
-}
-
-function collectorAddPath(value) {
-  const host = collectorDraft.hosts[collectorPathsIndex];
-  if (!host) return;
-  host.paths = host.paths || [];
-  const path = String(value || "").trim();
-  if (path && !host.paths.includes(path)) {
-    host.paths.push(path);
-  }
-  el.collectorPathsInput.value = "";
-  renderCollectorPaths();
-  renderCollectorHosts();
-  collectorAutoSave();
 }
 
 // Remote path picker (ssh ls) --------------------------------------------------
@@ -3770,13 +3753,6 @@ el.collectorPathsClose.onclick = () => {
   collectorPathsIndex = null;
   renderCollectorHosts();
 };
-el.collectorPathsAdd.onclick = () => collectorAddPath(el.collectorPathsInput.value);
-el.collectorPathsInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
-    event.preventDefault();
-    collectorAddPath(el.collectorPathsInput.value);
-  }
-});
 el.collectorPathsBrowse.onclick = () => collectorBrowseRemote();
 el.collectorPathsList.addEventListener("input", (event) => {
   const t = event.target;
