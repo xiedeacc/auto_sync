@@ -1510,19 +1510,21 @@ th {
   overflow-x: auto;
 }
 
-/* Columns: Host | HostName | User | Port | IdentityFile | Root | Files | on | x */
+/* Fixed, content-hugging columns (no fr stretching) so every row and the
+   header line up on the same left edges; the table left-aligns and any extra
+   modal width stays empty on the right.
+   Host | HostName | User | Port | IdentityFile | Root | Files | on | x */
 .collector-host-row {
   display: grid;
-  grid-template-columns: 1fr 1.2fr 0.8fr 64px 1.4fr 1.6fr auto auto auto;
+  grid-template-columns: 84px 116px 72px 78px 138px 158px 78px 48px 26px;
   gap: 6px;
   align-items: center;
-  min-width: 720px;
+  width: max-content;
 }
 
 .collector-host-head-row {
   font-size: 11px;
   color: var(--muted);
-  padding: 0 2px;
 }
 
 .collector-host-row input {
@@ -1535,8 +1537,8 @@ th {
 }
 
 .collector-host-extra {
-  min-width: 720px;
-  padding: 0 2px 8px;
+  width: 100%;
+  padding: 0 0 8px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -1551,13 +1553,20 @@ th {
   font-size: 12px;
 }
 
+.collector-host-row button {
+  padding-left: 6px;
+  padding-right: 6px;
+}
+
 .collector-host-remove {
-  width: 30px;
+  width: 100%;
   color: var(--red);
 }
 
 .collector-paths-btn {
+  width: 100%;
   white-space: nowrap;
+  font-size: 12px;
 }
 
 .collector-paths-list {
