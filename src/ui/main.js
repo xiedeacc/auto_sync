@@ -285,6 +285,7 @@ const el = {
   collectorGitDirBrowse: document.getElementById("collector-git-dir-browse"),
   collectorSplitMb: document.getElementById("collector-split-mb"),
   collectorAutoPush: document.getElementById("collector-auto-push"),
+  collectorImport: document.getElementById("collector-import"),
   collectorAddHost: document.getElementById("collector-add-host"),
   collectorHosts: document.getElementById("collector-hosts"),
   collectorSave: document.getElementById("collector-save"),
@@ -3671,6 +3672,30 @@ function collectorSelectRemotePath(path) {
   collectorBrowse = null;
 }
 
+async function importSshConfigHosts() {
+  if (!collectorDraft) return;
+  try {
+    const imported = await invoke("collector_ssh_config_hosts");
+    const existing = new Set((collectorDraft.hosts || []).map((h) => h.name.trim()).filter(Boolean));
+    let added = 0;
+    for (const raw of imported || []) {
+      const host = normalizeCollectorHost(raw);
+      if (host.name && existing.has(host.name)) continue;
+      collectorDraft.hosts.push(host);
+      if (host.name) existing.add(host.name);
+      added += 1;
+    }
+    renderCollectorHosts();
+    setCollectorRunState(
+      added
+        ? `Imported ${added} host(s) from ~/.ssh/config — set each Root and Files.`
+        : "No new hosts in ~/.ssh/config (all already present).",
+    );
+  } catch (error) {
+    setCollectorRunState(String(error));
+  }
+}
+
 async function openCollectorConfigFile() {
   el.collectorConfigPath.textContent = "";
   el.collectorConfigView.textContent = "Loading…";
@@ -3693,6 +3718,7 @@ el.collectorConfig.onclick = () => openCollectorConfigFile();
 el.collectorConfigClose.onclick = () => { el.collectorConfigModal.hidden = true; };
 el.collectorSave.onclick = () => saveCollector().catch((error) => setCollectorRunState(String(error)));
 el.collectorRun.onclick = () => runCollector();
+el.collectorImport.onclick = () => importSshConfigHosts();
 el.collectorAddHost.onclick = () => {
   if (!collectorDraft) return;
   collectorDraft.hosts.push(normalizeCollectorHost({}));
@@ -3861,6 +3887,7 @@ async function invokeWeb(command, payload = {}) {
     collector_get_config: ["GET", "/api/collector/config"],
     collector_save_config: ["POST", "/api/collector/config"],
     collector_config_file: ["GET", "/api/collector/config-file"],
+    collector_ssh_config_hosts: ["GET", "/api/collector/ssh-config-hosts"],
   };
   const route = routes[command];
   if (!route) {

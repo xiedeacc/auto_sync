@@ -342,7 +342,10 @@
         </div>
         <div class="collector-hosts-head">
           <span>Hosts</span>
-          <button id="collector-add-host" type="button" class="collector-add">+ Add host</button>
+          <div class="collector-hosts-head-actions">
+            <button id="collector-import" type="button" class="collector-add" title="Import Host entries from ~/.ssh/config">Import ~/.ssh/config</button>
+            <button id="collector-add-host" type="button" class="collector-add">+ Add host</button>
+          </div>
         </div>
         <div id="collector-hosts" class="collector-hosts"></div>
         <div class="collector-actions">

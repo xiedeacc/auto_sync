@@ -226,6 +226,11 @@ impl Backend {
         Ok(self.collector_status())
     }
 
+    /// Hosts parsed from the user's `~/.ssh/config`, for the Collector import.
+    pub fn collector_ssh_config_hosts(&self) -> Result<Vec<collector::SshConfigHost>> {
+        collector::parse_ssh_config()
+    }
+
     /// Browse a remote host over ssh for the Collector path picker.
     pub fn collector_browse(
         &self,

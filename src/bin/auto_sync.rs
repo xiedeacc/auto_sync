@@ -740,7 +740,8 @@ fn run_with_desktop(backend: Backend, port: u16, start_hidden: bool) {
             collector_browse,
             collector_get_config,
             collector_save_config,
-            collector_config_file
+            collector_config_file,
+            collector_ssh_config_hosts
         ])
         .run(tauri::generate_context!());
     if let Err(err) = result {
@@ -1283,4 +1284,13 @@ async fn collector_config_file(
 ) -> Result<CollectorConfigFile, String> {
     let backend = backend.inner().clone();
     run_blocking(move || backend.collector_config_file()).await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn collector_ssh_config_hosts(
+    backend: tauri::State<'_, Backend>,
+) -> Result<Vec<auto_sync::core::collector::SshConfigHost>, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.collector_ssh_config_hosts()).await
 }

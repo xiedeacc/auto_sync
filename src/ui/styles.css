@@ -1499,6 +1499,11 @@ th {
   font-size: 13px;
 }
 
+.collector-hosts-head-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .collector-hosts {
   display: grid;
   gap: 4px;
