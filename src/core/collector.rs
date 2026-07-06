@@ -26,6 +26,10 @@ use crate::core::config::{CollectorConfig, CollectorHost};
 /// `big.bin.autosplit.000`. Files carrying it are skipped by later splits.
 const AUTOSPLIT_MARKER: &str = ".autosplit.";
 
+/// Per-host permission cache written under the host's local root at collect
+/// time and replayed by `deploy` (Windows can't preserve Unix modes).
+const PERMS_FILE: &str = ".auto_sync_perms";
+
 /// Non-interactive ssh/scp options: never prompt for a password, auto-trust a
 /// new host key (LAN/known infra), and cap the connect wait so a dead host
 /// fails fast instead of hanging the run.
@@ -259,20 +263,100 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     log(state, format!("=== host {label} ({}) ===", conn.dest()));
 
     let mut failures = 0;
+    let mut pulled = Vec::new();
     for path in &host.paths {
         let remote = path.trim();
         if remote.is_empty() {
             continue;
         }
         match pull_path(host, &conn, remote, state) {
-            Ok(()) => log(state, format!("  ok {remote}")),
+            Ok(()) => {
+                log(state, format!("  ok {remote}"));
+                pulled.push(remote.to_string());
+            }
             Err(err) => {
                 failures += 1;
                 log(state, format!("  FAILED {remote}: {err:#}"));
             }
         }
     }
+    // Windows can't preserve Unix modes on the pulled files, so capture them
+    // from the remote into a per-host cache that `deploy` replays.
+    if !pulled.is_empty() {
+        if let Err(err) = record_host_perms(host, &conn, &pulled, state) {
+            log(state, format!("  perms: could not record: {err:#}"));
+        }
+    }
     failures
+}
+
+/// Capture the Unix mode of every file/dir under each pulled path (via
+/// `find … -exec ls -ldn`, since this busybox has no `stat`) and write a
+/// per-host cache `<root>/.auto_sync_perms` of `mode path` lines. `deploy`
+/// replays these because Windows can't hold the modes on the local copies.
+fn record_host_perms(
+    host: &CollectorHost,
+    conn: &SshConn,
+    paths: &[String],
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<()> {
+    let mut lines: Vec<String> = Vec::new();
+    for path in paths {
+        let cmd = format!(
+            "find {} \\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null",
+            shell_quote(path)
+        );
+        let out = match ssh_capture(conn, &cmd) {
+            Ok(out) => out,
+            Err(err) => {
+                log(state, format!("  perms: {path}: {err:#}"));
+                continue;
+            }
+        };
+        for line in out.lines() {
+            if let Some((mode, entry_path)) = parse_ls_mode(line) {
+                lines.push(format!("{mode} {entry_path}"));
+            }
+        }
+    }
+    lines.sort();
+    lines.dedup();
+    let file = host.root.join(PERMS_FILE);
+    let mut body = lines.join("\n");
+    body.push('\n');
+    fs::write(&file, body).with_context(|| format!("writing {}", file.display()))?;
+    log(state, format!("  perms: recorded {} entries", lines.len()));
+    Ok(())
+}
+
+/// Parse one `ls -ldn` line into (octal_mode, absolute_path). The perms string
+/// is the first field, the path the last; the modes may carry setuid/setgid/
+/// sticky bits (`s`/`S`/`t`/`T`).
+fn parse_ls_mode(line: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 9 {
+        return None;
+    }
+    let sym = parts[0].as_bytes();
+    if sym.len() < 10 {
+        return None;
+    }
+    let path = *parts.last()?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    let p = &sym[1..10];
+    let mut mode = 0u32;
+    if p[0] == b'r' { mode |= 0o400; }
+    if p[1] == b'w' { mode |= 0o200; }
+    match p[2] { b'x' => mode |= 0o100, b's' => mode |= 0o4100, b'S' => mode |= 0o4000, _ => {} }
+    if p[3] == b'r' { mode |= 0o40; }
+    if p[4] == b'w' { mode |= 0o20; }
+    match p[5] { b'x' => mode |= 0o10, b's' => mode |= 0o2010, b'S' => mode |= 0o2000, _ => {} }
+    if p[6] == b'r' { mode |= 0o4; }
+    if p[7] == b'w' { mode |= 0o2; }
+    match p[8] { b'x' => mode |= 0o1, b't' => mode |= 0o1001, b'T' => mode |= 0o1000, _ => {} }
+    Some((format!("{mode:o}"), path.to_string()))
 }
 
 /// Pull one remote path, reconstructing its directory structure under the
@@ -504,6 +588,13 @@ fn run_local_deploy_script(
     cmd.env("AS_ROOT", host.root.as_os_str());
     for other in all_hosts {
         cmd.env(format!("AS_HOST_{}", env_host_suffix(&other.name)), other.hostname.trim());
+    }
+
+    // Hand the script the per-host permission cache captured at collect time so
+    // it can restore modes Windows dropped.
+    let perms_file = host.root.join(PERMS_FILE);
+    if perms_file.exists() {
+        cmd.env("AS_PERMS_FILE", perms_file.as_os_str());
     }
 
     // If this host collected a shadowsocks client config, rewrite its server
@@ -922,6 +1013,22 @@ mod tests {
         assert_eq!(remote_parent("/"), None);
         assert_eq!(remote_parent("/etc"), Some("/".to_string()));
         assert_eq!(remote_parent("/usr/local/bin"), Some("/usr/local".to_string()));
+    }
+
+    #[test]
+    fn parse_ls_mode_reads_octal_and_path() {
+        let dir = "drwxr-xr-x    2 0        0             4096 Jun 30 21:40 /usr/local/shadowsocks/bin";
+        assert_eq!(parse_ls_mode(dir), Some(("755".to_string(), "/usr/local/shadowsocks/bin".to_string())));
+        let file = "-rw-r--r--    1 0    0    1024 Jun 30 21:40 /etc/config/dhcp";
+        assert_eq!(parse_ls_mode(file), Some(("644".to_string(), "/etc/config/dhcp".to_string())));
+        let key = "-rw-------    1 0 0 100 Jan 1 00:00 /root/.ssh/id_ed25519";
+        assert_eq!(parse_ls_mode(key), Some(("600".to_string(), "/root/.ssh/id_ed25519".to_string())));
+        // setuid + sticky
+        let suid = "-rwsr-xr-x 1 0 0 1 Jan 1 00:00 /bin/su";
+        assert_eq!(parse_ls_mode(suid).unwrap().0, "4755");
+        let sticky = "drwxrwxrwt 2 0 0 1 Jan 1 00:00 /tmp";
+        assert_eq!(parse_ls_mode(sticky).unwrap().0, "1777");
+        assert_eq!(parse_ls_mode("garbage"), None);
     }
 
     #[test]
