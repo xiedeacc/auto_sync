@@ -256,6 +256,11 @@ pub struct CollectorHost {
     pub root: PathBuf,
     /// Absolute remote paths (files or directories) to pull.
     pub paths: Vec<String>,
+    /// Host-native shell script run on the host (over ssh) during Deploy, after
+    /// the collected files are pushed back. e.g. on OpenWrt start the relevant
+    /// procd services and apply `uci` config. Empty = push files only.
+    #[serde(default)]
+    pub deploy_script: String,
     pub enabled: bool,
 }
 
@@ -269,6 +274,7 @@ impl Default for CollectorHost {
             identity_file: String::new(),
             root: PathBuf::new(),
             paths: Vec::new(),
+            deploy_script: String::new(),
             enabled: true,
         }
     }

@@ -38,6 +38,7 @@ pub struct Backend {
     port: u16,
     machine_cache: Arc<Mutex<MachineCache>>,
     collector_run: Arc<Mutex<CollectorRunState>>,
+    collector_deploy: Arc<Mutex<CollectorRunState>>,
 }
 
 #[derive(Default)]
@@ -82,6 +83,7 @@ impl Backend {
             port,
             machine_cache: Arc::new(Mutex::new(MachineCache::default())),
             collector_run: Arc::new(Mutex::new(CollectorRunState::default())),
+            collector_deploy: Arc::new(Mutex::new(CollectorRunState::default())),
         };
         backend.spawn_machine_discovery_worker();
         backend
@@ -224,6 +226,43 @@ impl Backend {
         let state = self.collector_run.clone();
         thread::spawn(move || collector::run(cfg, state));
         Ok(self.collector_status())
+    }
+
+    /// Current deploy run state (running flag + log), polled by the UI.
+    pub fn collector_deploy_status(&self) -> CollectorRunState {
+        self.collector_deploy
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Deploy the host at `index` (push its collected files back, then run its
+    /// deploy script on the host) in a background thread. Refuses to start a
+    /// second deploy while one is running.
+    pub fn collector_deploy_run(&self, index: usize) -> Result<CollectorRunState> {
+        let cfg = self.get_collector_config()?;
+        let host = cfg
+            .hosts
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no host at index {index}"))?;
+        {
+            let mut guard = self
+                .collector_deploy
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deploy state poisoned"))?;
+            if guard.running {
+                anyhow::bail!("a deploy is already in progress");
+            }
+            *guard = CollectorRunState {
+                running: true,
+                started_at: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+                ..Default::default()
+            };
+        }
+        let state = self.collector_deploy.clone();
+        thread::spawn(move || collector::deploy(host, state));
+        Ok(self.collector_deploy_status())
     }
 
     /// Browse a remote host over ssh for the Collector path picker.

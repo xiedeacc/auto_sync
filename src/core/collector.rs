@@ -13,7 +13,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -303,6 +303,164 @@ fn pull_path(
         bail!("scp failed: {}", stderr.trim());
     }
     Ok(())
+}
+
+// --- deploy (push files back + run host script) -------------------------------
+
+/// Deploy a single host: push its collected files back to their original remote
+/// paths, then run its host-native deploy script on the host over ssh. Returns
+/// the number of steps that failed.
+pub fn deploy(host: CollectorHost, state: Arc<Mutex<CollectorRunState>>) {
+    let ok = match deploy_inner(&host, &state) {
+        Ok(0) => {
+            log(&state, "Deploy finished.");
+            true
+        }
+        Ok(n) => {
+            log(&state, format!("Deploy finished with {n} error(s)."));
+            false
+        }
+        Err(err) => {
+            log(&state, format!("ERROR: {err:#}"));
+            false
+        }
+    };
+    if let Ok(mut guard) = state.lock() {
+        guard.running = false;
+        guard.ok = Some(ok);
+        guard.finished_at = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+    }
+}
+
+fn deploy_inner(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> Result<usize> {
+    if host.hostname.trim().is_empty() {
+        bail!("host has no hostname");
+    }
+    if host.root.as_os_str().is_empty() {
+        bail!("host has no local root");
+    }
+    let conn = SshConn::from_host(host);
+    let label = if host.name.trim().is_empty() {
+        host.hostname.clone()
+    } else {
+        host.name.clone()
+    };
+    log(state, format!("=== deploy {label} ({}) ===", conn.dest()));
+
+    let mut errors = 0;
+    // Phase 1: push each collected path back to its original remote location.
+    for path in &host.paths {
+        let remote = path.trim();
+        if remote.is_empty() {
+            continue;
+        }
+        match push_path(host, &conn, remote, state) {
+            Ok(()) => log(state, format!("  pushed {remote}")),
+            Err(err) => {
+                errors += 1;
+                log(state, format!("  FAILED push {remote}: {err:#}"));
+            }
+        }
+    }
+
+    // Phase 2: run the host-native deploy script on the host.
+    if host.deploy_script.trim().is_empty() {
+        log(state, "no deploy script — files pushed only");
+    } else {
+        log(state, "--- running deploy script on host ---");
+        match run_remote_script(&conn, &host.deploy_script, state) {
+            Ok(true) => log(state, "deploy script ok"),
+            Ok(false) => {
+                errors += 1;
+                log(state, "deploy script exited non-zero");
+            }
+            Err(err) => {
+                errors += 1;
+                log(state, format!("deploy script error: {err:#}"));
+            }
+        }
+    }
+    Ok(errors)
+}
+
+/// Split a remote absolute path into (parent components, leaf), sanitized.
+fn remote_split(remote: &str) -> Result<(Vec<String>, String)> {
+    let comps: Vec<String> = remote
+        .trim()
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .map(|c| c.to_string())
+        .collect();
+    if comps.is_empty() {
+        bail!("refusing the remote root '/'");
+    }
+    if comps.iter().any(|c| c == "..") {
+        bail!("remote path must not contain '..'");
+    }
+    let leaf = comps.last().cloned().unwrap();
+    let parent = comps[..comps.len() - 1].to_vec();
+    Ok((parent, leaf))
+}
+
+/// Push one locally-collected path back to its original remote location.
+fn push_path(
+    host: &CollectorHost,
+    conn: &SshConn,
+    remote: &str,
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<()> {
+    let (parent, leaf) = remote_split(remote)?;
+    let mut local_src = host.root.clone();
+    for component in &parent {
+        local_src.push(component);
+    }
+    local_src.push(&leaf);
+    if !local_src.exists() {
+        bail!("not collected locally: {}", local_src.display());
+    }
+    let remote_parent = if parent.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parent.join("/"))
+    };
+    // Ensure the remote parent exists (best effort).
+    let _ = ssh_capture(conn, &format!("mkdir -p {}", shell_quote(&remote_parent)));
+
+    log(state, format!("  scp {} -> {}:{}", local_src.display(), conn.dest(), remote));
+    let mut cmd = scp_command(conn);
+    cmd.arg("-r").arg("-p");
+    cmd.arg(&local_src);
+    cmd.arg(format!("{}:{}", conn.dest(), remote_parent));
+    let output = cmd.output().context("running scp")?;
+    if !output.status.success() {
+        bail!("scp failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
+/// Pipe a script to the host's shell over ssh (`sh -s`), logging its output.
+fn run_remote_script(
+    conn: &SshConn,
+    script: &str,
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<bool> {
+    let mut cmd = ssh_command(conn);
+    cmd.arg(conn.dest()).arg("sh -s");
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("spawning ssh")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(script.as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+    let output = child.wait_with_output().context("running deploy script")?;
+    for line in String::from_utf8_lossy(&output.stdout).lines().take(200) {
+        log(state, format!("  | {line}"));
+    }
+    for line in String::from_utf8_lossy(&output.stderr).lines().take(200) {
+        log(state, format!("  ! {line}"));
+    }
+    Ok(output.status.success())
 }
 
 /// Split every file at or above `threshold_mb` MiB under `git_dir` into

@@ -34,6 +34,9 @@ let collectorBrowse = null;
 let collectorLogTimer = null;
 // Index of the host whose files/folders are open in the paths editor modal.
 let collectorPathsIndex = null;
+// Index of the host whose deploy modal is open, plus its poll timer.
+let collectorDeployIndex = null;
+let collectorDeployTimer = null;
 // Remember the last remote directory browsed per host (keyed by hostname) so
 // the remote picker reopens there — handy for adding several files from one dir.
 let collectorLastRemotePath = {};
@@ -298,6 +301,13 @@ const el = {
   collectorConfigClose: document.getElementById("collector-config-close"),
   collectorConfigPath: document.getElementById("collector-config-path"),
   collectorConfigView: document.getElementById("collector-config-view"),
+  collectorDeployModal: document.getElementById("collector-deploy-modal"),
+  collectorDeployTitle: document.getElementById("collector-deploy-title"),
+  collectorDeployClose: document.getElementById("collector-deploy-close"),
+  collectorDeployScript: document.getElementById("collector-deploy-script"),
+  collectorDeployRun: document.getElementById("collector-deploy-run"),
+  collectorDeployState: document.getElementById("collector-deploy-state"),
+  collectorDeployLog: document.getElementById("collector-deploy-log"),
   collectorPathsModal: document.getElementById("collector-paths-modal"),
   collectorPathsTitle: document.getElementById("collector-paths-title"),
   collectorPathsClose: document.getElementById("collector-paths-close"),
@@ -3332,6 +3342,7 @@ function normalizeCollectorHost(raw) {
     identity_file: String(valueOr(src.identity_file, "")),
     root: String(valueOr(src.root, "")),
     paths: Array.isArray(src.paths) ? src.paths.map((p) => String(valueOr(p, ""))) : [],
+    deploy_script: String(valueOr(src.deploy_script, "")),
     enabled: src.enabled !== false,
   };
 }
@@ -3393,6 +3404,7 @@ function renderCollectorHosts() {
       <span>Files</span>
       <span></span>
       <span></span>
+      <span></span>
     </div>`;
   const rows = hosts.map((host, i) => {
     const pathCount = (host.paths || []).filter((p) => String(p).trim()).length;
@@ -3408,7 +3420,8 @@ function renderCollectorHosts() {
           <button type="button" data-action="browse-root" data-index="${i}" title="Choose local folder">…</button>
         </div>
         <button type="button" data-action="edit-paths" data-index="${i}" class="collector-paths-btn">Files (${pathCount})</button>
-        <label class="check-row collector-host-on"><input type="checkbox" data-field="enabled" data-index="${i}" ${host.enabled ? "checked" : ""}> on</label>
+        <button type="button" data-action="deploy" data-index="${i}" class="collector-deploy-btn" title="Deploy this host (copy files back + run its script)">🚀</button>
+        <label class="check-row collector-host-on" title="Enabled"><input type="checkbox" data-field="enabled" data-index="${i}" ${host.enabled ? "checked" : ""}></label>
         <button type="button" data-action="remove-host" data-index="${i}" class="collector-host-remove" title="Remove host">✕</button>
       </div>`;
   }).join("");
@@ -3451,6 +3464,8 @@ function onCollectorHostClick(event) {
     collectorPickLocalInto(ref.i);
   } else if (action === "edit-paths") {
     openCollectorPaths(ref.i);
+  } else if (action === "deploy") {
+    openCollectorDeploy(ref.i);
   }
 }
 
@@ -3615,6 +3630,111 @@ function renderCollectorPaths() {
       </div>`).join("");
 }
 
+// Per-host deploy (push files back + run host script) --------------------------
+
+function openCollectorDeploy(hostIndex) {
+  const host = collectorDraft.hosts[hostIndex];
+  if (!host) return;
+  collectorDeployIndex = hostIndex;
+  const label = host.name.trim() || host.hostname.trim() || `host ${hostIndex + 1}`;
+  el.collectorDeployTitle.textContent = `Deploy — ${label}`;
+  el.collectorDeployScript.value = host.deploy_script || "";
+  el.collectorDeployState.textContent = "";
+  el.collectorDeployLog.hidden = true;
+  el.collectorDeployLog.textContent = "";
+  el.collectorDeployModal.hidden = false;
+  refreshCollectorDeployStatus();
+}
+
+function closeCollectorDeploy() {
+  el.collectorDeployModal.hidden = true;
+  collectorDeployIndex = null;
+  stopCollectorDeployPolling();
+}
+
+function onCollectorDeployScriptInput() {
+  const host = collectorDraft && collectorDraft.hosts[collectorDeployIndex];
+  if (!host) return;
+  host.deploy_script = el.collectorDeployScript.value;
+  collectorAutoSave();
+}
+
+async function runCollectorDeploy() {
+  if (collectorDeployIndex == null) return;
+  const host = collectorDraft.hosts[collectorDeployIndex];
+  if (!host) return;
+  const dest = `${host.user ? host.user + "@" : ""}${host.hostname}`;
+  if (!window.confirm(
+    `Deploy to ${dest}?\n\nThis copies this host's collected files back to their original paths ON THE HOST, then runs the deploy script there.`,
+  )) {
+    return;
+  }
+  try {
+    await collectorPersistNow();
+    const state = await invoke("collector_deploy", { index: collectorDeployIndex });
+    applyCollectorDeployState(state);
+    startCollectorDeployPolling();
+  } catch (error) {
+    el.collectorDeployState.textContent = String(error);
+  }
+}
+
+function applyCollectorDeployState(state) {
+  if (!state) return;
+  if (state.running) {
+    el.collectorDeployState.textContent = "Running…";
+  } else if (state.ok === true) {
+    el.collectorDeployState.textContent = "Done ✓";
+  } else if (state.ok === false) {
+    el.collectorDeployState.textContent = "Finished with errors ✗";
+  } else {
+    el.collectorDeployState.textContent = "";
+  }
+  const log = Array.isArray(state.log) ? state.log : [];
+  if (log.length) {
+    el.collectorDeployLog.hidden = false;
+    el.collectorDeployLog.textContent = log.join("\n");
+    el.collectorDeployLog.scrollTop = el.collectorDeployLog.scrollHeight;
+  }
+}
+
+async function refreshCollectorDeployStatus() {
+  // Only show a live run; don't surface a previous host's finished log on open.
+  try {
+    const state = await invoke("collector_deploy_status");
+    if (state && state.running) {
+      applyCollectorDeployState(state);
+      startCollectorDeployPolling();
+    }
+  } catch (_error) {
+    // ignore
+  }
+}
+
+function startCollectorDeployPolling() {
+  if (collectorDeployTimer) return;
+  collectorDeployTimer = setInterval(async () => {
+    if (el.collectorDeployModal.hidden) {
+      stopCollectorDeployPolling();
+      return;
+    }
+    try {
+      const state = await invoke("collector_deploy_status");
+      applyCollectorDeployState(state);
+      if (!state || !state.running) stopCollectorDeployPolling();
+    } catch (_error) {
+      stopCollectorDeployPolling();
+    }
+  }, 1000);
+}
+
+function stopCollectorDeployPolling() {
+  if (collectorDeployTimer) {
+    clearInterval(collectorDeployTimer);
+    collectorDeployTimer = null;
+  }
+}
+
 // Remote path picker (ssh ls) --------------------------------------------------
 
 function collectorConnFor(host) {
@@ -3739,6 +3859,9 @@ el.collectorAutoPush.addEventListener("change", collectorAutoSave);
 el.collectorHosts.addEventListener("input", onCollectorHostInput);
 el.collectorHosts.addEventListener("change", onCollectorHostInput);
 el.collectorHosts.addEventListener("click", onCollectorHostClick);
+el.collectorDeployClose.onclick = closeCollectorDeploy;
+el.collectorDeployRun.onclick = () => runCollectorDeploy();
+el.collectorDeployScript.addEventListener("input", onCollectorDeployScriptInput);
 el.collectorPathsClose.onclick = () => {
   el.collectorPathsModal.hidden = true;
   collectorPathsIndex = null;
@@ -3896,6 +4019,8 @@ async function invokeWeb(command, payload = {}) {
     collector_get_config: ["GET", "/api/collector/config"],
     collector_save_config: ["POST", "/api/collector/config"],
     collector_config_file: ["GET", "/api/collector/config-file"],
+    collector_deploy: ["POST", "/api/collector/deploy"],
+    collector_deploy_status: ["GET", "/api/collector/deploy-status"],
   };
   const route = routes[command];
   if (!route) {
@@ -3959,6 +4084,8 @@ async function invokeWeb(command, payload = {}) {
       });
     } else if (command === "collector_save_config") {
       options.body = JSON.stringify(payload.cfg);
+    } else if (command === "collector_deploy") {
+      options.body = JSON.stringify({ index: payload.index });
     } else {
       options.body = JSON.stringify(payload);
     }

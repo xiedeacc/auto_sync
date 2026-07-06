@@ -740,7 +740,9 @@ fn run_with_desktop(backend: Backend, port: u16, start_hidden: bool) {
             collector_browse,
             collector_get_config,
             collector_save_config,
-            collector_config_file
+            collector_config_file,
+            collector_deploy,
+            collector_deploy_status
         ])
         .run(tauri::generate_context!());
     if let Err(err) = result {
@@ -1255,6 +1257,25 @@ async fn collector_browse(
         path: path.unwrap_or_default(),
     };
     run_blocking(move || backend.collector_browse(req)).await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn collector_deploy(
+    backend: tauri::State<'_, Backend>,
+    index: usize,
+) -> Result<CollectorRunState, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || backend.collector_deploy_run(index)).await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn collector_deploy_status(
+    backend: tauri::State<'_, Backend>,
+) -> Result<CollectorRunState, String> {
+    let backend = backend.inner().clone();
+    run_blocking(move || Ok(backend.collector_deploy_status())).await
 }
 
 #[cfg(feature = "gui")]

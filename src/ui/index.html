@@ -366,6 +366,24 @@
     </div>
   </div>
 
+  <div id="collector-deploy-modal" class="modal" hidden>
+    <div class="modal-panel collector-modal-panel">
+      <div class="modal-head">
+        <h2 id="collector-deploy-title">Deploy</h2>
+        <button id="collector-deploy-close" class="icon" title="Close">x</button>
+      </div>
+      <div class="collector-deploy-body">
+        <div class="subtle collector-deploy-note">Deploy copies this host's collected files back to their original paths, then runs the script below <strong>on the host</strong> (over ssh) — use host-native commands.</div>
+        <textarea id="collector-deploy-script" class="collector-ssh-config collector-deploy-script" spellcheck="false" placeholder="# runs on the host after files are copied back&#10;# OpenWrt example (procd):&#10;/etc/init.d/shadowsocks enable&#10;/etc/init.d/shadowsocks restart&#10;# leave shadowsocks-rust stopped&#10;uci commit"></textarea>
+        <div class="collector-actions">
+          <button id="collector-deploy-run" class="primary">Run deploy</button>
+          <span id="collector-deploy-state" class="collector-run-state"></span>
+        </div>
+        <pre id="collector-deploy-log" class="collector-log" hidden></pre>
+      </div>
+    </div>
+  </div>
+
   <div id="collector-paths-modal" class="modal" hidden>
     <div class="modal-panel exclude-modal-panel">
       <div class="modal-head">

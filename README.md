@@ -269,6 +269,8 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 **运行流程**：逐 host 逐 path：`scp -r -p`（带 `-i`/`-P`）拉取 → 切割超大文件、更新 `.gitignore` → 若开启则 `commit`/`push`。单个 path 失败只记日志不中断，最后汇总失败数;切割是幂等的（重跑先删旧分片再切）。要还原原文件，把分片按序拼接即可（`cat *.autosplit.* > 原名`）。
 
+**Deploy（回灌 + 起服务，反向操作）**：每个 host 行有个 🚀 图标，打开该 host 的 **deploy 脚本**（每 host 独立、可编辑、自动存进 `collector.toml` 的 `deploy_script`）。点 **Run deploy**（需二次确认，因为会写目标机）后：①把该 host 收集到的每个 path 从本地 `root` 用 `scp -r -p` **推回**其远端原路径（先 `mkdir -p` 远端父目录）；②把 deploy 脚本通过 `ssh <host> sh -s` **在目标机上执行**（用目标机原生命令，如 OpenWrt 的 `/etc/init.d/shadowsocks enable/restart`、`uci commit`——可只起 shadowsocks 不起 shadowsocks-rust）。后台线程执行、弹窗实时刷日志（`POST /api/collector/deploy` + `GET /api/collector/deploy-status`），同一时刻只允许一个 deploy。⚠️ 会覆盖目标机上的系统文件并重启服务，务必确认脚本正确。
+
 ### 任务类型与并发
 
 每次操作都在**执行机**的 `task_log` 表记一行，Tasks 面板按机器分组展示。当前的任务类型：

@@ -162,6 +162,11 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/collector/run", post(api_collector_run))
         .route("/api/collector/status", get(api_collector_status))
         .route("/api/collector/browse", post(api_collector_browse))
+        .route("/api/collector/deploy", post(api_collector_deploy))
+        .route(
+            "/api/collector/deploy-status",
+            get(api_collector_deploy_status),
+        )
         .route(
             "/api/collector/config",
             get(api_collector_get_config).post(api_collector_save_config),
@@ -742,6 +747,24 @@ async fn api_collector_browse(
     Json(req): Json<crate::core::collector::CollectorBrowseRequest>,
 ) -> Result<Json<CollectorBrowseResponse>, ApiError> {
     blocking(move || Ok(Json(backend.collector_browse(req)?))).await
+}
+
+#[derive(Deserialize)]
+struct CollectorDeployRequest {
+    index: usize,
+}
+
+async fn api_collector_deploy(
+    AxumState(backend): AxumState<Backend>,
+    Json(req): Json<CollectorDeployRequest>,
+) -> Result<Json<CollectorRunState>, ApiError> {
+    blocking(move || Ok(Json(backend.collector_deploy_run(req.index)?))).await
+}
+
+async fn api_collector_deploy_status(
+    AxumState(backend): AxumState<Backend>,
+) -> Result<Json<CollectorRunState>, ApiError> {
+    blocking(move || Ok(Json(backend.collector_deploy_status()))).await
 }
 
 async fn api_collector_get_config(
