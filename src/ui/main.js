@@ -290,7 +290,6 @@ const el = {
   collectorAutoPush: document.getElementById("collector-auto-push"),
   collectorAddHost: document.getElementById("collector-add-host"),
   collectorHosts: document.getElementById("collector-hosts"),
-  collectorSave: document.getElementById("collector-save"),
   collectorRun: document.getElementById("collector-run"),
   collectorRunState: document.getElementById("collector-run-state"),
   collectorConfig: document.getElementById("collector-config"),
@@ -3369,6 +3368,8 @@ async function openCollectorModal(event) {
 }
 
 function closeCollectorModal() {
+  // Flush any pending debounced save before discarding the draft.
+  collectorPersistNow().catch(() => {});
   el.collectorModal.hidden = true;
   collectorDraft = null;
   stopCollectorPolling();
@@ -3435,6 +3436,7 @@ function onCollectorHostInput(event) {
   } else if (field) {
     ref.host[field] = t.value;
   }
+  collectorAutoSave();
 }
 
 function onCollectorHostClick(event) {
@@ -3447,6 +3449,7 @@ function onCollectorHostClick(event) {
   if (action === "remove-host") {
     collectorDraft.hosts.splice(ref.i, 1);
     renderCollectorHosts();
+    collectorAutoSave();
   } else if (action === "browse-root") {
     collectorPickLocalInto(ref.i);
   } else if (action === "edit-paths") {
@@ -3462,6 +3465,7 @@ async function collectorPickLocalInto(hostIndex) {
   if (picked && picked.path) {
     collectorDraft.hosts[hostIndex].root = picked.path;
     renderCollectorHosts();
+    collectorAutoSave();
   }
 }
 
@@ -3476,6 +3480,7 @@ async function collectorPickLocalField(inputEl, appendDefault) {
     next = next.replace(/[\\/]+$/, "") + sep + base;
   }
   inputEl.value = next;
+  collectorAutoSave();
 }
 
 function collectorReadTopFields() {
@@ -3484,26 +3489,43 @@ function collectorReadTopFields() {
   collectorDraft.auto_commit_push = el.collectorAutoPush.checked;
 }
 
-async function saveCollector(options = {}) {
+// Read the form into the draft and return a cleaned config for persistence.
+function collectorCleanDraft() {
   collectorReadTopFields();
   const clean = normalizeCollector(collectorDraft);
   clean.hosts = clean.hosts.map((h) => ({
     ...h,
     paths: (h.paths || []).map((p) => p.trim()).filter(Boolean),
   }));
-  // Persist to the collector's own config file (separate from auto_sync.toml).
-  const saved = await invoke("collector_save_config", { cfg: clean });
-  collectorDraft = normalizeCollector(saved);
-  if (!options.silent) {
-    renderCollectorHosts();
-    setCollectorRunState("Saved.");
+  return clean;
+}
+
+// The Collector config auto-saves — there is no Save button. Persist on a short
+// debounce after edits; keep the draft/DOM as-is so typing isn't interrupted.
+let collectorSaveTimer = null;
+function collectorAutoSave() {
+  if (!collectorDraft) return;
+  if (collectorSaveTimer) clearTimeout(collectorSaveTimer);
+  collectorSaveTimer = setTimeout(() => {
+    collectorSaveTimer = null;
+    invoke("collector_save_config", { cfg: collectorCleanDraft() })
+      .catch((error) => setCollectorRunState(String(error)));
+  }, 400);
+}
+
+// Flush any pending debounced save immediately (before Run / opening Config).
+async function collectorPersistNow() {
+  if (!collectorDraft) return;
+  if (collectorSaveTimer) {
+    clearTimeout(collectorSaveTimer);
+    collectorSaveTimer = null;
   }
+  await invoke("collector_save_config", { cfg: collectorCleanDraft() });
 }
 
 async function runCollector() {
   try {
-    await saveCollector({ silent: true });
-    renderCollectorHosts();
+    await collectorPersistNow();
     const state = await invoke("collector_run");
     applyCollectorState(state);
     startCollectorPolling();
@@ -3605,6 +3627,7 @@ function collectorAddPath(value) {
   el.collectorPathsInput.value = "";
   renderCollectorPaths();
   renderCollectorHosts();
+  collectorAutoSave();
 }
 
 // Remote path picker (ssh ls) --------------------------------------------------
@@ -3705,6 +3728,7 @@ function collectorAddSelectedRemotePaths() {
   collectorBrowse = null;
   renderCollectorPaths();
   renderCollectorHosts();
+  collectorAutoSave();
 }
 
 async function openCollectorConfigFile() {
@@ -3713,7 +3737,7 @@ async function openCollectorConfigFile() {
   el.collectorConfigModal.hidden = false;
   try {
     // Persist the current form first so the file reflects what's on screen.
-    await saveCollector({ silent: true });
+    await collectorPersistNow();
     const info = await invoke("collector_config_file");
     el.collectorConfigPath.textContent = info.path || "";
     el.collectorConfigView.textContent = info.toml || "";
@@ -3727,14 +3751,17 @@ bindButtonClick(el.collector, openCollectorModal);
 el.collectorClose.onclick = closeCollectorModal;
 el.collectorConfig.onclick = () => openCollectorConfigFile();
 el.collectorConfigClose.onclick = () => { el.collectorConfigModal.hidden = true; };
-el.collectorSave.onclick = () => saveCollector().catch((error) => setCollectorRunState(String(error)));
 el.collectorRun.onclick = () => runCollector();
 el.collectorAddHost.onclick = () => {
   if (!collectorDraft) return;
   collectorDraft.hosts.push(normalizeCollectorHost({}));
   renderCollectorHosts();
+  collectorAutoSave();
 };
 el.collectorGitDirBrowse.onclick = () => collectorPickLocalField(el.collectorGitDir, "");
+el.collectorGitDir.addEventListener("input", collectorAutoSave);
+el.collectorSplitMb.addEventListener("input", collectorAutoSave);
+el.collectorAutoPush.addEventListener("change", collectorAutoSave);
 el.collectorHosts.addEventListener("input", onCollectorHostInput);
 el.collectorHosts.addEventListener("change", onCollectorHostInput);
 el.collectorHosts.addEventListener("click", onCollectorHostClick);
@@ -3755,7 +3782,10 @@ el.collectorPathsList.addEventListener("input", (event) => {
   const t = event.target;
   const pi = Number(t.dataset.pathsIndex);
   const host = collectorDraft && collectorDraft.hosts[collectorPathsIndex];
-  if (host && Number.isInteger(pi)) host.paths[pi] = t.value;
+  if (host && Number.isInteger(pi)) {
+    host.paths[pi] = t.value;
+    collectorAutoSave();
+  }
 });
 el.collectorPathsList.addEventListener("click", (event) => {
   const btn = event.target.closest("button[data-paths-remove]");
@@ -3767,6 +3797,7 @@ el.collectorPathsList.addEventListener("click", (event) => {
     host.paths.splice(pi, 1);
     renderCollectorPaths();
     renderCollectorHosts();
+    collectorAutoSave();
   }
 });
 el.collectorBrowseClose.onclick = () => {
