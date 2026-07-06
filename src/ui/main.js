@@ -285,7 +285,6 @@ const el = {
   collectorGitDirBrowse: document.getElementById("collector-git-dir-browse"),
   collectorSplitMb: document.getElementById("collector-split-mb"),
   collectorAutoPush: document.getElementById("collector-auto-push"),
-  collectorImport: document.getElementById("collector-import"),
   collectorAddHost: document.getElementById("collector-add-host"),
   collectorHosts: document.getElementById("collector-hosts"),
   collectorSave: document.getElementById("collector-save"),
@@ -3334,7 +3333,6 @@ function normalizeCollectorHost(raw) {
     port: Number.isFinite(port) ? port : 22,
     identity_file: String(valueOr(src.identity_file, "")),
     root: String(valueOr(src.root, "")),
-    install_cmd: String(valueOr(src.install_cmd, "")),
     paths: Array.isArray(src.paths) ? src.paths.map((p) => String(valueOr(p, ""))) : [],
     enabled: src.enabled !== false,
   };
@@ -3412,9 +3410,6 @@ function renderCollectorHosts() {
         <button type="button" data-action="edit-paths" data-index="${i}" class="collector-paths-btn">Files (${pathCount})</button>
         <label class="check-row collector-host-on"><input type="checkbox" data-field="enabled" data-index="${i}" ${host.enabled ? "checked" : ""}> on</label>
         <button type="button" data-action="remove-host" data-index="${i}" class="collector-host-remove" title="Remove host">✕</button>
-      </div>
-      <div class="collector-host-extra" data-index="${i}">
-        <input data-field="install_cmd" data-index="${i}" value="${escapeAttr(host.install_cmd)}" placeholder="install sftp-server if missing (optional) e.g. apk add openssh-sftp-server">
       </div>`;
   }).join("");
   el.collectorHosts.innerHTML = header + rows;
@@ -3672,30 +3667,6 @@ function collectorSelectRemotePath(path) {
   collectorBrowse = null;
 }
 
-async function importSshConfigHosts() {
-  if (!collectorDraft) return;
-  try {
-    const imported = await invoke("collector_ssh_config_hosts");
-    const existing = new Set((collectorDraft.hosts || []).map((h) => h.name.trim()).filter(Boolean));
-    let added = 0;
-    for (const raw of imported || []) {
-      const host = normalizeCollectorHost(raw);
-      if (host.name && existing.has(host.name)) continue;
-      collectorDraft.hosts.push(host);
-      if (host.name) existing.add(host.name);
-      added += 1;
-    }
-    renderCollectorHosts();
-    setCollectorRunState(
-      added
-        ? `Imported ${added} host(s) from ~/.ssh/config — set each Root and Files.`
-        : "No new hosts in ~/.ssh/config (all already present).",
-    );
-  } catch (error) {
-    setCollectorRunState(String(error));
-  }
-}
-
 async function openCollectorConfigFile() {
   el.collectorConfigPath.textContent = "";
   el.collectorConfigView.textContent = "Loading…";
@@ -3718,7 +3689,6 @@ el.collectorConfig.onclick = () => openCollectorConfigFile();
 el.collectorConfigClose.onclick = () => { el.collectorConfigModal.hidden = true; };
 el.collectorSave.onclick = () => saveCollector().catch((error) => setCollectorRunState(String(error)));
 el.collectorRun.onclick = () => runCollector();
-el.collectorImport.onclick = () => importSshConfigHosts();
 el.collectorAddHost.onclick = () => {
   if (!collectorDraft) return;
   collectorDraft.hosts.push(normalizeCollectorHost({}));
@@ -3887,7 +3857,6 @@ async function invokeWeb(command, payload = {}) {
     collector_get_config: ["GET", "/api/collector/config"],
     collector_save_config: ["POST", "/api/collector/config"],
     collector_config_file: ["GET", "/api/collector/config-file"],
-    collector_ssh_config_hosts: ["GET", "/api/collector/ssh-config-hosts"],
   };
   const route = routes[command];
   if (!route) {

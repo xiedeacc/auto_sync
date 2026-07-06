@@ -1499,14 +1499,9 @@ th {
   font-size: 13px;
 }
 
-.collector-hosts-head-actions {
-  display: flex;
-  gap: 8px;
-}
-
 .collector-hosts {
   display: grid;
-  gap: 4px;
+  gap: 8px;
   overflow-x: auto;
 }
 
@@ -1534,18 +1529,6 @@ th {
 
 .collector-host-row .collector-path-row {
   min-width: 0;
-}
-
-.collector-host-extra {
-  width: 100%;
-  padding: 0 0 8px;
-  border-bottom: 1px solid var(--line);
-}
-
-.collector-host-extra input {
-  width: 100%;
-  font-size: 12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .collector-host-on {

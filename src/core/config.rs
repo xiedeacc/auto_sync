@@ -256,9 +256,6 @@ pub struct CollectorHost {
     pub root: PathBuf,
     /// Absolute remote paths (files or directories) to pull.
     pub paths: Vec<String>,
-    /// Optional shell command run over ssh to install the sftp-server when the
-    /// remote lacks it (e.g. `apk add openssh-sftp-server`). Blank = skip.
-    pub install_cmd: String,
     pub enabled: bool,
 }
 
@@ -272,7 +269,6 @@ impl Default for CollectorHost {
             identity_file: String::new(),
             root: PathBuf::new(),
             paths: Vec::new(),
-            install_cmd: String::new(),
             enabled: true,
         }
     }

@@ -167,10 +167,6 @@ pub fn router(backend: Backend) -> Router {
             get(api_collector_get_config).post(api_collector_save_config),
         )
         .route("/api/collector/config-file", get(api_collector_config_file))
-        .route(
-            "/api/collector/ssh-config-hosts",
-            get(api_collector_ssh_config_hosts),
-        )
         .layer(middleware::from_fn(require_peer_token))
         // Bounded instead of disabled: the largest legitimate request bodies
         // are 16MiB transfer chunks and (worst case) a whole-file delta.
@@ -765,12 +761,6 @@ async fn api_collector_config_file(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<CollectorConfigFile>, ApiError> {
     blocking(move || Ok(Json(backend.collector_config_file()?))).await
-}
-
-async fn api_collector_ssh_config_hosts(
-    AxumState(backend): AxumState<Backend>,
-) -> Result<Json<Vec<crate::core::collector::SshConfigHost>>, ApiError> {
-    blocking(move || Ok(Json(backend.collector_ssh_config_hosts()?))).await
 }
 
 struct ApiError(anyhow::Error);

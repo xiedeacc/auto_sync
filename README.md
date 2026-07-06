@@ -259,14 +259,15 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 - `hosts[]`：每个目标主机一条，用**结构化字段**描述连接（没有 ssh 配置文件，引擎直接拼 `ssh`/`scp` 的 `-i`/`-p` 参数）：
   - `name`（Host 别名/标签）、`hostname`（HostName）、`user`（User）、`port`（Port，默认 22）、`identity_file`（IdentityFile，支持 `~` 展开）。
   - `root`：本地根目录；`paths[]`：要拉取的远端绝对路径（文件或目录），在 host 行的 **Files (N)** 按钮里编辑。
-  - `install_cmd`（可选）：远端没有 sftp-server 时执行的安装命令（新版 `scp` 走 SFTP 协议，像全新 OpenWrt 没有 `sftp-server` 就拉不动）。运行时先探测，缺失才执行，例如 `apk add openssh-sftp-server`。
   - `enabled`：关掉则跳过该 host。
+
+> 注：新版 OpenSSH `scp` 走 SFTP 协议，远端缺 `sftp-server`（如全新 OpenWrt）会拉取失败并记日志——自行在远端装好即可（例如 `apk add openssh-sftp-server` / `opkg install openssh-sftp-server`）。
 
 **路径重建规则**：远端路径的目录结构原样保留在 host `root` 之下。root=`D:\share\linux\aws`、远端 `/usr/local/shadowsocks` ⇒ 落到 `D:\share\linux\aws\usr\local\shadowsocks`（`scp -r -p` 把叶子拷进重建出来的父目录；`..` 和裸 `/` 会被拒绝，防止逃出 root）。
 
-**UI（全部在 Collector 弹窗内）**：每个 host 一行，列为 Host / HostName / User / Port / IdentityFile / Root（本地文件夹选择器）；**Files (N)** 按钮弹出该 host 的文件/文件夹列表，可手输或点 **Browse remote…** 通过 `ssh ls` 逐级浏览选取（`POST /api/collector/browse`，参数为该 host 的连接字段）。点 **Import ~/.ssh/config** 可一键把 `~/.ssh/config` 里的 `Host` 条目导入为 host 行（`GET /api/collector/ssh-config-hosts` 解析；按名字去重，通配 `Host *` 和注释跳过，缺 `HostName` 用别名、缺 `Port` 用 22），导入后再填 Root 和 Files 即可。**Save & Run** 先存配置再后台起线程执行，弹窗底部实时刷新运行日志（`GET /api/collector/status` 每秒轮询）；同一时刻只允许一个采集在跑。
+**UI（全部在 Collector 弹窗内）**：每个 host 一行，列为 Host / HostName / User / Port / IdentityFile / Root（本地文件夹选择器）；**Files (N)** 按钮弹出该 host 的文件/文件夹列表，可手输或点 **Browse remote…** 通过 `ssh ls` 逐级浏览选取（`POST /api/collector/browse`，参数为该 host 的连接字段）。**Save & Run** 先存配置再后台起线程执行，弹窗底部实时刷新运行日志（`GET /api/collector/status` 每秒轮询）；同一时刻只允许一个采集在跑。
 
-**运行流程**：逐 host 逐 path：探测/安装 sftp-server → `scp -r -p`（带 `-i`/`-P`）拉取 → 切割超大文件、更新 `.gitignore` → 若开启则 `commit`/`push`。单个 path 失败只记日志不中断，最后汇总失败数;切割是幂等的（重跑先删旧分片再切）。要还原原文件，把分片按序拼接即可（`cat *.autosplit.* > 原名`）。
+**运行流程**：逐 host 逐 path：`scp -r -p`（带 `-i`/`-P`）拉取 → 切割超大文件、更新 `.gitignore` → 若开启则 `commit`/`push`。单个 path 失败只记日志不中断，最后汇总失败数;切割是幂等的（重跑先删旧分片再切）。要还原原文件，把分片按序拼接即可（`cat *.autosplit.* > 原名`）。
 
 ### 任务类型与并发
 
@@ -525,7 +526,6 @@ curl -s -X POST http://127.0.0.1:18765/api/sync-destination-now \
 | --- | --- | --- |
 | `GET /api/collector/config` · `POST /api/collector/config` | —·`CollectorConfig` | 读/写独立的 `collector.toml`（不进主配置） |
 | `GET /api/collector/config-file` | — | 返回 `collector.toml` 的路径与原文，供弹窗 Config 视图 |
-| `GET /api/collector/ssh-config-hosts` | — | 解析 `~/.ssh/config` 的 `Host` 条目，供「Import」导入 |
 | `POST /api/collector/run` | — | 后台起一次采集（配置取自 `collector.toml`）；已有采集在跑时报错。返回初始运行状态 |
 | `GET /api/collector/status` | — | 当前采集状态：`running` / `ok` / `log[]`，UI 每秒轮询 |
 | `POST /api/collector/browse` | `{hostname,user,port,identity_file,path}` | 用 `ssh ls` 浏览远端目录，供 UI 选路径 |

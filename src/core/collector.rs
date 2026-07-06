@@ -65,16 +65,6 @@ pub struct CollectorBrowseResponse {
     pub entries: Vec<CollectorBrowseEntry>,
 }
 
-/// One host parsed out of `~/.ssh/config`, offered to the UI for import.
-#[derive(Debug, Clone, Serialize)]
-pub struct SshConfigHost {
-    pub name: String,
-    pub hostname: String,
-    pub user: String,
-    pub port: u16,
-    pub identity_file: String,
-}
-
 /// The connection parameters a browse request carries (a subset of
 /// `CollectorHost`). Sent by the UI so it can browse a host before it is saved.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -268,12 +258,6 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     let conn = SshConn::from_host(host);
     log(state, format!("=== host {label} ({}) ===", conn.dest()));
 
-    if !host.install_cmd.trim().is_empty() {
-        if let Err(err) = ensure_sftp_server(&conn, &host.install_cmd, state) {
-            log(state, format!("  sftp-server check/install failed: {err:#} (continuing)"));
-        }
-    }
-
     let mut failures = 0;
     for path in &host.paths {
         let remote = path.trim();
@@ -289,36 +273,6 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         }
     }
     failures
-}
-
-/// Detect the remote sftp-server; if missing and an install command is set,
-/// run it. New OpenSSH `scp` speaks the SFTP protocol, so a host without
-/// sftp-server (e.g. a fresh OpenWrt) cannot be pulled from until it is added.
-fn ensure_sftp_server(
-    conn: &SshConn,
-    install_cmd: &str,
-    state: &Arc<Mutex<CollectorRunState>>,
-) -> Result<()> {
-    let probe = "for p in /usr/lib/openssh/sftp-server /usr/libexec/sftp-server \
-/usr/lib/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server; do \
-[ -x \"$p\" ] && { echo found; exit 0; }; done; \
-command -v sftp-server >/dev/null 2>&1 && echo found; true";
-    let out = ssh_capture(conn, probe)?;
-    if out.contains("found") {
-        log(state, "  sftp-server present");
-        return Ok(());
-    }
-    log(state, format!("  sftp-server missing; installing: {install_cmd}"));
-    let (ok, output) = ssh_status(conn, install_cmd)?;
-    for line in output.lines().take(40) {
-        log(state, format!("    | {line}"));
-    }
-    if ok {
-        log(state, "  install command succeeded");
-    } else {
-        log(state, "  install command returned non-zero (continuing)");
-    }
-    Ok(())
 }
 
 /// Pull one remote path, reconstructing its directory structure under the
@@ -518,90 +472,6 @@ pub fn browse(req: &CollectorBrowseRequest) -> Result<CollectorBrowseResponse> {
     Ok(CollectorBrowseResponse { path: path.to_string(), parent: remote_parent(path), entries })
 }
 
-/// Parse the user's `~/.ssh/config` into importable hosts. Wildcard aliases
-/// (`Host *`) and commented lines are skipped; a missing `HostName` defaults to
-/// the alias and a missing `Port` to 22 (matching ssh's own behavior). Returns
-/// an empty list when the file is absent.
-pub fn parse_ssh_config() -> Result<Vec<SshConfigHost>> {
-    let path = user_ssh_config_path();
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => return Ok(Vec::new()),
-    };
-    Ok(parse_ssh_config_text(&text))
-}
-
-fn parse_ssh_config_text(text: &str) -> Vec<SshConfigHost> {
-    let mut hosts: Vec<SshConfigHost> = Vec::new();
-    let mut current: Vec<usize> = Vec::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, value) = split_config_kv(line);
-        let key = key.to_ascii_lowercase();
-        if key == "host" {
-            current.clear();
-            for alias in value.split_whitespace() {
-                if alias.contains('*') || alias.contains('?') {
-                    continue; // patterns are not concrete hosts
-                }
-                current.push(hosts.len());
-                hosts.push(SshConfigHost {
-                    name: alias.to_string(),
-                    hostname: String::new(),
-                    user: String::new(),
-                    port: 0,
-                    identity_file: String::new(),
-                });
-            }
-        } else {
-            for &idx in &current {
-                let host = &mut hosts[idx];
-                match key.as_str() {
-                    "hostname" => host.hostname = value.to_string(),
-                    "user" => host.user = value.to_string(),
-                    "port" => host.port = value.parse().unwrap_or(0),
-                    "identityfile" => host.identity_file = value.to_string(),
-                    _ => {}
-                }
-            }
-        }
-    }
-    for host in &mut hosts {
-        if host.hostname.trim().is_empty() {
-            host.hostname = host.name.clone();
-        }
-        if host.port == 0 {
-            host.port = 22;
-        }
-    }
-    hosts
-}
-
-fn user_ssh_config_path() -> PathBuf {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    PathBuf::from(home).join(".ssh").join("config")
-}
-
-/// Split an ssh_config line into (keyword, value); accepts `Key Value` and
-/// `Key=Value`.
-fn split_config_kv(line: &str) -> (&str, &str) {
-    match line.find(|c: char| c.is_whitespace() || c == '=') {
-        Some(pos) => {
-            let key = &line[..pos];
-            let value = line[pos + 1..]
-                .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
-                .trim();
-            (key, value)
-        }
-        None => (line, ""),
-    }
-}
-
 // --- ssh / git command helpers ------------------------------------------------
 
 /// Run a remote command over ssh, returning stdout (fails on non-zero exit).
@@ -614,16 +484,6 @@ fn ssh_capture(conn: &SshConn, remote_cmd: &str) -> Result<String> {
         bail!("ssh failed: {}", stderr.trim());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Run a remote command over ssh, returning (success, stdout+stderr combined).
-fn ssh_status(conn: &SshConn, remote_cmd: &str) -> Result<(bool, String)> {
-    let mut cmd = ssh_command(conn);
-    cmd.arg(conn.dest()).arg(remote_cmd);
-    let output = cmd.output().context("running ssh")?;
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
-    Ok((output.status.success(), combined))
 }
 
 fn git(git_dir: &Path) -> Command {
@@ -776,27 +636,6 @@ mod tests {
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("/a b"), "'/a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
-    }
-
-    #[test]
-    fn parses_ssh_config_hosts() {
-        let text = "Host openwrt\n    HostName 192.168.2.1\n    User root\n    Port 10022\n    IdentityFile ~/.ssh/id_ed25519\n\
-Host aws\n    HostName 54.179.191.126\n    User ubuntu\n    IdentityFile ~/.ssh/id_ed25519\n\
-Host *.internal\n    User admin\n\
-#Host commented\n    HostName nope\n\
-Host code.example\n    User git\n    Port 443\n";
-        let hosts = parse_ssh_config_text(text);
-        let names: Vec<&str> = hosts.iter().map(|h| h.name.as_str()).collect();
-        assert_eq!(names, vec!["openwrt", "aws", "code.example"]); // wildcard + comment skipped
-        let openwrt = &hosts[0];
-        assert_eq!(openwrt.hostname, "192.168.2.1");
-        assert_eq!(openwrt.user, "root");
-        assert_eq!(openwrt.port, 10022);
-        assert_eq!(openwrt.identity_file, "~/.ssh/id_ed25519");
-        // aws has no Port -> defaults to 22
-        assert_eq!(hosts[1].port, 22);
-        // code.example has no HostName -> defaults to the alias
-        assert_eq!(hosts[2].hostname, "code.example");
     }
 
     #[test]
