@@ -305,7 +305,6 @@ const el = {
   collectorDeployTitle: document.getElementById("collector-deploy-title"),
   collectorDeployClose: document.getElementById("collector-deploy-close"),
   collectorDeployScript: document.getElementById("collector-deploy-script"),
-  collectorDeployRun: document.getElementById("collector-deploy-run"),
   collectorDeployState: document.getElementById("collector-deploy-state"),
   collectorDeployLog: document.getElementById("collector-deploy-log"),
   collectorPathsModal: document.getElementById("collector-paths-modal"),
@@ -3405,6 +3404,7 @@ function renderCollectorHosts() {
       <span></span>
       <span></span>
       <span></span>
+      <span></span>
     </div>`;
   const rows = hosts.map((host, i) => {
     const pathCount = (host.paths || []).filter((p) => String(p).trim()).length;
@@ -3420,7 +3420,8 @@ function renderCollectorHosts() {
           <button type="button" data-action="browse-root" data-index="${i}" title="Choose local folder">…</button>
         </div>
         <button type="button" data-action="edit-paths" data-index="${i}" class="collector-paths-btn">Files (${pathCount})</button>
-        <button type="button" data-action="deploy" data-index="${i}" class="collector-deploy-btn" title="Deploy this host (copy files back + run its script)">🚀</button>
+        <button type="button" data-action="deploy-edit" data-index="${i}" class="collector-icon-btn" title="Edit deploy script">📝</button>
+        <button type="button" data-action="deploy-run" data-index="${i}" class="collector-icon-btn collector-run-icon" title="Run deploy (copy files back + run the script on the host)">▶</button>
         <label class="check-row collector-host-on" title="Enabled"><input type="checkbox" data-field="enabled" data-index="${i}" ${host.enabled ? "checked" : ""}></label>
         <button type="button" data-action="remove-host" data-index="${i}" class="collector-host-remove" title="Remove host">✕</button>
       </div>`;
@@ -3464,8 +3465,10 @@ function onCollectorHostClick(event) {
     collectorPickLocalInto(ref.i);
   } else if (action === "edit-paths") {
     openCollectorPaths(ref.i);
-  } else if (action === "deploy") {
+  } else if (action === "deploy-edit") {
     openCollectorDeploy(ref.i);
+  } else if (action === "deploy-run") {
+    runCollectorDeploy(ref.i);
   }
 }
 
@@ -3659,9 +3662,8 @@ function onCollectorDeployScriptInput() {
   collectorAutoSave();
 }
 
-async function runCollectorDeploy() {
-  if (collectorDeployIndex == null) return;
-  const host = collectorDraft.hosts[collectorDeployIndex];
+async function runCollectorDeploy(hostIndex) {
+  const host = collectorDraft && collectorDraft.hosts[hostIndex];
   if (!host) return;
   const dest = `${host.user ? host.user + "@" : ""}${host.hostname}`;
   if (!window.confirm(
@@ -3669,9 +3671,11 @@ async function runCollectorDeploy() {
   )) {
     return;
   }
+  // Open the deploy modal so the live log is visible.
+  openCollectorDeploy(hostIndex);
   try {
     await collectorPersistNow();
-    const state = await invoke("collector_deploy", { index: collectorDeployIndex });
+    const state = await invoke("collector_deploy", { index: hostIndex });
     applyCollectorDeployState(state);
     startCollectorDeployPolling();
   } catch (error) {
@@ -3860,7 +3864,6 @@ el.collectorHosts.addEventListener("input", onCollectorHostInput);
 el.collectorHosts.addEventListener("change", onCollectorHostInput);
 el.collectorHosts.addEventListener("click", onCollectorHostClick);
 el.collectorDeployClose.onclick = closeCollectorDeploy;
-el.collectorDeployRun.onclick = () => runCollectorDeploy();
 el.collectorDeployScript.addEventListener("input", onCollectorDeployScriptInput);
 el.collectorPathsClose.onclick = () => {
   el.collectorPathsModal.hidden = true;

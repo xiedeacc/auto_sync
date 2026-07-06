@@ -1508,10 +1508,10 @@ th {
 /* Fixed, content-hugging columns (no fr stretching) so every row and the
    header line up on the same left edges; the table left-aligns and any extra
    modal width stays empty on the right.
-   Host | HostName | User | Port | IdentityFile | Root | Files | Deploy | on | x */
+   Host | HostName | User | Port | IdentityFile | Root | Files | edit | run | on | x */
 .collector-host-row {
   display: grid;
-  grid-template-columns: 84px 116px 72px 78px 138px 158px 78px 34px 26px 26px;
+  grid-template-columns: 80px 112px 68px 72px 132px 150px 72px 30px 30px 24px 24px;
   gap: 6px;
   align-items: center;
   width: max-content;
@@ -1552,10 +1552,15 @@ th {
   font-size: 12px;
 }
 
-.collector-deploy-btn {
+.collector-icon-btn {
   width: 100%;
   padding-left: 0;
   padding-right: 0;
+}
+
+.collector-run-icon {
+  color: var(--green);
+  font-weight: 700;
 }
 
 .collector-host-on {
