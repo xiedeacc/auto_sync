@@ -46,7 +46,7 @@
   - **Compare（对账不同步）**：只读比对，产出差异报告，不改动任何数据。
 - **ZFS 强一致**：源在 ZFS 上时用 snapshot 提供稳定读视图，用 `zfs diff` 增量计划，避免百万文件全树遍历。
 - **局域网多机**：UDP 自动发现 + 手动添加机器；跨机同步走 auto_sync 自己的 HTTP + 长连接 TCP 池，无需 rsync/SSH 隧道。
-- **桌面 + Web 双端 UI**：同一份 `src/ui` 前端，桌面用 Tauri，无头机器用浏览器访问 Web UI，共享同一后台状态。
+- **桌面 + Web 双端 UI**：同一份 `src/ui` 前端，桌面用 Flutter/WebView2 壳承载，无头机器用浏览器访问 Web UI，共享同一后台状态。
 - **断点与并发友好**：大文件按 rsync 式 block delta 只传差异块；小文件成批打包传输；暂停/继续、跨机取消、任务历史一应俱全。
 - **跨平台**：Linux 用 fanotify 监听，Windows 用 NTFS USN Journal（并在需要时自动提权），无头 Linux 走 systemd，OpenWrt 走 procd。
 - **Collector（文件采集）**：从任意 SSH 主机（`ssh`/`scp`）把配置好的文件/目录拉到一个本地 git 仓库，自动切割超大文件、`commit` 并 `push`。见「系统设计 → Collector」。
@@ -75,15 +75,15 @@
 
 ### 构建
 
-单个运行时二进制 `auto_sync` 在一个进程内运行调度器、文件监听和 Web 服务，有显示环境时还会打开桌面窗口。GUI 主机用默认 feature（含 Tauri）构建；无头主机用 `--no-default-features` 构建纯 Web 版本。
+运行时二进制 `auto_sync` 在一个进程内运行调度器、文件监听和 Web 服务。桌面窗口由独立的 Flutter `auto_sync_gui` 进程打开同一份 Web UI。
 
 ```bash
-# 桌面版（默认 feature 含 GUI）：
 cargo build --release --bin auto_sync --bin auto_syncctl
-# 无头版（仅 Web，无 Tauri/webkit 依赖）：
-cargo build --release --no-default-features --bin auto_sync --bin auto_syncctl
 install -m 0755 target/release/auto_sync   bin/auto_sync
 install -m 0755 target/release/auto_syncctl bin/auto_syncctl
+
+cd flutter/auto_sync_gui
+flutter build windows --release
 ```
 
 ### 运行
@@ -159,13 +159,13 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 2. **状态层**：SQLite（WAL 模式）持久化事件、周期、offset、任务和校验结果；进程重启后据此恢复。
 3. **事件层**：Linux 用 fanotify、Windows 用 USN Journal 收集源目录变化，作为触发提示落盘。
 4. **同步层**：cycle 到点时为每个目标生成同步计划，执行拷贝/删除/校验并推进 offset；跨机时通过 peer HTTP + TCP 传输执行。
-5. **展示与控制层**：Tauri 桌面窗口与 Web UI 展示配置、状态、进度；后台按 `status_log_interval_secs` 输出状态日志；`auto_syncctl` 提供 CLI 控制。
+5. **展示与控制层**：Flutter 桌面窗口与 Web UI 展示配置、状态、进度；后台按 `status_log_interval_secs` 输出状态日志；`auto_syncctl` 提供 CLI 控制。
 
-进程形态（历史上的 `auto_syncd` / `auto_sync_gui` / `auto_sync_web` 已合并为单一 `auto_sync`）：
+进程形态：
 
-- **桌面模式**：有显示环境时打开 Tauri 窗口，前端资源 `src/ui` 由 `include_str!` 打进二进制，通过 Tauri asset 协议加载；窗口 URL 带构建号（`index.html?b=<commit>`）以彻底规避 WebView2 陈旧缓存。
-- **无头 Web 模式**：`--no-gui` 或无显示环境时只跑 Web UI，浏览器访问同一前端。
-- **后台模式**：Linux 由 systemd 拉起，Windows 由当前用户登录计划任务拉起。
+- **后端/Web 模式**：`auto_sync` 始终运行 scheduler、watcher 和 HTTP/Web UI，浏览器可直接访问同一前端。
+- **桌面模式**：`auto_sync_gui` 是 Flutter Windows 应用，使用 WebView2 打开 `auto_sync` 提供的 Web UI；URL 带加载时间戳以规避 WebView2 陈旧缓存。
+- **后台模式**：Linux 由 systemd 拉起，Windows 由当前用户 Startup launcher 拉起后端和 Flutter GUI。
 
 ### 模块划分
 

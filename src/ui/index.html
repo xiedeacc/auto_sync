@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>auto_sync</title>
-  <!-- Cache-bust the bundled assets: WebView2 (desktop) and browsers otherwise
+  <!-- Cache-bust the bundled assets: WebView2 and browsers otherwise
        heuristically cache main.js/styles.css by URL, so a redeployed binary's
        new UI would not load until the cache expired. A per-load token forces a
        fresh fetch every time (the assets are tiny and served from the binary). -->
@@ -418,8 +418,7 @@
 
   <script>
     (() => {
-      const isTauriAssetOrigin = location.hostname === "tauri.localhost";
-      const apiBase = (location.protocol === "http:" || location.protocol === "https:") && !isTauriAssetOrigin
+      const apiBase = (location.protocol === "http:" || location.protocol === "https:")
         ? ""
         : "http://127.0.0.1:18765";
       const valueOr = (value, fallback) => value === null || value === undefined ? fallback : value;
@@ -427,16 +426,6 @@
         if (event && event.preventDefault) {
           event.preventDefault();
         }
-      };
-      const getTauriInvoke = () => {
-        if (
-          window.__TAURI__ &&
-          window.__TAURI__.core &&
-          typeof window.__TAURI__.core.invoke === "function"
-        ) {
-          return window.__TAURI__.core.invoke;
-        }
-        return null;
       };
       const escapeHtml = (value) => String(valueOr(value, "")).replace(/[&<>"']/g, (ch) => ({
         "&": "&amp;",
@@ -489,11 +478,6 @@
         `;
       };
       const getMachineStatus = async (refresh = false) => {
-        const tauriInvoke = getTauriInvoke();
-        const command = refresh ? "discover_machines" : "get_machines";
-        if (tauriInvoke) {
-          return await tauriInvoke(command);
-        }
         const path = refresh ? "/api/machines/discover" : "/api/machines";
         const response = await fetch(`${apiBase}${path}`, {
           headers: { "Accept": "application/json" },

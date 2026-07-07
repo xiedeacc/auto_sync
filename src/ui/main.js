@@ -3278,17 +3278,6 @@ function preventDefault(event) {
   }
 }
 
-function getTauriInvoke() {
-  if (
-    window.__TAURI__ &&
-    window.__TAURI__.core &&
-    typeof window.__TAURI__.core.invoke === "function"
-  ) {
-    return window.__TAURI__.core.invoke;
-  }
-  return null;
-}
-
 function escapeHtml(value) {
   return String(valueOr(value, "")).replace(/[&<>"']/g, (ch) => ({
     "&": "&amp;",
@@ -4019,10 +4008,6 @@ document.addEventListener("visibilitychange", () => {
 loadAll().catch((error) => setMessage(String(error)));
 
 async function invokeBackend(command, payload = {}) {
-  const tauriInvoke = getTauriInvoke();
-  if (tauriInvoke) {
-    return await tauriInvoke(command, payload);
-  }
   return await invokeWeb(command, payload);
 }
 
@@ -4124,8 +4109,7 @@ async function invokeWeb(command, payload = {}) {
     }
   }
 
-  const isTauriAssetOrigin = location.hostname === "tauri.localhost";
-  const apiBase = (location.protocol === "http:" || location.protocol === "https:") && !isTauriAssetOrigin
+  const apiBase = (location.protocol === "http:" || location.protocol === "https:")
     ? ""
     : "http://127.0.0.1:18765";
   const response = await fetch(`${apiBase}${url}`, options);

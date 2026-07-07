@@ -166,9 +166,65 @@ function Copy-ReleaseBinaries {
         }
     }
     # Remove stale binaries from the previous multi-binary layout.
-    foreach ($stale in @("auto_syncd.exe", "auto_sync_web.exe", "auto_sync_gui.exe")) {
+    foreach ($stale in @("auto_syncd.exe", "auto_sync_web.exe")) {
         Remove-Item -LiteralPath (Join-Path $BinDir $stale) -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Get-FlutterExe {
+    $flutter = Get-Command flutter.bat -ErrorAction SilentlyContinue
+    if ($flutter) {
+        return $flutter.Source
+    }
+    $defaultFlutter = "D:\tools\flutter\bin\flutter.bat"
+    if (Test-Path -LiteralPath $defaultFlutter) {
+        $flutterBin = Split-Path -Parent $defaultFlutter
+        if (-not (($env:Path -split ";") -contains $flutterBin)) {
+            $env:Path = "$flutterBin;$env:Path"
+        }
+        return $defaultFlutter
+    }
+
+    $flutterRoot = "D:\tools\flutter"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $flutterRoot) | Out-Null
+    git clone --depth 1 -b stable https://github.com/flutter/flutter.git $flutterRoot
+    $flutterBin = Join-Path $flutterRoot "bin"
+    Add-PathEntries -Scope "User" -Paths @($flutterBin)
+    Join-Path $flutterBin "flutter.bat"
+}
+
+function Copy-FlutterGuiBinaries {
+    param(
+        [string]$RootDir,
+        [string]$BinDir
+    )
+
+    $flutterProject = Join-Path $RootDir "flutter\auto_sync_gui"
+    if (-not (Test-Path -LiteralPath (Join-Path $flutterProject "pubspec.yaml"))) {
+        throw "Missing Flutter project: $flutterProject"
+    }
+
+    $flutterExe = Get-FlutterExe
+    $env:PUB_HOSTED_URL = if ($env:PUB_HOSTED_URL) { $env:PUB_HOSTED_URL } else { "https://pub.flutter-io.cn" }
+    $env:FLUTTER_STORAGE_BASE_URL = if ($env:FLUTTER_STORAGE_BASE_URL) { $env:FLUTTER_STORAGE_BASE_URL } else { "https://storage.flutter-io.cn" }
+
+    if (-not $NoBuild) {
+        Push-Location $flutterProject
+        try {
+            & $flutterExe pub get
+            & $flutterExe build windows --release
+        }
+        finally {
+            Pop-Location
+        }
+    }
+
+    $releaseDir = Join-Path $flutterProject "build\windows\x64\runner\Release"
+    $guiExe = Join-Path $releaseDir "auto_sync_gui.exe"
+    if (-not (Test-Path -LiteralPath $guiExe)) {
+        throw "Missing Flutter GUI artifact: $guiExe"
+    }
+    Copy-Item -Path (Join-Path $releaseDir "*") -Destination $BinDir -Recurse -Force
 }
 
 function Stop-AutoSyncProcesses {
@@ -631,32 +687,58 @@ function Ensure-AutoSyncStartup {
     )
 
     $autoSyncExe = Join-Path $BinDir "auto_sync.exe"
-    if (-not (Test-Path -LiteralPath $autoSyncExe)) {
-        throw "Missing binary: $autoSyncExe"
+    $autoSyncGuiExe = Join-Path $BinDir "auto_sync_gui.exe"
+    foreach ($exe in @($autoSyncExe, $autoSyncGuiExe)) {
+        if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Missing binary: $exe"
+        }
     }
 
-    # Clean up obsolete Startup-folder launchers from earlier versions; the
-    # scheduled task is now the sole autostart mechanism.
     $startupDir = [Environment]::GetFolderPath("Startup")
     if (-not [string]::IsNullOrWhiteSpace($startupDir)) {
         Remove-Item -LiteralPath (Join-Path $startupDir "auto_syncd-start.vbs") -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $startupDir "auto_sync-start.vbs") -Force -ErrorAction SilentlyContinue
+        Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-backend-start.vbs") `
+            -WorkingDirectory $BinDir `
+            -Executable $autoSyncExe `
+            -Arguments @("--config", $ConfigPath)
+        Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-gui-start.vbs") `
+            -WorkingDirectory $BinDir `
+            -Executable $autoSyncGuiExe `
+            -Arguments @("--config", $ConfigPath)
     }
 
-    # auto_sync manages its own autostart entry -- a Highest-privilege scheduled
-    # task with an "at logon" trigger -- every time it starts, keyed off the
-    # app.autostart config setting (see apply_autostart_inner in
-    # src/bin/auto_sync.rs). The task fires elevated at logon with no
-    # interactive UAC prompt. It's created/refreshed the first time the process
-    # below runs elevated, so we just start the process here.
     Start-Process -FilePath $autoSyncExe `
         -ArgumentList @("--config", $ConfigPath) `
-        -WorkingDirectory (Split-Path -Parent $BinDir)
+        -WorkingDirectory $BinDir `
+        -WindowStyle Hidden
+    Start-Sleep -Seconds 1
+    Start-Process -FilePath $autoSyncGuiExe `
+        -ArgumentList @("--config", $ConfigPath) `
+        -WorkingDirectory $BinDir
 
     [PSCustomObject]@{
-        Launcher = "scheduled task 'auto_sync' (at logon)"
-        Processes = "auto_sync started"
+        Launcher = "current-user Startup launchers for auto_sync and auto_sync_gui"
+        Processes = "auto_sync and auto_sync_gui started"
     }
+}
+
+function Write-StartupLauncher {
+    param(
+        [string]$Path,
+        [string]$WorkingDirectory,
+        [string]$Executable,
+        [string[]]$Arguments
+    )
+
+    $argLine = ($Arguments | ForEach-Object { ConvertTo-CommandLineArgument $_ }) -join " "
+    $command = "$(ConvertTo-CommandLineArgument $Executable) $argLine"
+    $lines = @(
+        'Set shell = CreateObject("WScript.Shell")',
+        "shell.CurrentDirectory = ""$($WorkingDirectory -replace '"', '""')""",
+        "shell.Run ""$($command -replace '"', '""')"", 0, False"
+    )
+    Set-Content -LiteralPath $Path -Value $lines -Encoding ascii
 }
 
 if ($InstallSshd -and $SkipSshd) {
@@ -699,6 +781,7 @@ $targetRuntime = Join-Path $InstallDir "runtime"
 New-Item -ItemType Directory -Force -Path $InstallDir, $binDir, $confDir, $logDir | Out-Null
 Stop-AutoSyncProcesses
 Copy-ReleaseBinaries -RootDir $rootDir -BinDir $binDir
+Copy-FlutterGuiBinaries -RootDir $rootDir -BinDir $binDir
 $configAction = Initialize-Config -SourceConfig $Config -TargetConfig $targetConfig
 $runtime = Install-WindowsRuntime -RuntimeDir $RuntimeDir -TargetRuntime $targetRuntime
 

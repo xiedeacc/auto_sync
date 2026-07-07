@@ -128,6 +128,7 @@ impl Backend {
         };
         let next = clean_config_for_save(&cfg);
         apply_runtime_config(&cfg);
+        apply_desktop_config(&cfg, &self.config_path);
         let state_db = DbState::open(&cfg.app.data_db)?;
         state_db.ensure_config(&cfg)?;
         if let Some(current) = current.as_ref() {
@@ -1786,6 +1787,108 @@ fn apply_runtime_config(cfg: &AppConfig) {
     *CONFIG_WARNINGS
         .lock()
         .unwrap_or_else(|err| err.into_inner()) = config_warnings(cfg);
+}
+
+#[cfg(windows)]
+fn apply_desktop_config(cfg: &AppConfig, config_path: &Path) {
+    if let Err(err) = apply_desktop_config_inner(cfg, config_path) {
+        warn!(error = %err, "failed to apply desktop startup config");
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_desktop_config(_cfg: &AppConfig, _config_path: &Path) {}
+
+#[cfg(windows)]
+fn apply_desktop_config_inner(cfg: &AppConfig, config_path: &Path) -> Result<()> {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return Ok(());
+    };
+    let startup = PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup");
+    std::fs::create_dir_all(&startup).ok();
+
+    let backend_launcher = startup.join("auto_sync-backend-start.vbs");
+    let gui_launcher = startup.join("auto_sync-gui-start.vbs");
+    if !cfg.app.autostart {
+        let _ = std::fs::remove_file(backend_launcher);
+        let _ = std::fs::remove_file(gui_launcher);
+        return Ok(());
+    }
+
+    let backend_exe = std::env::current_exe().context("locating auto_sync executable")?;
+    let bin_dir = backend_exe
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let gui_exe = bin_dir.join("auto_sync_gui.exe");
+    write_startup_launcher(&backend_launcher, &bin_dir, &backend_exe, config_path)?;
+    if gui_exe.exists() {
+        write_startup_launcher(&gui_launcher, &bin_dir, &gui_exe, config_path)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_startup_launcher(
+    path: &Path,
+    working_dir: &Path,
+    executable: &Path,
+    config_path: &Path,
+) -> Result<()> {
+    let command = format!(
+        "{} --config {}",
+        quote_windows_arg(&executable.display().to_string()),
+        quote_windows_arg(&config_path.display().to_string())
+    );
+    let body = format!(
+        "Set shell = CreateObject(\"WScript.Shell\")\r\n\
+         shell.CurrentDirectory = \"{}\"\r\n\
+         shell.Run \"{}\", 0, False\r\n",
+        escape_vbs_string(&working_dir.display().to_string()),
+        escape_vbs_string(&command)
+    );
+    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(value: &str) -> String {
+    if value.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !value.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        return value.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0_usize;
+    for ch in value.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+#[cfg(windows)]
+fn escape_vbs_string(value: &str) -> String {
+    value.replace('"', "\"\"")
 }
 
 fn current_config_warnings() -> Vec<String> {

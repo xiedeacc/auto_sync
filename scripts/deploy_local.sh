@@ -98,14 +98,6 @@ ensure_linux_build_environment() {
   fi
 }
 
-has_gui_environment() {
-  [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && return 0
-  [[ -d /usr/share/xsessions ]] && compgen -G "/usr/share/xsessions/*.desktop" >/dev/null && return 0
-  [[ -d /usr/share/wayland-sessions ]] && compgen -G "/usr/share/wayland-sessions/*.desktop" >/dev/null && return 0
-  command -v Xorg >/dev/null 2>&1 && return 0
-  return 1
-}
-
 install_if_different() {
   local mode="$1"
   local src="$2"
@@ -119,15 +111,10 @@ install_if_different() {
 
 ensure_linux_build_environment
 
-# One unified binary. Build with the desktop (Tauri) feature only when a GUI is
-# present; otherwise build headless so hosts like the NAS need no webkit/Tauri.
-if has_gui_environment; then
-  cargo build --release --bin auto_sync --bin auto_syncctl
-  echo "GUI environment detected; built auto_sync with desktop support"
-else
-  cargo build --release --no-default-features --bin auto_sync --bin auto_syncctl
-  echo "No GUI environment detected; built headless auto_sync (web only)"
-fi
+# One unified backend binary. The desktop GUI is the separate Flutter
+# auto_sync_gui app on Windows; Linux/NAS deploys only the backend and web UI.
+cargo build --release --bin auto_sync --bin auto_syncctl
+echo "Built auto_sync backend and control utility"
 mkdir -p bin
 install -m 0755 target/release/auto_sync bin/auto_sync
 install -m 0755 target/release/auto_syncctl bin/auto_syncctl
