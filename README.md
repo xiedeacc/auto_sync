@@ -275,7 +275,7 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 服务器地址替换在 **Rust 侧**完成（不用脚本做字符串替换，避免出错）：deploy 前若该 host 收集了 `usr/local/shadowsocks/conf/shadowsocks-client.json` 且存在名为 `aws` 的 host，引擎会用 serde_json 解析该配置，按**地址族匹配**改写 `servers[]` 里的 `server`——aws 的 hostname 是 IPv4 就改 IPv4 那段、是 IPv6 就改 IPv6 段——把结果写到临时文件，通过 `AS_SS_CLIENT_CONF` 交给脚本 `scp` 上去。
 
-> 附带的 OpenWrt deploy 脚本示例（`collector.toml` 里 openwrt 的 `deploy_script`）：先停 shadowsocks 再把 `D:\share\openwrt` 下收集到的树 `scp` 回路由器对应目录（停服务是为了让 sslocal/xray-plugin 二进制不被占用）→ 用引擎备好的 `AS_SS_CLIENT_CONF`（已按族替换好 server 地址）覆盖远端 `shadowsocks-client.json` → 按 `AS_PERMS_FILE` 还原权限 → `sysctl -p`、重启 dnsmasq/odhcpd、`network reload` 让配置生效 → `enable`+`restart` shadowsocks（`sslocal`），并 `disable`+`stop` shadowsocks-rust（`sslocal-master`）避免 procd NAME 冲突。
+> 附带的 OpenWrt deploy 脚本示例（`collector.toml` 里 openwrt 的 `deploy_script`）：先做一次性 **provision**（把 apk feeds `/etc/apk/repositories.d/distfeeds.list` 里的官方 `downloads.openwrt.org` 换成 `http://mirrors.tuna.tsinghua.edu.cn/openwrt`；`apk update`；把 busybox `dnsmasq` 换成 `dnsmasq-full`——换之前先把 `/etc/resolv.conf` 指到公共 DNS，避免删掉 dnsmasq 后路由器自己断网；busybox `vi` 是内建 applet 删不掉，改装 `vim-full`；再 `apk add` 一批存储/nftables/tproxy/kmod-tcp-bbr 等包。重活用标记文件 `/etc/auto_sync.provisioned` 只跑一次，`rm` 掉即可重跑，换源那步每次都幂等执行）→ 停 shadowsocks 再把 `D:\share\openwrt` 下收集到的树 `scp` 回路由器对应目录（停服务是为了让 sslocal/xray-plugin 二进制不被占用）→ 用引擎备好的 `AS_SS_CLIENT_CONF`（已按族替换好 server 地址）覆盖远端 `shadowsocks-client.json` → 按 `AS_PERMS_FILE` 还原权限 → `sysctl -p`、重启 dnsmasq/odhcpd、`network reload` 让配置生效 → `enable`+`restart` shadowsocks（`sslocal`），并 `disable`+`stop` shadowsocks-rust（`sslocal-master`）避免 procd NAME 冲突。
 
 ### 任务类型与并发
 
