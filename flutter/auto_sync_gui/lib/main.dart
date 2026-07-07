@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:http/http.dart' as http;
 
 void main(List<String> args) {
@@ -1982,18 +1983,66 @@ class MasterIconButton extends StatelessWidget {
               ),
             )
           : Text(
-              '\u2699\uFE0E',
+              '\u2699',
               style: TextStyle(
                 color: color,
-                fontFamily: 'Segoe UI Symbol',
-                fontSize: 14,
-                fontWeight: FontWeight.w700,
-                height: 1,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                height: 1.1,
               ),
             ),
     );
   }
 }
+
+class MasterStatusIconButton extends StatelessWidget {
+  const MasterStatusIconButton({
+    super.key,
+    required this.color,
+    required this.onTap,
+  });
+
+  final Color color;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 32,
+      height: 32,
+      child: OutlinedButton(
+        onPressed: onTap,
+        style: OutlinedButton.styleFrom(
+          minimumSize: const Size(32, 32),
+          maximumSize: const Size(32, 32),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          visualDensity: VisualDensity.compact,
+          padding: EdgeInsets.zero,
+          backgroundColor: Colors.white,
+          foregroundColor: color,
+          side: const BorderSide(color: Palette.line),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        ),
+        child: SvgPicture.string(
+          _settingsStatusSvg(_svgColor(color)),
+          width: 18,
+          height: 18,
+        ),
+      ),
+    );
+  }
+}
+
+String _svgColor(Color color) =>
+    '#${(color.toARGB32() & 0x00ffffff).toRadixString(16).padLeft(6, '0')}';
+
+String _settingsStatusSvg(String color) =>
+    '''
+<svg viewBox="0 0 24 24" fill="none" stroke="$color" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg">
+  <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/>
+  <path d="M19.4 15a1.6 1.6 0 0 0 .32 1.76l.06.06a1.94 1.94 0 0 1-2.74 2.74l-.06-.06a1.6 1.6 0 0 0-1.76-.32 1.6 1.6 0 0 0-.96 1.46V21a1.94 1.94 0 0 1-3.88 0v-.08a1.6 1.6 0 0 0-1.04-1.46 1.6 1.6 0 0 0-1.76.32l-.06.06a1.94 1.94 0 0 1-2.74-2.74l.06-.06a1.6 1.6 0 0 0 .32-1.76 1.6 1.6 0 0 0-1.46-.96H3a1.94 1.94 0 0 1 0-3.88h.08a1.6 1.6 0 0 0 1.46-1.04 1.6 1.6 0 0 0-.32-1.76l-.06-.06A1.94 1.94 0 0 1 6.9 4.84l.06.06a1.6 1.6 0 0 0 1.76.32h.08a1.6 1.6 0 0 0 .96-1.46V3a1.94 1.94 0 0 1 3.88 0v.08a1.6 1.6 0 0 0 .96 1.46 1.6 1.6 0 0 0 1.76-.32l.06-.06a1.94 1.94 0 0 1 2.74 2.74l-.06.06a1.6 1.6 0 0 0-.32 1.76v.08a1.6 1.6 0 0 0 1.46.96H21a1.94 1.94 0 0 1 0 3.88h-.08a1.6 1.6 0 0 0-1.52 1.36Z"/>
+</svg>
+''';
 
 class MasterSelectButton extends StatelessWidget {
   const MasterSelectButton({
@@ -5583,11 +5632,7 @@ class _StatusBar extends StatelessWidget {
       ),
       child: Row(
         children: [
-          MasterIconButton(
-            kind: MasterIconKind.gear,
-            color: Palette.accent,
-            onTap: onConfig,
-          ),
+          MasterStatusIconButton(color: Palette.accent, onTap: onConfig),
           const SizedBox(width: 10),
           Expanded(
             child: Text(
