@@ -46,7 +46,7 @@
   - **Compare（对账不同步）**：只读比对，产出差异报告，不改动任何数据。
 - **ZFS 强一致**：源在 ZFS 上时用 snapshot 提供稳定读视图，用 `zfs diff` 增量计划，避免百万文件全树遍历。
 - **局域网多机**：UDP 自动发现 + 手动添加机器；跨机同步走 auto_sync 自己的 HTTP + 长连接 TCP 池，无需 rsync/SSH 隧道。
-- **桌面 + Web 双端 UI**：同一份 `src/ui` 前端，桌面用 Flutter/WebView2 壳承载，无头机器用浏览器访问 Web UI，共享同一后台状态。
+- **桌面 + Web 双端 UI**：桌面端使用原生 Flutter widget 直接调用 HTTP API，无头机器仍可用浏览器访问 Web UI，共享同一后台状态与业务逻辑。
 - **断点与并发友好**：大文件按 rsync 式 block delta 只传差异块；小文件成批打包传输；暂停/继续、跨机取消、任务历史一应俱全。
 - **跨平台**：Linux 用 fanotify 监听，Windows 用 NTFS USN Journal（并在需要时自动提权），无头 Linux 走 systemd，OpenWrt 走 procd。
 - **Collector（文件采集）**：从任意 SSH 主机（`ssh`/`scp`）把配置好的文件/目录拉到一个本地 git 仓库，自动切割超大文件、`commit` 并 `push`。见「系统设计 → Collector」。
@@ -75,7 +75,7 @@
 
 ### 构建
 
-运行时二进制 `auto_sync` 在一个进程内运行调度器、文件监听和 Web 服务。桌面窗口由独立的 Flutter `auto_sync_gui` 进程打开同一份 Web UI。
+运行时二进制 `auto_sync` 在一个进程内运行调度器、文件监听和 Web 服务。桌面窗口由独立的 Flutter `auto_sync_gui` 进程渲染原生界面，并直接调用同一组 HTTP API。
 
 ```bash
 cargo build --release --bin auto_sync --bin auto_syncctl
@@ -164,7 +164,7 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 进程形态：
 
 - **后端/Web 模式**：`auto_sync` 始终运行 scheduler、watcher 和 HTTP/Web UI，浏览器可直接访问同一前端。
-- **桌面模式**：`auto_sync_gui` 是 Flutter Windows 应用，使用 WebView2 打开 `auto_sync` 提供的 Web UI；URL 带加载时间戳以规避 WebView2 陈旧缓存。
+- **桌面模式**：`auto_sync_gui` 是 Flutter Windows 应用，使用原生 Flutter widget 展示配置、状态、任务与机器管理；所有操作直接调用 `auto_sync` 提供的 HTTP API。
 - **后台模式**：Linux 由 systemd 拉起，Windows 由当前用户 Startup launcher 拉起后端和 Flutter GUI。
 
 ### 模块划分

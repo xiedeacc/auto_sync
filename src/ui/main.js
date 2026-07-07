@@ -2325,7 +2325,7 @@ function renderDestinationLogModal() {
   }
 }
 
-// Copy text to the clipboard with a graceful fallback (older/embedded webviews
+// Copy text to the clipboard with a graceful fallback (older browsers
 // may not expose navigator.clipboard) and a brief confirmation.
 function copyTextToClipboard(text) {
   const value = String(text == null ? "" : text);

@@ -2,10 +2,6 @@
 #include <flutter/flutter_view_controller.h>
 #include <windows.h>
 
-#include <chrono>
-#include <fstream>
-#include <regex>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -40,45 +36,6 @@ std::string ArgValue(const std::vector<std::string>& args,
   return "";
 }
 
-std::string ReadPortFromConfig(const std::string& config_path) {
-  if (config_path.empty()) {
-    return "";
-  }
-  std::ifstream file(config_path);
-  if (!file) {
-    return "";
-  }
-  std::regex port_pattern(R"(^\s*port\s*=\s*([0-9]+)\s*(#.*)?$)");
-  std::string line;
-  std::smatch match;
-  while (std::getline(file, line)) {
-    if (std::regex_match(line, match, port_pattern)) {
-      return match[1].str();
-    }
-  }
-  return "";
-}
-
-std::wstring ResolveTargetUrl(const std::vector<std::string>& args) {
-  std::string url = ArgValue(args, "--url");
-  if (url.empty()) {
-    std::string port = ArgValue(args, "--port");
-    if (port.empty()) {
-      port = ReadPortFromConfig(ArgValue(args, "--config"));
-    }
-    if (port.empty()) {
-      port = "18765";
-    }
-    url = "http://127.0.0.1:" + port + "/";
-  }
-  const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-  url += (url.find('?') == std::string::npos ? "?" : "&");
-  url += "b=" + std::to_string(stamp);
-  return Utf8ToWide(url);
-}
-
 }  // namespace
 
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
@@ -97,12 +54,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();
-  std::wstring target_url = ResolveTargetUrl(command_line_arguments);
   std::wstring config_path = Utf8ToWide(ArgValue(command_line_arguments, "--config"));
 
   project.set_dart_entrypoint_arguments(std::move(command_line_arguments));
 
-  FlutterWindow window(project, target_url, config_path);
+  FlutterWindow window(project, config_path);
   Win32Window::Point origin(10, 10);
   Win32Window::Size size(1180, 1000);
   if (!window.Create(L"auto_sync", origin, size)) {

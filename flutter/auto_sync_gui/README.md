@@ -1,11 +1,10 @@
 # auto_sync_gui
 
-Flutter Windows desktop shell for auto_sync.
+Native Flutter Windows desktop UI for auto_sync.
 
-The app intentionally reuses the existing `src/ui` HTML/CSS/JavaScript served by
-the Rust `auto_sync` backend. The Windows runner hosts a WebView2 child window
-without Flutter plugins, avoiding Windows symlink/Developer Mode requirements
-while preserving the existing UI pixels and HTTP behavior.
+The app renders the desktop interface with Flutter widgets and talks directly to
+the Rust `auto_sync` HTTP API. It does not embed a browser view or reuse the
+HTML/CSS/JavaScript UI.
 
 ```powershell
 flutter pub get

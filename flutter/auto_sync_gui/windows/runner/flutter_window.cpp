@@ -1,12 +1,8 @@
 #include "flutter_window.h"
 
-#include <WebView2.h>
-#include <shlobj.h>
 #include <shellapi.h>
 #include <windows.h>
-#include <wrl.h>
 
-#include <cstdlib>
 #include <fstream>
 #include <optional>
 #include <regex>
@@ -16,7 +12,6 @@
 #include "resource.h"
 
 namespace {
-constexpr UINT_PTR kRetryNavigateTimer = 18765;
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kTrayId = 1;
 constexpr UINT kMenuShow = 1001;
@@ -24,10 +19,8 @@ constexpr UINT kMenuQuit = 1002;
 }
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project,
-                             std::wstring target_url,
                              std::wstring config_path)
     : project_(project),
-      target_url_(std::move(target_url)),
       config_path_(std::move(config_path)) {}
 
 FlutterWindow::~FlutterWindow() {}
@@ -53,7 +46,6 @@ bool FlutterWindow::OnCreate() {
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
     AddTrayIcon();
-    CreateWebView();
   });
 
   // Flutter can complete the first frame before the "show window" callback is
@@ -65,9 +57,6 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
-  KillTimer(GetHandle(), kRetryNavigateTimer);
-  webview_ = nullptr;
-  webview_controller_ = nullptr;
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -134,98 +123,6 @@ bool FlutterWindow::ShouldCloseToTray() const {
   return true;
 }
 
-void FlutterWindow::CreateWebView() {
-  if (webview_controller_) {
-    return;
-  }
-
-  std::wstring user_data_folder;
-  wchar_t* local_app_data = nullptr;
-  size_t local_app_data_len = 0;
-  if (_wdupenv_s(&local_app_data, &local_app_data_len, L"LOCALAPPDATA") == 0 &&
-      local_app_data != nullptr) {
-    user_data_folder = std::wstring(local_app_data) + L"\\auto_sync\\webview2";
-    free(local_app_data);
-    SHCreateDirectoryExW(nullptr, user_data_folder.c_str(), nullptr);
-  }
-
-  HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
-      nullptr, user_data_folder.empty() ? nullptr : user_data_folder.c_str(),
-      nullptr,
-      Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-          [this](HRESULT result, ICoreWebView2Environment* environment)
-              -> HRESULT {
-            if (FAILED(result) || environment == nullptr) {
-              SetTimer(GetHandle(), kRetryNavigateTimer, 2000, nullptr);
-              return S_OK;
-            }
-            environment->CreateCoreWebView2Controller(
-                GetHandle(),
-                Microsoft::WRL::Callback<
-                    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                    [this](HRESULT result,
-                           ICoreWebView2Controller* controller) -> HRESULT {
-                      if (FAILED(result) || controller == nullptr) {
-                        SetTimer(GetHandle(), kRetryNavigateTimer, 2000,
-                                 nullptr);
-                        return S_OK;
-                      }
-                      webview_controller_ = controller;
-                      webview_controller_->get_CoreWebView2(&webview_);
-                      if (flutter_controller_ && flutter_controller_->view()) {
-                        ShowWindow(flutter_controller_->view()->GetNativeWindow(), SW_HIDE);
-                      }
-                      ResizeWebView();
-                      if (webview_) {
-                        EventRegistrationToken token = {};
-                        webview_->add_NavigationCompleted(
-                            Microsoft::WRL::Callback<
-                                ICoreWebView2NavigationCompletedEventHandler>(
-                                [this](ICoreWebView2* sender,
-                                       ICoreWebView2NavigationCompletedEventArgs*
-                                           args) -> HRESULT {
-                                  BOOL success = FALSE;
-                                  if (args) {
-                                    args->get_IsSuccess(&success);
-                                  }
-                                  if (!success) {
-                                    SetTimer(GetHandle(), kRetryNavigateTimer,
-                                             2000, nullptr);
-                                  }
-                                  return S_OK;
-                                })
-                                .Get(),
-                            &token);
-                      }
-                      NavigateToTarget();
-                      return S_OK;
-                    })
-                    .Get());
-            return S_OK;
-          })
-          .Get());
-  if (FAILED(hr)) {
-    SetTimer(GetHandle(), kRetryNavigateTimer, 2000, nullptr);
-  }
-}
-
-void FlutterWindow::ResizeWebView() {
-  if (!webview_controller_) {
-    return;
-  }
-  RECT bounds = GetClientArea();
-  webview_controller_->put_Bounds(bounds);
-}
-
-void FlutterWindow::NavigateToTarget() {
-  if (!webview_) {
-    CreateWebView();
-    return;
-  }
-  KillTimer(GetHandle(), kRetryNavigateTimer);
-  webview_->Navigate(target_url_.c_str());
-}
-
 LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
@@ -281,15 +178,6 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
       info->ptMinTrackSize.y = 620;
       return 0;
     }
-    case WM_SIZE:
-      ResizeWebView();
-      break;
-    case WM_TIMER:
-      if (wparam == kRetryNavigateTimer) {
-        NavigateToTarget();
-        return 0;
-      }
-      break;
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
       break;

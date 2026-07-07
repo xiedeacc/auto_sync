@@ -37,12 +37,8 @@ target_link_libraries(${BINARY_NAME} PRIVATE
   "dwmapi.lib"
   "ole32.lib"
   "shell32.lib"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/webview2/x64/WebView2LoaderStatic.lib"
 )
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
-target_include_directories(${BINARY_NAME} PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/webview2/include"
-)
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)

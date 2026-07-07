@@ -244,7 +244,7 @@ pub async fn serve(backend: Backend, port: u16) -> Result<()> {
 }
 
 // The frontend assets are baked into the binary and change on every deploy;
-// no-store keeps a browser (or the desktop WebView2) from serving a stale
+// no-store keeps browsers from serving a stale
 // main.js/styles.css after an update.
 const NO_STORE: &str = "no-store";
 
