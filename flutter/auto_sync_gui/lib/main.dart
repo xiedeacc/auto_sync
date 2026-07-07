@@ -2654,77 +2654,77 @@ class _SettingsDialogState extends State<_SettingsDialog> {
     return _MasterDialogFrame(
       title: 'Settings',
       width: 760,
-      maxHeight: 500,
+      maxHeight: 720,
+      shrinkWrap: true,
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Expanded(
-            child: _SettingsGrid(
-              children: [
-                _SettingsSection(
-                  title: 'Sync',
-                  children: [
-                    _SettingsCheckRow(
-                      label: 'Mirror',
-                      value: _bool(widget.sync['mirror'], true),
-                      onChanged: (value) =>
-                          setState(() => widget.sync['mirror'] = value),
-                    ),
-                    _SettingsCheckRow(
-                      label: 'Checksum',
-                      value: _bool(widget.sync['checksum'], false),
-                      onChanged: (value) =>
-                          setState(() => widget.sync['checksum'] = value),
-                    ),
-                    _SettingsCheckRow(
-                      label: 'ZFS diff',
-                      value: _bool(widget.sync['zfs_diff'], true),
-                      onChanged: (value) =>
-                          setState(() => widget.sync['zfs_diff'] = value),
-                    ),
-                    _SettingsCheckRow(
-                      label: 'Debug logs',
-                      value: _bool(widget.sync['debug_logs'], false),
-                      onChanged: (value) =>
-                          setState(() => widget.sync['debug_logs'] = value),
-                    ),
-                  ],
-                ),
-                _SettingsSection(
-                  title: 'Limits',
-                  children: [
-                    _SettingsNumberField(
-                      label: 'Transfer timeout seconds',
-                      controller: timeout,
-                    ),
-                    _SettingsNumberField(
-                      label: 'Bandwidth KB/s',
-                      controller: bwlimit,
-                    ),
-                    _SettingsNumberField(
-                      label: 'TCP connection pool',
-                      controller: pool,
-                    ),
-                  ],
-                ),
-                _SettingsSection(
-                  title: 'Application',
-                  children: [
-                    _SettingsCheckRow(
-                      label: 'Start on boot',
-                      value: _bool(widget.app['autostart'], false),
-                      onChanged: (value) =>
-                          setState(() => widget.app['autostart'] = value),
-                    ),
-                    _SettingsCheckRow(
-                      label: 'Close button minimizes to tray',
-                      value: _bool(widget.app['close_to_tray'], true),
-                      onChanged: (value) =>
-                          setState(() => widget.app['close_to_tray'] = value),
-                    ),
-                  ],
-                ),
-              ],
-            ),
+          _SettingsGrid(
+            children: [
+              _SettingsSection(
+                title: 'Sync',
+                children: [
+                  _SettingsCheckRow(
+                    label: 'Mirror',
+                    value: _bool(widget.sync['mirror'], true),
+                    onChanged: (value) =>
+                        setState(() => widget.sync['mirror'] = value),
+                  ),
+                  _SettingsCheckRow(
+                    label: 'Checksum',
+                    value: _bool(widget.sync['checksum'], false),
+                    onChanged: (value) =>
+                        setState(() => widget.sync['checksum'] = value),
+                  ),
+                  _SettingsCheckRow(
+                    label: 'ZFS diff',
+                    value: _bool(widget.sync['zfs_diff'], true),
+                    onChanged: (value) =>
+                        setState(() => widget.sync['zfs_diff'] = value),
+                  ),
+                  _SettingsCheckRow(
+                    label: 'Debug logs',
+                    value: _bool(widget.sync['debug_logs'], false),
+                    onChanged: (value) =>
+                        setState(() => widget.sync['debug_logs'] = value),
+                  ),
+                ],
+              ),
+              _SettingsSection(
+                title: 'Limits',
+                children: [
+                  _SettingsNumberField(
+                    label: 'Transfer timeout seconds',
+                    controller: timeout,
+                  ),
+                  _SettingsNumberField(
+                    label: 'Bandwidth KB/s',
+                    controller: bwlimit,
+                  ),
+                  _SettingsNumberField(
+                    label: 'TCP connection pool',
+                    controller: pool,
+                  ),
+                ],
+              ),
+              _SettingsSection(
+                title: 'Application',
+                children: [
+                  _SettingsCheckRow(
+                    label: 'Start on boot',
+                    value: _bool(widget.app['autostart'], false),
+                    onChanged: (value) =>
+                        setState(() => widget.app['autostart'] = value),
+                  ),
+                  _SettingsCheckRow(
+                    label: 'Close button minimizes to tray',
+                    value: _bool(widget.app['close_to_tray'], true),
+                    onChanged: (value) =>
+                        setState(() => widget.app['close_to_tray'] = value),
+                  ),
+                ],
+              ),
+            ],
           ),
           const SizedBox(height: 12),
           Row(
@@ -2762,27 +2762,23 @@ class _SettingsGrid extends StatelessWidget {
     return LayoutBuilder(
       builder: (context, constraints) {
         if (constraints.maxWidth < 560) {
-          return SingleChildScrollView(
-            child: Column(
-              children: [
-                for (var i = 0; i < children.length; i += 1) ...[
-                  if (i > 0) const SizedBox(height: 12),
-                  children[i],
-                ],
+          return Column(
+            children: [
+              for (var i = 0; i < children.length; i += 1) ...[
+                if (i > 0) const SizedBox(height: 12),
+                children[i],
               ],
-            ),
+            ],
           );
         }
         final itemWidth = (constraints.maxWidth - 12) / 2;
-        return SingleChildScrollView(
-          child: Wrap(
-            spacing: 12,
-            runSpacing: 12,
-            children: [
-              for (final child in children)
-                SizedBox(width: itemWidth, child: child),
-            ],
-          ),
+        return Wrap(
+          spacing: 12,
+          runSpacing: 12,
+          children: [
+            for (final child in children)
+              SizedBox(width: itemWidth, child: child),
+          ],
         );
       },
     );
@@ -2883,8 +2879,31 @@ class _SettingsNumberField extends StatelessWidget {
             style: const TextStyle(color: Palette.muted, fontSize: 12),
           ),
           const SizedBox(height: 4),
-          _CompactInput(controller: controller, numeric: true),
+          _SettingsNumberInput(controller: controller),
         ],
+      ),
+    );
+  }
+}
+
+class _SettingsNumberInput extends StatelessWidget {
+  const _SettingsNumberInput({required this.controller});
+
+  final TextEditingController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: _masterControlHeight,
+      child: TextFormField(
+        controller: controller,
+        keyboardType: TextInputType.number,
+        style: const TextStyle(fontSize: 13, color: Palette.text, height: 1.2),
+        decoration: const InputDecoration(
+          isDense: true,
+          contentPadding: EdgeInsets.symmetric(horizontal: 9, vertical: 7),
+          constraints: BoxConstraints.tightFor(height: _masterControlHeight),
+        ),
       ),
     );
   }
@@ -2920,56 +2939,56 @@ class _SyncSettingsDialogState extends State<_SyncSettingsDialog> {
     return _MasterDialogFrame(
       title: 'Destination Sync',
       width: 760,
-      maxHeight: 300,
+      maxHeight: 720,
+      shrinkWrap: true,
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Expanded(
-            child: _SettingsGrid(
-              children: [
-                _SettingsSection(
-                  title: 'Sync',
-                  children: [
-                    _SettingsCheckRow(
-                      label: 'Mirror',
-                      value: _bool(widget.sync['mirror'], true),
-                      onChanged: (value) =>
-                          setState(() => widget.sync['mirror'] = value),
-                    ),
-                    _SettingsCheckRow(
-                      label: 'Checksum',
-                      value: _bool(widget.sync['checksum'], false),
-                      onChanged: (value) =>
-                          setState(() => widget.sync['checksum'] = value),
-                    ),
-                    _SettingsCheckRow(
-                      label: 'ZFS diff',
-                      value: _bool(widget.sync['zfs_diff'], true),
-                      onChanged: (value) =>
-                          setState(() => widget.sync['zfs_diff'] = value),
-                    ),
-                    _SettingsCheckRow(
-                      label: 'Debug logs',
-                      value: _bool(widget.sync['debug_logs'], false),
-                      onChanged: (value) =>
-                          setState(() => widget.sync['debug_logs'] = value),
-                    ),
-                  ],
-                ),
-                _SettingsSection(
-                  title: 'Limits',
-                  children: [
-                    _SettingsNumberField(
-                      label: 'Transfer timeout seconds',
-                      controller: timeout,
-                    ),
-                    _SettingsNumberField(
-                      label: 'Bandwidth KB/s',
-                      controller: bwlimit,
-                    ),
-                  ],
-                ),
-              ],
-            ),
+          _SettingsGrid(
+            children: [
+              _SettingsSection(
+                title: 'Sync',
+                children: [
+                  _SettingsCheckRow(
+                    label: 'Mirror',
+                    value: _bool(widget.sync['mirror'], true),
+                    onChanged: (value) =>
+                        setState(() => widget.sync['mirror'] = value),
+                  ),
+                  _SettingsCheckRow(
+                    label: 'Checksum',
+                    value: _bool(widget.sync['checksum'], false),
+                    onChanged: (value) =>
+                        setState(() => widget.sync['checksum'] = value),
+                  ),
+                  _SettingsCheckRow(
+                    label: 'ZFS diff',
+                    value: _bool(widget.sync['zfs_diff'], true),
+                    onChanged: (value) =>
+                        setState(() => widget.sync['zfs_diff'] = value),
+                  ),
+                  _SettingsCheckRow(
+                    label: 'Debug logs',
+                    value: _bool(widget.sync['debug_logs'], false),
+                    onChanged: (value) =>
+                        setState(() => widget.sync['debug_logs'] = value),
+                  ),
+                ],
+              ),
+              _SettingsSection(
+                title: 'Limits',
+                children: [
+                  _SettingsNumberField(
+                    label: 'Transfer timeout seconds',
+                    controller: timeout,
+                  ),
+                  _SettingsNumberField(
+                    label: 'Bandwidth KB/s',
+                    controller: bwlimit,
+                  ),
+                ],
+              ),
+            ],
           ),
           const SizedBox(height: 12),
           Row(
@@ -3112,12 +3131,14 @@ class _MasterDialogFrame extends StatelessWidget {
     required this.width,
     required this.maxHeight,
     required this.child,
+    this.shrinkWrap = false,
   });
 
   final String title;
   final double width;
   final double maxHeight;
   final Widget child;
+  final bool shrinkWrap;
 
   @override
   Widget build(BuildContext context) {
@@ -3127,39 +3148,49 @@ class _MasterDialogFrame extends StatelessWidget {
     return Dialog(
       insetPadding: const EdgeInsets.all(24),
       backgroundColor: Colors.transparent,
-      child: SizedBox(
-        width: panelWidth,
-        height: panelHeight,
-        child: Container(
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: Palette.panel,
-            border: Border.all(color: Palette.line),
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Column(
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      title,
-                      style: const TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w700,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          minWidth: panelWidth,
+          maxWidth: panelWidth,
+          maxHeight: panelHeight,
+        ),
+        child: SizedBox(
+          height: shrinkWrap ? null : panelHeight,
+          child: Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: Palette.panel,
+              border: Border.all(color: Palette.line),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Column(
+              mainAxisSize: shrinkWrap ? MainAxisSize.min : MainAxisSize.max,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                     ),
-                  ),
-                  MasterButton(
-                    label: 'x',
-                    square: true,
-                    onTap: () => Navigator.pop(context),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Expanded(child: child),
-            ],
+                    MasterButton(
+                      label: 'x',
+                      square: true,
+                      onTap: () => Navigator.pop(context),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                if (shrinkWrap)
+                  Flexible(child: child)
+                else
+                  Expanded(child: child),
+              ],
+            ),
           ),
         ),
       ),
