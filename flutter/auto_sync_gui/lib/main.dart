@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -474,51 +475,19 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
   }
 
   Future<void> _openConfigDialog() async {
-    final controller = TextEditingController(
-      text: const JsonEncoder.withIndent('  ').convert(cfg),
-    );
-    final result = await showDialog<Map<String, dynamic>>(
+    await showDialog<void>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Config JSON'),
-        content: SizedBox(
-          width: 900,
-          height: 620,
-          child: TextField(
-            controller: controller,
-            expands: true,
-            maxLines: null,
-            minLines: null,
-            style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
-            decoration: const InputDecoration(border: OutlineInputBorder()),
-          ),
+      builder: (context) => _MasterDialogFrame(
+        title: 'Config',
+        width: 900,
+        maxHeight: 720,
+        child: _MasterPre(
+          text: const JsonEncoder.withIndent('  ').convert(cfg),
+          minHeight: 260,
+          maxHeight: 640,
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton.icon(
-            onPressed: () {
-              try {
-                Navigator.pop(context, _map(jsonDecode(controller.text)));
-              } catch (error) {
-                ScaffoldMessenger.of(
-                  context,
-                ).showSnackBar(SnackBar(content: Text('Invalid JSON: $error')));
-              }
-            },
-            icon: const Icon(Icons.save_outlined, size: 18),
-            label: const Text('Save'),
-          ),
-        ],
       ),
     );
-    controller.dispose();
-    if (result != null) {
-      setState(() => cfg = result);
-      await _saveConfig('Config saved');
-    }
   }
 
   Future<void> _openTasksDialog() async {
@@ -534,70 +503,88 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     }
     await showDialog<void>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Tasks'),
-        content: SizedBox(
-          width: 900,
-          height: 620,
-          child: errorText.isNotEmpty
-              ? Text(errorText)
-              : ListView(
-                  children: tasks.map((machine) {
-                    final m = _map(machine);
-                    final list = _list(m['tasks']);
-                    return Section(
-                      title: _str(m['machine_id'], _str(m['id'], 'machine')),
-                      child: Column(
-                        children: list.isEmpty
-                            ? const [EmptyLine('No tasks')]
-                            : list
-                                  .map((task) => _TaskRow(task: _map(task)))
-                                  .toList(),
+      builder: (context) {
+        final running = tasks.fold<int>(0, (total, machine) {
+          return total +
+              _list(
+                _map(machine)['tasks'],
+              ).where((task) => _str(_map(task)['status']) == 'running').length;
+        });
+        return _MasterDialogFrame(
+          title: 'Tasks',
+          width: 980,
+          maxHeight: 760,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _IssueSummary(
+                errorText.isNotEmpty
+                    ? errorText
+                    : '$running running · newest first · each machine keeps its last 100 finished tasks',
+              ),
+              const SizedBox(height: 8),
+              Expanded(
+                child: errorText.isNotEmpty
+                    ? Text(errorText)
+                    : ListView(
+                        children: tasks.map((machine) {
+                          final m = _map(machine);
+                          final list = _list(m['tasks']);
+                          final name = _str(
+                            m['machine_id'],
+                            _str(m['id'], 'machine'),
+                          );
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 14),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Container(
+                                  width: double.infinity,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 2,
+                                    vertical: 6,
+                                  ),
+                                  decoration: const BoxDecoration(
+                                    border: Border(
+                                      bottom: BorderSide(color: Palette.line),
+                                    ),
+                                  ),
+                                  child: Text(
+                                    name,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                                const _TaskHeaderRow(),
+                                if (list.isEmpty)
+                                  const EmptyLine('No tasks')
+                                else
+                                  ...list.map(
+                                    (task) => _TaskRow(task: _map(task)),
+                                  ),
+                              ],
+                            ),
+                          );
+                        }).toList(),
                       ),
-                    );
-                  }).toList(),
-                ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
+              ),
+            ],
           ),
-        ],
-      ),
+        );
+      },
     );
   }
 
   Future<void> _openReadmeDialog() async {
-    String text = '';
-    try {
-      text = await widget.api.text('/README.md');
-    } catch (error) {
-      text = '$error';
-    }
-    if (!mounted) {
-      return;
-    }
     await showDialog<void>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Readme'),
-        content: SizedBox(
-          width: 860,
-          height: 620,
-          child: SingleChildScrollView(
-            child: Text(
-              text,
-              style: const TextStyle(fontSize: 12, height: 1.45),
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
-          ),
-        ],
+      builder: (context) => const _MasterDialogFrame(
+        title: 'Readme',
+        width: 860,
+        maxHeight: 720,
+        child: _ReadmeBody(),
       ),
     );
   }
@@ -608,6 +595,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
       builder: (context) => _MachinesDialog(
         api: widget.api,
         machines: machines,
+        initialStatus: machineStatus,
         onChanged: () async {
           cfg = await widget.api.getConfig();
           machineStatus = await widget.api.getMachines();
@@ -708,6 +696,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
             runtimeStatus: runtimeStatus,
             activity: syncActivity,
             saving: saving,
+            onConfig: _openConfigDialog,
           ),
         ],
       ),
@@ -770,102 +759,67 @@ class _Header extends StatelessWidget {
   Widget build(BuildContext context) {
     final online = _int(machineStatus['online'], 0);
     final total = _int(machineStatus['total'], 0);
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final headerWidth = constraints.maxWidth < 860
-            ? 860.0
-            : constraints.maxWidth;
-        return SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: SizedBox(
-            width: headerWidth,
-            child: Container(
-              height: 58,
-              padding: const EdgeInsets.symmetric(horizontal: 20),
-              decoration: const BoxDecoration(
-                color: Palette.panel,
-                border: Border(bottom: BorderSide(color: Palette.line)),
-              ),
-              child: Row(
-                children: [
-                  const Expanded(
-                    child: Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        'auto_sync',
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w800,
-                          color: Palette.text,
-                        ),
-                      ),
-                    ),
-                  ),
-                  SizedBox(
-                    width: 180,
-                    child: Center(
-                      child: OutlinedButton(
-                        onPressed: onMachines,
-                        style: OutlinedButton.styleFrom(
-                          minimumSize: const Size(118, 34),
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          foregroundColor: Palette.accent,
-                          side: const BorderSide(color: Palette.line),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          textStyle: const TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        child: Text(
-                          total == 0
-                              ? 'Machines -/-'
-                              : 'Machines $online/$total',
-                        ),
-                      ),
-                    ),
-                  ),
-                  Expanded(
-                    child: Align(
-                      alignment: Alignment.centerRight,
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          MasterButton(
-                            label: 'Readme',
-                            width: 74,
-                            onTap: onReadme,
-                          ),
-                          const SizedBox(width: 8),
-                          MasterButton(
-                            label: 'Collector',
-                            width: 86,
-                            onTap: onCollector,
-                          ),
-                          const SizedBox(width: 8),
-                          MasterButton(
-                            label: 'Config',
-                            width: 68,
-                            onTap: onConfig,
-                          ),
-                          const SizedBox(width: 8),
-                          MasterButton(
-                            label: 'Tasks',
-                            width: 64,
-                            onTap: onTasks,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
+    return Container(
+      height: 58,
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      decoration: const BoxDecoration(
+        color: Palette.panel,
+        border: Border(bottom: BorderSide(color: Palette.line)),
+      ),
+      child: Row(
+        children: [
+          const Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'auto_sync',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                  color: Palette.text,
+                ),
               ),
             ),
           ),
-        );
-      },
+          SizedBox(
+            width: 180,
+            child: Center(
+              child: OutlinedButton(
+                onPressed: onMachines,
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size(118, 34),
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  foregroundColor: Palette.accent,
+                  side: const BorderSide(color: Palette.line),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  textStyle: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                child: Text(
+                  total == 0 ? 'Machines -/-' : 'Machines $online/$total',
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              MasterButton(label: 'Readme', width: 80, onTap: onReadme),
+              const SizedBox(width: 8),
+              MasterButton(label: 'Collector', width: 104, onTap: onCollector),
+              const SizedBox(width: 8),
+              MasterButton(label: 'Config', width: 76, onTap: onConfig),
+              const SizedBox(width: 8),
+              MasterButton(label: 'Tasks', width: 70, onTap: onTasks),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }
@@ -2459,15 +2413,288 @@ class _SyncSettingsDialogState extends State<_SyncSettingsDialog> {
   }
 }
 
+class _MasterDialogFrame extends StatelessWidget {
+  const _MasterDialogFrame({
+    required this.title,
+    required this.width,
+    required this.maxHeight,
+    required this.child,
+  });
+
+  final String title;
+  final double width;
+  final double maxHeight;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final size = MediaQuery.sizeOf(context);
+    final panelWidth = math.max(320.0, math.min(width, size.width - 48));
+    final panelHeight = math.max(240.0, math.min(maxHeight, size.height - 48));
+    return Dialog(
+      insetPadding: const EdgeInsets.all(24),
+      backgroundColor: Colors.transparent,
+      child: SizedBox(
+        width: panelWidth,
+        height: panelHeight,
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: Palette.panel,
+            border: Border.all(color: Palette.line),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      title,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  MasterButton(
+                    label: 'x',
+                    square: true,
+                    onTap: () => Navigator.pop(context),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Expanded(child: child),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MasterPre extends StatelessWidget {
+  const _MasterPre({
+    required this.text,
+    this.minHeight = 160,
+    this.maxHeight = 520,
+  });
+
+  final String text;
+  final double minHeight;
+  final double maxHeight;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: BoxConstraints(minHeight: minHeight, maxHeight: maxHeight),
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xfff8fafc),
+        border: Border.all(color: Palette.line),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: SingleChildScrollView(
+          child: Text(
+            text,
+            style: const TextStyle(
+              fontFamily: 'Consolas',
+              fontSize: 12,
+              height: 1.5,
+              color: Palette.text,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _IssueSummary extends StatelessWidget {
+  const _IssueSummary(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      text,
+      maxLines: 2,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(color: Palette.muted, fontSize: 12),
+    );
+  }
+}
+
+class _ReadmeBody extends StatelessWidget {
+  const _ReadmeBody();
+
+  @override
+  Widget build(BuildContext context) {
+    return const SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _ReadmeSection(
+            title: 'Destination Sync',
+            paragraphs: [
+              'Incremental 会关闭当前 source cycle，并且只同步当前选中的 destination。对 Realtime 目标它应用积压的事件路径；ZFS 源上如果有已验证的基准快照，会走 zfs diff 快路径只同步差异。',
+              'Full 是完整对账加同步，修复包括目标侧漂移在内的所有差异；开启 Mirror 时删除 source 不存在的多余路径。有两个实现，按 ZFS diff 配置自动选择：zfs diff 版在 src 和 dst 都在本机 ZFS 且有已验证基准快照时，只对账变化过的路径；对比版会并行扫描整棵树、对比清单、只传输缺失或不一致的文件。',
+              'Scan（对账不同步）：生成差异报告，不改动任何文件。与 Full 相同，ZFS diff 可用时只比对两侧基准以来变化的路径；否则两端并行全树扫描。',
+            ],
+          ),
+          _ReadmeSection(
+            title: '可靠性行为',
+            paragraphs: [
+              '复制过程中源文件被修改不会把目标标红：这些路径记为黄色 source_changing 问题，下一轮自动收敛。单个文件失败不会中断整批传输（最多容忍 20 个），连接断开才会立即终止。',
+              '跨机传输的每个文件在落盘前都做 blake3 端到端校验，先写临时文件再原子改名，中断后可断点续传。',
+            ],
+          ),
+          _ReadmeSection(
+            title: 'Restart Recovery',
+            paragraphs: [
+              '进程重启后会重新驱动未完成的 cycle：目标端已经存在且匹配的文件会跳过；缺失文件、不一致文件、类型变化，以及未完成的临时传输都会被修复。',
+              '注意：Realtime 目标的绿点表示“事件都已应用”，不代表整棵树被验证过。如果怀疑有漂移，先用 Scan 查看差异，再用 Full 对账修复。',
+            ],
+          ),
+          _ReadmeSection(
+            title: 'Example',
+            paragraphs: [
+              r'对于 \\?\C:\Users\tiger\Documents\xwechat_files 到 nas:/opt，实际 destination root 通常是 /opt/xwechat_files。',
+              '如果重启前已经同步了一部分，Incremental 会继续补齐缺口并修复不一致；Full 会对账并修复所有差异，并在 Mirror 开启时删除额外文件。',
+            ],
+            last: true,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ReadmeSection extends StatelessWidget {
+  const _ReadmeSection({
+    required this.title,
+    required this.paragraphs,
+    this.last = false,
+  });
+
+  final String title;
+  final List<String> paragraphs;
+  final bool last;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.only(bottom: last ? 0 : 12),
+      margin: EdgeInsets.only(bottom: last ? 0 : 12),
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: last
+              ? BorderSide.none
+              : const BorderSide(color: Palette.line),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
+          ),
+          ...paragraphs.map(
+            (text) => Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                text,
+                style: const TextStyle(
+                  color: Palette.muted,
+                  fontSize: 13,
+                  height: 1.55,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CompactInput extends StatelessWidget {
+  const _CompactInput({
+    this.controller,
+    this.initialValue,
+    this.placeholder,
+    this.onChanged,
+    this.numeric = false,
+  });
+
+  final TextEditingController? controller;
+  final String? initialValue;
+  final String? placeholder;
+  final ValueChanged<String>? onChanged;
+  final bool numeric;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 34,
+      child: TextFormField(
+        controller: controller,
+        initialValue: controller == null ? initialValue : null,
+        keyboardType: numeric ? TextInputType.number : TextInputType.text,
+        onChanged: onChanged,
+        style: const TextStyle(fontSize: 12),
+        decoration: InputDecoration(hintText: placeholder),
+      ),
+    );
+  }
+}
+
+class _CheckCell extends StatelessWidget {
+  const _CheckCell({required this.value, required this.onChanged, this.label});
+
+  final bool value;
+  final ValueChanged<bool> onChanged;
+  final String? label;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 34,
+      child: Row(
+        mainAxisAlignment: label == null
+            ? MainAxisAlignment.center
+            : MainAxisAlignment.start,
+        children: [
+          Checkbox(
+            value: value,
+            visualDensity: VisualDensity.compact,
+            onChanged: (next) => onChanged(next ?? false),
+          ),
+          if (label != null) Text(label!, style: const TextStyle(fontSize: 13)),
+        ],
+      ),
+    );
+  }
+}
+
 class _MachinesDialog extends StatefulWidget {
   const _MachinesDialog({
     required this.api,
     required this.machines,
+    required this.initialStatus,
     required this.onChanged,
   });
 
   final AutoSyncApi api;
   final List<Map<String, dynamic>> machines;
+  final Map<String, dynamic> initialStatus;
   final Future<void> Function() onChanged;
 
   @override
@@ -2477,8 +2704,10 @@ class _MachinesDialog extends StatefulWidget {
 class _MachinesDialogState extends State<_MachinesDialog> {
   String message = '';
   bool busy = false;
+  List<Map<String, dynamic>> rows = [];
   final id = TextEditingController();
   final name = TextEditingController();
+  final alias = TextEditingController();
   final host = TextEditingController();
   final port = TextEditingController(text: '18765');
   final sshUser = TextEditingController();
@@ -2487,9 +2716,17 @@ class _MachinesDialogState extends State<_MachinesDialog> {
   String os = 'linux';
 
   @override
+  void initState() {
+    super.initState();
+    final statusRows = _mapRefs(widget.initialStatus['machines']);
+    rows = statusRows.isNotEmpty ? statusRows : widget.machines;
+  }
+
+  @override
   void dispose() {
     id.dispose();
     name.dispose();
+    alias.dispose();
     host.dispose();
     port.dispose();
     sshUser.dispose();
@@ -2506,152 +2743,373 @@ class _MachinesDialogState extends State<_MachinesDialog> {
     try {
       await action();
       await widget.onChanged();
+      await _refresh();
       setState(() => message = '$label done');
     } catch (error) {
       setState(() => message = '$label failed: $error');
     } finally {
-      setState(() => busy = false);
+      if (mounted) {
+        setState(() => busy = false);
+      }
     }
+  }
+
+  Future<void> _refresh({bool discover = false}) async {
+    final status = await widget.api.getMachines(discover: discover);
+    final nextRows = _mapRefs(status['machines']);
+    if (mounted && nextRows.isNotEmpty) {
+      setState(() => rows = nextRows);
+    }
+  }
+
+  void _select(Map<String, dynamic> machine) {
+    id.text = _str(machine['id']);
+    name.text = _str(machine['name']);
+    alias.text = _str(machine['alias_name']);
+    host.text = _str(machine['host']);
+    port.text = _str(machine['port'], '18765');
+    sshUser.text = _str(machine['ssh_user']);
+    sshPort.text = _str(machine['ssh_port'], '22');
+    installDir.text = _str(machine['install_dir']);
+    setState(() => os = _str(machine['os'], 'linux'));
+  }
+
+  Future<void> _saveMachine() {
+    final machineId = id.text.trim().isNotEmpty
+        ? id.text.trim()
+        : (name.text.trim().isNotEmpty ? name.text.trim() : host.text.trim());
+    final machine = {
+      'id': machineId,
+      'name': name.text.trim(),
+      'alias_name': alias.text.trim(),
+      'host': host.text.trim(),
+      'port': int.tryParse(port.text) ?? 18765,
+      'ssh_user': sshUser.text.trim(),
+      'ssh_port': int.tryParse(sshPort.text) ?? 22,
+      'os': os,
+      'install_dir': installDir.text.trim(),
+      'enabled': true,
+      'manual': true,
+    };
+    return widget.api.addMachine(machine);
   }
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Machines'),
-      content: SizedBox(
-        width: 820,
-        height: 560,
-        child: Column(
-          children: [
-            Expanded(
+    return _MasterDialogFrame(
+      title: 'Machines',
+      width: 880,
+      maxHeight: 760,
+      child: Column(
+        children: [
+          Expanded(
+            child: Container(
+              decoration: const BoxDecoration(
+                border: Border(top: BorderSide(color: Palette.line)),
+              ),
               child: ListView(
-                children: widget.machines.map((machine) {
-                  final id = _str(machine['id']);
-                  return Container(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      border: Border.all(color: Palette.line),
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                '$id  ${_str(machine['alias_name'], _str(machine['name']))}',
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w700,
-                                ),
+                children: [
+                  const _MachineHeaderRow(),
+                  if (rows.isEmpty)
+                    const EmptyLine('No machines discovered')
+                  else
+                    ...rows.map((machine) {
+                      final machineId = _str(machine['id']);
+                      return _MachineRow(
+                        machine: machine,
+                        selected: machineId == id.text,
+                        onTap: () => _select(machine),
+                        onRemove: machineId == 'local' || busy
+                            ? null
+                            : () => _do(
+                                'Remove $machineId',
+                                () => widget.api.removeMachine(machineId),
                               ),
-                              const SizedBox(height: 3),
-                              Text(
-                                '${_str(machine['host'])}:${_str(machine['port'])}  ${_str(machine['os'])}  ${_str(machine['install_dir'])}',
-                                style: const TextStyle(color: Palette.muted),
-                              ),
-                            ],
-                          ),
-                        ),
-                        IconButton(
-                          tooltip: 'Remove',
-                          onPressed: id == 'local' || busy
-                              ? null
-                              : () => _do(
-                                  'Remove $id',
-                                  () => widget.api.removeMachine(id),
-                                ),
-                          icon: const Icon(Icons.delete_outline),
-                        ),
-                      ],
-                    ),
-                  );
-                }).toList(),
+                      );
+                    }),
+                ],
               ),
             ),
-            const Divider(height: 18),
-            Wrap(
-              spacing: 10,
-              runSpacing: 10,
+          ),
+          Container(
+            padding: const EdgeInsets.only(top: 12),
+            decoration: const BoxDecoration(
+              border: Border(top: BorderSide(color: Palette.line)),
+            ),
+            child: Column(
               children: [
-                SizedBox(width: 110, child: _input('ID', id)),
-                SizedBox(width: 130, child: _input('Name', name)),
-                SizedBox(width: 150, child: _input('Host', host)),
-                SizedBox(width: 85, child: _input('Port', port)),
-                SizedBox(
-                  width: 110,
-                  child: EnumField(
-                    label: 'OS',
-                    value: os,
-                    values: const ['linux', 'windows', 'openwrt'],
-                    onChanged: (value) => setState(() => os = value),
-                  ),
+                const Row(
+                  children: [
+                    _FormHead(width: 110, text: 'Name'),
+                    SizedBox(width: 6),
+                    _FormHead(width: 110, text: 'Alias'),
+                    SizedBox(width: 6),
+                    Expanded(child: _FormHead(text: 'Host')),
+                    SizedBox(width: 6),
+                    _FormHead(width: 72, text: 'Port'),
+                    SizedBox(width: 6),
+                    _FormHead(width: 96, text: 'SSH User'),
+                    SizedBox(width: 6),
+                    _FormHead(width: 68, text: 'SSH Port'),
+                    SizedBox(width: 6),
+                    _FormHead(width: 88, text: 'OS'),
+                  ],
                 ),
-                SizedBox(width: 110, child: _input('SSH user', sshUser)),
-                SizedBox(width: 85, child: _input('SSH port', sshPort)),
-                SizedBox(width: 180, child: _input('Install dir', installDir)),
+                const SizedBox(height: 6),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    SizedBox(
+                      width: 110,
+                      child: _CompactInput(controller: name),
+                    ),
+                    const SizedBox(width: 6),
+                    SizedBox(
+                      width: 110,
+                      child: _CompactInput(controller: alias),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(child: _CompactInput(controller: host)),
+                    const SizedBox(width: 6),
+                    SizedBox(
+                      width: 72,
+                      child: _CompactInput(controller: port, numeric: true),
+                    ),
+                    const SizedBox(width: 6),
+                    SizedBox(
+                      width: 96,
+                      child: _CompactInput(controller: sshUser),
+                    ),
+                    const SizedBox(width: 6),
+                    SizedBox(
+                      width: 68,
+                      child: _CompactInput(controller: sshPort, numeric: true),
+                    ),
+                    const SizedBox(width: 6),
+                    SizedBox(
+                      width: 88,
+                      height: 34,
+                      child: DropdownButtonFormField<String>(
+                        initialValue: os == 'windows' ? 'windows' : 'linux',
+                        decoration: const InputDecoration(),
+                        items: const [
+                          DropdownMenuItem(
+                            value: 'linux',
+                            child: Text('Linux'),
+                          ),
+                          DropdownMenuItem(
+                            value: 'windows',
+                            child: Text('Windows'),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) setState(() => os = value);
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(child: _IssueSummary(message)),
+                    MasterButton(
+                      label: 'Save',
+                      width: 72,
+                      primary: true,
+                      onTap: busy
+                          ? null
+                          : () => _do('Save machine', _saveMachine),
+                    ),
+                    const SizedBox(width: 6),
+                    MasterButton(
+                      label: 'Discover',
+                      width: 76,
+                      onTap: busy
+                          ? null
+                          : () =>
+                                _do('Discover', () => _refresh(discover: true)),
+                    ),
+                  ],
+                ),
               ],
             ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    message,
-                    style: const TextStyle(color: Palette.muted),
-                  ),
-                ),
-                TextButton.icon(
-                  onPressed: busy
-                      ? null
-                      : () => _do(
-                          'Discover',
-                          () => widget.api.getMachines(discover: true),
-                        ),
-                  icon: const Icon(Icons.wifi_find_outlined, size: 18),
-                  label: const Text('Discover'),
-                ),
-                FilledButton.icon(
-                  onPressed: busy
-                      ? null
-                      : () => _do('Add machine', () {
-                          final machine = {
-                            'id': id.text.trim(),
-                            'alias_name': name.text.trim(),
-                            'name': name.text.trim(),
-                            'host': host.text.trim(),
-                            'port': int.tryParse(port.text) ?? 18765,
-                            'ssh_user': sshUser.text.trim(),
-                            'ssh_port': int.tryParse(sshPort.text) ?? 22,
-                            'os': os,
-                            'install_dir': installDir.text.trim(),
-                            'enabled': true,
-                            'manual': true,
-                          };
-                          return widget.api.addMachine(machine);
-                        }),
-                  icon: const Icon(Icons.add, size: 18),
-                  label: const Text('Add'),
-                ),
-              ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FormHead extends StatelessWidget {
+  const _FormHead({required this.text, this.width});
+
+  final String text;
+  final double? width;
+
+  @override
+  Widget build(BuildContext context) {
+    final child = Text(
+      text,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(
+        color: Palette.muted,
+        fontSize: 11,
+        fontWeight: FontWeight.w700,
+      ),
+    );
+    return width == null ? child : SizedBox(width: width, child: child);
+  }
+}
+
+class _MachineHeaderRow extends StatelessWidget {
+  const _MachineHeaderRow();
+
+  @override
+  Widget build(BuildContext context) {
+    return const _MachineGrid(
+      head: true,
+      dot: SizedBox.shrink(),
+      name: Text('Name'),
+      host: Text('Host'),
+      port: Text('Port'),
+      ssh: Text('SSH'),
+      os: Text('OS'),
+      action: SizedBox.shrink(),
+    );
+  }
+}
+
+class _MachineRow extends StatelessWidget {
+  const _MachineRow({
+    required this.machine,
+    required this.selected,
+    required this.onTap,
+    required this.onRemove,
+  });
+
+  final Map<String, dynamic> machine;
+  final bool selected;
+  final VoidCallback onTap;
+  final VoidCallback? onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final online = _bool(machine['online'], _str(machine['id']) == 'local');
+    final name = _str(machine['name'], _str(machine['id']));
+    final alias = _str(machine['alias_name']);
+    final meta = alias.isNotEmpty && alias != name
+        ? alias
+        : _str(machine['id']);
+    final ssh = [
+      _str(machine['ssh_user']),
+      _str(machine['ssh_port']),
+    ].where((part) => part.isNotEmpty).join(':');
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        color: selected ? const Color(0xfff8fafc) : Colors.transparent,
+        child: _MachineGrid(
+          dot: Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(
+              color: online ? Palette.green : Palette.red,
+              shape: BoxShape.circle,
             ),
+          ),
+          name: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              Text(
+                meta,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Palette.muted, fontSize: 12),
+              ),
+            ],
+          ),
+          host: _GridText(_str(machine['host'])),
+          port: _GridText(_str(machine['port'])),
+          ssh: _GridText(ssh),
+          os: _GridText(_str(machine['os'])),
+          action: MasterButton(
+            label: 'x',
+            square: true,
+            danger: true,
+            onTap: onRemove,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MachineGrid extends StatelessWidget {
+  const _MachineGrid({
+    required this.dot,
+    required this.name,
+    required this.host,
+    required this.port,
+    required this.ssh,
+    required this.os,
+    required this.action,
+    this.head = false,
+  });
+
+  final Widget dot;
+  final Widget name;
+  final Widget host;
+  final Widget port;
+  final Widget ssh;
+  final Widget os;
+  final Widget action;
+  final bool head;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = TextStyle(
+      color: head ? Palette.muted : Palette.text,
+      fontSize: head ? 12 : 13,
+      fontWeight: head ? FontWeight.w600 : FontWeight.w400,
+    );
+    return DefaultTextStyle.merge(
+      style: style,
+      child: Container(
+        constraints: const BoxConstraints(minHeight: 38),
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        decoration: const BoxDecoration(
+          border: Border(bottom: BorderSide(color: Palette.line)),
+        ),
+        child: Row(
+          children: [
+            SizedBox(width: 10, child: Center(child: dot)),
+            const SizedBox(width: 6),
+            Expanded(flex: 135, child: name),
+            const SizedBox(width: 6),
+            Expanded(flex: 110, child: host),
+            const SizedBox(width: 6),
+            SizedBox(width: 48, child: port),
+            const SizedBox(width: 6),
+            Expanded(flex: 95, child: ssh),
+            const SizedBox(width: 6),
+            SizedBox(width: 58, child: os),
+            const SizedBox(width: 6),
+            SizedBox(width: 52, child: action),
           ],
         ),
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Close'),
-        ),
-      ],
-    );
-  }
-
-  Widget _input(String label, TextEditingController controller) {
-    return TextField(
-      controller: controller,
-      decoration: InputDecoration(labelText: label),
     );
   }
 }
@@ -2670,11 +3128,24 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   Map<String, dynamic> status = {};
   String message = '';
   bool loading = true;
+  bool busy = false;
+  bool autoPush = false;
+  final gitDir = TextEditingController();
+  final splitMb = TextEditingController(text: '0');
+
+  List<Map<String, dynamic>> get hosts => _mapRefs(cfg['hosts']);
 
   @override
   void initState() {
     super.initState();
     _load();
+  }
+
+  @override
+  void dispose() {
+    gitDir.dispose();
+    splitMb.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -2683,9 +3154,16 @@ class _CollectorDialogState extends State<_CollectorDialog> {
       final nextStatus = await widget.api.collectorStatus();
       if (mounted) {
         setState(() {
-          cfg = nextCfg;
+          cfg = Map<String, dynamic>.from(nextCfg);
+          cfg['hosts'] = _mapRefs(
+            nextCfg['hosts'],
+          ).map((host) => Map<String, dynamic>.from(host)).toList();
           status = nextStatus;
+          gitDir.text = _str(cfg['git_dir']);
+          splitMb.text = _str(cfg['split_threshold_mb'], '0');
+          autoPush = _bool(cfg['auto_commit_push']);
           loading = false;
+          message = '';
         });
       }
     } catch (error) {
@@ -2698,84 +3176,558 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     }
   }
 
+  Future<void> _save() async {
+    cfg['git_dir'] = gitDir.text.trim();
+    cfg['split_threshold_mb'] = int.tryParse(splitMb.text) ?? 0;
+    cfg['auto_commit_push'] = autoPush;
+    await widget.api.saveCollectorConfig(cfg);
+  }
+
+  Future<void> _run() async {
+    setState(() {
+      busy = true;
+      message = 'Running...';
+    });
+    try {
+      await _save();
+      await widget.api.collectorRun();
+      await _load();
+    } catch (error) {
+      setState(() => message = '$error');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  void _addHost() {
+    final list = hosts;
+    list.add({
+      'name': '',
+      'hostname': '',
+      'user': 'root',
+      'port': 22,
+      'identity_file': '',
+      'root': '',
+      'paths': <String>[],
+      'exclude': <String>[],
+      'enabled': true,
+      'deploy_script': '',
+    });
+    setState(() => cfg['hosts'] = list);
+  }
+
+  Future<void> _showConfig() async {
+    await _save();
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => _MasterDialogFrame(
+        title: 'Collector Config',
+        width: 900,
+        maxHeight: 720,
+        child: _MasterPre(
+          text: const JsonEncoder.withIndent('  ').convert(cfg),
+          maxHeight: 640,
+        ),
+      ),
+    );
+  }
+
+  String _runState() {
+    if (loading) return 'Loading...';
+    if (message.isNotEmpty) return message;
+    if (_bool(status['running'])) return 'Running...';
+    if (status.containsKey('ok') && _bool(status['ok'])) return 'Done';
+    if (status.containsKey('ok') && !_bool(status['ok'], true)) {
+      return 'Finished with errors';
+    }
+    return '';
+  }
+
   @override
   Widget build(BuildContext context) {
-    final controller = TextEditingController(
-      text: const JsonEncoder.withIndent('  ').convert(cfg),
-    );
-    return AlertDialog(
-      title: const Text('Collector'),
-      content: SizedBox(
-        width: 760,
-        height: 560,
-        child: loading
-            ? const Center(child: CircularProgressIndicator())
-            : Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Wrap(
-                    spacing: 8,
-                    children: [
-                      StatusPill(
-                        text: _bool(status['running']) ? 'running' : 'idle',
-                        color: _bool(status['running'])
-                            ? Palette.warn
-                            : Palette.green,
+    final log = _list(status['log']).map((line) => '$line').join('\n');
+    return _MasterDialogFrame(
+      title: 'Collector',
+      width: 900,
+      maxHeight: 860,
+      child: loading
+          ? const Center(child: CircularProgressIndicator())
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const _MasterLabel('Git repository dir'),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: _CompactInput(controller: gitDir),
+                              ),
+                              const SizedBox(width: 6),
+                              MasterButton(
+                                label: '...',
+                                square: true,
+                                onTap: null,
+                              ),
+                            ],
+                          ),
+                        ],
                       ),
-                      if (message.isNotEmpty)
-                        StatusPill(text: message, color: Palette.muted),
+                    ),
+                    const SizedBox(width: 12),
+                    SizedBox(
+                      width: 120,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const _MasterLabel('Split at (MiB)'),
+                          _CompactInput(controller: splitMb, numeric: true),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    SizedBox(
+                      width: 150,
+                      child: _CheckCell(
+                        value: autoPush,
+                        label: 'Auto commit & push',
+                        onChanged: (next) => setState(() => autoPush = next),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.only(top: 10),
+                  decoration: const BoxDecoration(
+                    border: Border(top: BorderSide(color: Palette.line)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Hosts',
+                          style: TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                      MasterButton(
+                        label: '+ Add host',
+                        width: 96,
+                        onTap: busy ? null : _addHost,
+                      ),
                     ],
                   ),
-                  const SizedBox(height: 10),
-                  Expanded(
-                    child: TextField(
-                      controller: controller,
-                      expands: true,
-                      maxLines: null,
-                      minLines: null,
-                      style: const TextStyle(
-                        fontFamily: 'Consolas',
-                        fontSize: 12,
-                      ),
-                      decoration: const InputDecoration(
-                        border: OutlineInputBorder(),
+                ),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: SizedBox(
+                      width: 826,
+                      child: ListView(
+                        children: [
+                          const _CollectorHostHeader(),
+                          if (hosts.isEmpty)
+                            const EmptyLine(
+                              'No hosts yet - click "+ Add host".',
+                            )
+                          else
+                            ...hosts.asMap().entries.map(
+                              (entry) => _CollectorHostRow(
+                                index: entry.key,
+                                host: entry.value,
+                                onChanged: () => setState(() {}),
+                                onRemove: () {
+                                  final next = hosts;
+                                  next.removeAt(entry.key);
+                                  setState(() => cfg['hosts'] = next);
+                                },
+                                onPaths: () async {
+                                  await showDialog<void>(
+                                    context: context,
+                                    builder: (context) => _CollectorPathsDialog(
+                                      host: entry.value,
+                                      onChanged: () => setState(() {}),
+                                    ),
+                                  );
+                                },
+                                onDeploy: () async {
+                                  await showDialog<void>(
+                                    context: context,
+                                    builder: (context) =>
+                                        _CollectorDeployDialog(
+                                          host: entry.value,
+                                          onChanged: () => setState(() {}),
+                                        ),
+                                  );
+                                },
+                              ),
+                            ),
+                        ],
                       ),
                     ),
                   ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    MasterButton(
+                      label: 'Run',
+                      width: 72,
+                      primary: true,
+                      onTap: busy ? null : _run,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(child: _IssueSummary(_runState())),
+                    MasterButton(
+                      label: 'Config',
+                      width: 78,
+                      onTap: busy ? null : _showConfig,
+                    ),
+                  ],
+                ),
+                if (log.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: 120,
+                    child: _MasterPre(text: log, maxHeight: 120),
+                  ),
                 ],
+              ],
+            ),
+    );
+  }
+}
+
+class _CollectorHostHeader extends StatelessWidget {
+  const _CollectorHostHeader();
+
+  @override
+  Widget build(BuildContext context) {
+    return const _CollectorHostGrid(
+      head: true,
+      cells: [
+        Text('Host'),
+        Text('HostName'),
+        Text('User'),
+        Text('Port'),
+        Text('IdentityFile'),
+        Text('Root dir'),
+        Text('Files'),
+        Text(''),
+        Text(''),
+        Text(''),
+        Text(''),
+      ],
+    );
+  }
+}
+
+class _CollectorHostRow extends StatelessWidget {
+  const _CollectorHostRow({
+    required this.index,
+    required this.host,
+    required this.onChanged,
+    required this.onRemove,
+    required this.onPaths,
+    required this.onDeploy,
+  });
+
+  final int index;
+  final Map<String, dynamic> host;
+  final VoidCallback onChanged;
+  final VoidCallback onRemove;
+  final VoidCallback onPaths;
+  final VoidCallback onDeploy;
+
+  @override
+  Widget build(BuildContext context) {
+    final pathCount = _list(
+      host['paths'],
+    ).where((path) => _str(path).trim().isNotEmpty).length;
+    void setField(String key, dynamic value) {
+      host[key] = value;
+      onChanged();
+    }
+
+    return _CollectorHostGrid(
+      cells: [
+        _CompactInput(
+          initialValue: _str(host['name']),
+          placeholder: 'alias',
+          onChanged: (value) => setField('name', value),
+        ),
+        _CompactInput(
+          initialValue: _str(host['hostname']),
+          placeholder: '1.2.3.4',
+          onChanged: (value) => setField('hostname', value),
+        ),
+        _CompactInput(
+          initialValue: _str(host['user']),
+          placeholder: 'root',
+          onChanged: (value) => setField('user', value),
+        ),
+        _CompactInput(
+          initialValue: _str(host['port'], '22'),
+          numeric: true,
+          onChanged: (value) => setField('port', int.tryParse(value) ?? 22),
+        ),
+        _CompactInput(
+          initialValue: _str(host['identity_file']),
+          placeholder: '~/.ssh/id_ed25519',
+          onChanged: (value) => setField('identity_file', value),
+        ),
+        Row(
+          children: [
+            Expanded(
+              child: _CompactInput(
+                initialValue: _str(host['root']),
+                onChanged: (value) => setField('root', value),
               ),
+            ),
+            const SizedBox(width: 6),
+            MasterButton(label: '...', square: true, onTap: null),
+          ],
+        ),
+        MasterButton(label: 'Files ($pathCount)', onTap: onPaths),
+        MasterButton(label: 'E', square: true, onTap: onDeploy),
+        MasterButton(label: '>', square: true, accent: true, onTap: onDeploy),
+        _CheckCell(
+          value: _bool(host['enabled'], true),
+          onChanged: (value) => setField('enabled', value),
+        ),
+        MasterButton(label: 'x', square: true, danger: true, onTap: onRemove),
+      ],
+    );
+  }
+}
+
+class _CollectorHostGrid extends StatelessWidget {
+  const _CollectorHostGrid({required this.cells, this.head = false});
+
+  final List<Widget> cells;
+  final bool head;
+
+  @override
+  Widget build(BuildContext context) {
+    const widths = <double>[80, 112, 68, 72, 132, 150, 72, 30, 30, 24, 24];
+    final style = TextStyle(
+      color: head ? Palette.muted : Palette.text,
+      fontSize: head ? 11 : 12,
+    );
+    return DefaultTextStyle.merge(
+      style: style,
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Row(
+          children: [
+            for (var i = 0; i < widths.length; i++) ...[
+              SizedBox(width: widths[i], child: cells[i]),
+              if (i != widths.length - 1) const SizedBox(width: 6),
+            ],
+          ],
+        ),
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Close'),
-        ),
-        TextButton.icon(
-          onPressed: () async {
-            try {
-              await widget.api.collectorRun();
-              await _load();
-            } catch (error) {
-              setState(() => message = '$error');
-            }
-          },
-          icon: const Icon(Icons.play_arrow_outlined, size: 18),
-          label: const Text('Run'),
-        ),
-        FilledButton.icon(
-          onPressed: () async {
-            try {
-              await widget.api.saveCollectorConfig(
-                _map(jsonDecode(controller.text)),
-              );
-              await _load();
-            } catch (error) {
-              setState(() => message = '$error');
-            }
-          },
-          icon: const Icon(Icons.save_outlined, size: 18),
-          label: const Text('Save'),
-        ),
+    );
+  }
+}
+
+class _CollectorPathsDialog extends StatefulWidget {
+  const _CollectorPathsDialog({required this.host, required this.onChanged});
+
+  final Map<String, dynamic> host;
+  final VoidCallback onChanged;
+
+  @override
+  State<_CollectorPathsDialog> createState() => _CollectorPathsDialogState();
+}
+
+class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
+  List<String> get paths =>
+      _list(widget.host['paths']).map((p) => '$p').toList();
+  List<String> get exclude =>
+      _list(widget.host['exclude']).map((p) => '$p').toList();
+
+  void _setList(String key, List<String> value) {
+    widget.host[key] = value;
+    widget.onChanged();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final label = _str(
+      widget.host['name'],
+      _str(widget.host['hostname'], 'host'),
+    ).trim();
+    return _MasterDialogFrame(
+      title: 'Files & folders - $label',
+      width: 780,
+      maxHeight: 720,
+      child: ListView(
+        children: [
+          const _IssueSummary('Collect these paths'),
+          const SizedBox(height: 6),
+          _PathListEditor(
+            items: paths,
+            onChanged: (items) => setState(() => _setList('paths', items)),
+          ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: MasterButton(
+              label: 'Browse',
+              width: 72,
+              onTap: () => setState(() => _setList('paths', [...paths, ''])),
+            ),
+          ),
+          const SizedBox(height: 12),
+          const _IssueSummary('Ignore (skip these and everything under them)'),
+          const SizedBox(height: 6),
+          _PathListEditor(
+            items: exclude,
+            onChanged: (items) => setState(() => _setList('exclude', items)),
+          ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: MasterButton(
+              label: 'Browse',
+              width: 72,
+              onTap: () =>
+                  setState(() => _setList('exclude', [...exclude, ''])),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PathListEditor extends StatelessWidget {
+  const _PathListEditor({required this.items, required this.onChanged});
+
+  final List<String> items;
+  final ValueChanged<List<String>> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    if (items.isEmpty) {
+      return const EmptyLine('(empty)');
+    }
+    return Column(
+      children: items.asMap().entries.map((entry) {
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Row(
+            children: [
+              Expanded(
+                child: _CompactInput(
+                  initialValue: entry.value,
+                  placeholder: '/remote/absolute/path',
+                  onChanged: (value) {
+                    final next = [...items];
+                    next[entry.key] = value;
+                    onChanged(next);
+                  },
+                ),
+              ),
+              const SizedBox(width: 6),
+              MasterButton(
+                label: 'x',
+                square: true,
+                danger: true,
+                onTap: () {
+                  final next = [...items]..removeAt(entry.key);
+                  onChanged(next);
+                },
+              ),
+            ],
+          ),
+        );
+      }).toList(),
+    );
+  }
+}
+
+class _CollectorDeployDialog extends StatefulWidget {
+  const _CollectorDeployDialog({required this.host, required this.onChanged});
+
+  final Map<String, dynamic> host;
+  final VoidCallback onChanged;
+
+  @override
+  State<_CollectorDeployDialog> createState() => _CollectorDeployDialogState();
+}
+
+class _CollectorDeployDialogState extends State<_CollectorDeployDialog> {
+  late final TextEditingController script;
+
+  @override
+  void initState() {
+    super.initState();
+    script = TextEditingController(text: _str(widget.host['deploy_script']));
+  }
+
+  @override
+  void dispose() {
+    widget.host['deploy_script'] = script.text;
+    widget.onChanged();
+    script.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final label = _str(
+      widget.host['name'],
+      _str(widget.host['hostname'], 'host'),
+    ).trim();
+    return _MasterDialogFrame(
+      title: 'Deploy - $label',
+      width: 900,
+      maxHeight: 720,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const _IssueSummary(
+            'This script runs on this machine and deploys collected files back to the host.',
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: TextField(
+              controller: script,
+              expands: true,
+              maxLines: null,
+              minLines: null,
+              style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+              decoration: const InputDecoration(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TaskHeaderRow extends StatelessWidget {
+  const _TaskHeaderRow();
+
+  @override
+  Widget build(BuildContext context) {
+    return const _TaskGrid(
+      head: true,
+      cells: [
+        Text('ID'),
+        Text('Status'),
+        Text('Type'),
+        Text('Target'),
+        Text('Started'),
+        Text('Duration'),
+        Text('Result'),
       ],
     );
   }
@@ -2789,38 +3741,147 @@ class _TaskRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final status = _str(task['status']);
-    final color = status == 'success'
-        ? Palette.green
-        : status == 'running'
-        ? Palette.warn
-        : status == 'failed'
-        ? Palette.red
-        : Palette.muted;
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 7),
-      decoration: const BoxDecoration(
-        border: Border(bottom: BorderSide(color: Palette.line)),
-      ),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 90,
-            child: StatusPill(text: status, color: color),
+    return _TaskGrid(
+      cells: [
+        _GridText(_str(task['id'])),
+        Text(
+          status,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: _taskStatusColor(status),
+            fontWeight: FontWeight.w600,
           ),
-          Expanded(
-            child: Text(
-              '${_str(task['kind'])} ${_str(task['source_id'])} -> ${_str(task['destination_id'])}',
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-          Text(
-            _str(task['started_at']),
-            style: const TextStyle(color: Palette.muted, fontSize: 12),
-          ),
-        ],
+        ),
+        _GridText(_taskKindLabel(_str(task['kind']))),
+        _GridText(
+          '${_str(task['source_id'])} -> ${_str(task['destination_id'])}',
+        ),
+        _GridText(_str(task['started_at'])),
+        _GridText(_taskDurationLabel(task)),
+        _GridText(_taskResultLabel(task)),
+      ],
+    );
+  }
+}
+
+class _TaskGrid extends StatelessWidget {
+  const _TaskGrid({required this.cells, this.head = false});
+
+  final List<Widget> cells;
+  final bool head;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = TextStyle(
+      color: head ? Palette.muted : Palette.text,
+      fontSize: head ? 12 : 13,
+      fontWeight: head ? FontWeight.w600 : FontWeight.w400,
+    );
+    return DefaultTextStyle.merge(
+      style: style,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 5),
+        decoration: const BoxDecoration(
+          border: Border(bottom: BorderSide(color: Palette.line)),
+        ),
+        child: Row(
+          children: [
+            SizedBox(width: 46, child: cells[0]),
+            const SizedBox(width: 8),
+            SizedBox(width: 88, child: cells[1]),
+            const SizedBox(width: 8),
+            SizedBox(width: 110, child: cells[2]),
+            const SizedBox(width: 8),
+            Expanded(flex: 10, child: cells[3]),
+            const SizedBox(width: 8),
+            SizedBox(width: 150, child: cells[4]),
+            const SizedBox(width: 8),
+            SizedBox(width: 90, child: cells[5]),
+            const SizedBox(width: 8),
+            Expanded(flex: 14, child: cells[6]),
+          ],
+        ),
       ),
     );
   }
+}
+
+class _GridText extends StatelessWidget {
+  const _GridText(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(text, maxLines: 1, overflow: TextOverflow.ellipsis);
+  }
+}
+
+Color _taskStatusColor(String status) {
+  switch (status) {
+    case 'running':
+      return const Color(0xff2563eb);
+    case 'success':
+      return Palette.accent;
+    case 'failed':
+    case 'aborted':
+      return Palette.red;
+    case 'cancelled':
+    case 'warning':
+      return const Color(0xffb45309);
+    default:
+      return Palette.text;
+  }
+}
+
+String _taskKindLabel(String kind) {
+  switch (kind) {
+    case 'compare':
+      return 'Compare';
+    case 'incremental':
+      return 'Incremental';
+    case 'full':
+      return 'Full';
+    case 'repair_scan':
+      return 'Repair';
+    case 'repair_full':
+      return 'Repair -> Full';
+    default:
+      return kind.isEmpty ? '-' : kind;
+  }
+}
+
+String _taskDurationLabel(Map<String, dynamic> task) {
+  if (_str(task['status']) == 'running') {
+    return 'running';
+  }
+  final ms = task['duration_ms'];
+  if (ms == null) return '-';
+  final seconds =
+      (ms is num ? ms.toDouble() : double.tryParse('$ms') ?? 0) / 1000;
+  if (seconds < 60) return '${seconds.round()}s';
+  final minutes = seconds ~/ 60;
+  if (minutes < 60) return '${minutes}m ${seconds.round() % 60}s';
+  return '${minutes ~/ 60}h ${minutes % 60}m';
+}
+
+String _taskResultLabel(Map<String, dynamic> task) {
+  final parts = <String>[];
+  if (_str(task['kind']) == 'compare') {
+    final diffs = _int(task['differences']);
+    if (_str(task['status']) == 'success') {
+      parts.add('$diffs differences');
+    }
+    final entries = _int(task['entries_scanned']);
+    if (entries > 0) parts.add('$entries entries');
+  } else {
+    final synced = _int(task['files_synced']);
+    if (synced > 0) parts.add('$synced files');
+  }
+  final error = _str(task['error']);
+  if (error.isNotEmpty) parts.add(error);
+  return parts.isEmpty ? '-' : parts.join(' · ');
 }
 
 class _StatusBar extends StatelessWidget {
@@ -2829,63 +3890,84 @@ class _StatusBar extends StatelessWidget {
     required this.runtimeStatus,
     required this.activity,
     required this.saving,
+    required this.onConfig,
   });
 
   final String message;
   final Map<String, dynamic> runtimeStatus;
   final Map<String, dynamic> activity;
   final bool saving;
+  final VoidCallback onConfig;
 
   @override
   Widget build(BuildContext context) {
-    final syncing = _bool(runtimeStatus['syncing']);
-    final phase = _str(
-      runtimeStatus['sync_phase'],
-      _str(runtimeStatus['phase']),
-    );
-    final build = _str(_map(runtimeStatus['build'])['version']);
     final errors = _list(runtimeStatus['config_errors']);
+    final build = _map(runtimeStatus['build']);
+    final commit = _str(build['commit'], _str(build['version'], 'unknown'));
+    final time = _str(build['commit_time_beijing'], 'unknown');
     return Container(
-      height: 34,
-      padding: const EdgeInsets.symmetric(horizontal: 14),
+      height: 42,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
       decoration: const BoxDecoration(
-        color: Palette.panel,
+        color: Color(0xf5ffffff),
         border: Border(top: BorderSide(color: Palette.line)),
       ),
       child: Row(
         children: [
-          Icon(
-            syncing ? Icons.sync : Icons.check_circle_outline,
-            size: 17,
-            color: syncing ? Palette.warn : Palette.green,
+          MasterIconButton(
+            kind: MasterIconKind.gear,
+            color: Palette.accent,
+            onTap: onConfig,
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 10),
           Expanded(
             child: Text(
-              message.isNotEmpty
-                  ? message
-                  : syncing
-                  ? 'Syncing ${phase.isEmpty ? '' : phase}'
-                  : 'Idle',
+              _statusBarMessage(),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
               style: const TextStyle(color: Palette.muted, fontSize: 12),
             ),
           ),
-          if (errors.isNotEmpty)
-            Text(
-              '${errors.length} config errors',
-              style: const TextStyle(color: Palette.red, fontSize: 12),
-            ),
-          if (build.isNotEmpty) ...[
-            const SizedBox(width: 14),
-            Text(
-              build,
-              style: const TextStyle(color: Palette.muted, fontSize: 12),
+          if (errors.isNotEmpty) ...[
+            const SizedBox(width: 10),
+            Container(
+              constraints: const BoxConstraints(maxWidth: 320),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(
+                color: const Color(0x1fdc2626),
+                border: Border.all(color: const Color(0xffdc2626)),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                '${errors.length} config errors',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Color(0xffdc2626),
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
             ),
           ],
+          const SizedBox(width: 10),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 260),
+            child: Text(
+              '$commit · $time',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.right,
+              style: const TextStyle(
+                color: Palette.muted,
+                fontFamily: 'Consolas',
+                fontSize: 12,
+              ),
+            ),
+          ),
           if (saving) ...[
-            const SizedBox(width: 12),
+            const SizedBox(width: 10),
             const SizedBox(
               width: 14,
               height: 14,
@@ -2895,6 +3977,43 @@ class _StatusBar extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  String _statusBarMessage() {
+    final transfer = _map(runtimeStatus['transfer']);
+    if (transfer.isNotEmpty) {
+      final dst = _str(
+        transfer['destination_id'],
+        _str(transfer['destination']),
+      );
+      final file = _str(transfer['rel_path'], '-');
+      final speed = _str(transfer['bytes_per_sec']).isEmpty
+          ? ''
+          : '${_str(transfer['bytes_per_sec'])} B/s';
+      return [
+        'Backing up',
+        dst,
+        file,
+        speed,
+      ].where((part) => part.isNotEmpty).join(' · ');
+    }
+    final scan = _map(runtimeStatus['scan']);
+    if (scan.isNotEmpty) {
+      final current = _str(scan['current_path'], _str(scan['root_path']));
+      final entries = _int(scan['entries_seen']);
+      return entries > 0
+          ? 'Scanning $current · $entries entries'
+          : 'Scanning $current';
+    }
+    if (saving) return 'Saving config...';
+    if (message.isNotEmpty) return message;
+    final syncing = _bool(runtimeStatus['syncing']);
+    final phase = _str(
+      runtimeStatus['sync_phase'],
+      _str(runtimeStatus['phase']),
+    );
+    if (syncing) return 'Syncing ${phase.isEmpty ? '' : phase}'.trim();
+    return 'Ready';
   }
 }
 
