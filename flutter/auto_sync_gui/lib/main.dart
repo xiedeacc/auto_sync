@@ -1047,6 +1047,7 @@ class _MasterSourceGroup extends StatelessWidget {
                   ],
                 ),
                 right: Row(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
                     _MasterTextField(
                       label: 'Latest Cycle',
@@ -1241,6 +1242,7 @@ class _MasterDestinationRow extends StatelessWidget {
             ],
           ),
           right: Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
               _MasterActionStack(
                 label: '',
@@ -1278,10 +1280,15 @@ class _MasterDestinationRow extends StatelessWidget {
                 onCommit: (_) {},
               ),
               const SizedBox(width: 8),
-              MasterIconButton(
-                kind: MasterIconKind.gear,
-                color: Palette.text,
-                onTap: () {},
+              _MasterActionStack(
+                label: '',
+                children: [
+                  MasterIconButton(
+                    kind: MasterIconKind.gear,
+                    color: Palette.text,
+                    onTap: () {},
+                  ),
+                ],
               ),
               const SizedBox(width: 8),
               _MasterActionStack(
@@ -1348,7 +1355,7 @@ class _MasterSyncRow extends StatelessWidget {
                   : SizedBox(
                       width: rightWidth,
                       child: Align(
-                        alignment: Alignment.centerLeft,
+                        alignment: Alignment.centerRight,
                         child: right,
                       ),
                     ),
