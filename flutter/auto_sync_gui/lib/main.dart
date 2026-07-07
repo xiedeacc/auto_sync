@@ -218,6 +218,9 @@ bool _bool(dynamic value, [bool fallback = false]) =>
 String _normalizePath(String value) =>
     value.trim().replaceAll(RegExp(r'[\\/]+$'), '');
 
+bool _isStartupConnectionMessage(String value) =>
+    value.contains('SocketException') && value.contains('127.0.0.1:18765');
+
 int _int(dynamic value, [int fallback = 0]) {
   if (value is int) {
     return value;
@@ -394,6 +397,9 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
         setState(() {
           statuses = nextStatus;
           syncActivity = nextActivity;
+          if (_isStartupConnectionMessage(message)) {
+            message = '';
+          }
         });
       }
     } catch (_) {}
@@ -406,7 +412,12 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     try {
       final next = await widget.api.getRuntimeStatus();
       if (mounted) {
-        setState(() => runtimeStatus = next);
+        setState(() {
+          runtimeStatus = next;
+          if (_isStartupConnectionMessage(message)) {
+            message = '';
+          }
+        });
       }
     } catch (_) {}
   }
