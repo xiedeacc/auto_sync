@@ -1589,6 +1589,25 @@ th {
   gap: 10px;
 }
 
+.collector-exclude-label {
+  display: block;
+  margin: 8px 0 4px;
+  font-size: 11px;
+}
+
+.collector-exclude {
+  width: 100%;
+  min-height: 70px;
+  resize: vertical;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  flex: 0 0 auto;
+}
+
 .collector-paths-list {
   display: grid;
   gap: 6px;

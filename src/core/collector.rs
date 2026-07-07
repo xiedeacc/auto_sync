@@ -262,14 +262,19 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     let conn = SshConn::from_host(host);
     log(state, format!("=== host {label} ({}) ===", conn.dest()));
 
+    let excludes = normalize_excludes(&host.exclude);
     let mut failures = 0;
     let mut pulled = Vec::new();
     for path in &host.paths {
-        let remote = path.trim();
+        let remote = path.trim_end_matches('/').trim();
         if remote.is_empty() {
             continue;
         }
-        match pull_path(host, &conn, remote, state) {
+        if is_excluded(remote, &excludes) {
+            log(state, format!("  ignore {remote} (excluded)"));
+            continue;
+        }
+        match pull_path(host, &conn, remote, &excludes, state) {
             Ok(()) => {
                 log(state, format!("  ok {remote}"));
                 pulled.push(remote.to_string());
@@ -283,11 +288,34 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     // Windows can't preserve Unix modes on the pulled files, so capture them
     // from the remote into a per-host cache that `deploy` replays.
     if !pulled.is_empty() {
-        if let Err(err) = record_host_perms(host, &conn, &pulled, state) {
+        if let Err(err) = record_host_perms(host, &conn, &pulled, &excludes, state) {
             log(state, format!("  perms: could not record: {err:#}"));
         }
     }
     failures
+}
+
+/// Normalize exclude entries to absolute paths without a trailing slash.
+fn normalize_excludes(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .map(|e| e.trim().trim_end_matches('/').to_string())
+        .filter(|e| !e.is_empty())
+        .collect()
+}
+
+/// True if `path` is equal to, or nested under, any exclude entry.
+fn is_excluded(path: &str, excludes: &[String]) -> bool {
+    let path = path.trim_end_matches('/');
+    excludes
+        .iter()
+        .any(|e| path == e || path.starts_with(&format!("{e}/")))
+}
+
+/// True if any exclude entry lives strictly *under* `dir` (so `dir` must be
+/// pulled selectively rather than as one `scp -r`).
+fn has_exclude_under(dir: &str, excludes: &[String]) -> bool {
+    let prefix = format!("{}/", dir.trim_end_matches('/'));
+    excludes.iter().any(|e| e.starts_with(&prefix))
 }
 
 /// Capture the Unix mode of every file/dir under each pulled path and write a
@@ -299,6 +327,7 @@ fn record_host_perms(
     host: &CollectorHost,
     conn: &SshConn,
     paths: &[String],
+    excludes: &[String],
     state: &Arc<Mutex<CollectorRunState>>,
 ) -> Result<()> {
     let mut lines: Vec<String> = Vec::new();
@@ -320,6 +349,9 @@ fi"
         };
         for line in out.lines() {
             if let Some((mode, entry_path)) = parse_perm_line(line) {
+                if is_excluded(&entry_path, excludes) {
+                    continue;
+                }
                 lines.push(format!("{mode} {entry_path}"));
             }
         }
@@ -384,6 +416,7 @@ fn pull_path(
     host: &CollectorHost,
     conn: &SshConn,
     remote: &str,
+    excludes: &[String],
     state: &Arc<Mutex<CollectorRunState>>,
 ) -> Result<()> {
     let parent_components = remote_parent_components(remote)?;
@@ -393,18 +426,73 @@ fn pull_path(
     }
     fs::create_dir_all(&local_parent)
         .with_context(|| format!("creating {}", local_parent.display()))?;
-    log(state, format!("  scp {}:{} -> {}", conn.dest(), remote, local_parent.display()));
 
+    // If an excluded path lives inside this directory, walk it and copy only the
+    // children that are not (or do not contain) excludes — so excluded subtrees
+    // are never transferred.
+    if has_exclude_under(remote, excludes) {
+        let leaf = remote.rsplit('/').next().unwrap_or(remote);
+        let local_dir = local_parent.join(leaf);
+        return pull_dir_excluding(conn, remote, &local_dir, excludes, state);
+    }
+
+    log(state, format!("  scp {}:{} -> {}", conn.dest(), remote, local_parent.display()));
+    scp_recursive(conn, remote, &local_parent)
+}
+
+/// Copy `remote` (a file or whole directory subtree) into `local_dest` with
+/// `scp -r -p`. `local_dest` is the parent that will contain the copied leaf.
+fn scp_recursive(conn: &SshConn, remote: &str, local_dest: &Path) -> Result<()> {
     let mut cmd = scp_command(conn);
     cmd.arg("-r").arg("-p");
     cmd.arg(format!("{}:{}", conn.dest(), remote));
-    cmd.arg(&local_parent);
+    cmd.arg(local_dest);
     let output = cmd.output().context("running scp")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("scp failed: {}", stderr.trim());
+        bail!("scp failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(())
+}
+
+/// Pull `remote_dir` into `local_dir`, honoring `excludes`: skip excluded
+/// children outright, recurse into children that themselves contain an exclude,
+/// and `scp -r` the rest wholesale.
+fn pull_dir_excluding(
+    conn: &SshConn,
+    remote_dir: &str,
+    local_dir: &Path,
+    excludes: &[String],
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<()> {
+    fs::create_dir_all(local_dir)
+        .with_context(|| format!("creating {}", local_dir.display()))?;
+    let names = list_remote_names(conn, remote_dir)?;
+    for name in names {
+        let child = join_remote(remote_dir, &name);
+        if is_excluded(&child, excludes) {
+            log(state, format!("  ignore {child} (excluded)"));
+            continue;
+        }
+        if has_exclude_under(&child, excludes) {
+            pull_dir_excluding(conn, &child, &local_dir.join(&name), excludes, state)?;
+        } else {
+            scp_recursive(conn, &child, local_dir)?;
+        }
+    }
+    Ok(())
+}
+
+/// List the immediate entry names (files and dirs, including dotfiles) of a
+/// remote directory. Uses `ls -A1` piped through a read loop so an unmatched
+/// glob never aborts under zsh.
+fn list_remote_names(conn: &SshConn, dir: &str) -> Result<Vec<String>> {
+    let cmd = format!("cd -- {} 2>/dev/null && ls -A1 2>/dev/null", shell_quote(dir));
+    let out = ssh_capture(conn, &cmd)?;
+    Ok(out
+        .lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .filter(|l| !l.is_empty() && l != "." && l != "..")
+        .collect())
 }
 
 // --- deploy (run the host's deploy script on Windows) -------------------------
@@ -1031,6 +1119,24 @@ mod tests {
         assert_eq!(remote_parent("/"), None);
         assert_eq!(remote_parent("/etc"), Some("/".to_string()));
         assert_eq!(remote_parent("/usr/local/bin"), Some("/usr/local".to_string()));
+    }
+
+    #[test]
+    fn exclude_matching() {
+        let ex = normalize_excludes(&[
+            "/usr/local/blog/logs/".to_string(),
+            "/usr/local/blog/.backup-worktree".to_string(),
+        ]);
+        assert!(is_excluded("/usr/local/blog/logs", &ex));
+        assert!(is_excluded("/usr/local/blog/logs/app.log", &ex));
+        assert!(is_excluded("/usr/local/blog/.backup-worktree", &ex));
+        assert!(!is_excluded("/usr/local/blog", &ex));
+        assert!(!is_excluded("/usr/local/blog/logsX", &ex)); // not a path boundary
+        assert!(!is_excluded("/usr/local/blog/src", &ex));
+        // the parent dir contains excludes -> must be pulled selectively
+        assert!(has_exclude_under("/usr/local/blog", &ex));
+        assert!(!has_exclude_under("/usr/local/tbox", &ex));
+        assert!(!has_exclude_under("/usr/local/blog/logs", &ex));
     }
 
     #[test]

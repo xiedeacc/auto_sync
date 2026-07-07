@@ -256,6 +256,11 @@ pub struct CollectorHost {
     pub root: PathBuf,
     /// Absolute remote paths (files or directories) to pull.
     pub paths: Vec<String>,
+    /// Absolute remote paths to ignore while collecting: any entry equal to or
+    /// under one of these is skipped (never transferred). e.g. log/backup dirs
+    /// living inside a collected directory.
+    #[serde(default)]
+    pub exclude: Vec<String>,
     /// Host-native shell script run on the host (over ssh) during Deploy, after
     /// the collected files are pushed back. e.g. on OpenWrt start the relevant
     /// procd services and apply `uci` config. Empty = push files only.
@@ -274,6 +279,7 @@ impl Default for CollectorHost {
             identity_file: String::new(),
             root: PathBuf::new(),
             paths: Vec::new(),
+            exclude: Vec::new(),
             deploy_script: String::new(),
             enabled: true,
         }

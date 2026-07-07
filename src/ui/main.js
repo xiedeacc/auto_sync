@@ -312,6 +312,7 @@ const el = {
   collectorPathsClose: document.getElementById("collector-paths-close"),
   collectorPathsList: document.getElementById("collector-paths-list"),
   collectorPathsBrowse: document.getElementById("collector-paths-browse"),
+  collectorPathsExclude: document.getElementById("collector-paths-exclude"),
   collectorBrowseModal: document.getElementById("collector-browse-modal"),
   collectorBrowseTitle: document.getElementById("collector-browse-title"),
   collectorBrowseClose: document.getElementById("collector-browse-close"),
@@ -3341,6 +3342,7 @@ function normalizeCollectorHost(raw) {
     identity_file: String(valueOr(src.identity_file, "")),
     root: String(valueOr(src.root, "")),
     paths: Array.isArray(src.paths) ? src.paths.map((p) => String(valueOr(p, ""))) : [],
+    exclude: Array.isArray(src.exclude) ? src.exclude.map((p) => String(valueOr(p, ""))) : [],
     deploy_script: String(valueOr(src.deploy_script, "")),
     enabled: src.enabled !== false,
   };
@@ -3631,6 +3633,19 @@ function renderCollectorPaths() {
         <input data-paths-index="${pi}" value="${escapeAttr(p)}" placeholder="/remote/absolute/path">
         <button type="button" data-paths-remove="${pi}" title="Remove">✕</button>
       </div>`).join("");
+  if (el.collectorPathsExclude) {
+    el.collectorPathsExclude.value = (host.exclude || []).join("\n");
+  }
+}
+
+function onCollectorExcludeInput() {
+  const host = collectorDraft && collectorDraft.hosts[collectorPathsIndex];
+  if (!host) return;
+  host.exclude = el.collectorPathsExclude.value
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  collectorAutoSave();
 }
 
 // Per-host deploy (push files back + run host script) --------------------------
@@ -3871,6 +3886,9 @@ el.collectorPathsClose.onclick = () => {
   renderCollectorHosts();
 };
 el.collectorPathsBrowse.onclick = () => collectorBrowseRemote();
+if (el.collectorPathsExclude) {
+  el.collectorPathsExclude.addEventListener("input", onCollectorExcludeInput);
+}
 el.collectorPathsList.addEventListener("input", (event) => {
   const t = event.target;
   const pi = Number(t.dataset.pathsIndex);

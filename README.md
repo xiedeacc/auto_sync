@@ -259,6 +259,7 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 - `hosts[]`：每个目标主机一条，用**结构化字段**描述连接（没有 ssh 配置文件，引擎直接拼 `ssh`/`scp` 的 `-i`/`-p` 参数）：
   - `name`（Host 别名/标签）、`hostname`（HostName）、`user`（User）、`port`（Port，默认 22）、`identity_file`（IdentityFile，支持 `~` 展开）。
   - `root`：本地根目录；`paths[]`：要拉取的远端绝对路径（文件或目录），在 host 行的 **Files (N)** 按钮里编辑。
+  - `exclude[]`：采集时忽略的远端绝对路径（等于或位于其下的都跳过，**从不传输**，不是拉下来再删）。在 Files 弹窗底部的 **Ignore** 文本框里每行一个。含 exclude 的目录会改为逐个子项选择性 `scp`（不含 exclude 的子树整体拉、含的递归下去），例如 aws 忽略 `/usr/local/blog/logs`、`/usr/local/blog/.backup-worktree`、`/usr/local/tbox/log`、`/usr/local/tbox/logs`。
   - `enabled`：关掉则跳过该 host。
 
 > 注：新版 OpenSSH `scp` 走 SFTP 协议，远端缺 `sftp-server`（如全新 OpenWrt）会拉取失败并记日志——自行在远端装好即可（例如 `apk add openssh-sftp-server` / `opkg install openssh-sftp-server`）。
