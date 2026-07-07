@@ -441,18 +441,21 @@ fn pull_path(
 }
 
 /// Copy `remote` (a file or whole directory subtree) into `local_dest` with
-/// `scp -r -p`. `local_dest` is the parent that will contain the copied leaf.
+/// `scp -r`. `local_dest` is the parent that will contain the copied leaf.
+///
+/// We deliberately do NOT pass `-p`: preserving the source mode stamped git's
+/// read-only 0444 objects onto the local copy, which the next pull could not
+/// overwrite (`open local … Permission denied`). The Unix modes are captured
+/// separately in the per-host `.auto_sync_perms` cache and restored on deploy,
+/// so `-p` is unnecessary here. Any legacy read-only copies from earlier `-p`
+/// pulls are cleared first so they can still be overwritten.
 fn scp_recursive(conn: &SshConn, remote: &str, local_dest: &Path) -> Result<()> {
-    // A previous pull with `-p` preserves the source mode, so read-only files
-    // (notably git's 0444 objects) land read-only locally. scp cannot reopen a
-    // read-only file to overwrite it (`open local … Permission denied`), so
-    // clear the read-only bit on any existing copy first.
     if let Some(leaf) = remote.trim_end_matches('/').rsplit('/').next() {
         clear_readonly_recursive(&local_dest.join(leaf));
     }
 
     let mut cmd = scp_command(conn);
-    cmd.arg("-r").arg("-p");
+    cmd.arg("-r");
     cmd.arg(format!("{}:{}", conn.dest(), remote));
     cmd.arg(local_dest);
     let output = cmd.output().context("running scp")?;
