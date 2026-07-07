@@ -443,6 +443,14 @@ fn pull_path(
 /// Copy `remote` (a file or whole directory subtree) into `local_dest` with
 /// `scp -r -p`. `local_dest` is the parent that will contain the copied leaf.
 fn scp_recursive(conn: &SshConn, remote: &str, local_dest: &Path) -> Result<()> {
+    // A previous pull with `-p` preserves the source mode, so read-only files
+    // (notably git's 0444 objects) land read-only locally. scp cannot reopen a
+    // read-only file to overwrite it (`open local … Permission denied`), so
+    // clear the read-only bit on any existing copy first.
+    if let Some(leaf) = remote.trim_end_matches('/').rsplit('/').next() {
+        clear_readonly_recursive(&local_dest.join(leaf));
+    }
+
     let mut cmd = scp_command(conn);
     cmd.arg("-r").arg("-p");
     cmd.arg(format!("{}:{}", conn.dest(), remote));
@@ -452,6 +460,23 @@ fn scp_recursive(conn: &SshConn, remote: &str, local_dest: &Path) -> Result<()> 
         bail!("scp failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(())
+}
+
+/// Recursively clear the read-only attribute on `path` (a file or directory) so
+/// a subsequent overwrite/scp can replace it. Best-effort: errors are ignored.
+fn clear_readonly_recursive(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    for entry in WalkDir::new(path).into_iter().flatten() {
+        if let Ok(meta) = entry.metadata() {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(entry.path(), perms);
+            }
+        }
+    }
 }
 
 /// Pull `remote_dir` into `local_dir`, honoring `excludes`: skip excluded
@@ -1119,6 +1144,23 @@ mod tests {
         assert_eq!(remote_parent("/"), None);
         assert_eq!(remote_parent("/etc"), Some("/".to_string()));
         assert_eq!(remote_parent("/usr/local/bin"), Some("/usr/local".to_string()));
+    }
+
+    #[test]
+    fn clear_readonly_makes_files_writable() {
+        let dir = std::env::temp_dir().join(format!("collector_ro_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("obj");
+        fs::write(&file, b"x").unwrap();
+        let mut perms = fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&file, perms).unwrap();
+        assert!(fs::metadata(&file).unwrap().permissions().readonly());
+        clear_readonly_recursive(&dir);
+        assert!(!fs::metadata(&file).unwrap().permissions().readonly());
+        // overwriting now succeeds
+        fs::write(&file, b"yy").unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
