@@ -388,12 +388,16 @@
         <h2 id="collector-paths-title">Files &amp; folders</h2>
         <button id="collector-paths-close" class="icon" title="Close">x</button>
       </div>
+      <div class="collector-list-section-label subtle">Collect these paths</div>
       <div id="collector-paths-list" class="collector-paths-list"></div>
       <div class="collector-path-add-row collector-paths-add">
         <button id="collector-paths-browse" type="button">Browse</button>
       </div>
-      <label class="collector-exclude-label subtle">Ignore (one absolute path per line; skips it and everything under it)</label>
-      <textarea id="collector-paths-exclude" class="collector-exclude" spellcheck="false" placeholder="/usr/local/blog/logs&#10;/usr/local/tbox/logs"></textarea>
+      <div class="collector-list-section-label subtle">Ignore (skip these and everything under them)</div>
+      <div id="collector-exclude-list" class="collector-paths-list"></div>
+      <div class="collector-path-add-row collector-paths-add">
+        <button id="collector-exclude-browse" type="button">Browse</button>
+      </div>
     </div>
   </div>
 

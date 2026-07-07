@@ -34,6 +34,8 @@ let collectorBrowse = null;
 let collectorLogTimer = null;
 // Index of the host whose files/folders are open in the paths editor modal.
 let collectorPathsIndex = null;
+// Which list the remote Browse picker is adding to: "paths" or "exclude".
+let collectorBrowseTarget = "paths";
 // Index of the host whose deploy modal is open, plus its poll timer.
 let collectorDeployIndex = null;
 let collectorDeployTimer = null;
@@ -312,7 +314,8 @@ const el = {
   collectorPathsClose: document.getElementById("collector-paths-close"),
   collectorPathsList: document.getElementById("collector-paths-list"),
   collectorPathsBrowse: document.getElementById("collector-paths-browse"),
-  collectorPathsExclude: document.getElementById("collector-paths-exclude"),
+  collectorExcludeList: document.getElementById("collector-exclude-list"),
+  collectorExcludeBrowse: document.getElementById("collector-exclude-browse"),
   collectorBrowseModal: document.getElementById("collector-browse-modal"),
   collectorBrowseTitle: document.getElementById("collector-browse-title"),
   collectorBrowseClose: document.getElementById("collector-browse-close"),
@@ -3624,28 +3627,48 @@ function openCollectorPaths(hostIndex) {
 function renderCollectorPaths() {
   const host = collectorDraft.hosts[collectorPathsIndex];
   if (!host) return;
-  // Show paths in ascending alphabetical order. Sort the underlying array (not
-  // just the view) so the row indices used for edit/remove stay aligned.
+  // Show entries in ascending alphabetical order. Sort the underlying arrays
+  // (not just the view) so the row indices used for edit/remove stay aligned.
   host.paths = (host.paths || []).sort((a, b) => String(a).localeCompare(String(b)));
-  const paths = host.paths;
-  el.collectorPathsList.innerHTML = paths.map((p, pi) => `
+  host.exclude = (host.exclude || []).sort((a, b) => String(a).localeCompare(String(b)));
+  el.collectorPathsList.innerHTML = renderCollectorPathRows(host.paths, "paths");
+  el.collectorExcludeList.innerHTML = renderCollectorPathRows(host.exclude, "exclude");
+}
+
+// One shared row renderer for both the collect list and the ignore list; `kind`
+// ("paths" | "exclude") tags the row so the input/remove handlers know which
+// array to mutate.
+function renderCollectorPathRows(items, kind) {
+  return (items || []).map((p, pi) => `
       <div class="collector-path-item">
-        <input data-paths-index="${pi}" value="${escapeAttr(p)}" placeholder="/remote/absolute/path">
-        <button type="button" data-paths-remove="${pi}" title="Remove">✕</button>
+        <input data-list="${kind}" data-index="${pi}" value="${escapeAttr(p)}" placeholder="/remote/absolute/path">
+        <button type="button" data-list="${kind}" data-remove="${pi}" title="Remove">✕</button>
       </div>`).join("");
-  if (el.collectorPathsExclude) {
-    el.collectorPathsExclude.value = (host.exclude || []).join("\n");
+}
+
+// Shared input/remove handling for both lists.
+function onCollectorListInput(kind, event) {
+  const t = event.target;
+  const idx = Number(t.dataset.index);
+  const host = collectorDraft && collectorDraft.hosts[collectorPathsIndex];
+  if (host && Number.isInteger(idx) && Array.isArray(host[kind])) {
+    host[kind][idx] = t.value;
+    collectorAutoSave();
   }
 }
 
-function onCollectorExcludeInput() {
+function onCollectorListClick(kind, event) {
+  const btn = event.target.closest("button[data-remove]");
+  if (!btn) return;
+  event.preventDefault();
+  const idx = Number(btn.dataset.remove);
   const host = collectorDraft && collectorDraft.hosts[collectorPathsIndex];
-  if (!host) return;
-  host.exclude = el.collectorPathsExclude.value
-    .split("\n")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  collectorAutoSave();
+  if (host && Number.isInteger(idx) && Array.isArray(host[kind])) {
+    host[kind].splice(idx, 1);
+    renderCollectorPaths();
+    renderCollectorHosts();
+    collectorAutoSave();
+  }
 }
 
 // Per-host deploy (push files back + run host script) --------------------------
@@ -3765,7 +3788,8 @@ function collectorConnFor(host) {
   };
 }
 
-async function collectorBrowseRemote() {
+async function collectorBrowseRemote(target) {
+  collectorBrowseTarget = target === "exclude" ? "exclude" : "paths";
   const host = collectorDraft.hosts[collectorPathsIndex];
   if (!host || !host.hostname.trim()) {
     setCollectorBrowseError("Set the host's HostName first.");
@@ -3776,9 +3800,17 @@ async function collectorBrowseRemote() {
   // Reopen at the directory last browsed on this host.
   const start = collectorLastRemotePath[conn.hostname] || "/";
   collectorBrowse = { conn, path: start, parent: null };
-  el.collectorBrowseTitle.textContent = `Remote path — ${host.user ? host.user + "@" : ""}${host.hostname}`;
+  const verb = collectorBrowseTarget === "exclude" ? "Ignore" : "Collect";
+  el.collectorBrowseTitle.textContent = `${verb} — ${host.user ? host.user + "@" : ""}${host.hostname}`;
   el.collectorBrowseModal.hidden = false;
   await collectorLoadRemote(start);
+}
+
+// The list (paths or exclude) the remote picker is currently editing.
+function collectorBrowseTargetArray(host) {
+  if (!host) return [];
+  host[collectorBrowseTarget] = host[collectorBrowseTarget] || [];
+  return host[collectorBrowseTarget];
 }
 
 function setCollectorBrowseError(text) {
@@ -3814,11 +3846,11 @@ function renderCollectorBrowseList(entries) {
     el.collectorBrowseList.innerHTML = '<div class="empty">(empty)</div>';
     return;
   }
-  // Checkbox state mirrors the host's paths directly — ticking one adds it
-  // (and auto-saves), unticking removes it. No separate "Add selected" step.
-  const paths = (collectorBrowseHost()?.paths) || [];
+  // Checkbox state mirrors the target list (collect or ignore) directly —
+  // ticking one adds it (and auto-saves), unticking removes it.
+  const selected = collectorBrowseTargetArray(collectorBrowseHost());
   el.collectorBrowseList.innerHTML = entries.map((e) => {
-    const checked = paths.includes(e.path) ? "checked" : "";
+    const checked = selected.includes(e.path) ? "checked" : "";
     return `
       <div class="folder-item-row">
         <input type="checkbox" class="folder-item-check" data-path="${escapeAttr(e.path)}" ${checked}>
@@ -3832,12 +3864,12 @@ function renderCollectorBrowseList(entries) {
 function collectorToggleRemotePath(path, on) {
   const host = collectorBrowseHost();
   if (!host) return;
-  host.paths = host.paths || [];
-  const idx = host.paths.indexOf(path);
+  const arr = collectorBrowseTargetArray(host);
+  const idx = arr.indexOf(path);
   if (on && idx < 0) {
-    host.paths.push(path);
+    arr.push(path);
   } else if (!on && idx >= 0) {
-    host.paths.splice(idx, 1);
+    arr.splice(idx, 1);
   }
   renderCollectorPaths();
   renderCollectorHosts();
@@ -3885,32 +3917,12 @@ el.collectorPathsClose.onclick = () => {
   collectorPathsIndex = null;
   renderCollectorHosts();
 };
-el.collectorPathsBrowse.onclick = () => collectorBrowseRemote();
-if (el.collectorPathsExclude) {
-  el.collectorPathsExclude.addEventListener("input", onCollectorExcludeInput);
-}
-el.collectorPathsList.addEventListener("input", (event) => {
-  const t = event.target;
-  const pi = Number(t.dataset.pathsIndex);
-  const host = collectorDraft && collectorDraft.hosts[collectorPathsIndex];
-  if (host && Number.isInteger(pi)) {
-    host.paths[pi] = t.value;
-    collectorAutoSave();
-  }
-});
-el.collectorPathsList.addEventListener("click", (event) => {
-  const btn = event.target.closest("button[data-paths-remove]");
-  if (!btn) return;
-  event.preventDefault();
-  const pi = Number(btn.dataset.pathsRemove);
-  const host = collectorDraft && collectorDraft.hosts[collectorPathsIndex];
-  if (host && Number.isInteger(pi)) {
-    host.paths.splice(pi, 1);
-    renderCollectorPaths();
-    renderCollectorHosts();
-    collectorAutoSave();
-  }
-});
+el.collectorPathsBrowse.onclick = () => collectorBrowseRemote("paths");
+el.collectorExcludeBrowse.onclick = () => collectorBrowseRemote("exclude");
+el.collectorPathsList.addEventListener("input", (e) => onCollectorListInput("paths", e));
+el.collectorPathsList.addEventListener("click", (e) => onCollectorListClick("paths", e));
+el.collectorExcludeList.addEventListener("input", (e) => onCollectorListInput("exclude", e));
+el.collectorExcludeList.addEventListener("click", (e) => onCollectorListClick("exclude", e));
 el.collectorBrowseClose.onclick = () => {
   el.collectorBrowseModal.hidden = true;
   collectorBrowse = null;
