@@ -824,6 +824,8 @@ class _Header extends StatelessWidget {
   }
 }
 
+const double _masterRightBlockWidth = 446;
+
 class _MasterSourcePanel extends StatelessWidget {
   const _MasterSourcePanel({
     required this.sources,
@@ -871,14 +873,15 @@ class _MasterSourcePanel extends StatelessWidget {
             child: SingleChildScrollView(
               padding: const EdgeInsets.fromLTRB(80, 14, 80, 56),
               child: Container(
-                padding: const EdgeInsets.fromLTRB(28, 14, 14, 14),
+                width: pageWidth - 160,
+                padding: const EdgeInsets.all(14),
                 decoration: BoxDecoration(
                   color: Palette.panel,
                   border: Border.all(color: Palette.line),
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     Container(
                       padding: const EdgeInsets.only(bottom: 12),
@@ -888,15 +891,12 @@ class _MasterSourcePanel extends StatelessWidget {
                       child: Row(
                         children: [
                           Expanded(
-                            child: Transform.translate(
-                              offset: const Offset(-16, 0),
-                              child: const Text(
-                                'Source',
-                                style: TextStyle(
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.w700,
-                                  color: Palette.text,
-                                ),
+                            child: const Text(
+                              'Source',
+                              style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                                color: Palette.text,
                               ),
                             ),
                           ),
@@ -912,6 +912,7 @@ class _MasterSourcePanel extends StatelessWidget {
                     ),
                     const SizedBox(height: 14),
                     Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: sources.isEmpty
                           ? const [
                               SizedBox(
@@ -996,131 +997,126 @@ class _MasterSourceGroup extends StatelessWidget {
     final latest = _sourceLatestCycle(
       destinations.map((dst) => statusFor(sourceId, _str(dst['id']))),
     );
-    return Transform.translate(
-      offset: const Offset(-18, 0),
-      child: Stack(
-        children: [
-          const Positioned(
-            left: 7,
-            top: 12,
-            child: Text(
-              '⠿',
-              style: TextStyle(
-                color: Color(0xff94a3b8),
-                fontSize: 13,
-                height: 1,
+    return Stack(
+      children: [
+        const Positioned(
+          left: 7,
+          top: 12,
+          child: Text(
+            '⠿',
+            style: TextStyle(color: Color(0xff94a3b8), fontSize: 13, height: 1),
+          ),
+        ),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.fromLTRB(28, 10, 20, 12),
+          decoration: BoxDecoration(
+            color: const Color(0xfff8fafc),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Column(
+            children: [
+              _MasterSyncRow(
+                rightWidth: _masterRightBlockWidth,
+                left: Row(
+                  children: [
+                    _MasterTextField(
+                      label: 'ID',
+                      width: 56,
+                      value: sourceId,
+                      readOnly: true,
+                      onCommit: (value) {
+                        source['id'] = value;
+                        onChanged();
+                      },
+                    ),
+                    const SizedBox(width: 8),
+                    _MasterTextField(
+                      label: 'Source Path',
+                      width: 160,
+                      value: _machinePath(
+                        _str(source['machine_id'], 'local'),
+                        _str(source['src']),
+                      ),
+                      readOnly: true,
+                      onCommit: (value) {
+                        source['src'] = _stripMachinePrefix(value);
+                        onChanged();
+                      },
+                    ),
+                  ],
+                ),
+                right: Row(
+                  children: [
+                    _MasterTextField(
+                      label: 'Latest Cycle',
+                      width: 100,
+                      value: latest,
+                      readOnly: true,
+                      onCommit: (_) {},
+                    ),
+                    const SizedBox(width: 8),
+                    MasterButton(
+                      label: 'Excluded ${_list(source['excludes']).length}',
+                      onTap: () => _showExcludes(context),
+                    ),
+                    const SizedBox(width: 8),
+                    MasterButton(
+                      label: 'Sync',
+                      width: 58,
+                      onTap: () => onSyncSource(sourceId),
+                    ),
+                    const SizedBox(width: 8),
+                    MasterButton(
+                      label: 'x',
+                      square: true,
+                      danger: true,
+                      onTap: () => onRemoveSource(sourceId),
+                    ),
+                  ],
+                ),
               ),
-            ),
-          ),
-          Container(
-            padding: const EdgeInsets.fromLTRB(28, 10, 14, 12),
-            decoration: BoxDecoration(
-              color: const Color(0xfff8fafc),
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Column(
-              children: [
-                _MasterSyncRow(
-                  left: Row(
-                    children: [
-                      _MasterTextField(
-                        label: 'ID',
-                        width: 56,
-                        value: sourceId,
-                        readOnly: true,
-                        onCommit: (value) {
-                          source['id'] = value;
-                          onChanged();
-                        },
-                      ),
-                      const SizedBox(width: 8),
-                      _MasterTextField(
-                        label: 'Source Path',
-                        width: 160,
-                        value: _machinePath(
-                          _str(source['machine_id'], 'local'),
-                          _str(source['src']),
-                        ),
-                        readOnly: true,
-                        onCommit: (value) {
-                          source['src'] = _stripMachinePrefix(value);
-                          onChanged();
-                        },
-                      ),
-                    ],
-                  ),
-                  right: Row(
-                    children: [
-                      _MasterTextField(
-                        label: 'Latest Cycle',
-                        width: 100,
-                        value: latest,
-                        readOnly: true,
-                        onCommit: (_) {},
-                      ),
-                      const SizedBox(width: 8),
-                      MasterButton(
-                        label: 'Excluded ${_list(source['excludes']).length}',
-                        onTap: () => _showExcludes(context),
-                      ),
-                      const SizedBox(width: 8),
-                      MasterButton(
-                        label: 'Sync',
-                        width: 58,
-                        onTap: () => onSyncSource(sourceId),
-                      ),
-                      const SizedBox(width: 8),
-                      MasterButton(
-                        label: 'x',
-                        square: true,
-                        danger: true,
-                        onTap: () => onRemoveSource(sourceId),
-                      ),
-                    ],
-                  ),
+              for (final dst in destinations)
+                _MasterDestinationRow(
+                  sourceId: sourceId,
+                  destination: dst,
+                  destinations: _list(source['destinations']),
+                  status: statusFor(sourceId, _str(dst['id'])),
+                  onChanged: onChanged,
+                  onMutate: onMutate,
+                  onSync: onSyncDestination,
+                  onScan: onScan,
+                  onCancel: onCancel,
                 ),
-                for (final dst in destinations)
-                  _MasterDestinationRow(
-                    sourceId: sourceId,
-                    destination: dst,
-                    destinations: _list(source['destinations']),
-                    status: statusFor(sourceId, _str(dst['id'])),
-                    onChanged: onChanged,
-                    onMutate: onMutate,
-                    onSync: onSyncDestination,
-                    onScan: onScan,
-                    onCancel: onCancel,
-                  ),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: MasterButton(
-                    label: '+',
-                    square: true,
-                    accent: true,
-                    onTap: () {
-                      onMutate(() {
-                        _list(source['destinations']).add({
-                          'id': 'dst_${destinations.length + 1}',
-                          'machine_id': 'local',
-                          'path': '',
-                          'enabled': true,
-                          'schedule': {
-                            'mode': 'daily',
-                            'time': '10:00',
-                            'timezone': 'local',
-                            'weekday': 'saturday',
-                            'sync_current_cycle_manually': false,
-                          },
-                        });
+              Align(
+                alignment: Alignment.centerRight,
+                child: MasterButton(
+                  label: '+',
+                  square: true,
+                  accent: true,
+                  onTap: () {
+                    onMutate(() {
+                      _list(source['destinations']).add({
+                        'id': 'dst_${destinations.length + 1}',
+                        'machine_id': 'local',
+                        'path': '',
+                        'enabled': true,
+                        'schedule': {
+                          'mode': 'daily',
+                          'time': '10:00',
+                          'timezone': 'local',
+                          'weekday': 'saturday',
+                          'sync_current_cycle_manually': false,
+                        },
                       });
-                    },
-                  ),
+                    });
+                  },
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 
@@ -1215,6 +1211,7 @@ class _MasterDestinationRow extends StatelessWidget {
           ),
         ),
         _MasterSyncRow(
+          rightWidth: _masterRightBlockWidth,
           left: Row(
             children: [
               _MasterTextField(
@@ -1319,10 +1316,15 @@ class _MasterDestinationRow extends StatelessWidget {
 }
 
 class _MasterSyncRow extends StatelessWidget {
-  const _MasterSyncRow({required this.left, required this.right});
+  const _MasterSyncRow({
+    required this.left,
+    required this.right,
+    this.rightWidth,
+  });
 
   final Widget left;
   final Widget right;
+  final double? rightWidth;
 
   @override
   Widget build(BuildContext context) {
@@ -1338,9 +1340,19 @@ class _MasterSyncRow extends StatelessWidget {
         children: [
           left,
           const SizedBox(width: 8),
-          Flexible(
-            fit: FlexFit.loose,
-            child: Align(alignment: Alignment.centerRight, child: right),
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: rightWidth == null
+                  ? right
+                  : SizedBox(
+                      width: rightWidth,
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: right,
+                      ),
+                    ),
+            ),
           ),
         ],
       ),
