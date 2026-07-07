@@ -143,6 +143,26 @@ class AutoSyncApi {
         '/api/scan-destination-now',
         body: {'source_id': sourceId, 'destination_id': destinationId},
       );
+  Future<Map<String, dynamic>> scanReport(
+    String sourceId,
+    String destinationId,
+  ) async => _map(
+    await _request(
+      'GET',
+      '/api/scan-report',
+      query: {'source_id': sourceId, 'destination_id': destinationId},
+    ),
+  );
+  Future<Map<String, dynamic>> browsePaths({
+    required String path,
+    required String machineId,
+  }) async => _map(
+    await _request(
+      'GET',
+      '/api/browse-paths',
+      query: {'path': path, 'machine_id': machineId},
+    ),
+  );
   Future<void> cancelActivity({
     String? scope,
     String? sourceId,
@@ -167,6 +187,14 @@ class AutoSyncApi {
   Future<Map<String, dynamic>> collectorStatus() async =>
       _map(await _request('GET', '/api/collector/status'));
   Future<void> collectorRun() async => _request('POST', '/api/collector/run');
+  Future<Map<String, dynamic>> collectorBrowse(
+    Map<String, dynamic> req,
+  ) async => _map(await _request('POST', '/api/collector/browse', body: req));
+  Future<Map<String, dynamic>> collectorDeploy(int index) async => _map(
+    await _request('POST', '/api/collector/deploy', body: {'index': index}),
+  );
+  Future<Map<String, dynamic>> collectorDeployStatus() async =>
+      _map(await _request('GET', '/api/collector/deploy-status'));
 }
 
 Map<String, dynamic> _map(dynamic value) =>
@@ -186,6 +214,9 @@ String _str(dynamic value, [String fallback = '']) =>
 
 bool _bool(dynamic value, [bool fallback = false]) =>
     value is bool ? value : fallback;
+
+String _normalizePath(String value) =>
+    value.trim().replaceAll(RegExp(r'[\\/]+$'), '');
 
 int _int(dynamic value, [int fallback = 0]) {
   if (value is int) {
@@ -273,9 +304,12 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
   Map<String, dynamic> runtimeStatus = {};
   Map<String, dynamic> syncActivity = {};
   Map<String, dynamic> machineStatus = {};
+  Map<String, dynamic> latestDestinationSchedule =
+      _defaultDestinationSchedule();
   bool loading = true;
   bool busy = false;
   bool saving = false;
+  bool configLoaded = false;
   String message = '';
   Timer? statusTimer;
   Timer? runtimeTimer;
@@ -313,7 +347,9 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     final errors = <String>[];
     try {
       cfg = await widget.api.getConfig();
+      configLoaded = true;
     } catch (error) {
+      configLoaded = false;
       errors.add('$error');
     }
     try {
@@ -345,6 +381,10 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
 
   Future<void> _loadStatusOnly() async {
     if (!mounted || busy) {
+      return;
+    }
+    if (!configLoaded) {
+      await _loadAll();
       return;
     }
     try {
@@ -410,6 +450,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
       if (mounted) {
         setState(() {
           cfg = next;
+          configLoaded = true;
           message = label;
         });
       }
@@ -458,6 +499,245 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
       }
     }
     return id;
+  }
+
+  String _defaultPathForMachine(String machineId) {
+    for (final machine in machines) {
+      if (_str(machine['id']) == machineId) {
+        return _str(machine['os']).toLowerCase() == 'windows' ? r'C:\' : '/';
+      }
+    }
+    return machineId == 'local' && Platform.isWindows ? r'C:\' : '/';
+  }
+
+  String _nextSourceId() {
+    var maxId = 0;
+    for (final source in sources) {
+      final match = RegExp(r'^src_(\d+)$').firstMatch(_str(source['id']));
+      if (match != null) {
+        maxId = math.max(maxId, int.tryParse(match.group(1)!) ?? 0);
+      }
+    }
+    return 'src_${maxId + 1}';
+  }
+
+  String _nextDestinationId(Map<String, dynamic> source) {
+    var maxId = 0;
+    for (final dst in _mapRefs(source['destinations'])) {
+      final match = RegExp(r'^dst_(\d+)$').firstMatch(_str(dst['id']));
+      if (match != null) {
+        maxId = math.max(maxId, int.tryParse(match.group(1)!) ?? 0);
+      }
+    }
+    return 'dst_${maxId + 1}';
+  }
+
+  Future<Map<String, dynamic>?> _pickPath({
+    required String startPath,
+    required String machineId,
+    bool showAddDirectory = false,
+    bool addDirectory = false,
+    String? Function(Map<String, dynamic> selection)? validate,
+  }) {
+    return showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => _PathPickerDialog(
+        api: widget.api,
+        machineIds: _machineIds(machineId),
+        machineLabel: _machineLabel,
+        initialMachineId: machineId.isEmpty ? 'local' : machineId,
+        initialPath: startPath.isEmpty
+            ? _defaultPathForMachine(machineId)
+            : startPath,
+        showAddDirectory: showAddDirectory,
+        initialAddDirectory: addDirectory,
+        validate: validate,
+      ),
+    );
+  }
+
+  Future<void> _pickSourcePath(Map<String, dynamic> source) async {
+    if (_list(source['destinations']).isNotEmpty) {
+      setState(
+        () => message = _machinePath(
+          _str(source['machine_id'], 'local'),
+          _str(source['src']),
+        ),
+      );
+      return;
+    }
+    final selected = await _pickPath(
+      startPath: _str(
+        source['src'],
+        _defaultPathForMachine(_str(source['machine_id'], 'local')),
+      ),
+      machineId: _str(source['machine_id'], 'local'),
+      showAddDirectory: true,
+      addDirectory: _bool(source['add_directory']),
+    );
+    if (selected == null) return;
+    setState(() {
+      source['machine_id'] = _str(selected['machine_id'], 'local');
+      source['src'] = _str(selected['path']);
+      source['add_directory'] = _bool(selected['add_directory']);
+    });
+    await _saveConfig('Source path saved');
+  }
+
+  String? _destinationPathError(
+    Map<String, dynamic> source,
+    Map<String, dynamic> selection, [
+    Map<String, dynamic>? ignoreDst,
+  ]) {
+    final path = _normalizePath(_str(selection['path']));
+    final machineId = _str(selection['machine_id'], 'local');
+    for (final dst in _mapRefs(source['destinations'])) {
+      if (identical(dst, ignoreDst)) continue;
+      if (_str(dst['machine_id'], 'local') == machineId &&
+          _normalizePath(_str(dst['path'])) == path) {
+        return 'Destination path already exists: $path';
+      }
+    }
+    return null;
+  }
+
+  Future<void> _pickDestinationPath(
+    Map<String, dynamic> source,
+    Map<String, dynamic> destination,
+  ) async {
+    final machineId = _str(
+      destination['machine_id'],
+      _str(source['machine_id'], 'local'),
+    );
+    final selected = await _pickPath(
+      startPath: _str(destination['path'], _defaultPathForMachine(machineId)),
+      machineId: machineId,
+      validate: (selection) =>
+          _destinationPathError(source, selection, destination),
+    );
+    if (selected == null) return;
+    setState(() {
+      destination['machine_id'] = _str(selected['machine_id'], 'local');
+      destination['path'] = _str(selected['path']);
+    });
+    await _saveConfig('Destination path saved');
+  }
+
+  Future<void> _addDestination(Map<String, dynamic> source) async {
+    final machineId = _str(source['machine_id'], 'local');
+    final selected = await _pickPath(
+      startPath: _defaultPathForMachine(machineId),
+      machineId: machineId,
+      validate: (selection) => _destinationPathError(source, selection),
+    );
+    if (selected == null) return;
+    setState(() {
+      final list = _list(source['destinations']);
+      source['destinations'] = list;
+      list.add({
+        'id': _nextDestinationId(source),
+        'machine_id': _str(selected['machine_id'], 'local'),
+        'path': _str(selected['path']),
+        'enabled': true,
+        'schedule': _cloneSchedule(latestDestinationSchedule),
+      });
+    });
+    await _saveConfig('Destination added');
+  }
+
+  Future<void> _openDestinationInfo(
+    Map<String, dynamic> source,
+    Map<String, dynamic> destination,
+  ) async {
+    final sourceId = _str(source['id']);
+    final destinationId = _str(destination['id']);
+    Map<String, dynamic> report = {};
+    String error = '';
+    try {
+      report = await widget.api.scanReport(sourceId, destinationId);
+    } catch (err) {
+      error = '$err';
+    }
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => _DestinationInfoDialog(
+        source: source,
+        destination: destination,
+        status: _statusFor(sourceId, destinationId),
+        scanReport: report,
+        error: error,
+      ),
+    );
+  }
+
+  Future<void> _openDestinationSyncSettings(
+    Map<String, dynamic> destination,
+  ) async {
+    final sync = Map<String, dynamic>.from(_map(destination['sync']));
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => _SyncSettingsDialog(sync: sync),
+    );
+    if (result != null) {
+      setState(() => destination['sync'] = result);
+      await _saveConfig('Destination settings saved');
+    }
+  }
+
+  Future<void> _openDestinationSchedule(
+    Map<String, dynamic> destination,
+  ) async {
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => _ScheduleDialog(
+        schedule: _cloneSchedule(_map(destination['schedule'])),
+      ),
+    );
+    if (result == null) return;
+    setState(() {
+      final next = _cloneSchedule(result);
+      destination['schedule'] = next;
+      latestDestinationSchedule = _cloneSchedule(next);
+    });
+    await _saveConfig('Schedule saved');
+  }
+
+  String? _pathRelativeToSource(String sourcePath, String selectedPath) {
+    final sourceNorm = _normalizePath(sourcePath).replaceAll('\\', '/');
+    final selectedNorm = _normalizePath(selectedPath).replaceAll('\\', '/');
+    if (selectedNorm == sourceNorm) return '';
+    final prefix = sourceNorm.endsWith('/') ? sourceNorm : '$sourceNorm/';
+    if (!selectedNorm.startsWith(prefix)) return null;
+    return selectedNorm.substring(prefix.length);
+  }
+
+  Future<String?> _pickExcludePath(Map<String, dynamic> source) async {
+    final sourcePath = _str(source['src']);
+    if (sourcePath.isEmpty) {
+      setState(() => message = 'Select source path first');
+      return null;
+    }
+    final machineId = _str(source['machine_id'], 'local');
+    final selected = await _pickPath(
+      startPath: sourcePath,
+      machineId: machineId,
+    );
+    if (selected == null) return null;
+    if (_str(selected['machine_id'], 'local') != machineId) {
+      setState(() => message = 'Excluded path must be on the source machine');
+      return null;
+    }
+    final relative = _pathRelativeToSource(sourcePath, _str(selected['path']));
+    if (relative == null) {
+      setState(() => message = 'Excluded path must be inside source');
+      return null;
+    }
+    if (relative.isEmpty) {
+      setState(() => message = 'Choose a file or child folder inside source');
+      return null;
+    }
+    return relative;
   }
 
   List<String> _machineIds([String current = '']) {
@@ -604,7 +884,14 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
                       setState(mutate);
                       _saveConfig();
                     },
-                    onAddSource: _addSource,
+                    onAddSource: () => unawaited(_addSource()),
+                    onPickSourcePath: _pickSourcePath,
+                    onAddDestination: _addDestination,
+                    onPickDestinationPath: _pickDestinationPath,
+                    onDestinationInfo: _openDestinationInfo,
+                    onDestinationSyncSettings: _openDestinationSyncSettings,
+                    onDestinationSchedule: _openDestinationSchedule,
+                    onPickExcludePath: _pickExcludePath,
                     onRemoveSource: _removeSource,
                     onSyncAll: () => _run('Sync all', widget.api.syncAll),
                     onSyncSource: (id) => _run(
@@ -612,12 +899,16 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
                       () => widget.api.syncSource(id),
                     ),
                     onSyncDestination: (sourceId, destinationId, mode) => _run(
-                      'Sync $sourceId -> $destinationId',
-                      () => widget.api.syncDestination(
-                        sourceId,
-                        destinationId,
-                        mode,
-                      ),
+                      mode == 'scan'
+                          ? 'Compare $sourceId -> $destinationId'
+                          : 'Sync $sourceId -> $destinationId',
+                      () => mode == 'scan'
+                          ? widget.api.scanDestination(sourceId, destinationId)
+                          : widget.api.syncDestination(
+                              sourceId,
+                              destinationId,
+                              mode,
+                            ),
                     ),
                     onScan: (sourceId, destinationId) => _run(
                       'Compare $sourceId -> $destinationId',
@@ -645,16 +936,24 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     );
   }
 
-  void _addSource() {
+  Future<void> _addSource() async {
+    final machineId = 'local';
+    final selected = await _pickPath(
+      startPath: _defaultPathForMachine(machineId),
+      machineId: machineId,
+      showAddDirectory: true,
+      addDirectory: false,
+    );
+    if (selected == null) return;
     final list = _list(cfg['source_groups']);
     cfg['source_groups'] = list;
-    final next = 'src_${list.length + 1}';
+    final next = _nextSourceId();
     setState(() {
       list.add({
         'id': next,
-        'machine_id': 'local',
-        'src': '',
-        'add_directory': true,
+        'machine_id': _str(selected['machine_id'], 'local'),
+        'src': _str(selected['path']),
+        'add_directory': _bool(selected['add_directory']),
         'enabled': true,
         'order': list.length,
         'mode': 'mirror',
@@ -668,7 +967,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
         'destinations': [],
       });
     });
-    _saveConfig('Source added');
+    await _saveConfig('Source added');
   }
 
   void _removeSource(String sourceId) {
@@ -708,57 +1007,58 @@ class _Header extends StatelessWidget {
         color: Palette.panel,
         border: Border(bottom: BorderSide(color: Palette.line)),
       ),
-      child: Row(
+      child: Stack(
         children: [
-          const Expanded(
-            child: Align(
-              alignment: Alignment.centerLeft,
+          const Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'auto_sync',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.w800,
+                color: Palette.text,
+              ),
+            ),
+          ),
+          Center(
+            child: OutlinedButton(
+              onPressed: onMachines,
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size(118, 34),
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                foregroundColor: Palette.accent,
+                side: const BorderSide(color: Palette.line),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                textStyle: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
               child: Text(
-                'auto_sync',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w800,
-                  color: Palette.text,
-                ),
+                total == 0 ? 'Machines -/-' : 'Machines $online/$total',
               ),
             ),
           ),
-          SizedBox(
-            width: 180,
-            child: Center(
-              child: OutlinedButton(
-                onPressed: onMachines,
-                style: OutlinedButton.styleFrom(
-                  minimumSize: const Size(118, 34),
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  foregroundColor: Palette.accent,
-                  side: const BorderSide(color: Palette.line),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  textStyle: const TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w700,
-                  ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                MasterButton(label: 'Readme', width: 80, onTap: onReadme),
+                const SizedBox(width: 8),
+                MasterButton(
+                  label: 'Collector',
+                  width: 104,
+                  onTap: onCollector,
                 ),
-                child: Text(
-                  total == 0 ? 'Machines -/-' : 'Machines $online/$total',
-                ),
-              ),
+                const SizedBox(width: 8),
+                MasterButton(label: 'Config', width: 76, onTap: onConfig),
+                const SizedBox(width: 8),
+                MasterButton(label: 'Tasks', width: 70, onTap: onTasks),
+              ],
             ),
-          ),
-          const SizedBox(width: 12),
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              MasterButton(label: 'Readme', width: 80, onTap: onReadme),
-              const SizedBox(width: 8),
-              MasterButton(label: 'Collector', width: 104, onTap: onCollector),
-              const SizedBox(width: 8),
-              MasterButton(label: 'Config', width: 76, onTap: onConfig),
-              const SizedBox(width: 8),
-              MasterButton(label: 'Tasks', width: 70, onTap: onTasks),
-            ],
           ),
         ],
       ),
@@ -781,6 +1081,13 @@ class _MasterSourcePanel extends StatelessWidget {
     required this.onChanged,
     required this.onMutate,
     required this.onAddSource,
+    required this.onPickSourcePath,
+    required this.onAddDestination,
+    required this.onPickDestinationPath,
+    required this.onDestinationInfo,
+    required this.onDestinationSyncSettings,
+    required this.onDestinationSchedule,
+    required this.onPickExcludePath,
     required this.onRemoveSource,
     required this.onSyncAll,
     required this.onSyncSource,
@@ -797,6 +1104,23 @@ class _MasterSourcePanel extends StatelessWidget {
   final Future<void> Function([String label]) onChanged;
   final void Function(VoidCallback mutate) onMutate;
   final VoidCallback onAddSource;
+  final Future<void> Function(Map<String, dynamic> source) onPickSourcePath;
+  final Future<void> Function(Map<String, dynamic> source) onAddDestination;
+  final Future<void> Function(
+    Map<String, dynamic> source,
+    Map<String, dynamic> destination,
+  )
+  onPickDestinationPath;
+  final Future<void> Function(
+    Map<String, dynamic> source,
+    Map<String, dynamic> destination,
+  )
+  onDestinationInfo;
+  final Future<void> Function(Map<String, dynamic> destination)
+  onDestinationSyncSettings;
+  final Future<void> Function(Map<String, dynamic> destination)
+  onDestinationSchedule;
+  final Future<String?> Function(Map<String, dynamic> source) onPickExcludePath;
   final void Function(String sourceId) onRemoveSource;
   final VoidCallback onSyncAll;
   final void Function(String id) onSyncSource;
@@ -883,6 +1207,14 @@ class _MasterSourcePanel extends StatelessWidget {
                                   statusFor: statusFor,
                                   onChanged: onChanged,
                                   onMutate: onMutate,
+                                  onPickSourcePath: onPickSourcePath,
+                                  onAddDestination: onAddDestination,
+                                  onPickDestinationPath: onPickDestinationPath,
+                                  onDestinationInfo: onDestinationInfo,
+                                  onDestinationSyncSettings:
+                                      onDestinationSyncSettings,
+                                  onDestinationSchedule: onDestinationSchedule,
+                                  onPickExcludePath: onPickExcludePath,
                                   onRemoveSource: onRemoveSource,
                                   onSyncSource: onSyncSource,
                                   onSyncDestination: onSyncDestination,
@@ -913,6 +1245,13 @@ class _MasterSourceGroup extends StatelessWidget {
     required this.statusFor,
     required this.onChanged,
     required this.onMutate,
+    required this.onPickSourcePath,
+    required this.onAddDestination,
+    required this.onPickDestinationPath,
+    required this.onDestinationInfo,
+    required this.onDestinationSyncSettings,
+    required this.onDestinationSchedule,
+    required this.onPickExcludePath,
     required this.onRemoveSource,
     required this.onSyncSource,
     required this.onSyncDestination,
@@ -927,6 +1266,23 @@ class _MasterSourceGroup extends StatelessWidget {
   statusFor;
   final Future<void> Function([String label]) onChanged;
   final void Function(VoidCallback mutate) onMutate;
+  final Future<void> Function(Map<String, dynamic> source) onPickSourcePath;
+  final Future<void> Function(Map<String, dynamic> source) onAddDestination;
+  final Future<void> Function(
+    Map<String, dynamic> source,
+    Map<String, dynamic> destination,
+  )
+  onPickDestinationPath;
+  final Future<void> Function(
+    Map<String, dynamic> source,
+    Map<String, dynamic> destination,
+  )
+  onDestinationInfo;
+  final Future<void> Function(Map<String, dynamic> destination)
+  onDestinationSyncSettings;
+  final Future<void> Function(Map<String, dynamic> destination)
+  onDestinationSchedule;
+  final Future<String?> Function(Map<String, dynamic> source) onPickExcludePath;
   final void Function(String sourceId) onRemoveSource;
   final void Function(String id) onSyncSource;
   final void Function(String sourceId, String destinationId, String mode)
@@ -977,10 +1333,13 @@ class _MasterSourceGroup extends StatelessWidget {
                   const SizedBox(width: 8),
                   SizedBox(
                     width: 160,
-                    child: _MasterReadOnlyInput(
-                      value: _machinePath(
-                        _str(source['machine_id'], 'local'),
-                        _str(source['src']),
+                    child: InkWell(
+                      onTap: () => unawaited(onPickSourcePath(source)),
+                      child: _MasterReadOnlyInput(
+                        value: _machinePath(
+                          _str(source['machine_id'], 'local'),
+                          _str(source['src']),
+                        ),
                       ),
                     ),
                   ),
@@ -1023,11 +1382,16 @@ class _MasterSourceGroup extends StatelessWidget {
               for (final dst in destinations)
                 _MasterDestinationRow(
                   sourceId: sourceId,
+                  source: source,
                   destination: dst,
                   destinations: _list(source['destinations']),
                   status: statusFor(sourceId, _str(dst['id'])),
                   onChanged: onChanged,
                   onMutate: onMutate,
+                  onPickPath: onPickDestinationPath,
+                  onInfo: onDestinationInfo,
+                  onSyncSettings: onDestinationSyncSettings,
+                  onSchedule: onDestinationSchedule,
                   onSync: onSyncDestination,
                   onScan: onScan,
                   onCancel: onCancel,
@@ -1038,23 +1402,7 @@ class _MasterSourceGroup extends StatelessWidget {
                   label: '+',
                   square: true,
                   accent: true,
-                  onTap: () {
-                    onMutate(() {
-                      _list(source['destinations']).add({
-                        'id': 'dst_${destinations.length + 1}',
-                        'machine_id': 'local',
-                        'path': '',
-                        'enabled': true,
-                        'schedule': {
-                          'mode': 'daily',
-                          'time': '10:00',
-                          'timezone': 'local',
-                          'weekday': 'saturday',
-                          'sync_current_cycle_manually': false,
-                        },
-                      });
-                    });
-                  },
+                  onTap: () => unawaited(onAddDestination(source)),
                 ),
               ),
             ],
@@ -1069,7 +1417,9 @@ class _MasterSourceGroup extends StatelessWidget {
       context: context,
       builder: (context) => _ExcludedDialog(
         sourceId: _str(source['id'], 'source'),
+        sourcePath: _str(source['src'], '-'),
         initialItems: _list(source['excludes']).map((item) => '$item').toList(),
+        onAddPath: () => onPickExcludePath(source),
       ),
     );
     if (result != null) {
@@ -1082,22 +1432,40 @@ class _MasterSourceGroup extends StatelessWidget {
 class _MasterDestinationRow extends StatelessWidget {
   const _MasterDestinationRow({
     required this.sourceId,
+    required this.source,
     required this.destination,
     required this.destinations,
     required this.status,
     required this.onChanged,
     required this.onMutate,
+    required this.onPickPath,
+    required this.onInfo,
+    required this.onSyncSettings,
+    required this.onSchedule,
     required this.onSync,
     required this.onScan,
     required this.onCancel,
   });
 
   final String sourceId;
+  final Map<String, dynamic> source;
   final Map<String, dynamic> destination;
   final List<dynamic> destinations;
   final Map<String, dynamic>? status;
   final Future<void> Function([String label]) onChanged;
   final void Function(VoidCallback mutate) onMutate;
+  final Future<void> Function(
+    Map<String, dynamic> source,
+    Map<String, dynamic> destination,
+  )
+  onPickPath;
+  final Future<void> Function(
+    Map<String, dynamic> source,
+    Map<String, dynamic> destination,
+  )
+  onInfo;
+  final Future<void> Function(Map<String, dynamic> destination) onSyncSettings;
+  final Future<void> Function(Map<String, dynamic> destination) onSchedule;
   final void Function(String sourceId, String destinationId, String mode)
   onSync;
   final void Function(String sourceId, String destinationId) onScan;
@@ -1128,10 +1496,13 @@ class _MasterDestinationRow extends StatelessWidget {
         const SizedBox(width: 8),
         SizedBox(
           width: 160,
-          child: _MasterReadOnlyInput(
-            value: _machinePath(
-              _str(destination['machine_id'], 'local'),
-              _str(destination['path']),
+          child: InkWell(
+            onTap: () => unawaited(onPickPath(source, destination)),
+            child: _MasterReadOnlyInput(
+              value: _machinePath(
+                _str(destination['machine_id'], 'local'),
+                _str(destination['path']),
+              ),
             ),
           ),
         ),
@@ -1153,7 +1524,7 @@ class _MasterDestinationRow extends StatelessWidget {
         MasterIconButton(
           kind: MasterIconKind.info,
           color: _statusColor(status),
-          onTap: () => onScan(sourceId, dstId),
+          onTap: () => unawaited(onInfo(source, destination)),
         ),
         const SizedBox(width: 8),
         MasterButton(
@@ -1161,11 +1532,7 @@ class _MasterDestinationRow extends StatelessWidget {
           width: 100,
           accent: true,
           alignLeft: true,
-          onTap: () => onMutate(() {
-            schedule['mode'] = _str(schedule['mode']) == 'weekly'
-                ? 'daily'
-                : 'weekly';
-          }),
+          onTap: () => unawaited(onSchedule(destination)),
         ),
         const SizedBox(width: 8),
         SizedBox(
@@ -1176,7 +1543,7 @@ class _MasterDestinationRow extends StatelessWidget {
         MasterIconButton(
           kind: MasterIconKind.gear,
           color: Palette.text,
-          onTap: () {},
+          onTap: () => unawaited(onSyncSettings(destination)),
         ),
         const SizedBox(width: 8),
         MasterSelectButton(
@@ -1312,10 +1679,17 @@ class _MasterReadOnlyInput extends StatelessWidget {
 }
 
 class _ExcludedDialog extends StatefulWidget {
-  const _ExcludedDialog({required this.sourceId, required this.initialItems});
+  const _ExcludedDialog({
+    required this.sourceId,
+    required this.sourcePath,
+    required this.initialItems,
+    this.onAddPath,
+  });
 
   final String sourceId;
+  final String sourcePath;
   final List<String> initialItems;
+  final Future<String?> Function()? onAddPath;
 
   @override
   State<_ExcludedDialog> createState() => _ExcludedDialogState();
@@ -1353,8 +1727,12 @@ class _ExcludedDialogState extends State<_ExcludedDialog> {
     return next;
   }
 
-  void _add() {
-    setState(() => controllers.add(TextEditingController()));
+  Future<void> _add() async {
+    final picked = await widget.onAddPath?.call();
+    if (picked == null && widget.onAddPath != null) {
+      return;
+    }
+    setState(() => controllers.add(TextEditingController(text: picked ?? '')));
   }
 
   void _remove(int index) {
@@ -1372,7 +1750,7 @@ class _ExcludedDialogState extends State<_ExcludedDialog> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _IssueSummary(widget.sourceId),
+          _IssueSummary('${widget.sourceId}: ${widget.sourcePath}'),
           const SizedBox(height: 8),
           Expanded(
             child: Container(
@@ -1431,7 +1809,12 @@ class _ExcludedDialogState extends State<_ExcludedDialog> {
           Row(
             mainAxisAlignment: MainAxisAlignment.end,
             children: [
-              MasterButton(label: 'Add', width: 72, primary: true, onTap: _add),
+              MasterButton(
+                label: 'Add',
+                width: 72,
+                primary: true,
+                onTap: () => unawaited(_add()),
+              ),
               const SizedBox(width: 8),
               MasterButton(
                 label: 'Save',
@@ -1643,10 +2026,61 @@ String _machinePath(String machineId, String path) {
   return '$prefix: $clean';
 }
 
+Map<String, dynamic> _defaultDestinationSchedule() => {
+  'mode': 'realtime',
+  'time': '19:00',
+  'timezone': 'local',
+  'weekday': 'monday',
+  'sync_current_cycle_manually': false,
+};
+
+Map<String, dynamic> _cloneSchedule(Map<String, dynamic> schedule) {
+  final defaults = _defaultDestinationSchedule();
+  final mode = _str(schedule['mode'], _str(defaults['mode']));
+  return {
+    ...defaults,
+    ...schedule,
+    'mode': mode == 'weekly' || mode == 'daily' || mode == 'realtime'
+        ? mode
+        : _str(defaults['mode']),
+    'time': _normalizeScheduleTime(
+      _str(schedule['time'], _str(defaults['time'])),
+    ),
+    'timezone': 'local',
+    'weekday': _normalizeWeekday(
+      _str(schedule['weekday'], _str(defaults['weekday'])),
+    ),
+    'sync_current_cycle_manually': false,
+  };
+}
+
+String _normalizeScheduleTime(String value) {
+  final match = RegExp(r'^(\d{1,2}):(\d{2})(?::\d{2})?$').firstMatch(value);
+  if (match == null) return '19:00';
+  final hour = math.min(23, int.tryParse(match.group(1) ?? '') ?? 19);
+  final minute = math.min(59, int.tryParse(match.group(2) ?? '') ?? 0);
+  return '${hour.toString().padLeft(2, '0')}:${minute.toString().padLeft(2, '0')}';
+}
+
+String _normalizeWeekday(String value) {
+  const weekdays = {
+    'monday',
+    'tuesday',
+    'wednesday',
+    'thursday',
+    'friday',
+    'saturday',
+    'sunday',
+  };
+  final lower = value.trim().toLowerCase();
+  return weekdays.contains(lower) ? lower : 'monday';
+}
+
 String _scheduleLabel(Map<String, dynamic> schedule) {
-  final mode = _str(schedule['mode'], 'daily');
-  final time = _str(schedule['time'], '10:00');
-  final weekday = _str(schedule['weekday'], 'saturday');
+  final next = _cloneSchedule(schedule);
+  final mode = _str(next['mode'], 'realtime');
+  final time = _str(next['time'], '19:00');
+  final weekday = _str(next['weekday'], 'monday');
   if (mode == 'weekly') {
     const labels = {
       'monday': 'Mon',
@@ -1904,6 +2338,7 @@ class _SourceCard extends StatelessWidget {
       context: context,
       builder: (context) => _ExcludedDialog(
         sourceId: _str(source['id'], 'source'),
+        sourcePath: _str(source['src'], '-'),
         initialItems: _list(source['excludes']).map((item) => '$item').toList(),
       ),
     );
@@ -2395,6 +2830,110 @@ class _SyncSettingsDialogState extends State<_SyncSettingsDialog> {
   }
 }
 
+class _ScheduleDialog extends StatefulWidget {
+  const _ScheduleDialog({required this.schedule});
+
+  final Map<String, dynamic> schedule;
+
+  @override
+  State<_ScheduleDialog> createState() => _ScheduleDialogState();
+}
+
+class _ScheduleDialogState extends State<_ScheduleDialog> {
+  late String mode = _str(widget.schedule['mode'], 'realtime');
+  late String weekday = _normalizeWeekday(_str(widget.schedule['weekday']));
+  late final TextEditingController time = TextEditingController(
+    text: _normalizeScheduleTime(_str(widget.schedule['time'], '19:00')),
+  );
+
+  @override
+  void dispose() {
+    time.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheduled = mode != 'realtime';
+    return _MasterDialogFrame(
+      title: 'Schedule',
+      width: 420,
+      maxHeight: mode == 'weekly' ? 330 : 270,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const _MasterLabel('Mode'),
+          SizedBox(
+            height: _masterControlHeight,
+            child: DropdownButtonFormField<String>(
+              initialValue: mode,
+              decoration: const InputDecoration(),
+              items: const [
+                DropdownMenuItem(value: 'realtime', child: Text('Realtime')),
+                DropdownMenuItem(value: 'daily', child: Text('Daily')),
+                DropdownMenuItem(value: 'weekly', child: Text('Weekly')),
+              ],
+              onChanged: (value) {
+                if (value != null) setState(() => mode = value);
+              },
+            ),
+          ),
+          if (scheduled) ...[
+            const SizedBox(height: 10),
+            const _MasterLabel('Time'),
+            _CompactInput(controller: time, placeholder: '19:00'),
+          ],
+          if (mode == 'weekly') ...[
+            const SizedBox(height: 10),
+            const _MasterLabel('Weekday'),
+            SizedBox(
+              height: _masterControlHeight,
+              child: DropdownButtonFormField<String>(
+                initialValue: weekday,
+                decoration: const InputDecoration(),
+                items: const [
+                  DropdownMenuItem(value: 'monday', child: Text('Monday')),
+                  DropdownMenuItem(value: 'tuesday', child: Text('Tuesday')),
+                  DropdownMenuItem(
+                    value: 'wednesday',
+                    child: Text('Wednesday'),
+                  ),
+                  DropdownMenuItem(value: 'thursday', child: Text('Thursday')),
+                  DropdownMenuItem(value: 'friday', child: Text('Friday')),
+                  DropdownMenuItem(value: 'saturday', child: Text('Saturday')),
+                  DropdownMenuItem(value: 'sunday', child: Text('Sunday')),
+                ],
+                onChanged: (value) {
+                  if (value != null) setState(() => weekday = value);
+                },
+              ),
+            ),
+          ],
+          const Spacer(),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              MasterButton(
+                label: 'Apply',
+                width: 72,
+                primary: true,
+                onTap: () => Navigator.pop(
+                  context,
+                  _cloneSchedule({
+                    'mode': mode,
+                    'time': scheduled ? time.text : '19:00',
+                    'weekday': weekday,
+                  }),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _MasterDialogFrame extends StatelessWidget {
   const _MasterDialogFrame({
     required this.title,
@@ -2491,6 +3030,331 @@ class _MasterPre extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _PathPickerDialog extends StatefulWidget {
+  const _PathPickerDialog({
+    required this.api,
+    required this.machineIds,
+    required this.machineLabel,
+    required this.initialMachineId,
+    required this.initialPath,
+    required this.showAddDirectory,
+    required this.initialAddDirectory,
+    this.validate,
+  });
+
+  final AutoSyncApi api;
+  final List<String> machineIds;
+  final String Function(String id) machineLabel;
+  final String initialMachineId;
+  final String initialPath;
+  final bool showAddDirectory;
+  final bool initialAddDirectory;
+  final String? Function(Map<String, dynamic> selection)? validate;
+
+  @override
+  State<_PathPickerDialog> createState() => _PathPickerDialogState();
+}
+
+class _PathPickerDialogState extends State<_PathPickerDialog> {
+  late String machineId = widget.initialMachineId;
+  late String path = widget.initialPath;
+  String? parent;
+  String error = '';
+  bool loading = true;
+  late bool addDirectory = widget.initialAddDirectory;
+  List<Map<String, dynamic>> entries = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load(path);
+  }
+
+  Future<void> _load(String nextPath) async {
+    setState(() {
+      loading = true;
+      error = '';
+    });
+    try {
+      final res = await widget.api.browsePaths(
+        path: nextPath,
+        machineId: machineId,
+      );
+      if (!mounted) return;
+      setState(() {
+        path = _str(res['path'], nextPath);
+        parent = res['parent'] == null ? null : _str(res['parent']);
+        entries = _mapRefs(res['entries']);
+        loading = false;
+      });
+    } catch (err) {
+      if (!mounted) return;
+      setState(() {
+        error = '$err';
+        loading = false;
+      });
+    }
+  }
+
+  void _choose(String chosenPath) {
+    final selection = {
+      'machine_id': machineId,
+      'path': chosenPath,
+      'add_directory': addDirectory,
+    };
+    final validation = widget.validate?.call(selection);
+    if (validation != null && validation.isNotEmpty) {
+      setState(() => error = validation);
+      return;
+    }
+    Navigator.pop(context, selection);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _MasterDialogFrame(
+      title: 'Path',
+      width: 720,
+      maxHeight: 720,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              SizedBox(
+                width: 160,
+                height: _masterControlHeight,
+                child: DropdownButtonFormField<String>(
+                  initialValue: machineId,
+                  decoration: const InputDecoration(),
+                  items: widget.machineIds
+                      .map(
+                        (id) => DropdownMenuItem(
+                          value: id,
+                          child: Text(widget.machineLabel(id)),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (value) {
+                    if (value == null) return;
+                    setState(() => machineId = value);
+                    _load(
+                      value == 'local' && Platform.isWindows ? r'C:\' : '/',
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(child: _FolderPathLabel(path)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              MasterButton(
+                label: 'Up',
+                width: 64,
+                onTap: parent == null ? null : () => _load(parent!),
+              ),
+              const SizedBox(width: 8),
+              MasterButton(
+                label: 'Choose',
+                width: 82,
+                primary: true,
+                onTap: () => _choose(path),
+              ),
+              if (widget.showAddDirectory) ...[
+                const SizedBox(width: 12),
+                _CheckCell(
+                  value: addDirectory,
+                  label: 'Add containing directory',
+                  onChanged: (value) => setState(() => addDirectory = value),
+                ),
+              ],
+            ],
+          ),
+          if (error.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(error, style: const TextStyle(color: Palette.red)),
+          ],
+          const SizedBox(height: 8),
+          Expanded(
+            child: Container(
+              decoration: const BoxDecoration(
+                border: Border(top: BorderSide(color: Palette.line)),
+              ),
+              child: loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : entries.isEmpty
+                  ? const EmptyLine('No entries')
+                  : ListView.builder(
+                      itemCount: entries.length,
+                      itemBuilder: (context, index) {
+                        final entry = entries[index];
+                        final isDir = _str(entry['kind']) == 'dir';
+                        return InkWell(
+                          onTap: () => isDir
+                              ? _load(_str(entry['path']))
+                              : _choose(_str(entry['path'])),
+                          onDoubleTap: () => _choose(_str(entry['path'])),
+                          child: Container(
+                            height: 34,
+                            padding: const EdgeInsets.symmetric(horizontal: 2),
+                            decoration: const BoxDecoration(
+                              border: Border(
+                                bottom: BorderSide(color: Palette.line),
+                              ),
+                            ),
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              isDir
+                                  ? '${_str(entry['name'])}/'
+                                  : _str(entry['name']),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: isDir ? Palette.accent : Palette.text,
+                                fontFamily: 'Consolas',
+                                fontSize: 12,
+                                fontWeight: isDir
+                                    ? FontWeight.w700
+                                    : FontWeight.w400,
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FolderPathLabel extends StatelessWidget {
+  const _FolderPathLabel(this.path);
+
+  final String path;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: _masterControlHeight,
+      alignment: Alignment.centerLeft,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xfff8fafc),
+        border: Border.all(color: Palette.line),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        path,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+      ),
+    );
+  }
+}
+
+class _DestinationInfoDialog extends StatelessWidget {
+  const _DestinationInfoDialog({
+    required this.source,
+    required this.destination,
+    required this.status,
+    required this.scanReport,
+    required this.error,
+  });
+
+  final Map<String, dynamic> source;
+  final Map<String, dynamic> destination;
+  final Map<String, dynamic>? status;
+  final Map<String, dynamic> scanReport;
+  final String error;
+
+  @override
+  Widget build(BuildContext context) {
+    final title = '${_str(source['id'])} -> ${_str(destination['id'])}';
+    final rows = <MapEntry<String, String>>[
+      MapEntry(
+        'Source',
+        _machinePath(_str(source['machine_id'], 'local'), _str(source['src'])),
+      ),
+      MapEntry(
+        'Destination',
+        _machinePath(
+          _str(destination['machine_id'], 'local'),
+          _str(destination['path']),
+        ),
+      ),
+      MapEntry(
+        'Status',
+        status == null
+            ? 'unknown'
+            : '${_str(status?['status'])}: ${_str(status?['status_reason'])}',
+      ),
+      MapEntry('Cycle', _cycleDisplay(status)),
+      if (error.isNotEmpty) MapEntry('Error', error),
+    ];
+    return _MasterDialogFrame(
+      title: 'Destination Log',
+      width: 860,
+      maxHeight: 720,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _IssueSummary(title),
+          const SizedBox(height: 8),
+          for (final row in rows)
+            _InfoRow(
+              label: row.key,
+              value: row.value.isEmpty ? '-' : row.value,
+            ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: _MasterPre(
+              text: scanReport.isEmpty
+                  ? 'No scan report.'
+                  : const JsonEncoder.withIndent('  ').convert(scanReport),
+              maxHeight: 520,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _InfoRow extends StatelessWidget {
+  const _InfoRow({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: Palette.line)),
+      ),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 150,
+            child: Text(label, style: const TextStyle(color: Palette.muted)),
+          ),
+          Expanded(
+            child: Text(value, maxLines: 2, overflow: TextOverflow.ellipsis),
+          ),
+        ],
       ),
     );
   }
@@ -3225,6 +4089,60 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     _scheduleSave();
   }
 
+  Future<void> _browseRoot(Map<String, dynamic> host) async {
+    final selected = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => _PathPickerDialog(
+        api: widget.api,
+        machineIds: const ['local'],
+        machineLabel: (id) => id,
+        initialMachineId: 'local',
+        initialPath: _str(host['root'], Platform.isWindows ? r'C:\' : '/'),
+        showAddDirectory: false,
+        initialAddDirectory: false,
+      ),
+    );
+    if (selected == null) return;
+    setState(() => host['root'] = _str(selected['path']));
+    _scheduleSave();
+  }
+
+  Future<void> _browseGitDir() async {
+    final selected = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => _PathPickerDialog(
+        api: widget.api,
+        machineIds: const ['local'],
+        machineLabel: (id) => id,
+        initialMachineId: 'local',
+        initialPath: gitDir.text.trim().isEmpty
+            ? (Platform.isWindows ? r'C:\' : '/')
+            : gitDir.text.trim(),
+        showAddDirectory: false,
+        initialAddDirectory: false,
+      ),
+    );
+    if (selected == null) return;
+    gitDir.text = _str(selected['path']);
+    _scheduleSave();
+  }
+
+  Future<void> _runDeploy(int index) async {
+    setState(() {
+      busy = true;
+      message = 'Deploying...';
+    });
+    try {
+      await _persistNow();
+      final next = await widget.api.collectorDeploy(index);
+      if (mounted) setState(() => status = next);
+    } catch (error) {
+      if (mounted) setState(() => message = '$error');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
   Future<void> _showConfig() async {
     await _persistNow();
     if (!mounted) return;
@@ -3282,7 +4200,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                               MasterButton(
                                 label: '...',
                                 square: true,
-                                onTap: null,
+                                onTap: _browseGitDir,
                               ),
                             ],
                           ),
@@ -3338,62 +4256,75 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                 ),
                 const SizedBox(height: 8),
                 Expanded(
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: SizedBox(
-                      width: 854,
-                      child: ListView(
-                        children: [
-                          const _CollectorHostHeader(),
-                          if (hosts.isEmpty)
-                            const EmptyLine(
-                              'No hosts yet - click "+ Add host".',
-                            )
-                          else
-                            ...hosts.asMap().entries.map(
-                              (entry) => _CollectorHostRow(
-                                index: entry.key,
-                                host: entry.value,
-                                onChanged: () {
-                                  setState(() {});
-                                  _scheduleSave();
-                                },
-                                onRemove: () {
-                                  final next = hosts;
-                                  next.removeAt(entry.key);
-                                  setState(() => cfg['hosts'] = next);
-                                  _scheduleSave();
-                                },
-                                onPaths: () async {
-                                  await showDialog<void>(
-                                    context: context,
-                                    builder: (context) => _CollectorPathsDialog(
-                                      host: entry.value,
-                                      onChanged: () {
-                                        setState(() {});
-                                        _scheduleSave();
-                                      },
-                                    ),
-                                  );
-                                },
-                                onDeploy: () async {
-                                  await showDialog<void>(
-                                    context: context,
-                                    builder: (context) =>
-                                        _CollectorDeployDialog(
-                                          host: entry.value,
-                                          onChanged: () {
-                                            setState(() {});
-                                            _scheduleSave();
-                                          },
-                                        ),
-                                  );
-                                },
-                              ),
-                            ),
-                        ],
-                      ),
-                    ),
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final tableWidth = math.max(
+                        _collectorTableBaseWidth,
+                        constraints.maxWidth,
+                      );
+                      return SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: SizedBox(
+                          width: tableWidth,
+                          child: ListView(
+                            children: [
+                              const _CollectorHostHeader(),
+                              if (hosts.isEmpty)
+                                const EmptyLine(
+                                  'No hosts yet - click "+ Add host".',
+                                )
+                              else
+                                ...hosts.asMap().entries.map(
+                                  (entry) => _CollectorHostRow(
+                                    index: entry.key,
+                                    host: entry.value,
+                                    onChanged: () {
+                                      setState(() {});
+                                      _scheduleSave();
+                                    },
+                                    onRemove: () {
+                                      final next = hosts;
+                                      next.removeAt(entry.key);
+                                      setState(() => cfg['hosts'] = next);
+                                      _scheduleSave();
+                                    },
+                                    onBrowseRoot: () =>
+                                        _browseRoot(entry.value),
+                                    onPaths: () async {
+                                      await showDialog<void>(
+                                        context: context,
+                                        builder: (context) =>
+                                            _CollectorPathsDialog(
+                                              api: widget.api,
+                                              host: entry.value,
+                                              onChanged: () {
+                                                setState(() {});
+                                                _scheduleSave();
+                                              },
+                                            ),
+                                      );
+                                    },
+                                    onDeploy: () async {
+                                      await showDialog<void>(
+                                        context: context,
+                                        builder: (context) =>
+                                            _CollectorDeployDialog(
+                                              host: entry.value,
+                                              onChanged: () {
+                                                setState(() {});
+                                                _scheduleSave();
+                                              },
+                                            ),
+                                      );
+                                    },
+                                    onDeployRun: () => _runDeploy(entry.key),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
                   ),
                 ),
                 const SizedBox(height: 10),
@@ -3442,6 +4373,7 @@ class _CollectorHostHeader extends StatelessWidget {
         Text('IdentityFile'),
         Text('Root dir'),
         Text('Files'),
+        Text('Exclude'),
         Text(''),
         Text(''),
         Text(''),
@@ -3457,21 +4389,28 @@ class _CollectorHostRow extends StatelessWidget {
     required this.host,
     required this.onChanged,
     required this.onRemove,
+    required this.onBrowseRoot,
     required this.onPaths,
     required this.onDeploy,
+    required this.onDeployRun,
   });
 
   final int index;
   final Map<String, dynamic> host;
   final VoidCallback onChanged;
   final VoidCallback onRemove;
+  final VoidCallback onBrowseRoot;
   final VoidCallback onPaths;
   final VoidCallback onDeploy;
+  final VoidCallback onDeployRun;
 
   @override
   Widget build(BuildContext context) {
     final pathCount = _list(
       host['paths'],
+    ).where((path) => _str(path).trim().isNotEmpty).length;
+    final excludeCount = _list(
+      host['exclude'],
     ).where((path) => _str(path).trim().isNotEmpty).length;
     void setField(String key, dynamic value) {
       host[key] = value;
@@ -3514,16 +4453,17 @@ class _CollectorHostRow extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 6),
-            MasterButton(label: '...', square: true, onTap: null),
+            MasterButton(label: '...', square: true, onTap: onBrowseRoot),
           ],
         ),
-        MasterButton(label: 'Files ($pathCount)', onTap: onPaths),
-        _CollectorTinyButton(label: 'E', onTap: onDeploy),
+        MasterButton(label: '$pathCount', onTap: onPaths),
+        MasterButton(label: 'Exclude $excludeCount', onTap: onPaths),
+        _CollectorTinyButton(label: '📝', onTap: onDeploy),
         _CollectorTinyButton(
-          label: '>',
+          label: '▶',
           accent: true,
           color: Palette.green,
-          onTap: onDeploy,
+          onTap: onDeployRun,
         ),
         _CollectorCheckCell(
           value: _bool(host['enabled'], true),
@@ -3590,6 +4530,8 @@ class _CollectorCheckCell extends StatelessWidget {
   }
 }
 
+const double _collectorTableBaseWidth = 924;
+
 class _CollectorHostGrid extends StatelessWidget {
   const _CollectorHostGrid({required this.cells, this.head = false});
 
@@ -3598,31 +4540,57 @@ class _CollectorHostGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const widths = <double>[80, 112, 68, 72, 132, 150, 72, 30, 30, 24, 24];
     final style = TextStyle(
       color: head ? Palette.muted : Palette.text,
       fontSize: head ? 11 : 12,
     );
-    return DefaultTextStyle.merge(
-      style: style,
-      child: Padding(
-        padding: const EdgeInsets.only(bottom: 8),
-        child: Row(
-          children: [
-            for (var i = 0; i < widths.length; i++) ...[
-              SizedBox(width: widths[i], child: cells[i]),
-              if (i != widths.length - 1) const SizedBox(width: 6),
-            ],
-          ],
-        ),
-      ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final extra = math.max(
+          0.0,
+          constraints.maxWidth - _collectorTableBaseWidth,
+        );
+        final widths = <double>[
+          80,
+          112,
+          68,
+          72,
+          132 + extra * 0.45,
+          150 + extra * 0.55,
+          42,
+          94,
+          30,
+          30,
+          24,
+          24,
+        ];
+        return DefaultTextStyle.merge(
+          style: style,
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(
+              children: [
+                for (var i = 0; i < widths.length; i++) ...[
+                  SizedBox(width: widths[i], child: cells[i]),
+                  if (i != widths.length - 1) const SizedBox(width: 6),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }
 
 class _CollectorPathsDialog extends StatefulWidget {
-  const _CollectorPathsDialog({required this.host, required this.onChanged});
+  const _CollectorPathsDialog({
+    required this.api,
+    required this.host,
+    required this.onChanged,
+  });
 
+  final AutoSyncApi api;
   final Map<String, dynamic> host;
   final VoidCallback onChanged;
 
@@ -3639,6 +4607,25 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
   void _setList(String key, List<String> value) {
     widget.host[key] = value;
     widget.onChanged();
+  }
+
+  Future<void> _browse(String key) async {
+    final current = key == 'exclude' ? exclude : paths;
+    final selected = await showDialog<String>(
+      context: context,
+      builder: (context) => _CollectorRemotePathDialog(
+        api: widget.api,
+        host: widget.host,
+        title: key == 'exclude' ? 'Ignore' : 'Collect',
+        initialPath: current.isNotEmpty ? current.last : '/',
+      ),
+    );
+    if (selected == null || selected.trim().isEmpty) return;
+    final next = [...current];
+    if (!next.contains(selected)) {
+      next.add(selected);
+    }
+    setState(() => _setList(key, next));
   }
 
   @override
@@ -3664,7 +4651,7 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
             child: MasterButton(
               label: 'Browse',
               width: 72,
-              onTap: () => setState(() => _setList('paths', [...paths, ''])),
+              onTap: () => unawaited(_browse('paths')),
             ),
           ),
           const SizedBox(height: 12),
@@ -3679,8 +4666,163 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
             child: MasterButton(
               label: 'Browse',
               width: 72,
-              onTap: () =>
-                  setState(() => _setList('exclude', [...exclude, ''])),
+              onTap: () => unawaited(_browse('exclude')),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CollectorRemotePathDialog extends StatefulWidget {
+  const _CollectorRemotePathDialog({
+    required this.api,
+    required this.host,
+    required this.title,
+    required this.initialPath,
+  });
+
+  final AutoSyncApi api;
+  final Map<String, dynamic> host;
+  final String title;
+  final String initialPath;
+
+  @override
+  State<_CollectorRemotePathDialog> createState() =>
+      _CollectorRemotePathDialogState();
+}
+
+class _CollectorRemotePathDialogState
+    extends State<_CollectorRemotePathDialog> {
+  String path = '/';
+  String? parent;
+  String error = '';
+  bool loading = true;
+  List<Map<String, dynamic>> entries = [];
+
+  @override
+  void initState() {
+    super.initState();
+    path = widget.initialPath.trim().isEmpty ? '/' : widget.initialPath.trim();
+    _load(path);
+  }
+
+  Map<String, dynamic> _request(String nextPath) => {
+    'hostname': _str(widget.host['hostname']),
+    'user': _str(widget.host['user']),
+    'port': _int(widget.host['port'], 22),
+    'identity_file': _str(widget.host['identity_file']),
+    'path': nextPath,
+  };
+
+  Future<void> _load(String nextPath) async {
+    setState(() {
+      loading = true;
+      error = '';
+    });
+    try {
+      final response = await widget.api.collectorBrowse(_request(nextPath));
+      if (!mounted) return;
+      setState(() {
+        path = _str(response['path'], nextPath);
+        parent = response['parent'] == null ? null : _str(response['parent']);
+        entries = _mapRefs(response['entries']);
+        loading = false;
+      });
+    } catch (err) {
+      if (!mounted) return;
+      setState(() {
+        error = '$err';
+        loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hostLabel = [
+      _str(widget.host['user']),
+      _str(widget.host['hostname']),
+    ].where((part) => part.isNotEmpty).join('@');
+    return _MasterDialogFrame(
+      title: '${widget.title} - ${hostLabel.isEmpty ? 'host' : hostLabel}',
+      width: 760,
+      maxHeight: 720,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _FolderPathLabel(path),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              MasterButton(
+                label: 'Up',
+                width: 64,
+                onTap: parent == null ? null : () => _load(parent!),
+              ),
+              const SizedBox(width: 8),
+              MasterButton(
+                label: 'Choose',
+                width: 82,
+                primary: true,
+                onTap: () => Navigator.pop(context, path),
+              ),
+            ],
+          ),
+          if (error.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(error, style: const TextStyle(color: Palette.red)),
+          ],
+          const SizedBox(height: 8),
+          Expanded(
+            child: Container(
+              decoration: const BoxDecoration(
+                border: Border(top: BorderSide(color: Palette.line)),
+              ),
+              child: loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : entries.isEmpty
+                  ? const EmptyLine('(empty)')
+                  : ListView.builder(
+                      itemCount: entries.length,
+                      itemBuilder: (context, index) {
+                        final entry = entries[index];
+                        final isDir = _bool(entry['is_dir']);
+                        return InkWell(
+                          onTap: () => isDir
+                              ? _load(_str(entry['path']))
+                              : Navigator.pop(context, _str(entry['path'])),
+                          onDoubleTap: () =>
+                              Navigator.pop(context, _str(entry['path'])),
+                          child: Container(
+                            height: 34,
+                            alignment: Alignment.centerLeft,
+                            padding: const EdgeInsets.symmetric(horizontal: 2),
+                            decoration: const BoxDecoration(
+                              border: Border(
+                                bottom: BorderSide(color: Palette.line),
+                              ),
+                            ),
+                            child: Text(
+                              isDir
+                                  ? '${_str(entry['name'])}/'
+                                  : _str(entry['name']),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: isDir ? Palette.accent : Palette.text,
+                                fontFamily: 'Consolas',
+                                fontSize: 12,
+                                fontWeight: isDir
+                                    ? FontWeight.w700
+                                    : FontWeight.w400,
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
             ),
           ),
         ],
