@@ -191,7 +191,10 @@ pub fn run(cfg: CollectorConfig, state: Arc<Mutex<CollectorRunState>>) {
             true
         }
         Ok(failures) => {
-            log(&state, format!("Collector finished with {failures} failed path(s)."));
+            log(
+                &state,
+                format!("Collector finished with {failures} failed path(s)."),
+            );
             false
         }
         Err(err) => {
@@ -237,7 +240,10 @@ fn run_inner(cfg: &CollectorConfig, state: &Arc<Mutex<CollectorRunState>>) -> Re
     if cfg.auto_commit_push {
         commit_and_push(&git_dir, state)?;
     } else {
-        log(state, "auto commit/push disabled; leaving working tree as-is");
+        log(
+            state,
+            "auto commit/push disabled; leaving working tree as-is",
+        );
     }
 
     Ok(failures)
@@ -397,15 +403,42 @@ fn parse_perm_line(line: &str) -> Option<(String, String)> {
     }
     let p = &sym[1..10];
     let mut mode = 0u32;
-    if p[0] == b'r' { mode |= 0o400; }
-    if p[1] == b'w' { mode |= 0o200; }
-    match p[2] { b'x' => mode |= 0o100, b's' => mode |= 0o4100, b'S' => mode |= 0o4000, _ => {} }
-    if p[3] == b'r' { mode |= 0o40; }
-    if p[4] == b'w' { mode |= 0o20; }
-    match p[5] { b'x' => mode |= 0o10, b's' => mode |= 0o2010, b'S' => mode |= 0o2000, _ => {} }
-    if p[6] == b'r' { mode |= 0o4; }
-    if p[7] == b'w' { mode |= 0o2; }
-    match p[8] { b'x' => mode |= 0o1, b't' => mode |= 0o1001, b'T' => mode |= 0o1000, _ => {} }
+    if p[0] == b'r' {
+        mode |= 0o400;
+    }
+    if p[1] == b'w' {
+        mode |= 0o200;
+    }
+    match p[2] {
+        b'x' => mode |= 0o100,
+        b's' => mode |= 0o4100,
+        b'S' => mode |= 0o4000,
+        _ => {}
+    }
+    if p[3] == b'r' {
+        mode |= 0o40;
+    }
+    if p[4] == b'w' {
+        mode |= 0o20;
+    }
+    match p[5] {
+        b'x' => mode |= 0o10,
+        b's' => mode |= 0o2010,
+        b'S' => mode |= 0o2000,
+        _ => {}
+    }
+    if p[6] == b'r' {
+        mode |= 0o4;
+    }
+    if p[7] == b'w' {
+        mode |= 0o2;
+    }
+    match p[8] {
+        b'x' => mode |= 0o1,
+        b't' => mode |= 0o1001,
+        b'T' => mode |= 0o1000,
+        _ => {}
+    }
     Some((format!("{mode:o}"), path.to_string()))
 }
 
@@ -436,7 +469,15 @@ fn pull_path(
         return pull_dir_excluding(conn, remote, &local_dir, excludes, state);
     }
 
-    log(state, format!("  scp {}:{} -> {}", conn.dest(), remote, local_parent.display()));
+    log(
+        state,
+        format!(
+            "  scp {}:{} -> {}",
+            conn.dest(),
+            remote,
+            local_parent.display()
+        ),
+    );
     scp_recursive(conn, remote, &local_parent)
 }
 
@@ -460,7 +501,10 @@ fn scp_recursive(conn: &SshConn, remote: &str, local_dest: &Path) -> Result<()> 
     cmd.arg(local_dest);
     let output = cmd.output().context("running scp")?;
     if !output.status.success() {
-        bail!("scp failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        bail!(
+            "scp failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -492,8 +536,7 @@ fn pull_dir_excluding(
     excludes: &[String],
     state: &Arc<Mutex<CollectorRunState>>,
 ) -> Result<()> {
-    fs::create_dir_all(local_dir)
-        .with_context(|| format!("creating {}", local_dir.display()))?;
+    fs::create_dir_all(local_dir).with_context(|| format!("creating {}", local_dir.display()))?;
     let names = list_remote_names(conn, remote_dir)?;
     for name in names {
         let child = join_remote(remote_dir, &name);
@@ -514,7 +557,10 @@ fn pull_dir_excluding(
 /// remote directory. Uses `ls -A1` piped through a read loop so an unmatched
 /// glob never aborts under zsh.
 fn list_remote_names(conn: &SshConn, dir: &str) -> Result<Vec<String>> {
-    let cmd = format!("cd -- {} 2>/dev/null && ls -A1 2>/dev/null", shell_quote(dir));
+    let cmd = format!(
+        "cd -- {} 2>/dev/null && ls -A1 2>/dev/null",
+        shell_quote(dir)
+    );
     let out = ssh_capture(conn, &cmd)?;
     Ok(out
         .lines()
@@ -534,7 +580,11 @@ fn list_remote_names(conn: &SshConn, dir: &str) -> Result<Vec<String>> {
 ///   AS_ROOT                the host's local collected root (e.g. D:\share\openwrt)
 ///   AS_HOST_<NAME>         every collector host's hostname (so a script can, e.g.,
 ///                          read AS_HOST_AWS to substitute a server address)
-pub fn deploy(host: CollectorHost, all_hosts: Vec<CollectorHost>, state: Arc<Mutex<CollectorRunState>>) {
+pub fn deploy(
+    host: CollectorHost,
+    all_hosts: Vec<CollectorHost>,
+    state: Arc<Mutex<CollectorRunState>>,
+) {
     let ok = match deploy_inner(&host, &all_hosts, &state) {
         Ok(0) => {
             log(&state, "Deploy finished.");
@@ -573,7 +623,13 @@ fn deploy_inner(
     } else {
         host.name.clone()
     };
-    log(state, format!("=== deploy {label} ({}) — running on this machine ===", conn.dest()));
+    log(
+        state,
+        format!(
+            "=== deploy {label} ({}) — running on this machine ===",
+            conn.dest()
+        ),
+    );
 
     if host.deploy_script.trim().is_empty() {
         log(state, "no deploy script for this host — nothing to do");
@@ -656,7 +712,10 @@ fn resolve_ssh_tool(tool: &str) -> String {
         if let Some(dir) = exe.parent() {
             let exe_name = format!("{tool}.exe");
             let candidates = [
-                dir.join("windows").join("openssh").join("OpenSSH-Win64").join(&exe_name),
+                dir.join("windows")
+                    .join("openssh")
+                    .join("OpenSSH-Win64")
+                    .join(&exe_name),
                 dir.join("openssh").join("OpenSSH-Win64").join(&exe_name),
                 dir.join(&exe_name),
             ];
@@ -676,7 +735,13 @@ fn env_host_suffix(name: &str) -> String {
     let mut s: String = name
         .trim()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     if s.is_empty() {
         s.push('_');
@@ -701,7 +766,13 @@ fn run_local_deploy_script(
     #[cfg(windows)]
     let mut cmd = {
         let mut c = command("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]);
+        c.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ]);
         c
     };
     #[cfg(not(windows))]
@@ -717,11 +788,28 @@ fn run_local_deploy_script(
     cmd.env("AS_HOSTNAME", conn.hostname);
     cmd.env("AS_USER", conn.user);
     cmd.env("AS_DEST", conn.dest());
-    cmd.env("AS_PORT", if conn.port == 0 { String::new() } else { conn.port.to_string() });
-    cmd.env("AS_KEY", if conn.identity_file.is_empty() { String::new() } else { expand_tilde(conn.identity_file) });
+    cmd.env(
+        "AS_PORT",
+        if conn.port == 0 {
+            String::new()
+        } else {
+            conn.port.to_string()
+        },
+    );
+    cmd.env(
+        "AS_KEY",
+        if conn.identity_file.is_empty() {
+            String::new()
+        } else {
+            expand_tilde(conn.identity_file)
+        },
+    );
     cmd.env("AS_ROOT", host.root.as_os_str());
     for other in all_hosts {
-        cmd.env(format!("AS_HOST_{}", env_host_suffix(&other.name)), other.hostname.trim());
+        cmd.env(
+            format!("AS_HOST_{}", env_host_suffix(&other.name)),
+            other.hostname.trim(),
+        );
     }
 
     // Hand the script the per-host permission cache captured at collect time so
@@ -781,13 +869,19 @@ fn prepare_ss_client_conf(
         .map(|h| h.hostname.trim().to_string())
         .filter(|s| !s.is_empty())
     else {
-        log(state, "shadowsocks conf present but no 'aws' host — leaving server address unchanged");
+        log(
+            state,
+            "shadowsocks conf present but no 'aws' host — leaving server address unchanged",
+        );
         return None;
     };
     let text = match fs::read_to_string(&conf_local) {
         Ok(text) => text,
         Err(err) => {
-            log(state, format!("could not read {}: {err}", conf_local.display()));
+            log(
+                state,
+                format!("could not read {}: {err}", conf_local.display()),
+            );
             return None;
         }
     };
@@ -799,11 +893,17 @@ fn prepare_ss_client_conf(
                 return None;
             }
             let family = if is_ipv4(&aws) { "IPv4" } else { "IPv6" };
-            log(state, format!("shadowsocks server address -> {aws} ({family})"));
+            log(
+                state,
+                format!("shadowsocks server address -> {aws} ({family})"),
+            );
             Some(temp)
         }
         Err(err) => {
-            log(state, format!("shadowsocks server substitution skipped: {err:#}"));
+            log(
+                state,
+                format!("shadowsocks server substitution skipped: {err:#}"),
+            );
             None
         }
     }
@@ -833,7 +933,10 @@ fn split_large_files(
             continue;
         }
         let path = entry.path();
-        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
         if name.contains(AUTOSPLIT_MARKER) {
             continue; // already a part
         }
@@ -850,7 +953,12 @@ fn split_large_files(
         }
         log(
             state,
-            format!("  split {} ({} MiB) into {} part(s)", name, len / 1024 / 1024, parts),
+            format!(
+                "  split {} ({} MiB) into {} part(s)",
+                name,
+                len / 1024 / 1024,
+                parts
+            ),
         );
     }
     ignore.save()?;
@@ -871,8 +979,8 @@ fn split_file(path: &Path, part_size: u64) -> Result<usize> {
         let mut part_name = path.as_os_str().to_owned();
         part_name.push(format!("{AUTOSPLIT_MARKER}{index:0width$}"));
         let part_path = PathBuf::from(part_name);
-        let mut out =
-            File::create(&part_path).with_context(|| format!("creating {}", part_path.display()))?;
+        let mut out = File::create(&part_path)
+            .with_context(|| format!("creating {}", part_path.display()))?;
         let mut written = 0u64;
         while written < part_size {
             let want = std::cmp::min(buf.len() as u64, part_size - written) as usize;
@@ -915,11 +1023,18 @@ fn commit_and_push(git_dir: &Path, state: &Arc<Mutex<CollectorRunState>>) -> Res
     if status.trim().is_empty() {
         log(state, "nothing to commit");
     } else {
-        let message = format!("collector: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+        let message = format!(
+            "collector: {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
         let mut args: Vec<String> = Vec::new();
         // Supply a fallback identity only if the repo/global config lacks one,
         // so an unconfigured git does not hard-fail the commit.
-        if git_capture(git_dir, &["config", "user.email"]).unwrap_or_default().trim().is_empty() {
+        if git_capture(git_dir, &["config", "user.email"])
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
             args.push("-c".into());
             args.push("user.email=collector@auto_sync".into());
             args.push("-c".into());
@@ -983,10 +1098,18 @@ done",
             continue;
         }
         let child = join_remote(path, &name);
-        entries.push(CollectorBrowseEntry { name, path: child, is_dir });
+        entries.push(CollectorBrowseEntry {
+            name,
+            path: child,
+            is_dir,
+        });
     }
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
-    Ok(CollectorBrowseResponse { path: path.to_string(), parent: remote_parent(path), entries })
+    Ok(CollectorBrowseResponse {
+        path: path.to_string(),
+        parent: remote_parent(path),
+        entries,
+    })
 }
 
 // --- ssh / git command helpers ------------------------------------------------
@@ -1015,7 +1138,10 @@ fn run_git(git_dir: &Path, args: &[&str], state: &Arc<Mutex<CollectorRunState>>)
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         for line in stderr.lines().take(20) {
-            log(state, format!("  git {} | {line}", args.first().copied().unwrap_or("")));
+            log(
+                state,
+                format!("  git {} | {line}", args.first().copied().unwrap_or("")),
+            );
         }
         bail!("git {} failed", args.first().copied().unwrap_or(""));
     }
@@ -1098,7 +1224,11 @@ impl GitignoreEditor {
             Ok(text) => text.lines().map(|l| l.to_string()).collect(),
             Err(_) => Vec::new(),
         };
-        Ok(Self { path, lines, dirty: false })
+        Ok(Self {
+            path,
+            lines,
+            dirty: false,
+        })
     }
 
     /// Add a repo-relative path (anchored, forward-slashed) if not already present.
@@ -1117,8 +1247,7 @@ impl GitignoreEditor {
         }
         let mut body = self.lines.join("\n");
         body.push('\n');
-        fs::write(&self.path, body)
-            .with_context(|| format!("writing {}", self.path.display()))?;
+        fs::write(&self.path, body).with_context(|| format!("writing {}", self.path.display()))?;
         Ok(())
     }
 }
@@ -1129,8 +1258,14 @@ mod tests {
 
     #[test]
     fn remote_parent_components_reconstructs_structure() {
-        assert_eq!(remote_parent_components("/usr/local/shadowsocks").unwrap(), vec!["usr", "local"]);
-        assert_eq!(remote_parent_components("/etc").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            remote_parent_components("/usr/local/shadowsocks").unwrap(),
+            vec!["usr", "local"]
+        );
+        assert_eq!(
+            remote_parent_components("/etc").unwrap(),
+            Vec::<String>::new()
+        );
         assert_eq!(remote_parent_components("/a/b/c/").unwrap(), vec!["a", "b"]);
     }
 
@@ -1146,7 +1281,10 @@ mod tests {
         assert_eq!(join_remote("/usr/local", "bin"), "/usr/local/bin");
         assert_eq!(remote_parent("/"), None);
         assert_eq!(remote_parent("/etc"), Some("/".to_string()));
-        assert_eq!(remote_parent("/usr/local/bin"), Some("/usr/local".to_string()));
+        assert_eq!(
+            remote_parent("/usr/local/bin"),
+            Some("/usr/local".to_string())
+        );
     }
 
     #[test]
@@ -1197,10 +1335,17 @@ mod tests {
         );
         assert_eq!(parse_perm_line("4755 /bin/su").unwrap().0, "4755");
         // ls -ldn fallback (symbolic)
-        let dir = "drwxr-xr-x    2 0        0             4096 Jun 30 21:40 /usr/local/shadowsocks/bin";
-        assert_eq!(parse_perm_line(dir), Some(("755".to_string(), "/usr/local/shadowsocks/bin".to_string())));
+        let dir =
+            "drwxr-xr-x    2 0        0             4096 Jun 30 21:40 /usr/local/shadowsocks/bin";
+        assert_eq!(
+            parse_perm_line(dir),
+            Some(("755".to_string(), "/usr/local/shadowsocks/bin".to_string()))
+        );
         let key = "-rw-------    1 0 0 100 Jan 1 00:00 /root/.ssh/id_ed25519";
-        assert_eq!(parse_perm_line(key), Some(("600".to_string(), "/root/.ssh/id_ed25519".to_string())));
+        assert_eq!(
+            parse_perm_line(key),
+            Some(("600".to_string(), "/root/.ssh/id_ed25519".to_string()))
+        );
         let suid = "-rwsr-xr-x 1 0 0 1 Jan 1 00:00 /bin/su";
         assert_eq!(parse_perm_line(suid).unwrap().0, "4755");
         let sticky = "drwxrwxrwt 2 0 0 1 Jan 1 00:00 /tmp";
@@ -1248,7 +1393,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(SshConn::from_host(&host).dest(), "root@1.2.3.4");
-        let no_user = CollectorHost { hostname: "h".to_string(), ..Default::default() };
+        let no_user = CollectorHost {
+            hostname: "h".to_string(),
+            ..Default::default()
+        };
         assert_eq!(SshConn::from_host(&no_user).dest(), "h");
     }
 

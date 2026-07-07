@@ -309,7 +309,15 @@ fn run_fanotify_loop(
             thread::sleep(Duration::from_millis(200));
             continue;
         }
-        parse_events(&state, &mut sources, fd, mode, mask, &buf[..n as usize], &mut ctx)?;
+        parse_events(
+            &state,
+            &mut sources,
+            fd,
+            mode,
+            mask,
+            &buf[..n as usize],
+            &mut ctx,
+        )?;
     }
     Ok(())
 }
@@ -535,7 +543,13 @@ fn parse_events(
         if meta.mask & FAN_Q_OVERFLOW != 0 {
             warn!("fanotify queue overflow; recording realtime source events");
             for source in &mut *sources {
-                batch.push(pending_event(&source.id, meta.mask, "queue_overflow", None, true));
+                batch.push(pending_event(
+                    &source.id,
+                    meta.mask,
+                    "queue_overflow",
+                    None,
+                    true,
+                ));
                 // Eager handle maps (no open_by_handle_at) go permanently
                 // blind for directories whose create events the overflow ate:
                 // rebuild the map (throttled — a walk of a large tree).
@@ -559,9 +573,14 @@ fn parse_events(
         } else {
             let event = &bytes[..meta.event_len as usize];
             let collected = match mode {
-                FanotifyMode::FidName => {
-                    collect_fid_name_event(sources, fanotify_fd, mark_mask, &meta, event, &mut batch)
-                }
+                FanotifyMode::FidName => collect_fid_name_event(
+                    sources,
+                    fanotify_fd,
+                    mark_mask,
+                    &meta,
+                    event,
+                    &mut batch,
+                ),
                 FanotifyMode::FdPath => collect_fd_path_event(sources, &meta, &mut batch),
             };
             if let Err(err) = collected {
@@ -585,7 +604,10 @@ fn parse_events(
         // A previous batch was lost (persist failure): mark the gap before the
         // new events so the loss forces a reconcile.
         for source in &*sources {
-            batch.insert(0, pending_event(&source.id, 0, "event_persist_gap", None, true));
+            batch.insert(
+                0,
+                pending_event(&source.id, 0, "event_persist_gap", None, true),
+            );
         }
     }
     // One transaction (one fsync) for the whole batch. Persist failures must
@@ -689,7 +711,13 @@ fn collect_fid_name_event(
                 // The new subtree could not be marked (per-directory fallback
                 // hitting max_user_marks): it is permanently unwatched, which
                 // must trigger a reconcile instead of a silent blind spot.
-                batch.push(pending_event(&source.id, 0, "watch_mark_failed", None, true));
+                batch.push(pending_event(
+                    &source.id,
+                    0,
+                    "watch_mark_failed",
+                    None,
+                    true,
+                ));
             }
         }
     }

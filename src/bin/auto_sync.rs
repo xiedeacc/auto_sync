@@ -6,14 +6,14 @@
 //! API.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use auto_sync::core::backend::Backend;
-use auto_sync::core::config::{load_config, load_or_create_config, AppConfig};
+use auto_sync::core::config::{AppConfig, load_config, load_or_create_config};
 use auto_sync::core::logging::init_logging;
 use auto_sync::core::state::State;
 use auto_sync::core::sync::sync_all_pending;
@@ -230,7 +230,7 @@ fn write_lock_pid(file: &mut std::fs::File, path: &std::path::Path) -> Result<()
 fn try_lock_file(file: &std::fs::File) -> Result<bool> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
     };
     use windows_sys::Win32::System::IO::OVERLAPPED;
     let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;

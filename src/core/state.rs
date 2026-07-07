@@ -538,7 +538,11 @@ impl State {
             let open_has_events = self.cycle_has_actionable_events(&source.id, cycle.id)?;
             let mut due_destinations = Vec::new();
 
-            for dst in source.destinations.iter().filter(|d| d.enabled && !d.paused) {
+            for dst in source
+                .destinations
+                .iter()
+                .filter(|d| d.enabled && !d.paused)
+            {
                 let offset = self.destination_offset(&source.id, &dst.id)?;
                 if let Some(target) = offset.target_cycle_id {
                     if offset.last_verified_cycle_id < Some(target) {
@@ -608,7 +612,11 @@ impl State {
             };
             // Paused destinations are excluded: Sync All must not queue work
             // that would spring back to life on resume unasked.
-            for dst in source.destinations.iter().filter(|d| d.enabled && !d.paused) {
+            for dst in source
+                .destinations
+                .iter()
+                .filter(|d| d.enabled && !d.paused)
+            {
                 self.set_destination_target(&source.id, &dst.id, cycle.id)?;
             }
             closed.push(cycle);
@@ -629,7 +637,11 @@ impl State {
         let Some(cycle) = self.close_current_cycle_for_source(source_id)? else {
             return Ok(None);
         };
-        for dst in source.destinations.iter().filter(|d| d.enabled && !d.paused) {
+        for dst in source
+            .destinations
+            .iter()
+            .filter(|d| d.enabled && !d.paused)
+        {
             self.set_destination_target(source_id, &dst.id, cycle.id)?;
         }
         Ok(Some(cycle))
@@ -1048,7 +1060,8 @@ impl State {
         let _write = DB_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let now = now_string();
         let tx = self.conn.unchecked_transaction()?;
-        let mut rescan_sources: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut rescan_sources: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
         let mut cycles: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
         for event in events {
             let cycle_id = match cycles.get(event.source_id.as_str()) {
@@ -1676,8 +1689,9 @@ impl State {
                 // source_changing issue as yellow here regardless, keeping the
                 // dirty files visible (yellow dot + issue modal) until a later
                 // cycle re-syncs and clears them.
-                let has_source_changing =
-                    issues.iter().any(|issue| issue.issue_kind == "source_changing");
+                let has_source_changing = issues
+                    .iter()
+                    .any(|issue| issue.issue_kind == "source_changing");
                 let computed_status = if has_source_changing {
                     "yellow".to_string()
                 } else if offset.status == "green"
@@ -1697,7 +1711,8 @@ impl State {
                     && matches!(
                         offset.status_reason.as_str(),
                         "not_verified" | "pending_target_cycle" | "verified"
-                    ) {
+                    )
+                {
                     "behind_target_cycle".to_string()
                 } else {
                     offset.status_reason

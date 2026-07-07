@@ -169,8 +169,9 @@ impl Backend {
     pub fn get_collector_config(&self) -> Result<CollectorConfig> {
         let path = self.collector_config_path();
         match std::fs::read_to_string(&path) {
-            Ok(text) if !text.trim().is_empty() => toml::from_str(&text)
-                .with_context(|| format!("parsing {}", path.display())),
+            Ok(text) if !text.trim().is_empty() => {
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+            }
             _ => Ok(CollectorConfig::default()),
         }
     }
@@ -181,10 +182,8 @@ impl Backend {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let text = toml::to_string_pretty(cfg)
-            .with_context(|| "serializing collector config")?;
-        std::fs::write(&path, text)
-            .with_context(|| format!("writing {}", path.display()))?;
+        let text = toml::to_string_pretty(cfg).with_context(|| "serializing collector config")?;
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         Ok(cfg.clone())
     }
 
@@ -218,9 +217,7 @@ impl Backend {
             }
             *guard = CollectorRunState {
                 running: true,
-                started_at: Some(
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                ),
+                started_at: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
                 ..Default::default()
             };
         }
@@ -456,9 +453,8 @@ impl Backend {
             syncing: sync_is_running(),
             sync_kind: current_sync_kind(),
             sync_phase: current_sync_phase(),
-            sync_plan: current_sync_plan().map(|(total, to_copy, matched, done)| {
-                [total, to_copy, matched, done]
-            }),
+            sync_plan: current_sync_plan()
+                .map(|(total, to_copy, matched, done)| [total, to_copy, matched, done]),
             transfer: current_transfer_progress(),
             scan: current_scan_progress(),
             scans: current_scan_progresses(),
@@ -1008,7 +1004,9 @@ impl Backend {
                     .or_else(|| {
                         previous.and_then(|previous| find_machine(previous, &source_machine_id))
                     })
-                    .ok_or_else(|| anyhow::anyhow!("unknown source machine: {source_machine_id}"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unknown source machine: {source_machine_id}")
+                    })?;
                 let groups = delegated_groups_for_machine(cfg, &source_machine_id, &controller_id)?;
                 let req = DelegatedSourceGroupsRequest {
                     controller_id: controller_id.clone(),
@@ -1680,9 +1678,7 @@ fn confirm_machine_endpoint(host: &str, port: u16, machine_id: &str, alias: &str
         ..Default::default()
     };
     match remote_get_json::<MachineHealth>(&probe, "/api/health", Duration::from_secs(2)) {
-        Ok(health) => {
-            health.id == machine_id || (!alias.is_empty() && health.alias_name == alias)
-        }
+        Ok(health) => health.id == machine_id || (!alias.is_empty() && health.alias_name == alias),
         Err(_) => false,
     }
 }
@@ -1737,7 +1733,8 @@ fn refresh_machine_metadata_from_health(cfg: &mut AppConfig, discovered: &[Machi
                 false => {
                     warn!(
                         machine = machine.id,
-                        host, claimed_port,
+                        host,
+                        claimed_port,
                         "discovery reply advertises an endpoint that does not answer as this machine; ignoring"
                     );
                     continue;
@@ -2441,7 +2438,9 @@ mod tests {
         // Deleting a destination of the managed source is reported; deleting
         // the whole UNmanaged source is not (nobody else holds a copy).
         let mut next = current.clone();
-        next.source_groups[0].destinations.retain(|d| d.id != "dst_2");
+        next.source_groups[0]
+            .destinations
+            .retain(|d| d.id != "dst_2");
         next.source_groups.retain(|s| s.id != "src_free");
         let removed = removed_managed_entries(&current, &next);
         assert_eq!(
@@ -2623,7 +2622,8 @@ mod tests {
             enabled: true,
             ..MachineConfig::default()
         });
-        cfg.source_groups.push(managed_source("src_m", "ctl-health-1"));
+        cfg.source_groups
+            .push(managed_source("src_m", "ctl-health-1"));
         crate::core::config::save_config(&config_path, &cfg).unwrap();
         let backend = Backend::new(config_path.clone(), 18765);
 

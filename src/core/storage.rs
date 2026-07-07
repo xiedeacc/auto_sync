@@ -121,7 +121,10 @@ fn parse_zpool_devices(output: &str) -> Vec<String> {
         let Some(name) = line.split('\t').find(|field| !field.is_empty()) else {
             continue;
         };
-        if matches!(name, "cache" | "logs" | "log" | "spares" | "spare" | "special" | "dedup") {
+        if matches!(
+            name,
+            "cache" | "logs" | "log" | "spares" | "spare" | "special" | "dedup"
+        ) {
             break;
         }
         if name.starts_with("/dev/") {
@@ -152,7 +155,9 @@ fn rotational_of_devices(devices: &[String]) -> Option<bool> {
 
 #[cfg(target_os = "linux")]
 fn device_rotational(device: &Path) -> Option<bool> {
-    let canonical = device.canonicalize().unwrap_or_else(|_| device.to_path_buf());
+    let canonical = device
+        .canonicalize()
+        .unwrap_or_else(|_| device.to_path_buf());
     let name = canonical.file_name()?.to_str()?;
     block_name_rotational(name, 0)
 }

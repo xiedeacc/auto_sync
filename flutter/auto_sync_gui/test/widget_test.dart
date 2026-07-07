@@ -11,6 +11,6 @@ void main() {
     );
 
     expect(find.text('auto_sync'), findsOneWidget);
-    expect(find.text('No source groups configured'), findsOneWidget);
+    expect(find.text('No sources configured'), findsOneWidget);
   });
 }

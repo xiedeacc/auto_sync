@@ -235,6 +235,7 @@ fn build_config(state_db: &Path, source_root: &Path, dest_parent: &Path, port: u
         managed_by: String::new(),
         excludes: Vec::new(),
         enabled: true,
+        order: 0,
         mode: SyncMode::Mirror,
         snapshot: SnapshotConfig {
             backend: SnapshotBackend::Manifest,

@@ -24,20 +24,19 @@ use crate::core::config::{AppConfig, CollectorConfig, MachineConfig};
 use crate::core::machines::{MachineHealth, MachineStatus, spawn_discovery_responder};
 use crate::core::state::{DestinationView, ScanReport, SnapshotEntry};
 use crate::core::sync::{
-    SyncRequestMode, TransferAck, TransferApplyDeltaQuery, TransferBatchAck,
-    TransferBatchOutcome, TransferBlockSumsRequest, TransferCleanupTmpRequest, TransferPathInfo,
-    TransferPathInfoRequest, TransferPrepareDirRequest, TransferPrepareDirsRequest,
-    TransferPushFileRequest, TransferPushFilesBatchRequest, TransferPutFileQuery,
-    TransferPutFilesBatchQuery, TransferReceiveFileChunkQuery, TransferReceiveSymlinkRequest,
-    TransferRemovePathRequest, TransferRemovePathsRequest, TransferSetDirMtimesRequest,
-    TransferSetModesRequest, TransferSnapshotPathsRequest, TransferSnapshotRequest,
-    transfer_apply_delta, transfer_block_sums, transfer_cleanup_tmp, transfer_file_offset,
-    transfer_finish_file, transfer_open_file_stream_target, transfer_path_info,
-    transfer_prepare_dir, transfer_prepare_dirs, transfer_push_file, transfer_push_files_batch,
-    transfer_put_file, transfer_put_files_batch, transfer_receive_file_chunk,
-    transfer_receive_symlink, transfer_remove_path, transfer_remove_paths,
-    transfer_set_dir_mtimes, transfer_set_modes, transfer_snapshot, transfer_snapshot_paths,
-    transfer_snapshot_stream,
+    SyncRequestMode, TransferAck, TransferApplyDeltaQuery, TransferBatchAck, TransferBatchOutcome,
+    TransferBlockSumsRequest, TransferCleanupTmpRequest, TransferPathInfo, TransferPathInfoRequest,
+    TransferPrepareDirRequest, TransferPrepareDirsRequest, TransferPushFileRequest,
+    TransferPushFilesBatchRequest, TransferPutFileQuery, TransferPutFilesBatchQuery,
+    TransferReceiveFileChunkQuery, TransferReceiveSymlinkRequest, TransferRemovePathRequest,
+    TransferRemovePathsRequest, TransferSetDirMtimesRequest, TransferSetModesRequest,
+    TransferSnapshotPathsRequest, TransferSnapshotRequest, transfer_apply_delta,
+    transfer_block_sums, transfer_cleanup_tmp, transfer_file_offset, transfer_finish_file,
+    transfer_open_file_stream_target, transfer_path_info, transfer_prepare_dir,
+    transfer_prepare_dirs, transfer_push_file, transfer_push_files_batch, transfer_put_file,
+    transfer_put_files_batch, transfer_receive_file_chunk, transfer_receive_symlink,
+    transfer_remove_path, transfer_remove_paths, transfer_set_dir_mtimes, transfer_set_modes,
+    transfer_snapshot, transfer_snapshot_paths, transfer_snapshot_stream,
 };
 
 /// Peer-only surface: these endpoints write/delete under destination roots
@@ -644,10 +643,9 @@ async fn api_transfer_put_file_stream(
     use tokio_stream::StreamExt;
 
     let open_query = query.clone();
-    let file =
-        tokio::task::spawn_blocking(move || transfer_open_file_stream_target(&open_query))
-            .await
-            .map_err(|err| ApiError(anyhow::anyhow!("request worker failed: {err}")))??;
+    let file = tokio::task::spawn_blocking(move || transfer_open_file_stream_target(&open_query))
+        .await
+        .map_err(|err| ApiError(anyhow::anyhow!("request worker failed: {err}")))??;
     let mut file = tokio::fs::File::from_std(file);
     let size = query.size.max(0) as u64;
     let mut written = query.offset;

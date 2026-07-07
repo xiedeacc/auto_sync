@@ -589,10 +589,34 @@ pub fn load_or_create_config(path: &Path) -> Result<AppConfig> {
 pub fn load_config(path: &Path) -> Result<AppConfig> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    let cfg: AppConfig = toml::from_str(&raw)
+    let mut cfg: AppConfig = toml::from_str(&raw)
         .with_context(|| format!("failed to parse config {}", path.display()))?;
+    resolve_app_runtime_paths(path, &mut cfg);
     cfg.validate()?;
     Ok(cfg)
+}
+
+fn resolve_app_runtime_paths(config_path: &Path, cfg: &mut AppConfig) {
+    let base = config_runtime_base(config_path);
+    if cfg.app.data_db.is_relative() {
+        cfg.app.data_db = base.join(&cfg.app.data_db);
+    }
+    if cfg.app.log_dir.is_relative() {
+        cfg.app.log_dir = base.join(&cfg.app.log_dir);
+    }
+}
+
+fn config_runtime_base(config_path: &Path) -> PathBuf {
+    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
+    if parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("conf"))
+    {
+        parent.parent().unwrap_or(parent).to_path_buf()
+    } else {
+        parent.to_path_buf()
+    }
 }
 
 /// Serializes every load→mutate→save sequence in this process. Six writers
@@ -1179,7 +1203,8 @@ pub fn preferred_local_host() -> String {
         .clone();
     let probe: Option<Ipv4Addr> = format!("{subnet}1").parse().ok();
     if let Some(probe) = probe {
-        if let Some(ip) = detect_local_ip_for(probe).filter(|ip| ip.to_string().starts_with(&subnet))
+        if let Some(ip) =
+            detect_local_ip_for(probe).filter(|ip| ip.to_string().starts_with(&subnet))
         {
             return ip.to_string();
         }
@@ -1359,6 +1384,21 @@ mod tests {
         assert!(parse_schedule_time("25:00").is_err());
         assert!(parse_schedule_time("02:00:01").is_err());
         assert!(parse_schedule_time("02").is_err());
+    }
+
+    #[test]
+    fn resolves_app_paths_relative_to_install_root_config() {
+        let root = temp_dir("runtime_paths");
+        let config_path = root.join("conf").join("auto_sync.toml");
+        let mut cfg = AppConfig::default();
+        resolve_app_runtime_paths(&config_path, &mut cfg);
+
+        assert_eq!(
+            cfg.app.data_db,
+            root.join("conf").join("state").join("auto_sync.sqlite")
+        );
+        assert_eq!(cfg.app.log_dir, root.join("logs"));
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

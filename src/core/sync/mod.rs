@@ -22,8 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::core::cancel;
 use crate::core::config::{
     AppConfig, DEFAULT_MAX_PARALLEL_TRANSFERS, DEFAULT_TRANSFER_TIMEOUT_SECS, DestinationConfig,
-    NativeSyncConfig, SnapshotBackend, SourceGroupConfig, machine_id_or_local,
-    machine_is_local,
+    NativeSyncConfig, SnapshotBackend, SourceGroupConfig, machine_id_or_local, machine_is_local,
 };
 use crate::core::machines::{
     configure_tcp_connection_pool, encode_query_component, find_machine, remote_get_json,
@@ -163,7 +162,9 @@ fn sync_phase_lock() -> &'static Mutex<Option<String>> {
 /// `SyncPhaseReset` clears it when the top-level pass unwinds so it never
 /// sticks after work stops.
 fn set_sync_phase(phase: &str) {
-    *sync_phase_lock().lock().unwrap_or_else(|err| err.into_inner()) = Some(phase.to_string());
+    *sync_phase_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = Some(phase.to_string());
 }
 
 /// Live file-count progress for the pass currently holding the sync gate. Set
@@ -184,7 +185,9 @@ fn sync_plan_lock() -> &'static Mutex<Option<Arc<SyncPlan>>> {
 }
 
 fn set_sync_plan(total: u64, to_copy: u64, matched: u64) {
-    *sync_plan_lock().lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::new(SyncPlan {
+    *sync_plan_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = Some(Arc::new(SyncPlan {
         total,
         to_copy,
         matched,
@@ -228,8 +231,12 @@ impl SyncPhaseReset {
 
 impl Drop for SyncPhaseReset {
     fn drop(&mut self) {
-        *sync_phase_lock().lock().unwrap_or_else(|err| err.into_inner()) = None;
-        *sync_plan_lock().lock().unwrap_or_else(|err| err.into_inner()) = None;
+        *sync_phase_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = None;
+        *sync_plan_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = None;
     }
 }
 
@@ -384,7 +391,10 @@ fn sync_all_pending_inner(cfg: &AppConfig, state: &mut State) -> Result<()> {
     match state.prune_removed_destination_offsets(cfg) {
         Ok(orphans) => {
             for snapshot in orphans {
-                Command::new("zfs").args(["destroy", &snapshot]).status().ok();
+                Command::new("zfs")
+                    .args(["destroy", &snapshot])
+                    .status()
+                    .ok();
             }
         }
         Err(err) => warn!(error = %err, "failed to prune removed destination offsets"),
@@ -1831,13 +1841,16 @@ pub fn transfer_put_files_batch(
             .iter()
             .position(|byte| *byte == b'\n')
             .ok_or_else(|| anyhow!("malformed batch body: missing header terminator"))?;
-        let header: BatchFileHeader = serde_json::from_slice(&rest[..newline])
-            .context("malformed batch file header")?;
+        let header: BatchFileHeader =
+            serde_json::from_slice(&rest[..newline]).context("malformed batch file header")?;
         rest = &rest[newline + 1..];
         let size = usize::try_from(header.size.max(0))
             .map_err(|_| anyhow!("batch file size overflow for {}", header.rel_path))?;
         if rest.len() < size {
-            bail!("malformed batch body: truncated payload for {}", header.rel_path);
+            bail!(
+                "malformed batch body: truncated payload for {}",
+                header.rel_path
+            );
         }
         let (payload, tail) = rest.split_at(size);
         rest = tail;
@@ -2149,8 +2162,8 @@ pub fn transfer_push_files_batch(
         cancel::check()?;
         let read = (|| -> Result<Vec<u8>> {
             let src = safe_join_rel(&req.source_root, &entry.rel_path)?;
-            let bytes = fs::read(&src)
-                .with_context(|| format!("failed to read {}", src.display()))?;
+            let bytes =
+                fs::read(&src).with_context(|| format!("failed to read {}", src.display()))?;
             if bytes.len() as u64 != entry.size.max(0) as u64 {
                 bail!("source changed while copying {}", entry.rel_path);
             }
@@ -2195,16 +2208,16 @@ pub fn transfer_push_files_batch(
         encode_query_component(&req.destination_root.to_string_lossy()),
         req.cycle_id
     );
-    let ack: TransferBatchAck =
-        match remote_post_bytes(&req.destination, &api_path, &body, timeout) {
-            Ok(ack) => ack,
-            Err(err) if error_is_missing_endpoint(&err) => {
-                // Old peer: deliver the batch per file through the classic
-                // endpoints (send_file_tcp routes small files to put-file).
-                return push_batch_per_file_fallback(&req, &included, outcome, timeout);
-            }
-            Err(err) => return Err(err),
-        };
+    let ack: TransferBatchAck = match remote_post_bytes(&req.destination, &api_path, &body, timeout)
+    {
+        Ok(ack) => ack,
+        Err(err) if error_is_missing_endpoint(&err) => {
+            // Old peer: deliver the batch per file through the classic
+            // endpoints (send_file_tcp routes small files to put-file).
+            return push_batch_per_file_fallback(&req, &included, outcome, timeout);
+        }
+        Err(err) => return Err(err),
+    };
     if !ack.ok {
         bail!("peer rejected put-files-batch request");
     }
@@ -2691,8 +2704,8 @@ fn send_symlink_tcp(
     src: &Path,
     timeout: Duration,
 ) -> Result<()> {
-    let raw_target = fs::read_link(src)
-        .with_context(|| format!("failed to read symlink {}", src.display()))?;
+    let raw_target =
+        fs::read_link(src).with_context(|| format!("failed to read symlink {}", src.display()))?;
     // The link changed between the scan and this push: report the canonical
     // source-changing wording so the pass records a yellow retryable issue —
     // the receiver-side hash mismatch used to burn 3 retries and count as a
@@ -2885,7 +2898,9 @@ pub fn sync_cycle_for_source(
         .map(|dst| dst.id.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    let task_id = state.task_start(log_kind, &source.id, &destination_ids).ok();
+    let task_id = state
+        .task_start(log_kind, &source.id, &destination_ids)
+        .ok();
     // Phase indicator starts at "preparing"; the per-phase functions (zfs diff,
     // transferring, verifying) overwrite it as the pass advances.
     set_sync_phase("preparing");
@@ -2907,9 +2922,14 @@ pub fn sync_cycle_for_source(
         // report "N synced · M failed".
         let failed = cancel::failed_files();
         let record = match &result {
-            Err(err) if cancel::error_is_cancelled(err) => {
-                state.task_finish(task_id, "cancelled", cancel::CANCELLED_MESSAGE, files, failed, 0)
-            }
+            Err(err) if cancel::error_is_cancelled(err) => state.task_finish(
+                task_id,
+                "cancelled",
+                cancel::CANCELLED_MESSAGE,
+                files,
+                failed,
+                0,
+            ),
             Err(err) => state.task_finish(task_id, "failed", &format!("{err:#}"), files, failed, 0),
             // A pass that "failed" only because the live source changed under
             // the copy (destinations yellow `source_changing`, none red) copied
@@ -3042,8 +3062,7 @@ fn sync_cycle_for_source_inner(
             ) {
                 Ok(Some(gate)) => {
                     all_verified = false;
-                    let not_mounted =
-                        matches!(gate, crate::core::standby::Gate::NotMounted { .. });
+                    let not_mounted = matches!(gate, crate::core::standby::Gate::NotMounted { .. });
                     if not_mounted {
                         had_unblocked_failure = true;
                     } else {
@@ -4323,7 +4342,15 @@ fn sync_directory_with_transfer(
     set_dir_mtimes_on_machine(dst_machine_id, dst_machine, dst_root, &dirs, timeout)
         .context("failed to set destination directory mtimes")?;
 
-    cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, sync.trash_keep_days, timeout).ok();
+    cleanup_tmp_on_machine(
+        dst_machine_id,
+        dst_machine,
+        dst_root,
+        cycle_id,
+        sync.trash_keep_days,
+        timeout,
+    )
+    .ok();
 
     // No end-of-cycle destination re-scan: every transferred file was verified
     // end-to-end at receipt (blake3 full hash checked before the atomic rename,
@@ -4484,7 +4511,15 @@ fn sync_directory_event_paths_with_transfer(
     set_dir_mtimes_on_machine(dst_machine_id, dst_machine, dst_root, &dirs, timeout)
         .context("failed to set changed destination directory mtimes")?;
 
-    cleanup_tmp_on_machine(dst_machine_id, dst_machine, dst_root, cycle_id, sync.trash_keep_days, timeout).ok();
+    cleanup_tmp_on_machine(
+        dst_machine_id,
+        dst_machine,
+        dst_root,
+        cycle_id,
+        sync.trash_keep_days,
+        timeout,
+    )
+    .ok();
     let actual = snapshot_paths_on_machine(
         dst_machine_id,
         dst_machine,
@@ -4869,8 +4904,8 @@ fn remote_snapshot_streamed(
                 status = Some(mark);
                 return Ok(());
             }
-            let entry: SnapshotEntry = serde_json::from_slice(line)
-                .context("failed to parse streamed snapshot entry")?;
+            let entry: SnapshotEntry =
+                serde_json::from_slice(line).context("failed to parse streamed snapshot entry")?;
             entries.push(entry);
             Ok(())
         },
@@ -5432,9 +5467,7 @@ fn push_entries_parallel(
                                     *use_delta,
                                     sync,
                                 )
-                                .with_context(|| {
-                                    format!("failed to transfer {}", entry.rel_path)
-                                })
+                                .with_context(|| format!("failed to transfer {}", entry.rel_path))
                             }) {
                                 Ok(()) => {
                                     done.fetch_add(1, Ordering::Relaxed);
@@ -5507,10 +5540,7 @@ fn push_entries_parallel(
                                             error = failure.error,
                                             "file transfer failed; continuing with remaining files"
                                         );
-                                        if push_failed(
-                                            failure.rel_path,
-                                            anyhow!(failure.error),
-                                        ) {
+                                        if push_failed(failure.rel_path, anyhow!(failure.error)) {
                                             abort = true;
                                             break;
                                         }
@@ -5897,7 +5927,9 @@ impl ZfsSnapshot {
 /// looking frozen. Falls back to plain "zfs diff" when the names don't parse.
 fn zfs_diff_phase_label(base_full_name: &str, new_full_name: &str) -> String {
     let cycle_of = |name: &str| -> Option<i64> {
-        name.rsplit('_').next().and_then(|tail| tail.parse::<i64>().ok())
+        name.rsplit('_')
+            .next()
+            .and_then(|tail| tail.parse::<i64>().ok())
     };
     match (cycle_of(base_full_name), cycle_of(new_full_name)) {
         (Some(base), Some(to)) if base != to => format!("zfs diff {base}→{to}"),
@@ -6175,9 +6207,9 @@ fn zfs_mountpoint(dataset: &str) -> Result<PathBuf> {
 /// minus clock slack) is destroyed and recreated; `None` keeps the plain
 /// reuse semantics (same-cycle retry).
 fn ensure_zfs_snapshot(full_name: &str, not_created_before: Option<i64>) -> Result<()> {
-    if let Ok(raw) = command_stdout(Command::new("zfs").args([
-        "get", "-Hp", "-o", "value", "creation", full_name,
-    ])) {
+    if let Ok(raw) = command_stdout(
+        Command::new("zfs").args(["get", "-Hp", "-o", "value", "creation", full_name]),
+    ) {
         let created = raw.trim().parse::<i64>().unwrap_or(0);
         // 5 minutes of slack: the cycle row and the snapshot are stamped by
         // clocks that may disagree slightly.
@@ -6257,12 +6289,18 @@ fn cleanup_zfs_snapshots(
         if !status.success() {
             // One held/busy snapshot must not block reclaiming the rest —
             // bailing here let a single user hold pin every later snapshot.
-            warn!(snapshot, "zfs destroy failed; continuing with remaining snapshots");
+            warn!(
+                snapshot,
+                "zfs destroy failed; continuing with remaining snapshots"
+            );
             failures += 1;
         }
     }
     if failures > 0 {
-        warn!(failures, "some superseded source snapshots could not be destroyed");
+        warn!(
+            failures,
+            "some superseded source snapshots could not be destroyed"
+        );
     }
     Ok(())
 }
@@ -6984,8 +7022,12 @@ fn sync_destination_fast_missing_dirs(
                 let _cancel = cancel::enter(cancel_token.clone());
                 take_snapshot_with_excludes(src_root, SnapshotMode::Source, excludes, sync.checksum)
             });
-            let dst_result =
-                take_snapshot_with_excludes(dst_root, SnapshotMode::Destination, &[], sync.checksum);
+            let dst_result = take_snapshot_with_excludes(
+                dst_root,
+                SnapshotMode::Destination,
+                &[],
+                sync.checksum,
+            );
             (
                 dst_result,
                 src_handle.join().expect("source scan thread panicked"),
@@ -7591,21 +7633,29 @@ fn collect_snapshot_path(
         }
         let scan_progress = progress::start_scan(path);
         let mut entries_seen = 0_u64;
-        for_each_breadth_first_snapshot_path(root, path, mode, excludes, |item_path, item_meta| {
-            entries_seen += 1;
-            scan_progress.update(item_path, entries_seen);
-            let rel = item_path
-                .strip_prefix(root)
-                .with_context(|| format!("failed to strip root from {}", item_path.display()))?;
-            let Ok(rel_path) = rel_to_string(rel) else {
-                warn!(path = %item_path.display(), "skipping entry with non-UTF-8 name");
-                return Ok(());
-            };
-            if let Some(entry) = snapshot_entry_from_metadata(item_path, rel_path, checksum, item_meta)? {
-                entries.insert(entry.rel_path.clone(), entry);
-            }
-            Ok(())
-        })?;
+        for_each_breadth_first_snapshot_path(
+            root,
+            path,
+            mode,
+            excludes,
+            |item_path, item_meta| {
+                entries_seen += 1;
+                scan_progress.update(item_path, entries_seen);
+                let rel = item_path.strip_prefix(root).with_context(|| {
+                    format!("failed to strip root from {}", item_path.display())
+                })?;
+                let Ok(rel_path) = rel_to_string(rel) else {
+                    warn!(path = %item_path.display(), "skipping entry with non-UTF-8 name");
+                    return Ok(());
+                };
+                if let Some(entry) =
+                    snapshot_entry_from_metadata(item_path, rel_path, checksum, item_meta)?
+                {
+                    entries.insert(entry.rel_path.clone(), entry);
+                }
+                Ok(())
+            },
+        )?;
         return Ok(());
     }
 
@@ -8118,9 +8168,8 @@ fn move_to_trash(dst_root: &Path, rel: &str, cycle_id: i64) -> Result<()> {
         // Nested mounts can't rename across the device boundary; keep the
         // recycle-bin promise with a copy into the trash before deleting.
         Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
-            copy_tree_best_effort(&path, &trash).with_context(|| {
-                format!("failed to copy {rel} into the trash across devices")
-            })?;
+            copy_tree_best_effort(&path, &trash)
+                .with_context(|| format!("failed to copy {rel} into the trash across devices"))?;
             remove_any(&path)?;
             Ok(())
         }
@@ -8199,7 +8248,11 @@ fn entries_match(left: &SnapshotEntry, right: &SnapshotEntry, sync: &NativeSyncC
 /// timestamp granularity during whole-tree quick checks; on an evidence path
 /// it would swallow a same-size rewrite landing within the window of the
 /// previously synced version and leave the drift green forever.
-fn entries_match_exact(left: &SnapshotEntry, right: &SnapshotEntry, sync: &NativeSyncConfig) -> bool {
+fn entries_match_exact(
+    left: &SnapshotEntry,
+    right: &SnapshotEntry,
+    sync: &NativeSyncConfig,
+) -> bool {
     entries_match_with(left, right, sync, true)
 }
 
@@ -8569,7 +8622,11 @@ fn short_reason(err: &anyhow::Error) -> String {
 /// fail. The task-finish logic uses this so a failed pass is always logged (as
 /// `failed`) rather than discarded as a no-op when it transferred 0 files.
 fn failed_pass_reason(state: &State, source: &SourceGroupConfig, cycle_id: i64) -> Option<String> {
-    let status = state.cycle_by_id(&source.id, cycle_id).ok().flatten()?.status;
+    let status = state
+        .cycle_by_id(&source.id, cycle_id)
+        .ok()
+        .flatten()?
+        .status;
     if status != "failed" {
         return None;
     }
@@ -8603,7 +8660,11 @@ fn source_changing_only_pass(
     source: &SourceGroupConfig,
     cycle_id: i64,
 ) -> Option<usize> {
-    let status = state.cycle_by_id(&source.id, cycle_id).ok().flatten()?.status;
+    let status = state
+        .cycle_by_id(&source.id, cycle_id)
+        .ok()
+        .flatten()?
+        .status;
     if status != "failed" {
         return None;
     }
@@ -9105,10 +9166,16 @@ mod tests {
         ];
         // `*/cache` matches any account's cache dir and its subtree...
         assert!(is_rel_excluded(Path::new("x774796_4d47/cache"), &excludes));
-        assert!(is_rel_excluded(Path::new("wxid_abc/cache/img/1.dat"), &excludes));
+        assert!(is_rel_excluded(
+            Path::new("wxid_abc/cache/img/1.dat"),
+            &excludes
+        ));
         assert!(is_rel_excluded(Path::new("wxid_abc/temp/x"), &excludes));
         // ...but not the precious dirs next to it.
-        assert!(!is_rel_excluded(Path::new("x774796_4d47/db_storage/c.db"), &excludes));
+        assert!(!is_rel_excluded(
+            Path::new("x774796_4d47/db_storage/c.db"),
+            &excludes
+        ));
         assert!(!is_rel_excluded(Path::new("x774796_4d47/msg/a"), &excludes));
         // A top-level `cache` (no account segment) is NOT matched by `*/cache`.
         assert!(!is_rel_excluded(Path::new("cache"), &excludes));
@@ -9132,8 +9199,7 @@ mod tests {
         fs::create_dir_all(src.join(INTERNAL_TMP)).unwrap();
         fs::write(src.join(INTERNAL_PROBE), b"p").unwrap();
 
-        let snapshot =
-            take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap();
+        let snapshot = take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap();
         let paths: Vec<String> = snapshot.into_iter().map(|entry| entry.rel_path).collect();
 
         assert_eq!(paths, vec!["keep", "keep/real.txt"]);
@@ -9394,9 +9460,7 @@ mod tests {
         let work = plan_push_work(&entries);
         assert_eq!(work.len(), 3);
         assert!(matches!(&work[0], PushWork::Single(entry, false) if entry.rel_path == "big.bin"));
-        assert!(
-            matches!(&work[1], PushWork::Single(entry, true) if entry.rel_path == "delta.bin")
-        );
+        assert!(matches!(&work[1], PushWork::Single(entry, true) if entry.rel_path == "delta.bin"));
         assert!(matches!(&work[2], PushWork::SmallBatch(batch) if batch.len() == 2));
 
         // A batch of one degenerates to a Single (no gain over put-file).
@@ -9438,9 +9502,17 @@ mod tests {
             body.extend_from_slice(payload);
         };
         let good = b"hello batch";
-        frame("dir/good.txt", good, &blake3::hash(good).to_hex().to_string());
+        frame(
+            "dir/good.txt",
+            good,
+            &blake3::hash(good).to_hex().to_string(),
+        );
         // Wrong hash: must fail THAT file only, not the batch.
-        frame("bad.txt", b"corrupted", &blake3::hash(b"other").to_hex().to_string());
+        frame(
+            "bad.txt",
+            b"corrupted",
+            &blake3::hash(b"other").to_hex().to_string(),
+        );
         let also = b"second good";
         frame("also.txt", also, &blake3::hash(also).to_hex().to_string());
 
@@ -9508,8 +9580,7 @@ mod tests {
             fs::write(src.join(format!("good{i}.txt")), b"data").unwrap();
         }
         // Accurate size/mtime metadata (ensure_source_stable compares them).
-        let snapshot =
-            take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap();
+        let snapshot = take_snapshot_with_excludes(&src, SnapshotMode::Source, &[], false).unwrap();
         let mut entries: Vec<SnapshotEntry> = snapshot
             .into_iter()
             .filter(|entry| entry.file_type == "file")
@@ -9528,8 +9599,7 @@ mod tests {
 
         let sync = NativeSyncConfig::default();
         let _meter = progress::begin_transfer("dst_pool", &dst, 0);
-        let outcome =
-            copy_entries_parallel(&src, &dst, "dst_pool", 1, &entry_refs, &sync).unwrap();
+        let outcome = copy_entries_parallel(&src, &dst, "dst_pool", 1, &entry_refs, &sync).unwrap();
         assert_eq!(outcome.transferred, 5);
         assert_eq!(outcome.failed.len(), 3);
         assert!(outcome.changing.is_empty());
@@ -9609,9 +9679,13 @@ mod tests {
 
         // The scheduler assigns a paused destination no target (even a first
         // sync), and manual sync requests are refused outright.
-        assert_eq!(state.advance_due_destination_targets(&cfg).unwrap().len(), 0);
-        let err = queue_destination_sync(&cfg, &state, "src_1", "dst_1", SyncRequestMode::Incremental)
-            .unwrap_err();
+        assert_eq!(
+            state.advance_due_destination_targets(&cfg).unwrap().len(),
+            0
+        );
+        let err =
+            queue_destination_sync(&cfg, &state, "src_1", "dst_1", SyncRequestMode::Incremental)
+                .unwrap_err();
         assert!(err.to_string().contains("paused"), "{err:#}");
 
         // A target pending from before the pause (the stopped first sync) is
@@ -10252,7 +10326,8 @@ mod tests {
 
     #[test]
     fn diff_path_snapshot_skips_descendants_of_recursive_ancestors() {
-        let temp = std::env::temp_dir().join(format!("auto_sync_diff_dedup_{}", std::process::id()));
+        let temp =
+            std::env::temp_dir().join(format!("auto_sync_diff_dedup_{}", std::process::id()));
         fs::create_dir_all(temp.join("new_dir/sub")).unwrap();
         fs::write(temp.join("new_dir/a.txt"), b"a").unwrap();
         fs::write(temp.join("new_dir/sub/b.txt"), b"b").unwrap();
@@ -10327,7 +10402,8 @@ mod tests {
 
     #[test]
     fn snapshot_stream_roundtrips_entries_and_matches_buffered_walk() {
-        let temp = std::env::temp_dir().join(format!("auto_sync_snap_stream_{}", std::process::id()));
+        let temp =
+            std::env::temp_dir().join(format!("auto_sync_snap_stream_{}", std::process::id()));
         fs::create_dir_all(temp.join("dir")).unwrap();
         fs::write(temp.join("dir/a.txt"), b"aaa").unwrap();
         fs::write(temp.join("top.txt"), b"t").unwrap();
@@ -10400,10 +10476,8 @@ other /zfs_other zfs rw 0 0
 
         // Defense in depth: even if an internal path reaches the per-path
         // snapshot layer, it is skipped instead of recursed.
-        let temp = std::env::temp_dir().join(format!(
-            "auto_sync_internal_snap_{}",
-            std::process::id()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("auto_sync_internal_snap_{}", std::process::id()));
         fs::create_dir_all(temp.join(INTERNAL_TRASH).join("29")).unwrap();
         fs::write(temp.join(INTERNAL_TRASH).join("29").join("f.txt"), b"x").unwrap();
         let entries = take_snapshot_diff_paths_with_excludes(
@@ -10432,7 +10506,10 @@ other /zfs_other zfs rw 0 0
         let mut new = test_file_entry("f.txt", 10);
         old.mtime_ns = 1_000_000_000_000;
         new.mtime_ns = old.mtime_ns + 800_000_000; // +0.8s, same size
-        assert!(entries_match(&new, &old, &sync), "walk quick check tolerates");
+        assert!(
+            entries_match(&new, &old, &sync),
+            "walk quick check tolerates"
+        );
         assert!(
             !entries_match_exact(&new, &old, &sync),
             "evidence path must treat it as changed"

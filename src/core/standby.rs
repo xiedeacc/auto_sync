@@ -130,7 +130,10 @@ pub fn gate_for_sync(
 pub fn verify_pool_mounted(pool: &StandbyPoolConfig) -> Result<()> {
     for root in &pool.mount_roots {
         if !is_mount_point(root)? {
-            bail!("{} is not a mount point (pool not imported?)", root.display());
+            bail!(
+                "{} is not a mount point (pool not imported?)",
+                root.display()
+            );
         }
     }
     Ok(())
@@ -142,10 +145,10 @@ fn is_mount_point(root: &Path) -> Result<bool> {
     let Some(parent) = root.parent() else {
         return Ok(true); // filesystem root
     };
-    let here = std::fs::metadata(root)
-        .map_err(|e| anyhow::anyhow!("stat {}: {e}", root.display()))?;
-    let up = std::fs::metadata(parent)
-        .map_err(|e| anyhow::anyhow!("stat {}: {e}", parent.display()))?;
+    let here =
+        std::fs::metadata(root).map_err(|e| anyhow::anyhow!("stat {}: {e}", root.display()))?;
+    let up =
+        std::fs::metadata(parent).map_err(|e| anyhow::anyhow!("stat {}: {e}", parent.display()))?;
     Ok(here.dev() != up.dev())
 }
 
@@ -173,7 +176,9 @@ pub fn next_wake_start_after(
                 return Ok(start);
             }
         }
-        date = date.succ_opt().ok_or_else(|| anyhow::anyhow!("date overflow"))?;
+        date = date
+            .succ_opt()
+            .ok_or_else(|| anyhow::anyhow!("date overflow"))?;
     }
     bail!("could not find next wake within horizon")
 }
@@ -261,16 +266,25 @@ pub fn spin_down_devices(pool: &StandbyPoolConfig) {
             // `-y` = STANDBY (spins down, auto-wakes on the next I/O). NOT `-Y`
             // (SLEEP), which is lower power but can require a bus reset to wake —
             // unsafe for a pool that must come back on the next scheduled access.
-            match std::process::Command::new("hdparm").arg("-y").arg(dev).status() {
+            match std::process::Command::new("hdparm")
+                .arg("-y")
+                .arg(dev)
+                .status()
+            {
                 Ok(s) if s.success() => info!(pool = pool.name, device = dev, "spun down disk"),
-                Ok(s) => warn!(pool = pool.name, device = dev, code = ?s.code(), "hdparm -y failed"),
+                Ok(s) => {
+                    warn!(pool = pool.name, device = dev, code = ?s.code(), "hdparm -y failed")
+                }
                 Err(e) => warn!(pool = pool.name, device = dev, error = %e, "hdparm -y errored"),
             }
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = dev;
-            warn!(pool = pool.name, "active spindown requested but not supported on this OS");
+            warn!(
+                pool = pool.name,
+                "active spindown requested but not supported on this OS"
+            );
         }
     }
 }
@@ -346,7 +360,10 @@ impl StandbyManager {
             let should_park = !open || idle_enough;
             if should_park && prev != Some(false) {
                 if open {
-                    info!(pool = pool.name, "backlog drained; parking disk (still in window)");
+                    info!(
+                        pool = pool.name,
+                        "backlog drained; parking disk (still in window)"
+                    );
                 } else {
                     info!(pool = pool.name, "outside wake window; parking disk");
                 }
@@ -431,15 +448,28 @@ mod tests {
         };
         let pools = vec![pool];
         // Monday → asleep; a sync writing /zfs/wx is gated on its dest pool.
-        let g = gate_for_sync(&pools, Path::new("/opt/wx"), Path::new("/zfs/wx"),
-                              at(2026, 1, 5, 12, 0)).unwrap();
+        let g = gate_for_sync(
+            &pools,
+            Path::new("/opt/wx"),
+            Path::new("/zfs/wx"),
+            at(2026, 1, 5, 12, 0),
+        )
+        .unwrap();
         match g {
             Some(Gate::Asleep { pool, .. }) => assert_eq!(pool, "zfs"),
             other => panic!("expected Asleep, got {other:?}"),
         }
         // A sync entirely off the pool (/opt -> /opt) is never gated.
-        assert!(gate_for_sync(&pools, Path::new("/opt/a"), Path::new("/opt/b"),
-                              at(2026, 1, 5, 12, 0)).unwrap().is_none());
+        assert!(
+            gate_for_sync(
+                &pools,
+                Path::new("/opt/a"),
+                Path::new("/opt/b"),
+                at(2026, 1, 5, 12, 0)
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -463,8 +493,13 @@ mod tests {
         let pools = vec![zfs, zfs_pool];
         // Week-1 Saturday: /zfs open, /zfs_pool CLOSED. src_2 gated on the DEST
         // (/zfs_pool), never on the in-window source — proving the dest drives it.
-        let g = gate_for_sync(&pools, Path::new("/zfs"), Path::new("/zfs_pool"),
-                              at(2026, 1, 10, 11, 0)).unwrap();
+        let g = gate_for_sync(
+            &pools,
+            Path::new("/zfs"),
+            Path::new("/zfs_pool"),
+            at(2026, 1, 10, 11, 0),
+        )
+        .unwrap();
         match g {
             Some(Gate::Asleep { pool, .. }) => assert_eq!(pool, "zfs_pool"),
             other => panic!("expected Asleep(zfs_pool), got {other:?}"),
@@ -473,8 +508,13 @@ mod tests {
         // source's OWN window is irrelevant now — the gate does not defer on it.
         // (Proceeds to the mount check, which fails on these non-existent test
         //  paths — the point is only that it is NOT Asleep on the source.)
-        let g = gate_for_sync(&pools, Path::new("/zfs"), Path::new("/zfs_pool"),
-                              at(2026, 1, 31, 11, 0)).unwrap();
+        let g = gate_for_sync(
+            &pools,
+            Path::new("/zfs"),
+            Path::new("/zfs_pool"),
+            at(2026, 1, 31, 11, 0),
+        )
+        .unwrap();
         assert!(
             !matches!(g, Some(Gate::Asleep { .. })),
             "dest in-window must not be deferred by the source's schedule; got {g:?}"
