@@ -663,12 +663,20 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     final sourceId = _str(source['id']);
     final destinationId = _str(destination['id']);
     Map<String, dynamic> report = {};
+    Map<String, dynamic>? task;
     String error = '';
     try {
       report = await widget.api.scanReport(sourceId, destinationId);
     } catch (err) {
       error = '$err';
     }
+    try {
+      task = _newestTaskFor(
+        await widget.api.getAllTasks(limit: 50),
+        sourceId,
+        destinationId,
+      );
+    } catch (_) {}
     if (!mounted) return;
     await showDialog<void>(
       context: context,
@@ -676,6 +684,9 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
         source: source,
         destination: destination,
         status: _statusFor(sourceId, destinationId),
+        runtimeStatus: runtimeStatus,
+        syncActivity: syncActivity,
+        task: task,
         scanReport: report,
         error: error,
       ),
@@ -685,13 +696,24 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
   Future<void> _openDestinationSyncSettings(
     Map<String, dynamic> destination,
   ) async {
-    final sync = Map<String, dynamic>.from(_map(destination['sync']));
+    final localSync = Map<String, dynamic>.from(_map(destination['sync']));
+    final inherited = localSync.isEmpty;
+    final sync = inherited
+        ? Map<String, dynamic>.from(_map(_app()['sync']))
+        : localSync;
     final result = await showDialog<Map<String, dynamic>>(
       context: context,
-      builder: (context) => _SyncSettingsDialog(sync: sync),
+      builder: (context) =>
+          _SyncSettingsDialog(sync: sync, inherited: inherited),
     );
     if (result != null) {
-      setState(() => destination['sync'] = result);
+      setState(() {
+        if (result.isEmpty) {
+          destination.remove('sync');
+        } else {
+          destination['sync'] = result;
+        }
+      });
       await _saveConfig('Destination settings saved');
     }
   }
@@ -2732,9 +2754,10 @@ class _SettingsDialogState extends State<_SettingsDialog> {
 }
 
 class _SyncSettingsDialog extends StatefulWidget {
-  const _SyncSettingsDialog({required this.sync});
+  const _SyncSettingsDialog({required this.sync, this.inherited = false});
 
   final Map<String, dynamic> sync;
+  final bool inherited;
 
   @override
   State<_SyncSettingsDialog> createState() => _SyncSettingsDialogState();
@@ -2757,86 +2780,90 @@ class _SyncSettingsDialogState extends State<_SyncSettingsDialog> {
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Destination sync settings'),
-      content: SizedBox(
-        width: 430,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: timeout,
-                    decoration: const InputDecoration(
-                      labelText: 'Timeout secs',
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: TextField(
-                    controller: bwlimit,
-                    decoration: const InputDecoration(
-                      labelText: 'Bwlimit kbps',
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            Wrap(
-              spacing: 18,
-              children: [
-                LabeledSwitch(
-                  label: 'Mirror',
-                  value: _bool(widget.sync['mirror'], true),
-                  onChanged: (value) =>
-                      setState(() => widget.sync['mirror'] = value),
-                ),
-                LabeledSwitch(
-                  label: 'Checksum',
-                  value: _bool(widget.sync['checksum'], false),
-                  onChanged: (value) =>
-                      setState(() => widget.sync['checksum'] = value),
-                ),
-                LabeledSwitch(
-                  label: 'ZFS diff',
-                  value: _bool(widget.sync['zfs_diff'], true),
-                  onChanged: (value) =>
-                      setState(() => widget.sync['zfs_diff'] = value),
-                ),
-                LabeledSwitch(
-                  label: 'Debug logs',
-                  value: _bool(widget.sync['debug_logs'], false),
-                  onChanged: (value) =>
-                      setState(() => widget.sync['debug_logs'] = value),
-                ),
-              ],
-            ),
+    return _MasterDialogFrame(
+      title: 'Destination sync settings',
+      width: 470,
+      maxHeight: 310,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (widget.inherited) ...[
+            const _IssueSummary('Using global defaults until saved here.'),
+            const SizedBox(height: 8),
           ],
-        ),
+          const Row(
+            children: [
+              _FormHead(width: 140, text: 'Timeout secs'),
+              SizedBox(width: 10),
+              _FormHead(width: 140, text: 'Bwlimit kbps'),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              SizedBox(width: 140, child: _CompactInput(controller: timeout)),
+              const SizedBox(width: 10),
+              SizedBox(width: 140, child: _CompactInput(controller: bwlimit)),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              LabeledSwitch(
+                label: 'Mirror',
+                value: _bool(widget.sync['mirror'], true),
+                onChanged: (value) =>
+                    setState(() => widget.sync['mirror'] = value),
+              ),
+              LabeledSwitch(
+                label: 'Checksum',
+                value: _bool(widget.sync['checksum'], false),
+                onChanged: (value) =>
+                    setState(() => widget.sync['checksum'] = value),
+              ),
+              LabeledSwitch(
+                label: 'ZFS diff',
+                value: _bool(widget.sync['zfs_diff'], true),
+                onChanged: (value) =>
+                    setState(() => widget.sync['zfs_diff'] = value),
+              ),
+              LabeledSwitch(
+                label: 'Debug logs',
+                value: _bool(widget.sync['debug_logs'], false),
+                onChanged: (value) =>
+                    setState(() => widget.sync['debug_logs'] = value),
+              ),
+            ],
+          ),
+          const Spacer(),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              MasterButton(
+                label: 'Use global',
+                width: 96,
+                onTap: widget.inherited
+                    ? null
+                    : () => Navigator.pop(context, <String, dynamic>{}),
+              ),
+              const SizedBox(width: 8),
+              MasterButton(
+                label: 'Save',
+                width: 72,
+                primary: true,
+                onTap: () {
+                  widget.sync['transfer_timeout_secs'] =
+                      int.tryParse(timeout.text) ?? 120;
+                  widget.sync['bwlimit_kbps'] = int.tryParse(bwlimit.text) ?? 0;
+                  Navigator.pop(context, widget.sync);
+                },
+              ),
+            ],
+          ),
+        ],
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Cancel'),
-        ),
-        TextButton(
-          onPressed: () => Navigator.pop(context, <String, dynamic>{}),
-          child: const Text('Use global'),
-        ),
-        FilledButton(
-          onPressed: () {
-            widget.sync['transfer_timeout_secs'] =
-                int.tryParse(timeout.text) ?? 120;
-            widget.sync['bwlimit_kbps'] = int.tryParse(bwlimit.text) ?? 0;
-            Navigator.pop(context, widget.sync);
-          },
-          child: const Text('Save'),
-        ),
-      ],
     );
   }
 }
@@ -3280,6 +3307,9 @@ class _DestinationInfoDialog extends StatelessWidget {
     required this.source,
     required this.destination,
     required this.status,
+    required this.runtimeStatus,
+    required this.syncActivity,
+    required this.task,
     required this.scanReport,
     required this.error,
   });
@@ -3287,54 +3317,66 @@ class _DestinationInfoDialog extends StatelessWidget {
   final Map<String, dynamic> source;
   final Map<String, dynamic> destination;
   final Map<String, dynamic>? status;
+  final Map<String, dynamic> runtimeStatus;
+  final Map<String, dynamic> syncActivity;
+  final Map<String, dynamic>? task;
   final Map<String, dynamic> scanReport;
   final String error;
 
   @override
   Widget build(BuildContext context) {
-    final title = '${_str(source['id'])} -> ${_str(destination['id'])}';
+    final sourceId = _str(source['id']);
+    final destinationId = _str(destination['id']);
+    final runtime = _runtimeForDestination(
+      source,
+      destination,
+      runtimeStatus,
+      syncActivity,
+    );
+    final transfer = _matchingTransfer(runtime, sourceId, destinationId);
+    final scan = _matchingScan(runtime, sourceId, destinationId);
     final rows = <MapEntry<String, String>>[
+      MapEntry('Task', '$sourceId -> $destinationId'),
       MapEntry(
-        'Source',
-        _machinePath(_str(source['machine_id'], 'local'), _str(source['src'])),
+        'Path',
+        [
+          _machinePath(
+            _str(source['machine_id'], 'local'),
+            _str(source['src']),
+          ),
+          _machinePath(
+            _str(destination['machine_id'], 'local'),
+            _str(destination['path']),
+          ),
+        ].join('  ->  '),
       ),
-      MapEntry(
-        'Destination',
-        _machinePath(
-          _str(destination['machine_id'], 'local'),
-          _str(destination['path']),
-        ),
-      ),
-      MapEntry(
-        'Status',
-        status == null
-            ? 'unknown'
-            : '${_str(status?['status'])}: ${_str(status?['status_reason'])}',
-      ),
+      MapEntry('Status', _destinationStatusText(status)),
       MapEntry('Cycle', _cycleDisplay(status)),
+      MapEntry('Type', _infoTypeLabel(source, destination, runtime, task)),
+      MapEntry('Phase', _infoPhaseLabel(runtime, transfer, scan, task)),
+      MapEntry('Snapshot', _infoSnapshotLabel(runtime, transfer, scan)),
+      MapEntry(
+        'Summary',
+        _infoSummaryLabel(runtime, scanReport, task, scan, error),
+      ),
       if (error.isNotEmpty) MapEntry('Error', error),
     ];
     return _MasterDialogFrame(
-      title: 'Destination Log',
+      title: 'Info',
       width: 860,
-      maxHeight: 720,
+      maxHeight: 430,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _IssueSummary(title),
-          const SizedBox(height: 8),
-          for (final row in rows)
-            _InfoRow(
-              label: row.key,
-              value: row.value.isEmpty ? '-' : row.value,
-            ),
-          const SizedBox(height: 8),
           Expanded(
-            child: _MasterPre(
-              text: scanReport.isEmpty
-                  ? 'No scan report.'
-                  : const JsonEncoder.withIndent('  ').convert(scanReport),
-              maxHeight: 520,
+            child: ListView(
+              children: [
+                for (final row in rows)
+                  _InfoRow(
+                    label: row.key,
+                    value: row.value.isEmpty ? '-' : row.value,
+                  ),
+              ],
             ),
           ),
         ],
@@ -3352,7 +3394,7 @@ class _InfoRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 6),
+      padding: const EdgeInsets.symmetric(vertical: 8),
       decoration: const BoxDecoration(
         border: Border(bottom: BorderSide(color: Palette.line)),
       ),
@@ -3363,12 +3405,271 @@ class _InfoRow extends StatelessWidget {
             child: Text(label, style: const TextStyle(color: Palette.muted)),
           ),
           Expanded(
-            child: Text(value, maxLines: 2, overflow: TextOverflow.ellipsis),
+            child: Text(
+              value,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+            ),
           ),
         ],
       ),
     );
   }
+}
+
+Map<String, dynamic>? _newestTaskFor(
+  List<dynamic> machines,
+  String sourceId,
+  String destinationId,
+) {
+  Map<String, dynamic>? best;
+  DateTime? bestStarted;
+  for (final machine in machines) {
+    for (final item in _list(_map(machine)['tasks'])) {
+      final task = _map(item);
+      if (_str(task['source_id']) != sourceId) continue;
+      final ids = _str(
+        task['destination_id'],
+      ).split(',').map((id) => id.trim()).where((id) => id.isNotEmpty);
+      if (!ids.contains(destinationId)) continue;
+      final started = DateTime.tryParse(_str(task['started_at']));
+      if (best == null ||
+          (started != null &&
+              (bestStarted == null || started.isAfter(bestStarted)))) {
+        best = task;
+        bestStarted = started;
+      }
+    }
+  }
+  return best;
+}
+
+String _destinationStatusText(Map<String, dynamic>? status) {
+  if (status == null) return 'unknown';
+  final value = _str(status['status'], 'unknown');
+  final reason = _str(status['status_reason']);
+  return reason.isEmpty ? value : '$value: $reason';
+}
+
+Map<String, dynamic> _runtimeForDestination(
+  Map<String, dynamic> source,
+  Map<String, dynamic> destination,
+  Map<String, dynamic> localRuntime,
+  Map<String, dynamic> activity,
+) {
+  final sourceId = _str(source['id']);
+  final destinationId = _str(destination['id']);
+  bool matches(Map<String, dynamic> runtime) =>
+      _matchingTransfer(runtime, sourceId, destinationId).isNotEmpty ||
+      _matchingScan(runtime, sourceId, destinationId).isNotEmpty;
+  if (matches(localRuntime)) return localRuntime;
+  for (final machine in _list(activity['machines'])) {
+    final runtime = _map(_map(machine)['runtime']);
+    if (matches(runtime)) return runtime;
+  }
+  return localRuntime;
+}
+
+Map<String, dynamic> _matchingTransfer(
+  Map<String, dynamic> runtime,
+  String sourceId,
+  String destinationId,
+) {
+  final transfer = _map(runtime['transfer']);
+  if (transfer.isEmpty) return {};
+  final transferSource = _str(transfer['source_id']);
+  final transferDestination = _str(transfer['destination_id']);
+  if ((transferSource.isEmpty || transferSource == sourceId) &&
+      (transferDestination.isEmpty || transferDestination == destinationId)) {
+    return transfer;
+  }
+  return {};
+}
+
+Map<String, dynamic> _matchingScan(
+  Map<String, dynamic> runtime,
+  String sourceId,
+  String destinationId,
+) {
+  for (final item in _list(runtime['scans'])) {
+    final scan = _map(item);
+    final scanSource = _str(scan['source_id']);
+    final scanDestination = _str(scan['destination_id']);
+    if ((scanSource.isEmpty || scanSource == sourceId) &&
+        (scanDestination.isEmpty || scanDestination == destinationId)) {
+      return scan;
+    }
+  }
+  final scan = _map(runtime['scan']);
+  final scanSource = _str(scan['source_id']);
+  final scanDestination = _str(scan['destination_id']);
+  if (scan.isNotEmpty &&
+      (scanSource.isEmpty || scanSource == sourceId) &&
+      (scanDestination.isEmpty || scanDestination == destinationId)) {
+    return scan;
+  }
+  return {};
+}
+
+String _infoTypeLabel(
+  Map<String, dynamic> source,
+  Map<String, dynamic> destination,
+  Map<String, dynamic> runtime,
+  Map<String, dynamic>? task,
+) {
+  if (_str(task?['status']) == 'running') {
+    return _taskKindLabel(_str(task?['kind']));
+  }
+  final kind = _str(runtime['sync_kind']);
+  if (_bool(runtime['syncing']) && kind.isNotEmpty) {
+    return _taskKindLabel(kind == 'scan' ? 'compare' : kind);
+  }
+  return task == null ? '-' : _taskKindLabel(_str(task['kind']));
+}
+
+String _infoPhaseLabel(
+  Map<String, dynamic> runtime,
+  Map<String, dynamic> transfer,
+  Map<String, dynamic> scan,
+  Map<String, dynamic>? task,
+) {
+  if (transfer.isNotEmpty) return 'Transferring';
+  if (scan.isNotEmpty) {
+    return _str(scan['kind']) == 'compare' ? 'Comparing' : 'Scanning';
+  }
+  final phase = _str(runtime['sync_phase'], _str(runtime['phase']));
+  if (phase.isNotEmpty) return _phaseLabel(phase);
+  if (_str(task?['status']) == 'running') {
+    return _str(task?['kind']) == 'compare' ? 'Comparing' : 'Syncing';
+  }
+  return '-';
+}
+
+String _phaseLabel(String phase) {
+  switch (phase.trim()) {
+    case 'scanning':
+      return 'Scanning';
+    case 'transferring':
+      return 'Transferring';
+    case 'verifying':
+      return 'Verifying';
+    case 'preparing':
+      return 'Preparing';
+    default:
+      return phase;
+  }
+}
+
+String _infoSnapshotLabel(
+  Map<String, dynamic> runtime,
+  Map<String, dynamic> transfer,
+  Map<String, dynamic> scan,
+) {
+  if (transfer.isNotEmpty) {
+    final file = _compactStatusPath(_str(transfer['rel_path'], '-'), 42);
+    final speed = _formatBytesPerSecond(_int(transfer['bytes_per_sec']));
+    final transferred = _int(transfer['transferred_bytes']);
+    final total = _int(transfer['total_bytes']);
+    final progress = total > 0 ? '${(transferred * 100 / total).floor()}%' : '';
+    return [file, speed, progress].where((part) => part.isNotEmpty).join(' · ');
+  }
+  if (scan.isNotEmpty) {
+    final entries = _int(scan['entries_seen']);
+    final path = _compactStatusPath(
+      _str(scan['current_path'], _str(scan['root_path'])),
+      46,
+    );
+    return '$entries entries${path.isEmpty ? '' : ' · $path'}';
+  }
+  return 'idle';
+}
+
+String _infoSummaryLabel(
+  Map<String, dynamic> runtime,
+  Map<String, dynamic> report,
+  Map<String, dynamic>? task,
+  Map<String, dynamic> scan,
+  String error,
+) {
+  if (error.isNotEmpty) return 'compare failed: $error';
+  if (_str(task?['status']) == 'running') {
+    if (_str(task?['kind']) == 'compare') {
+      final entries = scan.isEmpty ? 0 : _int(scan['entries_seen']);
+      return entries > 0
+          ? 'comparing... $entries entries compared so far'
+          : 'comparing... (waiting for result)';
+    }
+    return _syncProgressLabel(runtime).isEmpty
+        ? 'syncing...'
+        : _syncProgressLabel(runtime);
+  }
+  if (report.isNotEmpty) {
+    final total =
+        _int(report['to_add']) +
+        _int(report['to_update']) +
+        _int(report['to_delete']) +
+        _int(report['type_mismatch']) +
+        _int(report['metadata']);
+    if (total == 0) {
+      final matched = _int(report['in_sync']);
+      return matched > 0 ? '0 differences ($matched matched)' : '0 differences';
+    }
+    final parts = <String>[];
+    if (_int(report['to_add']) > 0) parts.add('+${_int(report['to_add'])}');
+    if (_int(report['to_update']) > 0) {
+      parts.add('~${_int(report['to_update'])}');
+    }
+    if (_int(report['to_delete']) > 0) {
+      parts.add('-${_int(report['to_delete'])}');
+    }
+    if (_int(report['type_mismatch']) > 0) {
+      parts.add('!${_int(report['type_mismatch'])}');
+    }
+    if (_int(report['metadata']) > 0) {
+      parts.add('#${_int(report['metadata'])}');
+    }
+    final matched = _int(report['in_sync']);
+    final note = matched > 0 ? ' · $matched / ${matched + total} matched' : '';
+    return '$total differences (${parts.join(' ')})$note';
+  }
+  if (task == null) return '-';
+  if (_str(task['kind']) == 'compare') {
+    final diffs = _int(task['differences']);
+    final scanned = _int(task['entries_scanned']);
+    final suffix = scanned > 0 ? ' · $scanned compared' : '';
+    return diffs == 0 ? '0 differences$suffix' : '$diffs differences$suffix';
+  }
+  final synced = _int(task['files_synced']);
+  final failed = _int(task['differences']);
+  if (failed > 0) {
+    return '$synced/${synced + failed} files synced · $failed failed';
+  }
+  if (synced > 0) return '$synced files synced';
+  return _str(task['status'], '-');
+}
+
+String _syncProgressLabel(Map<String, dynamic> runtime) {
+  final plan = _list(runtime['sync_plan']);
+  if (plan.length < 4) return '';
+  final total = _int(plan[0]);
+  final toCopy = _int(plan[1]);
+  final matched = _int(plan[2]);
+  final done = _int(plan[3]);
+  if (total == 0 && toCopy == 0 && matched == 0) return '';
+  return 'synced $done / $toCopy to copy · $matched unchanged ($total total)';
+}
+
+String _compactStatusPath(String value, int maxLength) {
+  if (value.length <= maxLength) return value;
+  return '...${value.substring(value.length - maxLength + 3)}';
+}
+
+String _formatBytesPerSecond(int bytes) {
+  if (bytes <= 0) return '';
+  if (bytes < 1024) return '$bytes B/s';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KiB/s';
+  return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MiB/s';
 }
 
 class _IssueSummary extends StatelessWidget {
@@ -3507,7 +3808,50 @@ class _CompactInput extends StatelessWidget {
         keyboardType: numeric ? TextInputType.number : TextInputType.text,
         onChanged: onChanged,
         style: const TextStyle(fontSize: 12),
-        decoration: InputDecoration(hintText: placeholder),
+        decoration: _compactInputDecoration(hintText: placeholder),
+      ),
+    );
+  }
+}
+
+InputDecoration _compactInputDecoration({String? hintText, String? labelText}) {
+  return InputDecoration(
+    hintText: hintText,
+    labelText: labelText,
+    isDense: true,
+    contentPadding: const EdgeInsets.symmetric(horizontal: 9, vertical: 0),
+    constraints: const BoxConstraints.tightFor(height: _masterControlHeight),
+  );
+}
+
+class _CompactSelect extends StatelessWidget {
+  const _CompactSelect({
+    required this.value,
+    required this.items,
+    required this.onChanged,
+  });
+
+  final String value;
+  final List<DropdownMenuItem<String>> items;
+  final ValueChanged<String> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: _masterControlHeight,
+      child: DropdownButtonFormField<String>(
+        initialValue: value,
+        isDense: true,
+        decoration: _compactInputDecoration(),
+        style: const TextStyle(
+          fontSize: 13,
+          color: Palette.text,
+          fontWeight: FontWeight.w600,
+        ),
+        items: items,
+        onChanged: (next) {
+          if (next != null) onChanged(next);
+        },
       ),
     );
   }
@@ -3697,11 +4041,11 @@ class _MachinesDialogState extends State<_MachinesDialog> {
               children: [
                 const Row(
                   children: [
-                    _FormHead(width: 110, text: 'Name'),
+                    _FormHead(width: 96, text: 'Name'),
                     SizedBox(width: 6),
-                    _FormHead(width: 110, text: 'Alias'),
+                    _FormHead(width: 96, text: 'Alias'),
                     SizedBox(width: 6),
-                    Expanded(child: _FormHead(text: 'Host')),
+                    _FormHead(width: 210, text: 'Host'),
                     SizedBox(width: 6),
                     _FormHead(width: 72, text: 'Port'),
                     SizedBox(width: 6),
@@ -3716,17 +4060,17 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
-                    SizedBox(
-                      width: 110,
-                      child: _CompactInput(controller: name),
-                    ),
+                    SizedBox(width: 96, child: _CompactInput(controller: name)),
                     const SizedBox(width: 6),
                     SizedBox(
-                      width: 110,
+                      width: 96,
                       child: _CompactInput(controller: alias),
                     ),
                     const SizedBox(width: 6),
-                    Expanded(child: _CompactInput(controller: host)),
+                    SizedBox(
+                      width: 210,
+                      child: _CompactInput(controller: host),
+                    ),
                     const SizedBox(width: 6),
                     SizedBox(
                       width: 72,
@@ -3745,23 +4089,19 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                     const SizedBox(width: 6),
                     SizedBox(
                       width: 88,
-                      height: _masterControlHeight,
-                      child: DropdownButtonFormField<String>(
-                        initialValue: os == 'windows' ? 'windows' : 'linux',
-                        decoration: const InputDecoration(),
+                      child: _CompactSelect(
+                        value: os == 'windows' ? 'windows' : 'linux',
                         items: const [
                           DropdownMenuItem(
                             value: 'linux',
-                            child: Text('Linux'),
+                            child: Text('linux'),
                           ),
                           DropdownMenuItem(
                             value: 'windows',
-                            child: Text('Windows'),
+                            child: Text('windows'),
                           ),
                         ],
-                        onChanged: (value) {
-                          if (value != null) setState(() => os = value);
-                        },
+                        onChanged: (value) => setState(() => os = value),
                       ),
                     ),
                   ],
@@ -3831,7 +4171,8 @@ class _MachineHeaderRow extends StatelessWidget {
       name: Text('Name'),
       host: Text('Host'),
       port: Text('Port'),
-      ssh: Text('SSH'),
+      sshUser: Text('SSH User'),
+      sshPort: Text('SSH Port'),
       os: Text('OS'),
       action: SizedBox.shrink(),
     );
@@ -3859,10 +4200,6 @@ class _MachineRow extends StatelessWidget {
     final meta = alias.isNotEmpty && alias != name
         ? alias
         : _str(machine['id']);
-    final ssh = [
-      _str(machine['ssh_user']),
-      _str(machine['ssh_port']),
-    ].where((part) => part.isNotEmpty).join(':');
     return InkWell(
       onTap: onTap,
       child: Container(
@@ -3899,7 +4236,8 @@ class _MachineRow extends StatelessWidget {
           ),
           host: _GridText(_str(machine['host'])),
           port: _GridText(_str(machine['port'])),
-          ssh: _GridText(ssh),
+          sshUser: _GridText(_str(machine['ssh_user'], '-')),
+          sshPort: _GridText(_str(machine['ssh_port'], '22')),
           os: _GridText(_str(machine['os'])),
           action: MasterButton(
             label: 'x',
@@ -3919,7 +4257,8 @@ class _MachineGrid extends StatelessWidget {
     required this.name,
     required this.host,
     required this.port,
-    required this.ssh,
+    required this.sshUser,
+    required this.sshPort,
     required this.os,
     required this.action,
     this.head = false,
@@ -3929,7 +4268,8 @@ class _MachineGrid extends StatelessWidget {
   final Widget name;
   final Widget host;
   final Widget port;
-  final Widget ssh;
+  final Widget sshUser;
+  final Widget sshPort;
   final Widget os;
   final Widget action;
   final bool head;
@@ -3953,13 +4293,15 @@ class _MachineGrid extends StatelessWidget {
           children: [
             SizedBox(width: 10, child: Center(child: dot)),
             const SizedBox(width: 6),
-            Expanded(flex: 135, child: name),
+            Expanded(flex: 105, child: name),
             const SizedBox(width: 6),
-            Expanded(flex: 110, child: host),
+            Expanded(flex: 92, child: host),
             const SizedBox(width: 6),
             SizedBox(width: 48, child: port),
             const SizedBox(width: 6),
-            Expanded(flex: 95, child: ssh),
+            SizedBox(width: 82, child: sshUser),
+            const SizedBox(width: 6),
+            SizedBox(width: 68, child: sshPort),
             const SizedBox(width: 6),
             SizedBox(width: 58, child: os),
             const SizedBox(width: 6),
@@ -4187,7 +4529,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     final log = _list(status['log']).map((line) => '$line').join('\n');
     return _MasterDialogFrame(
       title: 'Collector',
-      width: 900,
+      width: 980,
       maxHeight: 860,
       child: loading
           ? const Center(child: CircularProgressIndicator())
@@ -4541,7 +4883,7 @@ class _CollectorCheckCell extends StatelessWidget {
   }
 }
 
-const double _collectorTableBaseWidth = 924;
+const double _collectorTableBaseWidth = 956;
 
 class _CollectorHostGrid extends StatelessWidget {
   const _CollectorHostGrid({required this.cells, this.head = false});
@@ -4570,10 +4912,10 @@ class _CollectorHostGrid extends StatelessWidget {
           150 + extra * 0.55,
           42,
           94,
-          30,
-          30,
-          24,
-          24,
+          34,
+          34,
+          34,
+          34,
         ];
         return DefaultTextStyle.merge(
           style: style,
