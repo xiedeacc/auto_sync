@@ -1600,11 +1600,21 @@ th {
   display: grid;
   gap: 6px;
   margin-bottom: 10px;
-  /* Scroll the list inside the capped modal so a long path set never pushes
-     the Browse row out of the panel. */
-  flex: 1 1 auto;
+  /* Each list scrolls internally and is capped so neither one pushes the
+     other (or its Browse row) out of the panel. */
+  flex: 0 1 auto;
   min-height: 0;
   overflow-y: auto;
+}
+
+/* Keep the (usually long) collect list to about a quarter of the panel so the
+   Ignore list below it stays visible; the Ignore list gets its own smaller cap. */
+#collector-paths-list {
+  max-height: 180px;
+}
+
+#collector-exclude-list {
+  max-height: 150px;
 }
 
 .collector-path-item {
