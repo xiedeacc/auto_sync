@@ -481,10 +481,13 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
         title: 'Config',
         width: 900,
         maxHeight: 720,
-        child: _MasterPre(
-          text: const JsonEncoder.withIndent('  ').convert(cfg),
-          minHeight: 260,
-          maxHeight: 640,
+        child: SizedBox(
+          height: 640,
+          child: _MasterPre(
+            text: const JsonEncoder.withIndent('  ').convert(cfg),
+            minHeight: 640,
+            maxHeight: 640,
+          ),
         ),
       ),
     );
@@ -504,74 +507,13 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     await showDialog<void>(
       context: context,
       builder: (context) {
-        final running = tasks.fold<int>(0, (total, machine) {
-          return total +
-              _list(
-                _map(machine)['tasks'],
-              ).where((task) => _str(_map(task)['status']) == 'running').length;
-        });
         return _MasterDialogFrame(
           title: 'Tasks',
           width: 980,
           maxHeight: 760,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _IssueSummary(
-                errorText.isNotEmpty
-                    ? errorText
-                    : '$running running · newest first · each machine keeps its last 100 finished tasks',
-              ),
-              const SizedBox(height: 8),
-              Expanded(
-                child: errorText.isNotEmpty
-                    ? Text(errorText)
-                    : ListView(
-                        children: tasks.map((machine) {
-                          final m = _map(machine);
-                          final list = _list(m['tasks']);
-                          final name = _str(
-                            m['machine_id'],
-                            _str(m['id'], 'machine'),
-                          );
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 14),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Container(
-                                  width: double.infinity,
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 2,
-                                    vertical: 6,
-                                  ),
-                                  decoration: const BoxDecoration(
-                                    border: Border(
-                                      bottom: BorderSide(color: Palette.line),
-                                    ),
-                                  ),
-                                  child: Text(
-                                    name,
-                                    style: const TextStyle(
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ),
-                                const _TaskHeaderRow(),
-                                if (list.isEmpty)
-                                  const EmptyLine('No tasks')
-                                else
-                                  ...list.map(
-                                    (task) => _TaskRow(task: _map(task)),
-                                  ),
-                              ],
-                            ),
-                          );
-                        }).toList(),
-                      ),
-              ),
-            ],
-          ),
+          child: errorText.isNotEmpty
+              ? _IssueSummary(errorText)
+              : _TasksTabbedView(machines: _mapRefs(tasks)),
         );
       },
     );
@@ -826,6 +768,8 @@ class _Header extends StatelessWidget {
 
 const double _masterRightBlockWidth = 446;
 const double _masterControlHeight = 34;
+const double _masterControlGap = 8;
+const double _masterLabelControlGap = 4;
 const double _masterStatusDotSize = 10;
 
 class _MasterSourcePanel extends StatelessWidget {
@@ -1121,44 +1065,13 @@ class _MasterSourceGroup extends StatelessWidget {
   }
 
   Future<void> _showExcludes(BuildContext context) async {
-    final controller = TextEditingController(
-      text: _list(source['excludes']).join('\n'),
-    );
     final result = await showDialog<List<String>>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Excluded'),
-        content: SizedBox(
-          width: 560,
-          height: 360,
-          child: TextField(
-            controller: controller,
-            expands: true,
-            maxLines: null,
-            minLines: null,
-            decoration: const InputDecoration(border: OutlineInputBorder()),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(
-              context,
-              controller.text
-                  .split('\n')
-                  .map((line) => line.trim())
-                  .where((line) => line.isNotEmpty)
-                  .toList(),
-            ),
-            child: const Text('Save'),
-          ),
-        ],
+      builder: (context) => _ExcludedDialog(
+        sourceId: _str(source['id'], 'source'),
+        initialItems: _list(source['excludes']).map((item) => '$item').toList(),
       ),
     );
-    controller.dispose();
     if (result != null) {
       source['excludes'] = result;
       onChanged('Excludes saved');
@@ -1315,6 +1228,7 @@ class _MasterSplitRow extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Row(children: leftLabels),
+              const SizedBox(height: _masterLabelControlGap),
               Stack(
                 clipBehavior: Clip.none,
                 children: [
@@ -1342,6 +1256,7 @@ class _MasterSplitRow extends StatelessWidget {
                       mainAxisAlignment: MainAxisAlignment.end,
                       children: rightLabels,
                     ),
+                    const SizedBox(height: _masterLabelControlGap),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.end,
                       children: rightControls,
@@ -1391,6 +1306,141 @@ class _MasterReadOnlyInput extends StatelessWidget {
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(fontSize: 13, color: Palette.text),
+      ),
+    );
+  }
+}
+
+class _ExcludedDialog extends StatefulWidget {
+  const _ExcludedDialog({required this.sourceId, required this.initialItems});
+
+  final String sourceId;
+  final List<String> initialItems;
+
+  @override
+  State<_ExcludedDialog> createState() => _ExcludedDialogState();
+}
+
+class _ExcludedDialogState extends State<_ExcludedDialog> {
+  late final List<TextEditingController> controllers;
+
+  @override
+  void initState() {
+    super.initState();
+    controllers = widget.initialItems
+        .map((item) => TextEditingController(text: item))
+        .toList();
+  }
+
+  @override
+  void dispose() {
+    for (final controller in controllers) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  List<String> _cleanItems() {
+    final seen = <String>{};
+    final next = <String>[];
+    for (final controller in controllers) {
+      final value = controller.text.trim();
+      if (value.isNotEmpty && seen.add(value)) {
+        next.add(value);
+      }
+    }
+    next.sort();
+    return next;
+  }
+
+  void _add() {
+    setState(() => controllers.add(TextEditingController()));
+  }
+
+  void _remove(int index) {
+    final controller = controllers.removeAt(index);
+    controller.dispose();
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _MasterDialogFrame(
+      title: 'Excluded',
+      width: 780,
+      maxHeight: 720,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _IssueSummary(widget.sourceId),
+          const SizedBox(height: 8),
+          Expanded(
+            child: Container(
+              decoration: const BoxDecoration(
+                border: Border(top: BorderSide(color: Palette.line)),
+              ),
+              child: controllers.isEmpty
+                  ? const Align(
+                      alignment: Alignment.topLeft,
+                      child: EmptyLine('(empty)'),
+                    )
+                  : ListView.builder(
+                      itemCount: controllers.length,
+                      itemBuilder: (context, index) => Container(
+                        constraints: const BoxConstraints(minHeight: 42),
+                        decoration: const BoxDecoration(
+                          border: Border(
+                            bottom: BorderSide(color: Palette.line),
+                          ),
+                        ),
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: controllers[index],
+                                maxLines: 1,
+                                style: const TextStyle(
+                                  fontFamily: 'Consolas',
+                                  fontSize: 12,
+                                  color: Palette.text,
+                                ),
+                                decoration: const InputDecoration(
+                                  hintText: 'relative/path',
+                                  border: InputBorder.none,
+                                  contentPadding: EdgeInsets.symmetric(
+                                    horizontal: 2,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: _masterControlGap),
+                            MasterButton(
+                              label: 'x',
+                              square: true,
+                              danger: true,
+                              onTap: () => _remove(index),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              MasterButton(label: 'Add', width: 72, primary: true, onTap: _add),
+              const SizedBox(width: 8),
+              MasterButton(
+                label: 'Save',
+                width: 72,
+                onTap: () => Navigator.pop(context, _cleanItems()),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -1850,50 +1900,13 @@ class _SourceCard extends StatelessWidget {
     Map<String, dynamic> source,
     Future<void> Function([String label]) onChanged,
   ) async {
-    final controller = TextEditingController(
-      text: _list(source['excludes']).join('\n'),
-    );
     final result = await showDialog<List<String>>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Excluded paths'),
-        content: SizedBox(
-          width: 560,
-          height: 360,
-          child: TextField(
-            controller: controller,
-            expands: true,
-            maxLines: null,
-            minLines: null,
-            decoration: const InputDecoration(
-              hintText: 'One relative path per line',
-              border: OutlineInputBorder(),
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () {
-              final lines =
-                  controller.text
-                      .split('\n')
-                      .map((line) => line.trim())
-                      .where((line) => line.isNotEmpty)
-                      .toSet()
-                      .toList()
-                    ..sort();
-              Navigator.pop(context, lines);
-            },
-            child: const Text('Save'),
-          ),
-        ],
+      builder: (context) => _ExcludedDialog(
+        sourceId: _str(source['id'], 'source'),
+        initialItems: _list(source['excludes']).map((item) => '$item').toList(),
       ),
     );
-    controller.dispose();
     if (result != null) {
       source['excludes'] = result;
       await onChanged('Excludes saved');
@@ -2466,8 +2479,8 @@ class _MasterPre extends StatelessWidget {
         borderRadius: BorderRadius.circular(6),
       ),
       child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
         child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
           child: Text(
             text,
             style: const TextStyle(
@@ -2612,7 +2625,7 @@ class _CompactInput extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: 34,
+      height: _masterControlHeight,
       child: TextFormField(
         controller: controller,
         initialValue: controller == null ? initialValue : null,
@@ -2635,7 +2648,7 @@ class _CheckCell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: 34,
+      height: _masterControlHeight,
       child: Row(
         mainAxisAlignment: label == null
             ? MainAxisAlignment.center
@@ -2857,7 +2870,7 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                     const SizedBox(width: 6),
                     SizedBox(
                       width: 88,
-                      height: 34,
+                      height: _masterControlHeight,
                       child: DropdownButtonFormField<String>(
                         initialValue: os == 'windows' ? 'windows' : 'linux',
                         decoration: const InputDecoration(),
@@ -3075,7 +3088,7 @@ class _MachineGrid extends StatelessWidget {
             const SizedBox(width: 6),
             SizedBox(width: 58, child: os),
             const SizedBox(width: 6),
-            SizedBox(width: 52, child: action),
+            SizedBox(width: 52, child: Center(child: action)),
           ],
         ),
       ),
@@ -3099,19 +3112,28 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   bool loading = true;
   bool busy = false;
   bool autoPush = false;
+  Timer? saveTimer;
   final gitDir = TextEditingController();
-  final splitMb = TextEditingController(text: '0');
+  final splitMb = TextEditingController(text: '95');
 
   List<Map<String, dynamic>> get hosts => _mapRefs(cfg['hosts']);
 
   @override
   void initState() {
     super.initState();
+    gitDir.addListener(_scheduleSave);
+    splitMb.addListener(_scheduleSave);
     _load();
   }
 
   @override
   void dispose() {
+    gitDir.removeListener(_scheduleSave);
+    splitMb.removeListener(_scheduleSave);
+    saveTimer?.cancel();
+    if (cfg.isNotEmpty) {
+      unawaited(_save());
+    }
     gitDir.dispose();
     splitMb.dispose();
     super.dispose();
@@ -3129,7 +3151,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
           ).map((host) => Map<String, dynamic>.from(host)).toList();
           status = nextStatus;
           gitDir.text = _str(cfg['git_dir']);
-          splitMb.text = _str(cfg['split_threshold_mb'], '0');
+          splitMb.text = _str(cfg['split_threshold_mb'], '95');
           autoPush = _bool(cfg['auto_commit_push']);
           loading = false;
           message = '';
@@ -3147,9 +3169,26 @@ class _CollectorDialogState extends State<_CollectorDialog> {
 
   Future<void> _save() async {
     cfg['git_dir'] = gitDir.text.trim();
-    cfg['split_threshold_mb'] = int.tryParse(splitMb.text) ?? 0;
+    cfg['split_threshold_mb'] = int.tryParse(splitMb.text) ?? 95;
     cfg['auto_commit_push'] = autoPush;
     await widget.api.saveCollectorConfig(cfg);
+  }
+
+  void _scheduleSave() {
+    if (loading || cfg.isEmpty) return;
+    saveTimer?.cancel();
+    saveTimer = Timer(const Duration(milliseconds: 400), () {
+      saveTimer = null;
+      _save().catchError((Object error) {
+        if (mounted) setState(() => message = '$error');
+      });
+    });
+  }
+
+  Future<void> _persistNow() async {
+    saveTimer?.cancel();
+    saveTimer = null;
+    await _save();
   }
 
   Future<void> _run() async {
@@ -3158,7 +3197,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
       message = 'Running...';
     });
     try {
-      await _save();
+      await _persistNow();
       await widget.api.collectorRun();
       await _load();
     } catch (error) {
@@ -3183,10 +3222,11 @@ class _CollectorDialogState extends State<_CollectorDialog> {
       'deploy_script': '',
     });
     setState(() => cfg['hosts'] = list);
+    _scheduleSave();
   }
 
   Future<void> _showConfig() async {
-    await _save();
+    await _persistNow();
     if (!mounted) return;
     await showDialog<void>(
       context: context,
@@ -3266,7 +3306,10 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                       child: _CheckCell(
                         value: autoPush,
                         label: 'Auto commit & push',
-                        onChanged: (next) => setState(() => autoPush = next),
+                        onChanged: (next) {
+                          setState(() => autoPush = next);
+                          _scheduleSave();
+                        },
                       ),
                     ),
                   ],
@@ -3298,7 +3341,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                   child: SingleChildScrollView(
                     scrollDirection: Axis.horizontal,
                     child: SizedBox(
-                      width: 826,
+                      width: 854,
                       child: ListView(
                         children: [
                           const _CollectorHostHeader(),
@@ -3311,18 +3354,25 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                               (entry) => _CollectorHostRow(
                                 index: entry.key,
                                 host: entry.value,
-                                onChanged: () => setState(() {}),
+                                onChanged: () {
+                                  setState(() {});
+                                  _scheduleSave();
+                                },
                                 onRemove: () {
                                   final next = hosts;
                                   next.removeAt(entry.key);
                                   setState(() => cfg['hosts'] = next);
+                                  _scheduleSave();
                                 },
                                 onPaths: () async {
                                   await showDialog<void>(
                                     context: context,
                                     builder: (context) => _CollectorPathsDialog(
                                       host: entry.value,
-                                      onChanged: () => setState(() {}),
+                                      onChanged: () {
+                                        setState(() {});
+                                        _scheduleSave();
+                                      },
                                     ),
                                   );
                                 },
@@ -3332,7 +3382,10 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                                     builder: (context) =>
                                         _CollectorDeployDialog(
                                           host: entry.value,
-                                          onChanged: () => setState(() {}),
+                                          onChanged: () {
+                                            setState(() {});
+                                            _scheduleSave();
+                                          },
                                         ),
                                   );
                                 },
@@ -3465,14 +3518,74 @@ class _CollectorHostRow extends StatelessWidget {
           ],
         ),
         MasterButton(label: 'Files ($pathCount)', onTap: onPaths),
-        MasterButton(label: 'E', square: true, onTap: onDeploy),
-        MasterButton(label: '>', square: true, accent: true, onTap: onDeploy),
-        _CheckCell(
+        _CollectorTinyButton(label: 'E', onTap: onDeploy),
+        _CollectorTinyButton(
+          label: '>',
+          accent: true,
+          color: Palette.green,
+          onTap: onDeploy,
+        ),
+        _CollectorCheckCell(
           value: _bool(host['enabled'], true),
           onChanged: (value) => setField('enabled', value),
         ),
-        MasterButton(label: 'x', square: true, danger: true, onTap: onRemove),
+        _CollectorTinyButton(label: 'x', color: Palette.red, onTap: onRemove),
       ],
+    );
+  }
+}
+
+class _CollectorTinyButton extends StatelessWidget {
+  const _CollectorTinyButton({
+    required this.label,
+    required this.onTap,
+    this.color,
+    this.accent = false,
+  });
+
+  final String label;
+  final VoidCallback? onTap;
+  final Color? color;
+  final bool accent;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: _masterControlHeight,
+      width: double.infinity,
+      child: OutlinedButton(
+        onPressed: onTap,
+        style: OutlinedButton.styleFrom(
+          padding: EdgeInsets.zero,
+          minimumSize: const Size(0, _masterControlHeight),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          visualDensity: VisualDensity.compact,
+          foregroundColor: color ?? (accent ? Palette.accent : Palette.text),
+          side: const BorderSide(color: Palette.line),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+          textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+        ),
+        child: Text(label, maxLines: 1, overflow: TextOverflow.clip),
+      ),
+    );
+  }
+}
+
+class _CollectorCheckCell extends StatelessWidget {
+  const _CollectorCheckCell({required this.value, required this.onChanged});
+
+  final bool value;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Checkbox(
+        value: value,
+        visualDensity: VisualDensity.compact,
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        onChanged: (next) => onChanged(next ?? false),
+      ),
     );
   }
 }
@@ -3680,6 +3793,98 @@ class _CollectorDeployDialogState extends State<_CollectorDeployDialog> {
       ),
     );
   }
+}
+
+class _TasksTabbedView extends StatefulWidget {
+  const _TasksTabbedView({required this.machines});
+
+  final List<Map<String, dynamic>> machines;
+
+  @override
+  State<_TasksTabbedView> createState() => _TasksTabbedViewState();
+}
+
+class _TasksTabbedViewState extends State<_TasksTabbedView> {
+  int selected = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.machines.isEmpty) {
+      return const EmptyLine('No tasks');
+    }
+    final index = math.min(selected, widget.machines.length - 1);
+    final machine = widget.machines[index];
+    final tasks = _list(machine['tasks']);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: [
+              for (var i = 0; i < widget.machines.length; i++) ...[
+                _TaskMachineTab(
+                  label: _taskMachineLabel(widget.machines[i]),
+                  selected: i == index,
+                  onTap: () => setState(() => selected = i),
+                ),
+                if (i != widget.machines.length - 1) const SizedBox(width: 8),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        Expanded(
+          child: ListView(
+            children: [
+              const _TaskHeaderRow(),
+              if (tasks.isEmpty)
+                const EmptyLine('No tasks')
+              else
+                ...tasks.map((task) => _TaskRow(task: _map(task))),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _TaskMachineTab extends StatelessWidget {
+  const _TaskMachineTab({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: _masterControlHeight,
+      child: OutlinedButton(
+        onPressed: onTap,
+        style: OutlinedButton.styleFrom(
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          visualDensity: VisualDensity.compact,
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          backgroundColor: selected ? const Color(0xfff8fafc) : Colors.white,
+          foregroundColor: selected ? Palette.accent : Palette.text,
+          side: BorderSide(color: selected ? Palette.accent : Palette.line),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+          textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
+        ),
+        child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
+      ),
+    );
+  }
+}
+
+String _taskMachineLabel(Map<String, dynamic> machine) {
+  return _str(machine['machine_id'], _str(machine['id'], 'machine'));
 }
 
 class _TaskHeaderRow extends StatelessWidget {
