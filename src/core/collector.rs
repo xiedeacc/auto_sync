@@ -290,10 +290,11 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     failures
 }
 
-/// Capture the Unix mode of every file/dir under each pulled path (via
-/// `find … -exec ls -ldn`, since this busybox has no `stat`) and write a
+/// Capture the Unix mode of every file/dir under each pulled path and write a
 /// per-host cache `<root>/.auto_sync_perms` of `mode path` lines. `deploy`
 /// replays these because Windows can't hold the modes on the local copies.
+/// Prefers `stat -c '%a %n'` (gives the octal mode directly); falls back to
+/// parsing `ls -ldn` on hosts where `stat` is not installed yet.
 fn record_host_perms(
     host: &CollectorHost,
     conn: &SshConn,
@@ -302,9 +303,13 @@ fn record_host_perms(
 ) -> Result<()> {
     let mut lines: Vec<String> = Vec::new();
     for path in paths {
+        let q = shell_quote(path);
         let cmd = format!(
-            "find {} \\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null",
-            shell_quote(path)
+            "if command -v stat >/dev/null 2>&1; then \
+find {q} \\( -type f -o -type d \\) -exec stat -c '%a %n' {{}} \\; 2>/dev/null; \
+else \
+find {q} \\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null; \
+fi"
         );
         let out = match ssh_capture(conn, &cmd) {
             Ok(out) => out,
@@ -314,7 +319,7 @@ fn record_host_perms(
             }
         };
         for line in out.lines() {
-            if let Some((mode, entry_path)) = parse_ls_mode(line) {
+            if let Some((mode, entry_path)) = parse_perm_line(line) {
                 lines.push(format!("{mode} {entry_path}"));
             }
         }
@@ -329,10 +334,23 @@ fn record_host_perms(
     Ok(())
 }
 
-/// Parse one `ls -ldn` line into (octal_mode, absolute_path). The perms string
-/// is the first field, the path the last; the modes may carry setuid/setgid/
-/// sticky bits (`s`/`S`/`t`/`T`).
-fn parse_ls_mode(line: &str) -> Option<(String, String)> {
+/// Parse one permission line into (octal_mode, absolute_path). Accepts both
+/// `stat -c '%a %n'` output (`755 /path` — mode already octal) and `ls -ldn`
+/// output (`drwxr-xr-x … /path` — symbolic, may carry setuid/setgid/sticky).
+fn parse_perm_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    // stat format: an octal mode token, then the path (rest of the line).
+    if let Some((first, rest)) = line.split_once(char::is_whitespace) {
+        let rest = rest.trim();
+        if !first.is_empty()
+            && first.len() <= 5
+            && first.bytes().all(|b| b.is_ascii_digit())
+            && rest.starts_with('/')
+        {
+            return Some((first.to_string(), rest.to_string()));
+        }
+    }
+    // ls -ldn fallback: symbolic perms first, absolute path last.
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 9 {
         return None;
@@ -1016,19 +1034,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_ls_mode_reads_octal_and_path() {
+    fn parse_perm_line_handles_stat_and_ls() {
+        // stat -c '%a %n' (mode already octal)
+        assert_eq!(
+            parse_perm_line("755 /usr/local/shadowsocks/bin"),
+            Some(("755".to_string(), "/usr/local/shadowsocks/bin".to_string()))
+        );
+        assert_eq!(
+            parse_perm_line("644 /etc/config/dhcp"),
+            Some(("644".to_string(), "/etc/config/dhcp".to_string()))
+        );
+        assert_eq!(parse_perm_line("4755 /bin/su").unwrap().0, "4755");
+        // ls -ldn fallback (symbolic)
         let dir = "drwxr-xr-x    2 0        0             4096 Jun 30 21:40 /usr/local/shadowsocks/bin";
-        assert_eq!(parse_ls_mode(dir), Some(("755".to_string(), "/usr/local/shadowsocks/bin".to_string())));
-        let file = "-rw-r--r--    1 0    0    1024 Jun 30 21:40 /etc/config/dhcp";
-        assert_eq!(parse_ls_mode(file), Some(("644".to_string(), "/etc/config/dhcp".to_string())));
+        assert_eq!(parse_perm_line(dir), Some(("755".to_string(), "/usr/local/shadowsocks/bin".to_string())));
         let key = "-rw-------    1 0 0 100 Jan 1 00:00 /root/.ssh/id_ed25519";
-        assert_eq!(parse_ls_mode(key), Some(("600".to_string(), "/root/.ssh/id_ed25519".to_string())));
-        // setuid + sticky
+        assert_eq!(parse_perm_line(key), Some(("600".to_string(), "/root/.ssh/id_ed25519".to_string())));
         let suid = "-rwsr-xr-x 1 0 0 1 Jan 1 00:00 /bin/su";
-        assert_eq!(parse_ls_mode(suid).unwrap().0, "4755");
+        assert_eq!(parse_perm_line(suid).unwrap().0, "4755");
         let sticky = "drwxrwxrwt 2 0 0 1 Jan 1 00:00 /tmp";
-        assert_eq!(parse_ls_mode(sticky).unwrap().0, "1777");
-        assert_eq!(parse_ls_mode("garbage"), None);
+        assert_eq!(parse_perm_line(sticky).unwrap().0, "1777");
+        assert_eq!(parse_perm_line("garbage"), None);
     }
 
     #[test]
