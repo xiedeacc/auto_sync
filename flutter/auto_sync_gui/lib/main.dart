@@ -825,6 +825,8 @@ class _Header extends StatelessWidget {
 }
 
 const double _masterRightBlockWidth = 446;
+const double _masterControlHeight = 34;
+const double _masterStatusDotSize = 10;
 
 class _MasterSourcePanel extends StatelessWidget {
   const _MasterSourcePanel({
@@ -1193,97 +1195,88 @@ class _MasterDestinationRow extends StatelessWidget {
     destination['schedule'] = _mapRef(destination['schedule']);
     final schedule = destination['schedule'] as Map<String, dynamic>;
     final dstId = _str(destination['id'], 'dst');
-    return Stack(
-      clipBehavior: Clip.none,
-      children: [
-        Positioned(
-          left: -16,
-          top: 34,
-          child: Container(
-            width: 10,
-            height: 10,
-            decoration: BoxDecoration(
-              color: _statusColor(status),
-              shape: BoxShape.circle,
+    return _MasterSplitRow(
+      rightWidth: _masterRightBlockWidth,
+      leftControlMarker: Container(
+        width: _masterStatusDotSize,
+        height: _masterStatusDotSize,
+        decoration: BoxDecoration(
+          color: _statusColor(status),
+          shape: BoxShape.circle,
+        ),
+      ),
+      leftLabels: const [
+        _MasterLabelBox('ID', width: 56),
+        SizedBox(width: 8),
+        _MasterLabelBox('Destination Path', width: 160),
+      ],
+      leftControls: [
+        SizedBox(width: 56, child: _MasterReadOnlyInput(value: dstId)),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 160,
+          child: _MasterReadOnlyInput(
+            value: _machinePath(
+              _str(destination['machine_id'], 'local'),
+              _str(destination['path']),
             ),
           ),
         ),
-        _MasterSplitRow(
-          rightWidth: _masterRightBlockWidth,
-          leftLabels: const [
-            _MasterLabelBox('ID', width: 56),
-            SizedBox(width: 8),
-            _MasterLabelBox('Destination Path', width: 160),
-          ],
-          leftControls: [
-            SizedBox(width: 56, child: _MasterReadOnlyInput(value: dstId)),
-            const SizedBox(width: 8),
-            SizedBox(
-              width: 160,
-              child: _MasterReadOnlyInput(
-                value: _machinePath(
-                  _str(destination['machine_id'], 'local'),
-                  _str(destination['path']),
-                ),
-              ),
-            ),
-          ],
-          rightLabels: const [
-            _MasterLabelBox('', width: 34),
-            SizedBox(width: 8),
-            _MasterLabelBox('Schedule', width: 100),
-            SizedBox(width: 8),
-            _MasterLabelBox('Cycle', width: 100),
-            SizedBox(width: 8),
-            _MasterLabelBox('', width: 34),
-            SizedBox(width: 8),
-            _MasterLabelBox('Sync', width: 104),
-            SizedBox(width: 8),
-            _MasterLabelBox('', width: 34),
-          ],
-          rightControls: [
-            MasterIconButton(
-              kind: MasterIconKind.info,
-              color: _statusColor(status),
-              onTap: () => onScan(sourceId, dstId),
-            ),
-            const SizedBox(width: 8),
-            MasterButton(
-              label: _scheduleLabel(schedule),
-              width: 100,
-              accent: true,
-              alignLeft: true,
-              onTap: () => onMutate(() {
-                schedule['mode'] = _str(schedule['mode']) == 'weekly'
-                    ? 'daily'
-                    : 'weekly';
-              }),
-            ),
-            const SizedBox(width: 8),
-            SizedBox(
-              width: 100,
-              child: _MasterReadOnlyInput(value: _cycleDisplay(status)),
-            ),
-            const SizedBox(width: 8),
-            MasterIconButton(
-              kind: MasterIconKind.gear,
-              color: Palette.text,
-              onTap: () {},
-            ),
-            const SizedBox(width: 8),
-            MasterSelectButton(
-              value: 'Sync',
-              width: 104,
-              onSelected: (mode) => onSync(sourceId, dstId, mode),
-            ),
-            const SizedBox(width: 8),
-            MasterButton(
-              label: 'x',
-              square: true,
-              danger: true,
-              onTap: () => onMutate(() => destinations.remove(destination)),
-            ),
-          ],
+      ],
+      rightLabels: const [
+        _MasterLabelBox('', width: 34),
+        SizedBox(width: 8),
+        _MasterLabelBox('Schedule', width: 100),
+        SizedBox(width: 8),
+        _MasterLabelBox('Cycle', width: 100),
+        SizedBox(width: 8),
+        _MasterLabelBox('', width: 34),
+        SizedBox(width: 8),
+        _MasterLabelBox('Sync', width: 104),
+        SizedBox(width: 8),
+        _MasterLabelBox('', width: 34),
+      ],
+      rightControls: [
+        MasterIconButton(
+          kind: MasterIconKind.info,
+          color: _statusColor(status),
+          onTap: () => onScan(sourceId, dstId),
+        ),
+        const SizedBox(width: 8),
+        MasterButton(
+          label: _scheduleLabel(schedule),
+          width: 100,
+          accent: true,
+          alignLeft: true,
+          onTap: () => onMutate(() {
+            schedule['mode'] = _str(schedule['mode']) == 'weekly'
+                ? 'daily'
+                : 'weekly';
+          }),
+        ),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 100,
+          child: _MasterReadOnlyInput(value: _cycleDisplay(status)),
+        ),
+        const SizedBox(width: 8),
+        MasterIconButton(
+          kind: MasterIconKind.gear,
+          color: Palette.text,
+          onTap: () {},
+        ),
+        const SizedBox(width: 8),
+        MasterSelectButton(
+          value: 'Sync',
+          width: 104,
+          onSelected: (mode) => onSync(sourceId, dstId, mode),
+        ),
+        const SizedBox(width: 8),
+        MasterButton(
+          label: 'x',
+          square: true,
+          danger: true,
+          onTap: () => onMutate(() => destinations.remove(destination)),
         ),
       ],
     );
@@ -1297,6 +1290,7 @@ class _MasterSplitRow extends StatelessWidget {
     required this.rightLabels,
     required this.rightControls,
     required this.rightWidth,
+    this.leftControlMarker,
   });
 
   final List<Widget> leftLabels;
@@ -1304,6 +1298,7 @@ class _MasterSplitRow extends StatelessWidget {
   final List<Widget> rightLabels;
   final List<Widget> rightControls;
   final double rightWidth;
+  final Widget? leftControlMarker;
 
   @override
   Widget build(BuildContext context) {
@@ -1320,7 +1315,18 @@ class _MasterSplitRow extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Row(children: leftLabels),
-              Row(children: leftControls),
+              Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  if (leftControlMarker != null)
+                    Positioned(
+                      left: -16,
+                      top: (_masterControlHeight - _masterStatusDotSize) / 2,
+                      child: leftControlMarker!,
+                    ),
+                  Row(children: leftControls),
+                ],
+              ),
             ],
           ),
           const SizedBox(width: 8),
@@ -1371,7 +1377,7 @@ class _MasterReadOnlyInput extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      height: 34,
+      height: _masterControlHeight,
       width: double.infinity,
       alignment: Alignment.centerLeft,
       padding: const EdgeInsets.symmetric(horizontal: 9),
@@ -1437,13 +1443,16 @@ class MasterButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: square ? 34 : width,
-      height: 34,
+      width: square ? _masterControlHeight : width,
+      height: _masterControlHeight,
       child: OutlinedButton(
         onPressed: onTap,
         style: OutlinedButton.styleFrom(
-          minimumSize: Size(square ? 34 : 0, 34),
-          maximumSize: Size(width ?? double.infinity, 34),
+          minimumSize: Size(
+            square ? _masterControlHeight : 0,
+            _masterControlHeight,
+          ),
+          maximumSize: Size(width ?? double.infinity, _masterControlHeight),
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           visualDensity: VisualDensity.compact,
           padding: EdgeInsets.symmetric(horizontal: square ? 0 : 12),
@@ -1536,11 +1545,11 @@ class MasterSelectButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return SizedBox(
       width: width,
-      height: 34,
+      height: _masterControlHeight,
       child: PopupMenuButton<String>(
         tooltip: 'Sync',
         padding: EdgeInsets.zero,
-        offset: const Offset(0, 34),
+        offset: const Offset(0, _masterControlHeight),
         onSelected: onSelected,
         itemBuilder: (context) => const [
           PopupMenuItem(value: 'incremental', child: Text('Incremental')),
@@ -1548,7 +1557,7 @@ class MasterSelectButton extends StatelessWidget {
           PopupMenuItem(value: 'scan', child: Text('Compare')),
         ],
         child: Container(
-          height: 34,
+          height: _masterControlHeight,
           padding: const EdgeInsets.symmetric(horizontal: 10),
           decoration: BoxDecoration(
             color: Colors.white,
