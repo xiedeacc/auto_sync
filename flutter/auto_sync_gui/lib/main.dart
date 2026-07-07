@@ -1016,66 +1016,63 @@ class _MasterSourceGroup extends StatelessWidget {
           ),
           child: Column(
             children: [
-              _MasterSyncRow(
+              _MasterSplitRow(
                 rightWidth: _masterRightBlockWidth,
-                left: Row(
-                  children: [
-                    _MasterTextField(
-                      label: 'ID',
-                      width: 56,
-                      value: sourceId,
-                      readOnly: true,
-                      onCommit: (value) {
-                        source['id'] = value;
-                        onChanged();
-                      },
-                    ),
-                    const SizedBox(width: 8),
-                    _MasterTextField(
-                      label: 'Source Path',
-                      width: 160,
+                leftLabels: const [
+                  _MasterLabelBox('ID', width: 56),
+                  SizedBox(width: 8),
+                  _MasterLabelBox('Source Path', width: 160),
+                ],
+                leftControls: [
+                  SizedBox(
+                    width: 56,
+                    child: _MasterReadOnlyInput(value: sourceId),
+                  ),
+                  const SizedBox(width: 8),
+                  SizedBox(
+                    width: 160,
+                    child: _MasterReadOnlyInput(
                       value: _machinePath(
                         _str(source['machine_id'], 'local'),
                         _str(source['src']),
                       ),
-                      readOnly: true,
-                      onCommit: (value) {
-                        source['src'] = _stripMachinePrefix(value);
-                        onChanged();
-                      },
                     ),
-                  ],
-                ),
-                right: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _MasterTextField(
-                      label: 'Latest Cycle',
-                      width: 100,
-                      value: latest,
-                      readOnly: true,
-                      onCommit: (_) {},
-                    ),
-                    const SizedBox(width: 8),
-                    MasterButton(
-                      label: 'Excluded ${_list(source['excludes']).length}',
-                      onTap: () => _showExcludes(context),
-                    ),
-                    const SizedBox(width: 8),
-                    MasterButton(
-                      label: 'Sync',
-                      width: 58,
-                      onTap: () => onSyncSource(sourceId),
-                    ),
-                    const SizedBox(width: 8),
-                    MasterButton(
-                      label: 'x',
-                      square: true,
-                      danger: true,
-                      onTap: () => onRemoveSource(sourceId),
-                    ),
-                  ],
-                ),
+                  ),
+                ],
+                rightLabels: const [
+                  _MasterLabelBox('Latest Cycle', width: 100),
+                  SizedBox(width: 8),
+                  _MasterLabelBox('', width: 112),
+                  SizedBox(width: 8),
+                  _MasterLabelBox('', width: 58),
+                  SizedBox(width: 8),
+                  _MasterLabelBox('', width: 34),
+                ],
+                rightControls: [
+                  SizedBox(
+                    width: 100,
+                    child: _MasterReadOnlyInput(value: latest),
+                  ),
+                  const SizedBox(width: 8),
+                  MasterButton(
+                    label: 'Excluded ${_list(source['excludes']).length}',
+                    width: 112,
+                    onTap: () => _showExcludes(context),
+                  ),
+                  const SizedBox(width: 8),
+                  MasterButton(
+                    label: 'Sync',
+                    width: 58,
+                    onTap: () => onSyncSource(sourceId),
+                  ),
+                  const SizedBox(width: 8),
+                  MasterButton(
+                    label: 'x',
+                    square: true,
+                    danger: true,
+                    onTap: () => onRemoveSource(sourceId),
+                  ),
+                ],
               ),
               for (final dst in destinations)
                 _MasterDestinationRow(
@@ -1201,7 +1198,7 @@ class _MasterDestinationRow extends StatelessWidget {
       children: [
         Positioned(
           left: -16,
-          top: 45,
+          top: 34,
           child: Container(
             width: 10,
             height: 10,
@@ -1211,127 +1208,102 @@ class _MasterDestinationRow extends StatelessWidget {
             ),
           ),
         ),
-        _MasterSyncRow(
+        _MasterSplitRow(
           rightWidth: _masterRightBlockWidth,
-          left: Row(
-            children: [
-              _MasterTextField(
-                label: 'ID',
-                width: 56,
-                value: dstId,
-                readOnly: true,
-                onCommit: (value) {
-                  destination['id'] = value;
-                  onChanged();
-                },
-              ),
-              const SizedBox(width: 8),
-              _MasterTextField(
-                label: 'Destination Path',
-                width: 160,
+          leftLabels: const [
+            _MasterLabelBox('ID', width: 56),
+            SizedBox(width: 8),
+            _MasterLabelBox('Destination Path', width: 160),
+          ],
+          leftControls: [
+            SizedBox(width: 56, child: _MasterReadOnlyInput(value: dstId)),
+            const SizedBox(width: 8),
+            SizedBox(
+              width: 160,
+              child: _MasterReadOnlyInput(
                 value: _machinePath(
                   _str(destination['machine_id'], 'local'),
                   _str(destination['path']),
                 ),
-                readOnly: true,
-                onCommit: (value) {
-                  destination['path'] = _stripMachinePrefix(value);
-                  onChanged();
-                },
               ),
-            ],
-          ),
-          right: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _MasterActionStack(
-                label: '',
-                children: [
-                  MasterIconButton(
-                    kind: MasterIconKind.info,
-                    color: _statusColor(status),
-                    onTap: () => onScan(sourceId, dstId),
-                  ),
-                ],
-              ),
-              const SizedBox(width: 8),
-              _MasterActionStack(
-                label: 'Schedule',
-                children: [
-                  MasterButton(
-                    label: _scheduleLabel(schedule),
-                    width: 100,
-                    accent: true,
-                    alignLeft: true,
-                    onTap: () => onMutate(() {
-                      schedule['mode'] = _str(schedule['mode']) == 'weekly'
-                          ? 'daily'
-                          : 'weekly';
-                    }),
-                  ),
-                ],
-              ),
-              const SizedBox(width: 8),
-              _MasterTextField(
-                label: 'Cycle',
-                width: 100,
-                value: _cycleDisplay(status),
-                readOnly: true,
-                onCommit: (_) {},
-              ),
-              const SizedBox(width: 8),
-              _MasterActionStack(
-                label: '',
-                children: [
-                  MasterIconButton(
-                    kind: MasterIconKind.gear,
-                    color: Palette.text,
-                    onTap: () {},
-                  ),
-                ],
-              ),
-              const SizedBox(width: 8),
-              _MasterActionStack(
-                label: 'Sync',
-                children: [
-                  MasterSelectButton(
-                    value: 'Sync',
-                    width: 104,
-                    onSelected: (mode) => onSync(sourceId, dstId, mode),
-                  ),
-                ],
-              ),
-              const SizedBox(width: 8),
-              _MasterActionStack(
-                label: '',
-                children: [
-                  MasterButton(
-                    label: 'x',
-                    square: true,
-                    danger: true,
-                    onTap: () =>
-                        onMutate(() => destinations.remove(destination)),
-                  ),
-                ],
-              ),
-            ],
-          ),
+            ),
+          ],
+          rightLabels: const [
+            _MasterLabelBox('', width: 34),
+            SizedBox(width: 8),
+            _MasterLabelBox('Schedule', width: 100),
+            SizedBox(width: 8),
+            _MasterLabelBox('Cycle', width: 100),
+            SizedBox(width: 8),
+            _MasterLabelBox('', width: 34),
+            SizedBox(width: 8),
+            _MasterLabelBox('Sync', width: 104),
+            SizedBox(width: 8),
+            _MasterLabelBox('', width: 34),
+          ],
+          rightControls: [
+            MasterIconButton(
+              kind: MasterIconKind.info,
+              color: _statusColor(status),
+              onTap: () => onScan(sourceId, dstId),
+            ),
+            const SizedBox(width: 8),
+            MasterButton(
+              label: _scheduleLabel(schedule),
+              width: 100,
+              accent: true,
+              alignLeft: true,
+              onTap: () => onMutate(() {
+                schedule['mode'] = _str(schedule['mode']) == 'weekly'
+                    ? 'daily'
+                    : 'weekly';
+              }),
+            ),
+            const SizedBox(width: 8),
+            SizedBox(
+              width: 100,
+              child: _MasterReadOnlyInput(value: _cycleDisplay(status)),
+            ),
+            const SizedBox(width: 8),
+            MasterIconButton(
+              kind: MasterIconKind.gear,
+              color: Palette.text,
+              onTap: () {},
+            ),
+            const SizedBox(width: 8),
+            MasterSelectButton(
+              value: 'Sync',
+              width: 104,
+              onSelected: (mode) => onSync(sourceId, dstId, mode),
+            ),
+            const SizedBox(width: 8),
+            MasterButton(
+              label: 'x',
+              square: true,
+              danger: true,
+              onTap: () => onMutate(() => destinations.remove(destination)),
+            ),
+          ],
         ),
       ],
     );
   }
 }
 
-class _MasterSyncRow extends StatelessWidget {
-  const _MasterSyncRow({
-    required this.left,
-    required this.right,
-    this.rightWidth,
+class _MasterSplitRow extends StatelessWidget {
+  const _MasterSplitRow({
+    required this.leftLabels,
+    required this.leftControls,
+    required this.rightLabels,
+    required this.rightControls,
+    required this.rightWidth,
   });
 
-  final Widget left;
-  final Widget right;
-  final double? rightWidth;
+  final List<Widget> leftLabels;
+  final List<Widget> leftControls;
+  final List<Widget> rightLabels;
+  final List<Widget> rightControls;
+  final double rightWidth;
 
   @override
   Widget build(BuildContext context) {
@@ -1342,23 +1314,35 @@ class _MasterSyncRow extends StatelessWidget {
         border: Border(bottom: BorderSide(color: Palette.line)),
       ),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          left,
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: leftLabels),
+              Row(children: leftControls),
+            ],
+          ),
           const SizedBox(width: 8),
           Expanded(
             child: Align(
               alignment: Alignment.centerRight,
-              child: rightWidth == null
-                  ? right
-                  : SizedBox(
-                      width: rightWidth,
-                      child: Align(
-                        alignment: Alignment.centerRight,
-                        child: right,
-                      ),
+              child: SizedBox(
+                width: rightWidth,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: rightLabels,
                     ),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: rightControls,
+                    ),
+                  ],
+                ),
+              ),
             ),
           ),
         ],
@@ -1367,35 +1351,15 @@ class _MasterSyncRow extends StatelessWidget {
   }
 }
 
-class _MasterTextField extends StatelessWidget {
-  const _MasterTextField({
-    required this.label,
-    required this.width,
-    required this.value,
-    required this.onCommit,
-    this.readOnly = false,
-  });
+class _MasterLabelBox extends StatelessWidget {
+  const _MasterLabelBox(this.text, {required this.width});
 
-  final String label;
+  final String text;
   final double width;
-  final String value;
-  final bool readOnly;
-  final ValueChanged<String> onCommit;
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: width,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _MasterLabel(label),
-          readOnly
-              ? _MasterReadOnlyInput(value: value)
-              : CommitField(label: '', value: value, onCommit: onCommit),
-        ],
-      ),
-    );
+    return SizedBox(width: width, child: _MasterLabel(text));
   }
 }
 
@@ -1422,24 +1386,6 @@ class _MasterReadOnlyInput extends StatelessWidget {
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(fontSize: 13, color: Palette.text),
       ),
-    );
-  }
-}
-
-class _MasterActionStack extends StatelessWidget {
-  const _MasterActionStack({required this.label, required this.children});
-
-  final String label;
-  final List<Widget> children;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _MasterLabel(label),
-        Row(children: children),
-      ],
     );
   }
 }
@@ -1636,11 +1582,6 @@ String _machinePath(String machineId, String path) {
   final clean = path.startsWith(r'\\?\') ? path.substring(4) : path;
   final prefix = machineId.isEmpty ? 'local' : machineId;
   return '$prefix: $clean';
-}
-
-String _stripMachinePrefix(String value) {
-  final idx = value.indexOf(': ');
-  return idx >= 0 ? value.substring(idx + 2) : value;
 }
 
 String _scheduleLabel(Map<String, dynamic> schedule) {
