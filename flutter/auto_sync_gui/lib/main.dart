@@ -1451,7 +1451,10 @@ class _MasterSourceGroup extends StatelessWidget {
       context: context,
       builder: (context) => _ExcludedDialog(
         sourceId: _str(source['id'], 'source'),
-        sourcePath: _str(source['src'], '-'),
+        sourcePath: _machinePath(
+          _str(source['machine_id'], 'local'),
+          _str(source['src'], '-'),
+        ),
         initialItems: _list(source['excludes']).map((item) => '$item').toList(),
         onAddPath: () => onPickExcludePath(source),
       ),
@@ -1792,10 +1795,7 @@ class _ExcludedDialogState extends State<_ExcludedDialog> {
                 border: Border(top: BorderSide(color: Palette.line)),
               ),
               child: controllers.isEmpty
-                  ? const Align(
-                      alignment: Alignment.topLeft,
-                      child: EmptyLine('(empty)'),
-                    )
+                  ? const SizedBox.shrink()
                   : ListView.builder(
                       itemCount: controllers.length,
                       itemBuilder: (context, index) => Container(
@@ -2079,9 +2079,93 @@ class MasterSelectButton extends StatelessWidget {
 }
 
 String _machinePath(String machineId, String path) {
-  final clean = path.startsWith(r'\\?\') ? path.substring(4) : path;
   final prefix = machineId.isEmpty ? 'local' : machineId;
-  return '$prefix: $clean';
+  return '$prefix: ${_displayPath(path)}';
+}
+
+String _displayPath(String value) {
+  return value
+      .replaceFirst(RegExp(r'^\\\\\?\\UNC\\', caseSensitive: false), r'\\')
+      .replaceFirst(RegExp(r'^\\\\\?\\'), '');
+}
+
+String _compactStatusPath(String value, int maxChars) {
+  final path = _displayPath(value);
+  if (path.length <= maxChars) return path;
+  final separator = path.contains('\\') ? '\\' : '/';
+  var prefix = '';
+  var rest = path;
+  final drive = RegExp(r'^[A-Za-z]:\\').firstMatch(path);
+  if (drive != null) {
+    prefix = drive.group(0)!;
+    rest = path.substring(prefix.length);
+  } else if (path.startsWith('\\\\')) {
+    final parts = path.substring(2).split(RegExp(r'[\\\/]+'));
+    if (parts.length >= 2) {
+      prefix = '\\\\${parts[0]}\\${parts[1]}\\';
+      rest = parts.skip(2).join(separator);
+    }
+  } else if (path.startsWith('/')) {
+    prefix = '/';
+    rest = path.substring(1);
+  }
+
+  final parts = rest
+      .split(RegExp(r'[\\\/]+'))
+      .where((part) => part.isNotEmpty)
+      .toList();
+  if (parts.length <= 2) {
+    return '${path.substring(0, math.max(0, maxChars - 3))}...';
+  }
+
+  var headCount = math.min(4, parts.length - 1);
+  var tailCount = math.min(3, parts.length - headCount);
+  var compact = _renderCompactPath(
+    prefix,
+    parts,
+    separator,
+    headCount,
+    tailCount,
+  );
+  while (compact.length > maxChars && headCount > 1) {
+    headCount -= 1;
+    compact = _renderCompactPath(
+      prefix,
+      parts,
+      separator,
+      headCount,
+      tailCount,
+    );
+  }
+  while (compact.length > maxChars && tailCount > 1) {
+    tailCount -= 1;
+    compact = _renderCompactPath(
+      prefix,
+      parts,
+      separator,
+      headCount,
+      tailCount,
+    );
+  }
+  if (compact.length <= maxChars) return compact;
+  final tail = parts.last;
+  final headBudget = math.max(0, maxChars - tail.length - separator.length - 3);
+  return '${path.substring(0, headBudget)}...$separator$tail';
+}
+
+String _renderCompactPath(
+  String prefix,
+  List<String> parts,
+  String separator,
+  int headCount,
+  int tailCount,
+) {
+  final head = parts.take(headCount).join(separator);
+  final tail = parts.skip(parts.length - tailCount).join(separator);
+  final left = head.isNotEmpty
+      ? '$prefix$head'
+      : prefix.replaceFirst(RegExp(r'[\\\/]$'), '');
+  return '$left$separator...$separator$tail';
 }
 
 Map<String, dynamic> _defaultDestinationSchedule() => {
@@ -2396,7 +2480,10 @@ class _SourceCard extends StatelessWidget {
       context: context,
       builder: (context) => _ExcludedDialog(
         sourceId: _str(source['id'], 'source'),
-        sourcePath: _str(source['src'], '-'),
+        sourcePath: _machinePath(
+          _str(source['machine_id'], 'local'),
+          _str(source['src'], '-'),
+        ),
         initialItems: _list(source['excludes']).map((item) => '$item').toList(),
       ),
     );
@@ -3366,34 +3453,21 @@ class _PathPickerDialogState extends State<_PathPickerDialog> {
     return _MasterDialogFrame(
       title: 'Path',
       width: 720,
-      maxHeight: 720,
+      maxHeight: 480,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              SizedBox(
+              _MachineSelectButton(
                 width: 160,
-                height: _masterControlHeight,
-                child: DropdownButtonFormField<String>(
-                  initialValue: machineId,
-                  decoration: const InputDecoration(),
-                  items: widget.machineIds
-                      .map(
-                        (id) => DropdownMenuItem(
-                          value: id,
-                          child: Text(widget.machineLabel(id)),
-                        ),
-                      )
-                      .toList(),
-                  onChanged: (value) {
-                    if (value == null) return;
-                    setState(() => machineId = value);
-                    _load(
-                      value == 'local' && Platform.isWindows ? r'C:\' : '/',
-                    );
-                  },
-                ),
+                value: machineId,
+                options: widget.machineIds,
+                labelFor: widget.machineLabel,
+                onSelected: (value) {
+                  setState(() => machineId = value);
+                  _load(value == 'local' && Platform.isWindows ? r'C:\' : '/');
+                },
               ),
               const SizedBox(width: 8),
               Expanded(child: _FolderPathLabel(path)),
@@ -3501,10 +3575,88 @@ class _FolderPathLabel extends StatelessWidget {
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
-        path,
+        _displayPath(path),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+      ),
+    );
+  }
+}
+
+class _MachineSelectButton extends StatelessWidget {
+  const _MachineSelectButton({
+    required this.width,
+    required this.value,
+    required this.options,
+    required this.labelFor,
+    required this.onSelected,
+  });
+
+  final double width;
+  final String value;
+  final List<String> options;
+  final String Function(String id) labelFor;
+  final ValueChanged<String> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: width,
+      height: _masterControlHeight,
+      child: PopupMenuButton<String>(
+        tooltip: 'Machine',
+        padding: EdgeInsets.zero,
+        color: Colors.white,
+        elevation: 2,
+        surfaceTintColor: Colors.transparent,
+        shadowColor: const Color(0x33000000),
+        constraints: BoxConstraints.tightFor(width: width),
+        shape: RoundedRectangleBorder(
+          side: const BorderSide(color: Palette.line),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        offset: const Offset(0, _masterControlHeight),
+        onSelected: onSelected,
+        itemBuilder: (context) => [
+          for (final option in options)
+            PopupMenuItem(
+              value: option,
+              height: _masterControlHeight,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Text(
+                labelFor(option),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+        ],
+        child: Container(
+          height: _masterControlHeight,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            border: Border.all(color: Palette.line),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  labelFor(value),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Palette.text,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              const Icon(Icons.arrow_drop_down, size: 18, color: Palette.text),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -3866,11 +4018,6 @@ String _syncProgressLabel(Map<String, dynamic> runtime) {
   final done = _int(plan[3]);
   if (total == 0 && toCopy == 0 && matched == 0) return '';
   return 'synced $done / $toCopy to copy · $matched unchanged ($total total)';
-}
-
-String _compactStatusPath(String value, int maxLength) {
-  if (value.length <= maxLength) return value;
-  return '...${value.substring(value.length - maxLength + 3)}';
 }
 
 String _formatBytesPerSecond(int bytes) {
@@ -5863,7 +6010,7 @@ class _StatusBar extends StatelessWidget {
         transfer['destination_id'],
         _str(transfer['destination']),
       );
-      final file = _str(transfer['rel_path'], '-');
+      final file = _compactStatusPath(_str(transfer['rel_path'], '-'), 56);
       final speed = _str(transfer['bytes_per_sec']).isEmpty
           ? ''
           : '${_str(transfer['bytes_per_sec'])} B/s';
@@ -5876,7 +6023,10 @@ class _StatusBar extends StatelessWidget {
     }
     final scan = _map(runtimeStatus['scan']);
     if (scan.isNotEmpty) {
-      final current = _str(scan['current_path'], _str(scan['root_path']));
+      final current = _compactStatusPath(
+        _str(scan['current_path'], _str(scan['root_path'])),
+        56,
+      );
       final entries = _int(scan['entries_seen']);
       return entries > 0
           ? 'Scanning $current · $entries entries'
