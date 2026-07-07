@@ -1101,6 +1101,7 @@ class _Header extends StatelessWidget {
 
 const double _masterRightBlockWidth = 446;
 const double _masterControlHeight = 34;
+const double _settingsInputHeight = 38;
 const double _masterControlGap = 8;
 const double _masterLabelControlGap = 4;
 const double _masterStatusDotSize = 10;
@@ -2015,12 +2016,36 @@ class MasterSelectButton extends StatelessWidget {
       child: PopupMenuButton<String>(
         tooltip: 'Sync',
         padding: EdgeInsets.zero,
+        color: Colors.white,
+        elevation: 2,
+        surfaceTintColor: Colors.transparent,
+        shadowColor: const Color(0x33000000),
+        constraints: BoxConstraints.tightFor(width: width),
+        shape: RoundedRectangleBorder(
+          side: const BorderSide(color: Palette.line),
+          borderRadius: BorderRadius.circular(6),
+        ),
         offset: const Offset(0, _masterControlHeight),
         onSelected: onSelected,
         itemBuilder: (context) => const [
-          PopupMenuItem(value: 'incremental', child: Text('Incremental')),
-          PopupMenuItem(value: 'full', child: Text('Full')),
-          PopupMenuItem(value: 'scan', child: Text('Compare')),
+          PopupMenuItem(
+            value: 'incremental',
+            height: _masterControlHeight,
+            padding: EdgeInsets.symmetric(horizontal: 12),
+            child: Text('Incremental'),
+          ),
+          PopupMenuItem(
+            value: 'full',
+            height: _masterControlHeight,
+            padding: EdgeInsets.symmetric(horizontal: 12),
+            child: Text('Full'),
+          ),
+          PopupMenuItem(
+            value: 'scan',
+            height: _masterControlHeight,
+            padding: EdgeInsets.symmetric(horizontal: 12),
+            child: Text('Compare'),
+          ),
         ],
         child: Container(
           height: _masterControlHeight,
@@ -2771,13 +2796,31 @@ class _SettingsGrid extends StatelessWidget {
             ],
           );
         }
-        final itemWidth = (constraints.maxWidth - 12) / 2;
-        return Wrap(
-          spacing: 12,
-          runSpacing: 12,
+        final rows = <Widget>[];
+        for (var i = 0; i < children.length; i += 2) {
+          rows.add(
+            IntrinsicHeight(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Expanded(child: children[i]),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: i + 1 < children.length
+                        ? children[i + 1]
+                        : const SizedBox.shrink(),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+        return Column(
           children: [
-            for (final child in children)
-              SizedBox(width: itemWidth, child: child),
+            for (var i = 0; i < rows.length; i += 1) ...[
+              if (i > 0) const SizedBox(height: 12),
+              rows[i],
+            ],
           ],
         );
       },
@@ -2894,15 +2937,15 @@ class _SettingsNumberInput extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: _masterControlHeight,
+      height: _settingsInputHeight,
       child: TextFormField(
         controller: controller,
         keyboardType: TextInputType.number,
-        style: const TextStyle(fontSize: 13, color: Palette.text, height: 1.2),
+        style: const TextStyle(fontSize: 14, color: Palette.text, height: 1.2),
         decoration: const InputDecoration(
           isDense: true,
-          contentPadding: EdgeInsets.symmetric(horizontal: 9, vertical: 7),
-          constraints: BoxConstraints.tightFor(height: _masterControlHeight),
+          contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+          constraints: BoxConstraints.tightFor(height: _settingsInputHeight),
         ),
       ),
     );
