@@ -962,7 +962,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
             runtimeStatus: runtimeStatus,
             activity: syncActivity,
             saving: saving,
-            onConfig: _openConfigDialog,
+            onConfig: _openSettingsDialog,
           ),
         ],
       ),
