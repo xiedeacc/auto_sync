@@ -10,6 +10,7 @@
 /conf/.auto_sync.lock
 /conf/.auto_sync.lock.pid
 /runtime/
+/web/
 /logs/*
 !/logs/.gitkeep
 /bin/*
