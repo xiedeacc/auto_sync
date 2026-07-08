@@ -502,7 +502,7 @@ fn pull_paths_tar(
         clear_readonly_recursive(&host.root.join(local_rel_path(rel)));
     }
 
-    let exclude_patterns = tar_exclude_patterns(excludes);
+    let exclude_patterns = tar_exclude_patterns(&rel_paths, excludes);
     let mut remote_cmd = String::from("cd / && tar -cf - ");
     if !exclude_patterns.is_empty() {
         remote_cmd.push_str("-X - ");
@@ -1478,10 +1478,16 @@ fn local_rel_path(rel: &str) -> PathBuf {
     path
 }
 
-fn tar_exclude_patterns(excludes: &[String]) -> Vec<String> {
+fn tar_exclude_patterns(roots: &[String], excludes: &[String]) -> Vec<String> {
     let mut patterns = Vec::new();
     for exclude in excludes {
         if let Ok(rel) = remote_tar_path(exclude) {
+            if !roots
+                .iter()
+                .any(|root| rel == *root || rel.starts_with(&format!("{root}/")))
+            {
+                continue;
+            }
             patterns.push(rel.clone());
             patterns.push(format!("{rel}/*"));
         }
@@ -1590,18 +1596,23 @@ mod tests {
     }
 
     #[test]
-    fn tar_exclude_patterns_cover_directory_contents() {
-        let patterns = tar_exclude_patterns(&[
-            "/usr/local/blog/logs/".to_string(),
-            "/root/.ssh".to_string(),
-        ]);
+    fn tar_exclude_patterns_exclude_only_paths_under_archived_roots() {
+        let patterns = tar_exclude_patterns(
+            &["usr/local/blog".to_string()],
+            &[
+                "/usr/local/blog/logs/".to_string(),
+                "/usr/local/blog/.backup-worktree".to_string(),
+                "/root/.ssh".to_string(),
+                "/usr/local/tbox/log".to_string(),
+            ],
+        );
         assert_eq!(
             patterns,
             vec![
                 "usr/local/blog/logs",
                 "usr/local/blog/logs/*",
-                "root/.ssh",
-                "root/.ssh/*",
+                "usr/local/blog/.backup-worktree",
+                "usr/local/blog/.backup-worktree/*",
             ]
         );
     }
