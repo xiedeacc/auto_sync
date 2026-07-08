@@ -322,6 +322,7 @@ class AutoSyncHome extends StatefulWidget {
 class _AutoSyncHomeState extends State<AutoSyncHome> {
   Map<String, dynamic> cfg = {'app': {}, 'machines': [], 'source_groups': []};
   List<dynamic> statuses = [];
+  List<dynamic> taskMachines = [];
   Map<String, dynamic> runtimeStatus = {};
   Map<String, dynamic> syncActivity = {};
   Map<String, dynamic> machineStatus = {};
@@ -387,6 +388,9 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
       syncActivity = await widget.api.getSyncActivity();
     } catch (_) {}
     try {
+      taskMachines = await widget.api.getAllTasks(limit: 80);
+    } catch (_) {}
+    try {
       machineStatus = await widget.api.getMachines();
     } catch (error) {
       errors.add('$error');
@@ -400,8 +404,8 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     });
   }
 
-  Future<void> _loadStatusOnly() async {
-    if (!mounted || busy) {
+  Future<void> _loadStatusOnly({bool force = false}) async {
+    if (!mounted || (busy && !force)) {
       return;
     }
     if (!configLoaded) {
@@ -411,10 +415,15 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     try {
       final nextStatus = await widget.api.getStatus();
       final nextActivity = await widget.api.getSyncActivity();
+      var nextTasks = taskMachines;
+      try {
+        nextTasks = await widget.api.getAllTasks(limit: 80);
+      } catch (_) {}
       if (mounted) {
         setState(() {
           statuses = nextStatus;
           syncActivity = nextActivity;
+          taskMachines = nextTasks;
           if (_isStartupConnectionMessage(message)) {
             message = '';
           }
@@ -450,7 +459,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     });
     try {
       await action();
-      await _loadStatusOnly();
+      await _loadStatusOnly(force: true);
       if (mounted) {
         setState(() => message = '$label done');
       }
@@ -940,6 +949,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
                     sources: sources,
                     runtimeStatus: runtimeStatus,
                     syncActivity: syncActivity,
+                    taskMachines: taskMachines,
                     busy: busy,
                     machineIdsFor: (source) =>
                         _machineIds(_str(source['machine_id'])),
@@ -1145,6 +1155,7 @@ class _MasterSourcePanel extends StatelessWidget {
     required this.sources,
     required this.runtimeStatus,
     required this.syncActivity,
+    required this.taskMachines,
     required this.busy,
     required this.machineIdsFor,
     required this.machineLabel,
@@ -1171,6 +1182,7 @@ class _MasterSourcePanel extends StatelessWidget {
   final List<Map<String, dynamic>> sources;
   final Map<String, dynamic> runtimeStatus;
   final Map<String, dynamic> syncActivity;
+  final List<dynamic> taskMachines;
   final bool busy;
   final List<String> Function(Map<String, dynamic> source) machineIdsFor;
   final String Function(String id) machineLabel;
@@ -1212,6 +1224,7 @@ class _MasterSourcePanel extends StatelessWidget {
       sources: sources,
       runtimeStatus: runtimeStatus,
       syncActivity: syncActivity,
+      taskMachines: taskMachines,
       busy: busy,
       statusFor: statusFor,
     );
@@ -1580,8 +1593,11 @@ class _MasterDestinationRow extends StatelessWidget {
       destination,
       status,
     );
+    final diffCount = _int(status?['scan_differences']);
+    final showRepair = diffCount > 0;
+    final infoCellWidth = showRepair ? 72.0 : 34.0;
     return _MasterSplitRow(
-      rightWidth: _masterRightBlockWidth,
+      rightWidth: _masterRightBlockWidth + (showRepair ? 38 : 0),
       leftControlMarker: Container(
         width: _masterStatusDotSize,
         height: _masterStatusDotSize,
@@ -1611,24 +1627,40 @@ class _MasterDestinationRow extends StatelessWidget {
           ),
         ),
       ],
-      rightLabels: const [
-        _MasterLabelBox('', width: 34),
-        SizedBox(width: 8),
-        _MasterLabelBox('Schedule', width: 100),
-        SizedBox(width: 8),
-        _MasterLabelBox('Cycle', width: 100),
-        SizedBox(width: 8),
-        _MasterLabelBox('', width: 34),
-        SizedBox(width: 8),
-        _MasterLabelBox('Sync', width: 104),
-        SizedBox(width: 8),
-        _MasterLabelBox('', width: 34),
+      rightLabels: [
+        _MasterLabelBox('', width: infoCellWidth),
+        const SizedBox(width: 8),
+        const _MasterLabelBox('Schedule', width: 100),
+        const SizedBox(width: 8),
+        const _MasterLabelBox('Cycle', width: 100),
+        const SizedBox(width: 8),
+        const _MasterLabelBox('', width: 34),
+        const SizedBox(width: 8),
+        const _MasterLabelBox('Sync', width: 104),
+        const SizedBox(width: 8),
+        const _MasterLabelBox('', width: 34),
       ],
       rightControls: [
-        MasterIconButton(
-          kind: MasterIconKind.info,
-          color: _statusColor(status),
-          onTap: () => unawaited(onInfo(source, destination)),
+        SizedBox(
+          width: infoCellWidth,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              if (showRepair) ...[
+                _RepairScanButton(
+                  enabled: !dstSyncDisabled,
+                  diffCount: diffCount,
+                  onTap: () => onSync(sourceId, dstId, 'repair_scan'),
+                ),
+                const SizedBox(width: 4),
+              ],
+              MasterIconButton(
+                kind: MasterIconKind.info,
+                color: _statusColor(status),
+                onTap: () => unawaited(onInfo(source, destination)),
+              ),
+            ],
+          ),
         ),
         const SizedBox(width: 8),
         MasterButton(
@@ -1980,6 +2012,7 @@ class MasterButton extends StatelessWidget {
           visualDensity: VisualDensity.compact,
           padding: EdgeInsets.symmetric(horizontal: square ? 0 : 12),
           backgroundColor: primary ? Palette.accent : Colors.white,
+          disabledBackgroundColor: const Color(0xffe2e8f0),
           foregroundColor: danger
               ? Palette.red
               : primary
@@ -1987,6 +2020,7 @@ class MasterButton extends StatelessWidget {
               : accent
               ? Palette.accent
               : Palette.text,
+          disabledForegroundColor: const Color(0xff64748b),
           side: BorderSide(color: primary ? Palette.accent : Palette.line),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
           textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
@@ -2052,6 +2086,60 @@ class MasterIconButton extends StatelessWidget {
   }
 }
 
+class _RepairScanButton extends StatelessWidget {
+  const _RepairScanButton({
+    required this.enabled,
+    required this.diffCount,
+    required this.onTap,
+  });
+
+  final bool enabled;
+  final int diffCount;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final border = enabled ? const Color(0xffb45309) : const Color(0xff94a3b8);
+    final background = enabled
+        ? const Color(0x1ab45309)
+        : const Color(0xffe2e8f0);
+    final foreground = enabled
+        ? const Color(0xffb45309)
+        : const Color(0xff64748b);
+    return Tooltip(
+      message:
+          'Compare found $diffCount difference${diffCount == 1 ? '' : 's'} - sync just these paths',
+      child: SizedBox(
+        width: _masterControlHeight,
+        height: _masterControlHeight,
+        child: OutlinedButton(
+          onPressed: enabled ? onTap : null,
+          style: OutlinedButton.styleFrom(
+            minimumSize: const Size(_masterControlHeight, _masterControlHeight),
+            maximumSize: const Size(_masterControlHeight, _masterControlHeight),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
+            backgroundColor: background,
+            foregroundColor: foreground,
+            disabledBackgroundColor: background,
+            disabledForegroundColor: foreground,
+            side: BorderSide(color: border),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(6),
+            ),
+            textStyle: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          child: const Text('\u21c6'),
+        ),
+      ),
+    );
+  }
+}
+
 class MasterSelectButton extends StatelessWidget {
   const MasterSelectButton({
     super.key,
@@ -2068,6 +2156,9 @@ class MasterSelectButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final background = enabled ? Colors.white : const Color(0xffe2e8f0);
+    final border = enabled ? Palette.line : const Color(0xffcbd5e1);
+    final foreground = enabled ? Palette.text : const Color(0xff64748b);
     return SizedBox(
       width: width,
       height: _masterControlHeight,
@@ -2110,8 +2201,8 @@ class MasterSelectButton extends StatelessWidget {
           height: _masterControlHeight,
           padding: const EdgeInsets.symmetric(horizontal: 10),
           decoration: BoxDecoration(
-            color: enabled ? Colors.white : const Color(0xfff8fafc),
-            border: Border.all(color: Palette.line),
+            color: background,
+            border: Border.all(color: border),
             borderRadius: BorderRadius.circular(6),
           ),
           child: Row(
@@ -2122,17 +2213,13 @@ class MasterSelectButton extends StatelessWidget {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    color: enabled ? Palette.text : Palette.muted,
+                    color: foreground,
                     fontSize: 13,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
               ),
-              Icon(
-                Icons.arrow_drop_down,
-                size: 18,
-                color: enabled ? Palette.text : Palette.muted,
-              ),
+              Icon(Icons.arrow_drop_down, size: 18, color: foreground),
             ],
           ),
         ),
@@ -2236,6 +2323,8 @@ class _SyncDisableState {
     required this.busy,
     required this.unavailableSourceIds,
     required this.machineSyncingKeys,
+    required this.runningSourceIds,
+    required this.runningDestinationKeys,
     required this.compareKeys,
     required this.overlapRoots,
   });
@@ -2243,6 +2332,8 @@ class _SyncDisableState {
   final bool busy;
   final Set<String> unavailableSourceIds;
   final Set<String> machineSyncingKeys;
+  final Set<String> runningSourceIds;
+  final Set<String> runningDestinationKeys;
   final Set<String> compareKeys;
   final List<_PathRoot> overlapRoots;
 
@@ -2253,6 +2344,7 @@ class _SyncDisableState {
     required List<Map<String, dynamic>> sources,
     required Map<String, dynamic> runtimeStatus,
     required Map<String, dynamic> syncActivity,
+    required List<dynamic> taskMachines,
     required bool busy,
     required Map<String, dynamic>? Function(
       String sourceId,
@@ -2262,6 +2354,8 @@ class _SyncDisableState {
   }) {
     final machineSyncingKeys = <String>{};
     final unavailableSourceIds = <String>{};
+    final runningSourceIds = <String>{};
+    final runningDestinationKeys = <String>{};
     final compareKeys = <String>{};
     final overlapRoots = <_PathRoot>[];
     final activities = _activityRows(syncActivity, runtimeStatus);
@@ -2321,10 +2415,35 @@ class _SyncDisableState {
       );
     }
 
+    for (final task in _runningTaskRows(taskMachines)) {
+      final sourceId = _str(task['source_id']);
+      if (sourceId.isEmpty) continue;
+      final source = _findSource(sources, sourceId);
+      if (source == null) continue;
+      runningSourceIds.add(sourceId);
+      final kind = _str(task['kind']);
+      final destinationIds = _taskDestinationIds(task);
+      for (final destinationId in destinationIds) {
+        final key = '$sourceId/$destinationId';
+        runningDestinationKeys.add(key);
+        if (kind == 'compare') {
+          compareKeys.add(key);
+        } else {
+          _addOverlapRoots(
+            overlapRoots,
+            source,
+            _findDestination(source, destinationId),
+          );
+        }
+      }
+    }
+
     return _SyncDisableState(
       busy: busy,
       unavailableSourceIds: unavailableSourceIds,
       machineSyncingKeys: machineSyncingKeys,
+      runningSourceIds: runningSourceIds,
+      runningDestinationKeys: runningDestinationKeys,
       compareKeys: compareKeys,
       overlapRoots: overlapRoots,
     );
@@ -2333,6 +2452,7 @@ class _SyncDisableState {
   bool sourceDisabled(Map<String, dynamic> source) {
     if (busy) return true;
     if (unavailableSourceIds.contains(_str(source['id']))) return true;
+    if (runningSourceIds.contains(_str(source['id']))) return true;
     if (machineSyncingKeys.contains(
       _machineKey(_str(source['machine_id'], 'local')),
     )) {
@@ -2351,6 +2471,9 @@ class _SyncDisableState {
     if (_bool(destination['paused'])) return true;
     final sourceId = _str(source['id']);
     final destinationId = _str(destination['id']);
+    if (runningDestinationKeys.contains('$sourceId/$destinationId')) {
+      return true;
+    }
     if (compareKeys.contains('$sourceId/$destinationId')) return true;
     if (machineSyncingKeys.contains(
       _machineKey(_str(source['machine_id'], 'local')),
@@ -2404,6 +2527,25 @@ List<Map<String, dynamic>> _runtimeScans(Map<String, dynamic> runtime) {
   if (scans.isNotEmpty) return scans;
   final scan = _map(runtime['scan']);
   return scan.isEmpty ? const [] : [scan];
+}
+
+List<Map<String, dynamic>> _runningTaskRows(List<dynamic> taskMachines) {
+  final rows = <Map<String, dynamic>>[];
+  for (final machine in taskMachines) {
+    for (final item in _list(_map(machine)['tasks'])) {
+      final task = _map(item);
+      if (_str(task['status']) == 'running') {
+        rows.add(task);
+      }
+    }
+  }
+  return rows;
+}
+
+List<String> _taskDestinationIds(Map<String, dynamic> task) {
+  return _str(
+    task['destination_id'],
+  ).split(',').map((id) => id.trim()).where((id) => id.isNotEmpty).toList();
 }
 
 Map<String, dynamic>? _findSource(
@@ -4794,96 +4936,16 @@ class _MachinesDialogState extends State<_MachinesDialog> {
             ),
             child: Column(
               children: [
-                const Row(
-                  children: [
-                    _FormHead(width: 96, text: 'Name'),
-                    SizedBox(width: 6),
-                    _FormHead(width: 96, text: 'Alias'),
-                    SizedBox(width: 6),
-                    _FormHead(width: 140, text: 'Host'),
-                    SizedBox(width: 6),
-                    _FormHead(width: 90, text: 'Port'),
-                    SizedBox(width: 6),
-                    _FormHead(width: 114, text: 'SSH User'),
-                    SizedBox(width: 6),
-                    _FormHead(width: 86, text: 'SSH Port'),
-                    SizedBox(width: 6),
-                    _FormHead(width: 104, text: 'OS'),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SizedBox(
-                      width: 96,
-                      child: _CompactInput(
-                        controller: name,
-                        height: _editorHeight,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    SizedBox(
-                      width: 96,
-                      child: _CompactInput(
-                        controller: alias,
-                        height: _editorHeight,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    SizedBox(
-                      width: 140,
-                      child: _CompactInput(
-                        controller: host,
-                        height: _editorHeight,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    SizedBox(
-                      width: 90,
-                      child: _CompactInput(
-                        controller: port,
-                        numeric: true,
-                        height: _editorHeight,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    SizedBox(
-                      width: 114,
-                      child: _CompactInput(
-                        controller: sshUser,
-                        height: _editorHeight,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    SizedBox(
-                      width: 86,
-                      child: _CompactInput(
-                        controller: sshPort,
-                        numeric: true,
-                        height: _editorHeight,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    SizedBox(
-                      width: 104,
-                      child: _CompactSelect(
-                        height: _editorHeight,
-                        value: os == 'windows' ? 'windows' : 'linux',
-                        items: const [
-                          DropdownMenuItem(
-                            value: 'linux',
-                            child: Text('linux'),
-                          ),
-                          DropdownMenuItem(
-                            value: 'windows',
-                            child: Text('windows'),
-                          ),
-                        ],
-                        onChanged: (value) => setState(() => os = value),
-                      ),
-                    ),
-                  ],
+                _MachineEditorGrid(
+                  height: _editorHeight,
+                  name: name,
+                  alias: alias,
+                  host: host,
+                  port: port,
+                  sshUser: sshUser,
+                  sshPort: sshPort,
+                  os: os == 'windows' ? 'windows' : 'linux',
+                  onOsChanged: (value) => setState(() => os = value),
                 ),
                 const SizedBox(height: 8),
                 Row(
@@ -4918,10 +4980,9 @@ class _MachinesDialogState extends State<_MachinesDialog> {
 }
 
 class _FormHead extends StatelessWidget {
-  const _FormHead({required this.text, this.width});
+  const _FormHead({required this.text});
 
   final String text;
-  final double? width;
 
   @override
   Widget build(BuildContext context) {
@@ -4935,7 +4996,88 @@ class _FormHead extends StatelessWidget {
         fontWeight: FontWeight.w700,
       ),
     );
-    return width == null ? child : SizedBox(width: width, child: child);
+    return child;
+  }
+}
+
+class _MachineEditorGrid extends StatelessWidget {
+  const _MachineEditorGrid({
+    required this.height,
+    required this.name,
+    required this.alias,
+    required this.host,
+    required this.port,
+    required this.sshUser,
+    required this.sshPort,
+    required this.os,
+    required this.onOsChanged,
+  });
+
+  static const _labels = [
+    'Name',
+    'Alias',
+    'Host',
+    'Port',
+    'SSH User',
+    'SSH Port',
+    'OS',
+  ];
+  static const _flexes = [96, 96, 140, 90, 114, 86, 104];
+
+  final double height;
+  final TextEditingController name;
+  final TextEditingController alias;
+  final TextEditingController host;
+  final TextEditingController port;
+  final TextEditingController sshUser;
+  final TextEditingController sshPort;
+  final String os;
+  final ValueChanged<String> onOsChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final controls = <Widget>[
+      _CompactInput(controller: name, height: height),
+      _CompactInput(controller: alias, height: height),
+      _CompactInput(controller: host, height: height),
+      _CompactInput(controller: port, numeric: true, height: height),
+      _CompactInput(controller: sshUser, height: height),
+      _CompactInput(controller: sshPort, numeric: true, height: height),
+      _CompactSelect(
+        height: height,
+        value: os,
+        items: const [
+          DropdownMenuItem(value: 'linux', child: Text('linux')),
+          DropdownMenuItem(value: 'windows', child: Text('windows')),
+        ],
+        onChanged: onOsChanged,
+      ),
+    ];
+    return Column(
+      children: [
+        Row(
+          children: [
+            for (var i = 0; i < _labels.length; i++) ...[
+              Expanded(
+                flex: _flexes[i],
+                child: _FormHead(text: _labels[i]),
+              ),
+              if (i != _labels.length - 1) const SizedBox(width: 6),
+            ],
+          ],
+        ),
+        const SizedBox(height: 6),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            for (var i = 0; i < controls.length; i++) ...[
+              Expanded(flex: _flexes[i], child: controls[i]),
+              if (i != controls.length - 1) const SizedBox(width: 6),
+            ],
+          ],
+        ),
+      ],
+    );
   }
 }
 
