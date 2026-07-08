@@ -4652,7 +4652,7 @@ class _MachinesDialog extends StatefulWidget {
 }
 
 class _MachinesDialogState extends State<_MachinesDialog> {
-  static const double _editorHeight = 50;
+  static const double _editorHeight = 34;
 
   String message = '';
   bool busy = false;
@@ -4800,15 +4800,15 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                     SizedBox(width: 6),
                     _FormHead(width: 96, text: 'Alias'),
                     SizedBox(width: 6),
-                    _FormHead(width: 210, text: 'Host'),
+                    _FormHead(width: 140, text: 'Host'),
                     SizedBox(width: 6),
-                    _FormHead(width: 72, text: 'Port'),
+                    _FormHead(width: 90, text: 'Port'),
                     SizedBox(width: 6),
-                    _FormHead(width: 96, text: 'SSH User'),
+                    _FormHead(width: 114, text: 'SSH User'),
                     SizedBox(width: 6),
-                    _FormHead(width: 68, text: 'SSH Port'),
+                    _FormHead(width: 86, text: 'SSH Port'),
                     SizedBox(width: 6),
-                    _FormHead(width: 88, text: 'OS'),
+                    _FormHead(width: 104, text: 'OS'),
                   ],
                 ),
                 const SizedBox(height: 6),
@@ -4832,7 +4832,7 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                     ),
                     const SizedBox(width: 6),
                     SizedBox(
-                      width: 210,
+                      width: 140,
                       child: _CompactInput(
                         controller: host,
                         height: _editorHeight,
@@ -4840,7 +4840,7 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                     ),
                     const SizedBox(width: 6),
                     SizedBox(
-                      width: 72,
+                      width: 90,
                       child: _CompactInput(
                         controller: port,
                         numeric: true,
@@ -4849,7 +4849,7 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                     ),
                     const SizedBox(width: 6),
                     SizedBox(
-                      width: 96,
+                      width: 114,
                       child: _CompactInput(
                         controller: sshUser,
                         height: _editorHeight,
@@ -4857,7 +4857,7 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                     ),
                     const SizedBox(width: 6),
                     SizedBox(
-                      width: 68,
+                      width: 86,
                       child: _CompactInput(
                         controller: sshPort,
                         numeric: true,
@@ -4866,7 +4866,7 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                     ),
                     const SizedBox(width: 6),
                     SizedBox(
-                      width: 88,
+                      width: 104,
                       child: _CompactSelect(
                         height: _editorHeight,
                         value: os == 'windows' ? 'windows' : 'linux',
@@ -5074,15 +5074,15 @@ class _MachineGrid extends StatelessWidget {
             const SizedBox(width: 6),
             Expanded(flex: 105, child: name),
             const SizedBox(width: 6),
-            Expanded(flex: 92, child: host),
+            Expanded(flex: 61, child: host),
             const SizedBox(width: 6),
-            SizedBox(width: 48, child: port),
+            SizedBox(width: 84, child: port),
             const SizedBox(width: 6),
-            SizedBox(width: 82, child: sshUser),
+            SizedBox(width: 118, child: sshUser),
             const SizedBox(width: 6),
-            SizedBox(width: 68, child: sshPort),
+            SizedBox(width: 104, child: sshPort),
             const SizedBox(width: 6),
-            SizedBox(width: 58, child: os),
+            SizedBox(width: 94, child: os),
             const SizedBox(width: 6),
             SizedBox(width: 52, child: Center(child: action)),
           ],
