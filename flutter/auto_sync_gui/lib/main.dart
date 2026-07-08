@@ -5417,6 +5417,23 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     }
   }
 
+  Future<void> _showLog() async {
+    final log = _list(status['log']).map((line) => '$line').join('\n');
+    await showDialog<void>(
+      context: context,
+      builder: (context) => _MasterDialogFrame(
+        title: 'Collector Log',
+        width: 900,
+        maxHeight: 720,
+        child: _MasterPre(
+          text: log.isEmpty ? _runState().trim() : log,
+          minHeight: 320,
+          maxHeight: 640,
+        ),
+      ),
+    );
+  }
+
   Future<void> _showConfig() async {
     await _persistNow();
     if (!mounted) return;
@@ -5447,14 +5464,15 @@ class _CollectorDialogState extends State<_CollectorDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final log = _list(status['log']).map((line) => '$line').join('\n');
     return _MasterDialogFrame(
       title: 'Collector',
       width: 980,
-      maxHeight: 860,
+      maxHeight: 640,
+      shrinkWrap: true,
       child: loading
           ? const Center(child: CircularProgressIndicator())
           : Column(
+              mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Row(
@@ -5520,6 +5538,8 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                           style: TextStyle(fontWeight: FontWeight.w600),
                         ),
                       ),
+                      MasterButton(label: 'Log', width: 64, onTap: _showLog),
+                      const SizedBox(width: 6),
                       MasterButton(
                         label: '+ Add host',
                         width: 96,
@@ -5529,76 +5549,59 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                   ),
                 ),
                 const SizedBox(height: 8),
-                Expanded(
-                  child: LayoutBuilder(
-                    builder: (context, constraints) {
-                      final tableWidth = math.max(
-                        _collectorTableBaseWidth,
-                        constraints.maxWidth,
-                      );
-                      return SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: SizedBox(
-                          width: tableWidth,
-                          child: ListView(
-                            children: [
-                              const _CollectorHostHeader(),
-                              if (hosts.isEmpty)
-                                const EmptyLine(
-                                  'No hosts yet - click "+ Add host".',
-                                )
-                              else
-                                ...hosts.asMap().entries.map(
-                                  (entry) => _CollectorHostRow(
-                                    index: entry.key,
-                                    host: entry.value,
-                                    onChanged: () {
-                                      setState(() {});
-                                      _scheduleSave();
-                                    },
-                                    onRemove: () {
-                                      final next = hosts;
-                                      next.removeAt(entry.key);
-                                      setState(() => cfg['hosts'] = next);
-                                      _scheduleSave();
-                                    },
-                                    onBrowseRoot: () =>
-                                        _browseRoot(entry.value),
-                                    onPaths: () async {
-                                      await showDialog<void>(
-                                        context: context,
-                                        builder: (context) =>
-                                            _CollectorPathsDialog(
-                                              api: widget.api,
-                                              host: entry.value,
-                                              onChanged: () {
-                                                setState(() {});
-                                                _scheduleSave();
-                                              },
-                                            ),
-                                      );
-                                    },
-                                    onDeploy: () async {
-                                      await showDialog<void>(
-                                        context: context,
-                                        builder: (context) =>
-                                            _CollectorDeployDialog(
-                                              host: entry.value,
-                                              onChanged: () {
-                                                setState(() {});
-                                                _scheduleSave();
-                                              },
-                                            ),
-                                      );
-                                    },
-                                    onDeployRun: () => _runDeploy(entry.key),
-                                  ),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 260),
+                  child: ListView(
+                    shrinkWrap: true,
+                    children: [
+                      const _CollectorHostHeader(),
+                      if (hosts.isEmpty)
+                        const EmptyLine('No hosts yet - click "+ Add host".')
+                      else
+                        ...hosts.asMap().entries.map(
+                          (entry) => _CollectorHostRow(
+                            index: entry.key,
+                            host: entry.value,
+                            onChanged: () {
+                              setState(() {});
+                              _scheduleSave();
+                            },
+                            onRemove: () {
+                              final next = hosts;
+                              next.removeAt(entry.key);
+                              setState(() => cfg['hosts'] = next);
+                              _scheduleSave();
+                            },
+                            onBrowseRoot: () => _browseRoot(entry.value),
+                            onPaths: () async {
+                              await showDialog<void>(
+                                context: context,
+                                builder: (context) => _CollectorPathsDialog(
+                                  api: widget.api,
+                                  host: entry.value,
+                                  onChanged: () {
+                                    setState(() {});
+                                    _scheduleSave();
+                                  },
                                 ),
-                            ],
+                              );
+                            },
+                            onDeploy: () async {
+                              await showDialog<void>(
+                                context: context,
+                                builder: (context) => _CollectorDeployDialog(
+                                  host: entry.value,
+                                  onChanged: () {
+                                    setState(() {});
+                                    _scheduleSave();
+                                  },
+                                ),
+                              );
+                            },
+                            onDeployRun: () => _runDeploy(entry.key),
                           ),
                         ),
-                      );
-                    },
+                    ],
                   ),
                 ),
                 const SizedBox(height: 10),
@@ -5619,13 +5622,6 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                     ),
                   ],
                 ),
-                if (log.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  SizedBox(
-                    height: 120,
-                    child: _MasterPre(text: log, maxHeight: 120),
-                  ),
-                ],
               ],
             ),
     );
@@ -5718,17 +5714,10 @@ class _CollectorHostRow extends StatelessWidget {
           placeholder: '~/.ssh/id_ed25519',
           onChanged: (value) => setField('identity_file', value),
         ),
-        Row(
-          children: [
-            Expanded(
-              child: _CompactInput(
-                initialValue: _str(host['root']),
-                onChanged: (value) => setField('root', value),
-              ),
-            ),
-            const SizedBox(width: 6),
-            MasterButton(label: '...', square: true, onTap: onBrowseRoot),
-          ],
+        InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: onBrowseRoot,
+          child: _MasterReadOnlyInput(value: _str(host['root'])),
         ),
         MasterButton(label: '$pathCount', onTap: onPaths),
         MasterButton(label: 'Exclude $excludeCount', onTap: onPaths),
@@ -5804,7 +5793,7 @@ class _CollectorCheckCell extends StatelessWidget {
   }
 }
 
-const double _collectorTableBaseWidth = 956;
+const double _collectorTableBaseWidth = 952;
 
 class _CollectorHostGrid extends StatelessWidget {
   const _CollectorHostGrid({required this.cells, this.head = false});
@@ -5825,12 +5814,12 @@ class _CollectorHostGrid extends StatelessWidget {
           constraints.maxWidth - _collectorTableBaseWidth,
         );
         final widths = <double>[
-          80,
-          112,
-          68,
           72,
-          132 + extra * 0.45,
-          150 + extra * 0.55,
+          104,
+          60,
+          54,
+          160 + extra * 0.65,
+          164 + extra * 0.35,
           42,
           94,
           34,
