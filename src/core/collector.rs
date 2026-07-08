@@ -416,16 +416,15 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
             state,
             Some(&format!("{} folder(s) from {label}", dirs.len())),
         );
-        match pull_paths_tar(host, &conn, &dirs, &excludes, state) {
-            Ok(()) => {
-                for remote in &dirs {
+        for remote in &dirs {
+            set_current_file(state, Some(remote));
+            match pull_paths_tar(host, &conn, std::slice::from_ref(remote), &excludes, state) {
+                Ok(()) => {
                     record_file_ok(state);
                     log(state, format!("  ok {remote}"));
                     pulled.push(remote.clone());
                 }
-            }
-            Err(err) => {
-                for remote in &dirs {
+                Err(err) => {
                     failures += 1;
                     record_file_failed(state, 1);
                     record_run_issue(
