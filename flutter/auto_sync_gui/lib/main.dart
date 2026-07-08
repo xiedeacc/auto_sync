@@ -4060,6 +4060,7 @@ class _PathPickerDialog extends StatefulWidget {
 class _PathPickerDialogState extends State<_PathPickerDialog> {
   late String machineId = widget.initialMachineId;
   late String path = widget.initialPath;
+  late String selectedPath = widget.initialPath;
   String? parent;
   String error = '';
   bool loading = true;
@@ -4073,6 +4074,9 @@ class _PathPickerDialogState extends State<_PathPickerDialog> {
   }
 
   Future<void> _load(String nextPath) async {
+    if (nextPath != path) {
+      selectedPath = '';
+    }
     setState(() {
       loading = true;
       error = '';
@@ -4129,7 +4133,10 @@ class _PathPickerDialogState extends State<_PathPickerDialog> {
                 options: widget.machineIds,
                 labelFor: widget.machineLabel,
                 onSelected: (value) {
-                  setState(() => machineId = value);
+                  setState(() {
+                    machineId = value;
+                    selectedPath = '';
+                  });
                   _load(value == 'local' && Platform.isWindows ? r'C:\' : '/');
                 },
               ),
@@ -4150,7 +4157,8 @@ class _PathPickerDialogState extends State<_PathPickerDialog> {
                 label: 'Choose',
                 width: 82,
                 primary: true,
-                onTap: () => _choose(path),
+                onTap: () =>
+                    _choose(selectedPath.isEmpty ? path : selectedPath),
               ),
               if (widget.showAddDirectory) ...[
                 const SizedBox(width: 12),
@@ -4168,41 +4176,14 @@ class _PathPickerDialogState extends State<_PathPickerDialog> {
           ],
           const SizedBox(height: 8),
           Expanded(
-            child: Container(
-              decoration: const BoxDecoration(
-                border: Border(top: BorderSide(color: Palette.line)),
-              ),
-              child: loading
-                  ? const Center(child: CircularProgressIndicator())
-                  : entries.isEmpty
-                  ? const SizedBox.shrink()
-                  : ListView.builder(
-                      itemCount: entries.length,
-                      itemBuilder: (context, index) {
-                        final entry = entries[index];
-                        final isDir = _str(entry['kind']) == 'dir';
-                        return InkWell(
-                          onTap: () => isDir
-                              ? _load(_str(entry['path']))
-                              : _choose(_str(entry['path'])),
-                          onDoubleTap: () => _choose(_str(entry['path'])),
-                          child: Container(
-                            height: 34,
-                            padding: const EdgeInsets.symmetric(horizontal: 2),
-                            decoration: const BoxDecoration(
-                              border: Border(
-                                bottom: BorderSide(color: Palette.line),
-                              ),
-                            ),
-                            alignment: Alignment.centerLeft,
-                            child: _FileListEntryLabel(
-                              name: _str(entry['name']),
-                              isDir: isDir,
-                            ),
-                          ),
-                        );
-                      },
-                    ),
+            child: _FileListView(
+              loading: loading,
+              entries: entries,
+              isDir: (entry) => _str(entry['kind']) == 'dir',
+              isSelected: (itemPath) => selectedPath == itemPath,
+              onSelected: (itemPath, value) =>
+                  setState(() => selectedPath = value ? itemPath : ''),
+              onOpenDir: _load,
             ),
           ),
         ],
@@ -6493,6 +6474,9 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
         .map((path) => path.trim())
         .where((path) => path.isNotEmpty)
         .toSet();
+    final disabled = key == 'paths'
+        ? _sortRemotePaths(exclude).toSet()
+        : <String>{};
     await showDialog<void>(
       context: context,
       builder: (context) => _CollectorRemotePathDialog(
@@ -6501,6 +6485,7 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
         title: key == 'exclude' ? 'Ignore' : 'Collect',
         initialPath: current.isNotEmpty ? current.last : '/',
         selectedPaths: selected,
+        disabledPaths: disabled,
         onSelectionChanged: (items) {
           setState(() => _setList(key, _sortRemotePaths(items)));
         },
@@ -6755,6 +6740,7 @@ class _CollectorRemotePathDialog extends StatefulWidget {
     required this.title,
     required this.initialPath,
     required this.selectedPaths,
+    required this.disabledPaths,
     required this.onSelectionChanged,
   });
 
@@ -6763,6 +6749,7 @@ class _CollectorRemotePathDialog extends StatefulWidget {
   final String title;
   final String initialPath;
   final Set<String> selectedPaths;
+  final Set<String> disabledPaths;
   final ValueChanged<List<String>> onSelectionChanged;
 
   @override
@@ -6778,6 +6765,9 @@ class _CollectorRemotePathDialogState
   bool loading = true;
   List<Map<String, dynamic>> entries = [];
   late final Set<String> selected = {...widget.selectedPaths};
+  late final Set<String> disabled = _sortRemotePaths(
+    widget.disabledPaths,
+  ).toSet();
   final pageCache = <String, Map<String, dynamic>>{};
 
   @override
@@ -6832,6 +6822,7 @@ class _CollectorRemotePathDialogState
   }
 
   void _togglePath(String itemPath, bool value) {
+    if (_remotePathCoveredByAny(itemPath, disabled)) return;
     setState(() {
       if (value) {
         selected.add(itemPath);
@@ -6877,29 +6868,15 @@ class _CollectorRemotePathDialogState
           ],
           const SizedBox(height: 8),
           Expanded(
-            child: Container(
-              decoration: const BoxDecoration(
-                border: Border(top: BorderSide(color: Palette.line)),
-              ),
-              child: loading
-                  ? const Center(child: CircularProgressIndicator())
-                  : entries.isEmpty
-                  ? const SizedBox.shrink()
-                  : ListView.builder(
-                      itemCount: entries.length,
-                      itemBuilder: (context, index) {
-                        final entry = entries[index];
-                        final isDir = _bool(entry['is_dir']);
-                        final itemPath = _str(entry['path']);
-                        return _CollectorRemoteEntryRow(
-                          name: _str(entry['name']),
-                          isDir: isDir,
-                          selected: selected.contains(itemPath),
-                          onSelected: (value) => _togglePath(itemPath, value),
-                          onOpen: isDir ? () => _load(itemPath) : null,
-                        );
-                      },
-                    ),
+            child: _FileListView(
+              loading: loading,
+              entries: entries,
+              isDir: (entry) => _bool(entry['is_dir']),
+              isSelected: selected.contains,
+              isDisabled: (itemPath) =>
+                  _remotePathCoveredByAny(itemPath, disabled),
+              onSelected: _togglePath,
+              onOpenDir: _load,
             ),
           ),
         ],
@@ -6918,11 +6895,83 @@ List<String> _sortRemotePaths(Iterable<String> items) {
   return paths;
 }
 
-class _CollectorRemoteEntryRow extends StatelessWidget {
-  const _CollectorRemoteEntryRow({
+bool _remotePathCoveredByAny(String path, Iterable<String> roots) {
+  final target = _normalizeRemoteComparePath(path);
+  if (target.isEmpty) return false;
+  for (final root in roots.map(_normalizeRemoteComparePath)) {
+    if (root.isEmpty) continue;
+    if (root == '/') return true;
+    if (target == root || target.startsWith('$root/')) return true;
+  }
+  return false;
+}
+
+String _normalizeRemoteComparePath(String path) {
+  var value = path.trim().replaceAll('\\', '/');
+  while (value.contains('//')) {
+    value = value.replaceAll('//', '/');
+  }
+  while (value.length > 1 && value.endsWith('/')) {
+    value = value.substring(0, value.length - 1);
+  }
+  return value;
+}
+
+class _FileListView extends StatelessWidget {
+  const _FileListView({
+    required this.loading,
+    required this.entries,
+    required this.isDir,
+    required this.isSelected,
+    this.isDisabled,
+    required this.onSelected,
+    required this.onOpenDir,
+  });
+
+  final bool loading;
+  final List<Map<String, dynamic>> entries;
+  final bool Function(Map<String, dynamic> entry) isDir;
+  final bool Function(String path) isSelected;
+  final bool Function(String path)? isDisabled;
+  final void Function(String path, bool selected) onSelected;
+  final ValueChanged<String> onOpenDir;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        border: Border(top: BorderSide(color: Palette.line)),
+      ),
+      child: loading
+          ? const Center(child: CircularProgressIndicator())
+          : entries.isEmpty
+          ? const SizedBox.shrink()
+          : ListView.builder(
+              itemCount: entries.length,
+              itemBuilder: (context, index) {
+                final entry = entries[index];
+                final dir = isDir(entry);
+                final itemPath = _str(entry['path']);
+                return _FileListEntryRow(
+                  name: _str(entry['name']),
+                  isDir: dir,
+                  selected: isSelected(itemPath),
+                  disabled: isDisabled?.call(itemPath) ?? false,
+                  onSelected: (value) => onSelected(itemPath, value),
+                  onOpen: dir ? () => onOpenDir(itemPath) : null,
+                );
+              },
+            ),
+    );
+  }
+}
+
+class _FileListEntryRow extends StatelessWidget {
+  const _FileListEntryRow({
     required this.name,
     required this.isDir,
     required this.selected,
+    this.disabled = false,
     required this.onSelected,
     required this.onOpen,
   });
@@ -6930,6 +6979,7 @@ class _CollectorRemoteEntryRow extends StatelessWidget {
   final String name;
   final bool isDir;
   final bool selected;
+  final bool disabled;
   final ValueChanged<bool> onSelected;
   final VoidCallback? onOpen;
 
@@ -6943,12 +6993,13 @@ class _CollectorRemoteEntryRow extends StatelessWidget {
       child: Row(
         children: [
           SizedBox(
-            width: 30,
-            child: Checkbox(
-              value: selected,
-              onChanged: (value) => onSelected(value ?? false),
-              visualDensity: VisualDensity.compact,
-              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            width: 26,
+            child: Center(
+              child: _FileListCheckbox(
+                value: selected,
+                disabled: disabled,
+                onChanged: onSelected,
+              ),
             ),
           ),
           Expanded(
@@ -6958,11 +7009,56 @@ class _CollectorRemoteEntryRow extends StatelessWidget {
                 height: 34,
                 alignment: Alignment.centerLeft,
                 padding: const EdgeInsets.symmetric(horizontal: 2),
-                child: _FileListEntryLabel(name: name, isDir: isDir),
+                child: Opacity(
+                  opacity: disabled ? 0.45 : 1,
+                  child: _FileListEntryLabel(name: name, isDir: isDir),
+                ),
               ),
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _FileListCheckbox extends StatelessWidget {
+  const _FileListCheckbox({
+    required this.value,
+    required this.disabled,
+    required this.onChanged,
+  });
+
+  final bool value;
+  final bool disabled;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: disabled ? null : () => onChanged(!value),
+      borderRadius: BorderRadius.circular(3),
+      child: Container(
+        width: 16,
+        height: 16,
+        decoration: BoxDecoration(
+          color: disabled
+              ? const Color(0xfff1f5f9)
+              : value
+              ? Palette.accent
+              : Colors.white,
+          border: Border.all(
+            color: disabled
+                ? const Color(0xffcbd5e1)
+                : value
+                ? Palette.accent
+                : Palette.line,
+          ),
+          borderRadius: BorderRadius.circular(3),
+        ),
+        child: value
+            ? const Icon(Icons.check, size: 13, color: Colors.white)
+            : null,
       ),
     );
   }
