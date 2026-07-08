@@ -378,9 +378,6 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     let mut pulled = Vec::new();
     let excludes = normalize_excludes(&host.exclude);
     let mut targets = collect_targets(host);
-    if targets.is_empty() {
-        return 0;
-    }
     if let Err(err) = ssh_capture(&conn, "true") {
         let message = format!("host connection failed: {err:#}");
         log(state, format!("host '{label}': {message}"));
@@ -391,8 +388,10 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         record_file_failed(state, failed);
         return failed;
     }
+    let mut cleanup_database_dump_dir = false;
     match prepare_database_dumps(host, &conn, &label, state) {
-        Ok(dump_paths) => {
+        Ok(Some(dump_paths)) => {
+            cleanup_database_dump_dir = true;
             for dump_path in dump_paths {
                 if !is_excluded(&dump_path, &excludes) && !targets.iter().any(|p| p == &dump_path) {
                     log(state, format!("  dump ready {dump_path}"));
@@ -400,6 +399,7 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
                 }
             }
         }
+        Ok(None) => {}
         Err(err) => {
             log(state, format!("  database dump skipped/failed: {err:#}"));
             record_run_issue(
@@ -410,6 +410,12 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
                 format!("{err:#}"),
             );
         }
+    }
+    if targets.is_empty() {
+        if cleanup_database_dump_dir {
+            cleanup_database_dumps(&conn, state);
+        }
+        return 0;
     }
     set_current_file(
         state,
@@ -483,6 +489,9 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
             log(state, format!("  perms: could not record: {err:#}"));
         }
     }
+    if cleanup_database_dump_dir {
+        cleanup_database_dumps(&conn, state);
+    }
     failures
 }
 
@@ -491,10 +500,10 @@ fn prepare_database_dumps(
     conn: &SshConn,
     label: &str,
     state: &Arc<Mutex<CollectorRunState>>,
-) -> Result<Vec<String>> {
+) -> Result<Option<Vec<String>>> {
     let host_name = host.name.trim().to_ascii_lowercase();
     if host_name == "aws" || host_name == "openwrt" {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     let os_release = ssh_capture(
@@ -504,7 +513,7 @@ fn prepare_database_dumps(
     .unwrap_or_default()
     .to_ascii_lowercase();
     if !os_release.lines().any(|line| line.trim() == "ubuntu") {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     log(state, "  database dumps: preparing MySQL/PostgreSQL dumps");
@@ -516,6 +525,32 @@ if [ "$(id -u)" = "0" ]; then
 fi
 mkdir -p "$dump_dir"
 chmod 700 "$dump_dir" 2>/dev/null || true
+
+install_pkgs=""
+command -v gzip >/dev/null 2>&1 || install_pkgs="$install_pkgs gzip"
+command -v mysqldump >/dev/null 2>&1 || install_pkgs="$install_pkgs default-mysql-client"
+command -v pg_dumpall >/dev/null 2>&1 || install_pkgs="$install_pkgs postgresql-client"
+if [ -n "$install_pkgs" ]; then
+    if command -v apt-get >/dev/null 2>&1; then
+        if [ "$(id -u)" = "0" ]; then
+            apt_prefix=""
+        elif command -v sudo >/dev/null 2>&1; then
+            apt_prefix="sudo -n"
+        else
+            apt_prefix=""
+        fi
+        if [ "$(id -u)" = "0" ] || [ -n "$apt_prefix" ]; then
+            echo "DUMP_INSTALL$install_pkgs"
+            DEBIAN_FRONTEND=noninteractive $apt_prefix apt-get update -qq \
+                && DEBIAN_FRONTEND=noninteractive $apt_prefix apt-get install -y -qq $install_pkgs \
+                || echo "DUMP_FAIL install apt-get install$install_pkgs failed"
+        else
+            echo "DUMP_FAIL install not root and sudo unavailable"
+        fi
+    else
+        echo "DUMP_FAIL install apt-get not found"
+    fi
+fi
 
 if ! command -v gzip >/dev/null 2>&1; then
     echo "DUMP_FAIL common gzip not found"
@@ -584,7 +619,20 @@ fi
             );
         }
     }
-    Ok(dump_paths)
+    Ok(Some(dump_paths))
+}
+
+fn cleanup_database_dumps(conn: &SshConn, state: &Arc<Mutex<CollectorRunState>>) {
+    match ssh_capture(
+        conn,
+        "rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true",
+    ) {
+        Ok(_) => log(state, "  dump cleanup: removed remote auto_sync_db_dumps"),
+        Err(err) => log(
+            state,
+            format!("  dump cleanup: could not remove remote auto_sync_db_dumps: {err:#}"),
+        ),
+    }
 }
 
 enum RemotePathKind {
