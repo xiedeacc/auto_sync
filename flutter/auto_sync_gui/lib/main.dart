@@ -4781,7 +4781,7 @@ class _ReadmeSection extends StatelessWidget {
   }
 }
 
-class _CompactInput extends StatelessWidget {
+class _CompactInput extends StatefulWidget {
   const _CompactInput({
     this.controller,
     this.initialValue,
@@ -4801,9 +4801,59 @@ class _CompactInput extends StatelessWidget {
   final double height;
 
   @override
+  State<_CompactInput> createState() => _CompactInputState();
+}
+
+class _CompactInputState extends State<_CompactInput> {
+  TextEditingController? internalController;
+  late final FocusNode focusNode;
+
+  TextEditingController get effectiveController =>
+      widget.controller ?? internalController!;
+
+  @override
+  void initState() {
+    super.initState();
+    focusNode = FocusNode();
+    if (widget.controller == null) {
+      internalController = TextEditingController(
+        text: widget.initialValue ?? '',
+      );
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _CompactInput oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.controller != null) {
+      internalController?.dispose();
+      internalController = null;
+      return;
+    }
+    internalController ??= TextEditingController(
+      text: widget.initialValue ?? '',
+    );
+    final oldText = oldWidget.initialValue ?? '';
+    final nextText = widget.initialValue ?? '';
+    final canReplaceFocusedText =
+        focusNode.hasFocus && effectiveController.text == oldText;
+    if (effectiveController.text != nextText &&
+        (!focusNode.hasFocus || canReplaceFocusedText)) {
+      effectiveController.text = nextText;
+    }
+  }
+
+  @override
+  void dispose() {
+    internalController?.dispose();
+    focusNode.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Container(
-      height: height,
+      height: widget.height,
       padding: const EdgeInsets.symmetric(horizontal: 9),
       decoration: BoxDecoration(
         color: Colors.white,
@@ -4812,15 +4862,17 @@ class _CompactInput extends StatelessWidget {
       ),
       child: Center(
         child: TextFormField(
-          controller: controller,
-          initialValue: controller == null ? initialValue : null,
-          keyboardType: numeric ? TextInputType.number : TextInputType.text,
+          controller: effectiveController,
+          focusNode: focusNode,
+          keyboardType: widget.numeric
+              ? TextInputType.number
+              : TextInputType.text,
           maxLines: 1,
-          onChanged: onChanged,
-          onTap: onTap,
+          onChanged: widget.onChanged,
+          onTap: widget.onTap,
           style: const TextStyle(fontSize: 12),
           decoration: InputDecoration(
-            hintText: placeholder,
+            hintText: widget.placeholder,
             border: InputBorder.none,
             enabledBorder: InputBorder.none,
             focusedBorder: InputBorder.none,
@@ -6522,6 +6574,9 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
             child: ListView(
               children: [
                 _PathListEditor(
+                  key: ValueKey(
+                    showingExclude ? 'collector-ignore' : 'collector-collect',
+                  ),
                   items: showingExclude ? exclude : paths,
                   iconFor: (path) => _collectorPathIcon(widget.host, path),
                   onPreview: _previewPath,
@@ -6838,6 +6893,7 @@ class _CollectorRemotePathDialogState
 
 class _PathListEditor extends StatelessWidget {
   const _PathListEditor({
+    super.key,
     required this.items,
     required this.onChanged,
     this.iconFor,
