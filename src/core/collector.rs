@@ -60,9 +60,7 @@ pub struct CollectorRunState {
     pub log: Vec<String>,
 }
 
-/// Structured details for the UI's Collector Error dialog. `folder` entries are
-/// successful directories copied through tar; `dir_failed` entries are directory
-/// tar-copy failures.
+/// Structured details for the UI's Collector Error dialog.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CollectorRunIssue {
     pub kind: String,
@@ -342,11 +340,11 @@ fn record_host_setup_failure(
 ) -> usize {
     let targets = collect_targets(host);
     if targets.is_empty() {
-        record_run_issue(state, "failed", label, "", message);
+        record_run_issue(state, "host_failed", label, "", message);
         return 0;
     }
     for target in &targets {
-        record_run_issue(state, "failed", label, target, message);
+        record_run_issue(state, "host_failed", label, target, message);
     }
     targets.len()
 }
@@ -383,6 +381,16 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     if targets.is_empty() {
         return 0;
     }
+    if let Err(err) = ssh_capture(&conn, "true") {
+        let message = format!("host connection failed: {err:#}");
+        log(state, format!("host '{label}': {message}"));
+        for target in &targets {
+            record_run_issue(state, "host_failed", &label, target, message.clone());
+        }
+        let failed = targets.len();
+        record_file_failed(state, failed);
+        return failed;
+    }
     set_current_file(
         state,
         Some(&format!("{} path(s) from {label}", targets.len())),
@@ -397,7 +405,7 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
             Err(err) => {
                 failures += 1;
                 record_file_failed(state, 1);
-                record_run_issue(state, "failed", &label, remote, format!("{err:#}"));
+                record_run_issue(state, "file_failed", &label, remote, format!("{err:#}"));
                 log(state, format!("  FAILED {remote}: {err:#}"));
             }
         }
@@ -412,7 +420,6 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
             Ok(()) => {
                 for remote in &dirs {
                     record_file_ok(state);
-                    record_run_issue(state, "folder", &label, remote, "copied as folder");
                     log(state, format!("  ok {remote}"));
                     pulled.push(remote.clone());
                 }
@@ -445,7 +452,7 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
             Err(err) => {
                 failures += 1;
                 record_file_failed(state, 1);
-                record_run_issue(state, "failed", &label, remote, format!("{err:#}"));
+                record_run_issue(state, "file_failed", &label, remote, format!("{err:#}"));
                 log(state, format!("  FAILED {remote}: {err:#}"));
             }
         }
