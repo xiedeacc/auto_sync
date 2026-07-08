@@ -4997,10 +4997,8 @@ class _MachinesDialogState extends State<_MachinesDialog> {
     return _MasterDialogFrame(
       title: 'Machines',
       width: 880,
-      maxHeight: 560,
-      shrinkWrap: true,
+      maxHeight: 650,
       child: Column(
-        mainAxisSize: MainAxisSize.min,
         children: [
           ConstrainedBox(
             constraints: const BoxConstraints(maxHeight: 330),
@@ -5034,7 +5032,7 @@ class _MachinesDialogState extends State<_MachinesDialog> {
             ),
           ),
           Container(
-            padding: const EdgeInsets.only(top: 12),
+            padding: const EdgeInsets.only(top: 20),
             decoration: const BoxDecoration(
               border: Border(top: BorderSide(color: Palette.line)),
             ),
