@@ -38,6 +38,79 @@ if (-not [string]::IsNullOrEmpty($env:AS_PORT)) { $sshArgs += @('-p', $env:AS_PO
 if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KEY);  $scpArgs += @('-i', $env:AS_KEY) }
 
 $errCount = 0
+$collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+$excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
+
+function Normalize-RemotePath([string]$Path) {
+    $p = ($Path -replace '\\','/').Trim()
+    if ($p -eq '') { return '/' }
+    if (-not $p.StartsWith('/')) { $p = '/' + $p }
+    while ($p.Length -gt 1 -and $p.EndsWith('/')) { $p = $p.Substring(0, $p.Length - 1) }
+    return $p
+}
+
+function Test-RemoteExcluded([string]$Path) {
+    $p = Normalize-RemotePath $Path
+    foreach ($ex in $excludePaths) {
+        $e = Normalize-RemotePath $ex
+        if ($p -eq $e -or $p.StartsWith($e + '/')) { return $true }
+    }
+    return $false
+}
+
+function Get-LocalCollectedPath([string]$RemotePath) {
+    return Join-Path $root ((Normalize-RemotePath $RemotePath).TrimStart([char[]]"/") -replace '/','\')
+}
+
+function Join-RemotePath([string]$Base, [string]$Relative) {
+    $b = Normalize-RemotePath $Base
+    $r = ($Relative -replace '\\','/').Trim([char[]]"/")
+    if ($r -eq '') { return $b }
+    if ($b -eq '/') { return '/' + $r }
+    return $b + '/' + $r
+}
+
+function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
+    $remote = Normalize-RemotePath $RemotePath
+    if (Test-RemoteExcluded $remote) {
+        Write-Host "skip excluded $remote"
+        return
+    }
+
+    $local = Get-LocalCollectedPath $remote
+    if (-not (Test-Path -LiteralPath $local)) {
+        Write-Host "! missing local $local"
+        $script:errCount++
+        return
+    }
+
+    $target = Join-Path $StageRoot ($remote.TrimStart([char[]]"/") -replace '/','\')
+    $item = Get-Item -LiteralPath $local -Force
+    if (-not $item.PSIsContainer) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+        Copy-Item -LiteralPath $local -Destination $target -Force
+        Write-Host "stage $remote"
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    Write-Host "stage $remote"
+    $baseLen = $item.FullName.TrimEnd([char[]]"\/").Length
+    Get-ChildItem -LiteralPath $local -Force -Recurse | ForEach-Object {
+        $rel = $_.FullName.Substring($baseLen).TrimStart([char[]]"\/")
+        $remoteChild = Join-RemotePath $remote $rel
+        if (-not (Test-RemoteExcluded $remoteChild)) {
+            $childTarget = Join-Path $target ($rel -replace '/','\')
+            if ($_.PSIsContainer) {
+                New-Item -ItemType Directory -Force -Path $childTarget | Out-Null
+            } else {
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $childTarget) | Out-Null
+                Copy-Item -LiteralPath $_.FullName -Destination $childTarget -Force
+            }
+        }
+    }
+}
+
 # Send the remote script base64-encoded as a plain ASCII argv and decode it on
 # the router. This avoids Windows PowerShell prepending a UTF-8 BOM to native
 # stdin (which made the remote `sh` choke on the first token) and sidesteps all
@@ -47,19 +120,6 @@ function Invoke-Remote([string]$Script) {
     & $ssh @sshArgs $dest "echo $b64 | base64 -d | sh"
     if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
 }
-
-# Remote absolute paths collected under $root; each is pushed back to its parent.
-$paths = @(
-  '/etc/init.d/shadowsocks',
-  '/etc/init.d/shadowsocks-rust',
-  '/etc/sysctl.d/10-default.conf',
-  '/etc/sysctl.d/11-nf-conntrack.conf',
-  '/etc/resolv.conf',
-  '/etc/sysctl.conf',
-  '/etc/config/dhcp',
-  '/etc/config/network',
-  '/usr/local/shadowsocks'
-)
 
 # 0. Provision the router: repoint apk at the TUNA mirror, swap busybox
 #    dnsmasq/vi for dnsmasq-full/vim without dropping DNS, and install the
@@ -124,15 +184,21 @@ sleep 1
 mkdir -p /etc/init.d /etc/sysctl.d /etc/config /usr/local
 '@
 
-# 2. Push every collected path back into its parent directory.
-foreach ($p in $paths) {
-    $parent = [regex]::Replace($p, '/[^/]+$', '')
-    if ($parent -eq '') { $parent = '/' }
-    $local = Join-Path $root ($p.TrimStart('/') -replace '/','\')
-    if (-not (Test-Path -LiteralPath $local)) { Write-Host "! missing local $local"; $errCount++; continue }
-    Write-Host "scp $p"
-    & $scp @scpArgs -- $local ('{0}:{1}/' -f $dest, $parent)
-    if ($LASTEXITCODE -ne 0) { Write-Host "! scp failed for $p"; $errCount++ }
+# 2. Push every path in the Collector list, excluding anything in Ignore.
+$localStage = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_openwrt_deploy_stage_" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $localStage | Out-Null
+try {
+    foreach ($p in $collectPaths) {
+        Copy-CollectedPathToStage $p $localStage
+    }
+
+    foreach ($entry in Get-ChildItem -LiteralPath $localStage -Force) {
+        Write-Host "scp staged $($entry.Name)"
+        & $scp @scpArgs -- $entry.FullName ('{0}:/' -f $dest)
+        if ($LASTEXITCODE -ne 0) { Write-Host "! scp failed for staged $($entry.Name)"; $errCount++ }
+    }
+} finally {
+    Remove-Item -LiteralPath $localStage -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # 3. Overwrite the remote client config with the server-substituted copy that
