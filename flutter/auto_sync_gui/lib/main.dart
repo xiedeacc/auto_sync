@@ -5903,15 +5903,21 @@ class _CollectorErrorDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final failed = issues
-        .where((issue) => _str(issue['kind']) != 'folder')
+    final sortedIssues = [...issues]..sort(_compareCollectorIssues);
+    final dirFailed = sortedIssues
+        .where((issue) => _str(issue['kind']) == 'dir_failed')
         .length;
-    final folders = issues
+    final failed = sortedIssues.where((issue) {
+      final kind = _str(issue['kind']);
+      return kind != 'folder' && kind != 'dir_failed';
+    }).length;
+    final folders = sortedIssues
         .where((issue) => _str(issue['kind']) == 'folder')
         .length;
     final summary = [
-      if (failed > 0) '$failed failed',
-      if (folders > 0) '$folders folders',
+      if (dirFailed > 0) '$dirFailed dir copy failed',
+      if (failed > 0) '$failed path failed',
+      if (folders > 0) '$folders folders copied by tar',
     ].join(' · ');
     return _MasterDialogFrame(
       title: 'Collector Error',
@@ -5931,7 +5937,8 @@ class _CollectorErrorDialog extends StatelessWidget {
               child: ListView(
                 children: [
                   const _CollectorErrorHeader(),
-                  for (final issue in issues) _CollectorErrorRow(issue: issue),
+                  for (final issue in sortedIssues)
+                    _CollectorErrorRow(issue: issue),
                 ],
               ),
             ),
@@ -5940,6 +5947,21 @@ class _CollectorErrorDialog extends StatelessWidget {
       ),
     );
   }
+}
+
+int _compareCollectorIssues(Map<String, dynamic> a, Map<String, dynamic> b) {
+  final weightA = _collectorIssueWeight(_str(a['kind']));
+  final weightB = _collectorIssueWeight(_str(b['kind']));
+  if (weightA != weightB) return weightA.compareTo(weightB);
+  final hostCompare = _str(a['host']).compareTo(_str(b['host']));
+  if (hostCompare != 0) return hostCompare;
+  return _str(a['path']).compareTo(_str(b['path']));
+}
+
+int _collectorIssueWeight(String kind) {
+  if (kind == 'dir_failed') return 0;
+  if (kind == 'folder') return 2;
+  return 1;
 }
 
 class _CollectorErrorHeader extends StatelessWidget {
@@ -5997,6 +6019,7 @@ class _CollectorErrorRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final kind = _str(issue['kind']);
     final isFolder = kind == 'folder';
+    final isDirFailed = kind == 'dir_failed';
     final color = isFolder ? Palette.accent : Palette.red;
     return Container(
       constraints: const BoxConstraints(minHeight: 38),
@@ -6010,7 +6033,11 @@ class _CollectorErrorRow extends StatelessWidget {
           SizedBox(
             width: 76,
             child: Text(
-              isFolder ? 'Folder' : 'Failed',
+              isFolder
+                  ? 'Folder'
+                  : isDirFailed
+                  ? 'Dir Failed'
+                  : 'Failed',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
