@@ -1068,6 +1068,8 @@ fn run_local_deploy_script(
         },
     );
     cmd.env("AS_ROOT", host.root.as_os_str());
+    cmd.env("AS_COLLECT_PATHS", host.paths.join("\n"));
+    cmd.env("AS_EXCLUDE_PATHS", host.exclude.join("\n"));
     for other in all_hosts {
         cmd.env(
             format!("AS_HOST_{}", env_host_suffix(&other.name)),

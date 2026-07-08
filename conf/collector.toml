@@ -342,6 +342,78 @@ if (-not [string]::IsNullOrEmpty($env:AS_PORT)) { $sshArgs += @('-p', $env:AS_PO
 if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KEY);  $scpArgs += @('-i', $env:AS_KEY) }
 
 $errCount = 0
+$collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+$excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
+
+function Normalize-RemotePath([string]$Path) {
+    $p = ($Path -replace '\\','/').Trim()
+    if ($p -eq '') { return '/' }
+    if (-not $p.StartsWith('/')) { $p = '/' + $p }
+    while ($p.Length -gt 1 -and $p.EndsWith('/')) { $p = $p.Substring(0, $p.Length - 1) }
+    return $p
+}
+
+function Test-RemoteExcluded([string]$Path) {
+    $p = Normalize-RemotePath $Path
+    foreach ($ex in $excludePaths) {
+        $e = Normalize-RemotePath $ex
+        if ($p -eq $e -or $p.StartsWith($e + '/')) { return $true }
+    }
+    return $false
+}
+
+function Get-LocalCollectedPath([string]$RemotePath) {
+    return Join-Path $root ((Normalize-RemotePath $RemotePath).TrimStart([char[]]"/") -replace '/','\')
+}
+
+function Join-RemotePath([string]$Base, [string]$Relative) {
+    $b = Normalize-RemotePath $Base
+    $r = ($Relative -replace '\\','/').Trim([char[]]"/")
+    if ($r -eq '') { return $b }
+    if ($b -eq '/') { return '/' + $r }
+    return $b + '/' + $r
+}
+
+function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
+    $remote = Normalize-RemotePath $RemotePath
+    if (Test-RemoteExcluded $remote) {
+        Write-Host "skip excluded $remote"
+        return
+    }
+
+    $local = Get-LocalCollectedPath $remote
+    if (-not (Test-Path -LiteralPath $local)) {
+        Write-Host "! missing local $local"
+        return
+    }
+
+    $target = Join-Path $StageRoot ($remote.TrimStart([char[]]"/") -replace '/','\')
+    $item = Get-Item -LiteralPath $local -Force
+    if (-not $item.PSIsContainer) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+        Copy-Item -LiteralPath $local -Destination $target -Force
+        Write-Host "stage $remote"
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    Write-Host "stage $remote"
+    $baseLen = $item.FullName.TrimEnd([char[]]"\/").Length
+    Get-ChildItem -LiteralPath $local -Force -Recurse | ForEach-Object {
+        $rel = $_.FullName.Substring($baseLen).TrimStart([char[]]"\/")
+        $remoteChild = Join-RemotePath $remote $rel
+        if (-not (Test-RemoteExcluded $remoteChild)) {
+            $childTarget = Join-Path $target ($rel -replace '/','\')
+            if ($_.PSIsContainer) {
+                New-Item -ItemType Directory -Force -Path $childTarget | Out-Null
+            } else {
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $childTarget) | Out-Null
+                Copy-Item -LiteralPath $_.FullName -Destination $childTarget -Force
+            }
+        }
+    }
+}
+
 # Remote commands run as the ubuntu user; root actions use `sudo` inline
 # (passwordless). base64 stdin avoids the Windows-PowerShell UTF-8 BOM.
 function Invoke-Remote([string]$Script) {
@@ -350,38 +422,25 @@ function Invoke-Remote([string]$Script) {
     if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
 }
 
-# Config paths pushed on every deploy (root-owned, small). The large app trees
-# under /usr/local and the home dotfiles are NOT re-pushed here (they are big
-# and already on the server); collect keeps them backed up. .ssh is never
-# pushed (avoids locking ourselves out).
-$configPaths = @(
-  '/etc/systemd/system/rblog.service',
-  '/etc/systemd/system/rblog-backup.service',
-  '/etc/systemd/system/rblog-backup.timer',
-  '/etc/systemd/system/shadowsocks-rust.service',
-  '/etc/systemd/system/tbox_server.service',
-  '/etc/systemd/system/vlmcsd.service',
-  '/etc/systemd/system/waiwei.service',
-  '/etc/systemd/system/xray.service',
-  '/etc/nginx',
-  '/etc/sysctl.d/99-shadowsocks-tune.conf'
-)
-
-# 1. Stage config files under ~/.auto_sync_stage (ubuntu-writable), mirroring
-#    their absolute paths, then install with sudo rsync.
+# 1. Stage every path in the Collector list, excluding anything in Ignore, then
+#    install with sudo rsync.
 Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
-foreach ($p in $configPaths) {
-    $parent = [regex]::Replace($p, '/[^/]+$', ''); if ($parent -eq '') { $parent = '/' }
-    $local = Join-Path $root ($p.TrimStart('/') -replace '/','\')
-    if (-not (Test-Path -LiteralPath $local)) { Write-Host "! missing local $local"; continue }
-    Invoke-Remote ("mkdir -p ~/.auto_sync_stage$parent")
-    Write-Host "stage $p"
-    & $scp @scpArgs -- $local ('{0}:~/.auto_sync_stage{1}/' -f $dest, $parent)
-    if ($LASTEXITCODE -ne 0) { Write-Host "! scp failed for $p"; $errCount++ }
+$localStage = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_deploy_stage_" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $localStage | Out-Null
+try {
+    foreach ($p in $collectPaths) {
+        Copy-CollectedPathToStage $p $localStage
+    }
+
+    foreach ($entry in Get-ChildItem -LiteralPath $localStage -Force) {
+        & $scp @scpArgs -- $entry.FullName ('{0}:~/.auto_sync_stage/' -f $dest)
+        if ($LASTEXITCODE -ne 0) { Write-Host "! scp failed for staged $($entry.Name)"; $errCount++ }
+    }
+} finally {
+    Remove-Item -LiteralPath $localStage -Recurse -Force -ErrorAction SilentlyContinue
 }
-# rsync without -o/-g so installed files are root-owned (correct for /etc);
-# modes are fixed by the perms restore below, ssl dir is re-chowned to ubuntu.
-Invoke-Remote 'sudo rsync -rlptD ~/.auto_sync_stage/ / && rm -rf ~/.auto_sync_stage && echo "installed config"'
+# rsync without -o/-g; ownership for ubuntu-owned trees is fixed below.
+Invoke-Remote 'sudo rsync -rlptD ~/.auto_sync_stage/ / && rm -rf ~/.auto_sync_stage && echo "installed collected paths"'
 
 # 2. Restore recorded permissions for the pushed /etc files.
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
@@ -395,8 +454,16 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
     if ($chmods.Count -gt 0) { Write-Host "restoring $($chmods.Count) /etc permissions"; Invoke-Remote ($chmods -join "`n") }
 }
 
-# 3. Operational setup: vlmcsd binary symlink, services, acme/ssl, backup.
+# 3. Operational setup: services, acme/ssl, backup.
 $remote = @'
+# Files installed by sudo rsync may be root-owned when they were created fresh.
+# rblog and acme.sh run as ubuntu, so restore ownership for those trees.
+for p in /home/ubuntu /usr/local/blog; do
+    if [ -e "$p" ]; then
+        sudo chown -R ubuntu:ubuntu "$p" || echo "!! chown $p FAILED"
+    fi
+done
+
 # rblog backup: /usr/local/blog/.backup-worktree is the real blog_data checkout
 # used by rblog-backup. Do not copy it back over /usr/local/blog.
 BLOG_DIR=/usr/local/blog
@@ -419,12 +486,6 @@ else
     sudo -u ubuntu git clone "$BACKUP_REPO" "$BACKUP_WORKTREE" \
         && echo "rblog backup worktree cloned" \
         || echo "!! rblog backup worktree clone FAILED"
-fi
-
-# vlmcsd: unit calls /usr/local/bin/vlmcsd but the binary lives under
-# /usr/local/vlmcsd/bin; keep the symlink so the service can start.
-if [ -x /usr/local/vlmcsd/bin/vlmcsd ] && [ ! -e /usr/local/bin/vlmcsd ]; then
-    sudo ln -sf /usr/local/vlmcsd/bin/vlmcsd /usr/local/bin/vlmcsd
 fi
 
 sudo systemctl daemon-reload
