@@ -3989,20 +3989,9 @@ class _PathPickerDialogState extends State<_PathPickerDialog> {
                               ),
                             ),
                             alignment: Alignment.centerLeft,
-                            child: Text(
-                              isDir
-                                  ? '${_str(entry['name'])}/'
-                                  : _str(entry['name']),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: isDir ? Palette.accent : Palette.text,
-                                fontFamily: 'Consolas',
-                                fontSize: 12,
-                                fontWeight: isDir
-                                    ? FontWeight.w700
-                                    : FontWeight.w400,
-                              ),
+                            child: _FileListEntryLabel(
+                              name: _str(entry['name']),
+                              isDir: isDir,
                             ),
                           ),
                         );
@@ -4163,6 +4152,44 @@ class _MachineSelectButtonState extends State<_MachineSelectButton> {
           );
         },
       ),
+    );
+  }
+}
+
+class _FileListEntryLabel extends StatelessWidget {
+  const _FileListEntryLabel({required this.name, required this.isDir});
+
+  final String name;
+  final bool isDir;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = isDir ? Palette.accent : Palette.text;
+    return Row(
+      children: [
+        SizedBox(
+          width: 20,
+          child: Icon(
+            isDir ? Icons.folder_outlined : Icons.description_outlined,
+            size: 16,
+            color: color,
+          ),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: color,
+              fontFamily: 'Consolas',
+              fontSize: 12,
+              fontWeight: isDir ? FontWeight.w700 : FontWeight.w400,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -6318,6 +6345,7 @@ class _CollectorFilePreviewDialogState
               maxLines: null,
               minLines: null,
               keyboardType: TextInputType.multiline,
+              textAlignVertical: TextAlignVertical.top,
               style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
               decoration: InputDecoration(
                 filled: true,
@@ -6469,20 +6497,9 @@ class _CollectorRemotePathDialogState
                                 bottom: BorderSide(color: Palette.line),
                               ),
                             ),
-                            child: Text(
-                              isDir
-                                  ? '${_str(entry['name'])}/'
-                                  : _str(entry['name']),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: isDir ? Palette.accent : Palette.text,
-                                fontFamily: 'Consolas',
-                                fontSize: 12,
-                                fontWeight: isDir
-                                    ? FontWeight.w700
-                                    : FontWeight.w400,
-                              ),
+                            child: _FileListEntryLabel(
+                              name: _str(entry['name']),
+                              isDir: isDir,
                             ),
                           ),
                         );
