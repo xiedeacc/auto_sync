@@ -4649,6 +4649,7 @@ class _CompactInput extends StatelessWidget {
     this.initialValue,
     this.placeholder,
     this.onChanged,
+    this.onTap,
     this.numeric = false,
     this.height = _masterControlHeight,
   });
@@ -4657,6 +4658,7 @@ class _CompactInput extends StatelessWidget {
   final String? initialValue;
   final String? placeholder;
   final ValueChanged<String>? onChanged;
+  final VoidCallback? onTap;
   final bool numeric;
   final double height;
 
@@ -4677,6 +4679,7 @@ class _CompactInput extends StatelessWidget {
           keyboardType: numeric ? TextInputType.number : TextInputType.text,
           maxLines: 1,
           onChanged: onChanged,
+          onTap: onTap,
           style: const TextStyle(fontSize: 12),
           decoration: InputDecoration(
             hintText: placeholder,
@@ -6101,6 +6104,31 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
     setState(() => _setList(key, next));
   }
 
+  Future<void> _previewPath(String remotePath) async {
+    final filePath = _collectorLocalPath(widget.host, remotePath);
+    if (filePath.isEmpty) return;
+    final file = File(filePath);
+    try {
+      final stat = await file.stat();
+      if (stat.type != FileSystemEntityType.file) return;
+      if (stat.size > 2 * 1024 * 1024) return;
+      final bytes = await file.readAsBytes();
+      if (bytes.contains(0)) return;
+      final text = utf8.decode(bytes);
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (context) => _CollectorFilePreviewDialog(
+          filePath: filePath,
+          remotePath: remotePath,
+          initialText: text,
+        ),
+      );
+    } catch (_) {
+      return;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final label = _str(
@@ -6145,11 +6173,152 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
               children: [
                 _PathListEditor(
                   items: showingExclude ? exclude : paths,
+                  onPreview: _previewPath,
                   onChanged: (items) => setState(
                     () => _setList(showingExclude ? 'exclude' : 'paths', items),
                   ),
                 ),
               ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _collectorLocalPath(Map<String, dynamic> host, String remotePath) {
+  final root = _str(host['root']).trim();
+  if (root.isEmpty) return '';
+  final parts = remotePath
+      .trim()
+      .replaceAll('\\', '/')
+      .split('/')
+      .where((part) => part.isNotEmpty && part != '.')
+      .toList();
+  if (parts.isEmpty || parts.any((part) => part == '..')) return '';
+  var path = root;
+  for (final part in parts) {
+    final needsSeparator = !path.endsWith('\\') && !path.endsWith('/');
+    path = '$path${needsSeparator ? Platform.pathSeparator : ''}$part';
+  }
+  return path;
+}
+
+class _CollectorFilePreviewDialog extends StatefulWidget {
+  const _CollectorFilePreviewDialog({
+    required this.filePath,
+    required this.remotePath,
+    required this.initialText,
+  });
+
+  final String filePath;
+  final String remotePath;
+  final String initialText;
+
+  @override
+  State<_CollectorFilePreviewDialog> createState() =>
+      _CollectorFilePreviewDialogState();
+}
+
+class _CollectorFilePreviewDialogState
+    extends State<_CollectorFilePreviewDialog> {
+  late final TextEditingController controller;
+  bool editing = false;
+  bool saving = false;
+  String message = '';
+
+  @override
+  void initState() {
+    super.initState();
+    controller = TextEditingController(text: widget.initialText);
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    if (saving) return;
+    setState(() {
+      saving = true;
+      message = '';
+    });
+    try {
+      await File(
+        widget.filePath,
+      ).writeAsString(controller.text, encoding: utf8);
+      if (!mounted) return;
+      setState(() {
+        editing = false;
+        saving = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        saving = false;
+        message = '$error';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _MasterDialogFrame(
+      title: widget.remotePath,
+      width: 900,
+      maxHeight: 720,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              MasterButton(
+                label: 'Edit',
+                width: 72,
+                onTap: editing ? null : () => setState(() => editing = true),
+              ),
+              if (editing) ...[
+                const SizedBox(width: 8),
+                MasterButton(
+                  label: 'Save',
+                  width: 72,
+                  primary: true,
+                  onTap: saving ? null : () => unawaited(_save()),
+                ),
+              ],
+            ],
+          ),
+          if (message.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(message, style: const TextStyle(color: Palette.red)),
+          ],
+          const SizedBox(height: 8),
+          Expanded(
+            child: TextField(
+              controller: controller,
+              readOnly: !editing,
+              expands: true,
+              maxLines: null,
+              minLines: null,
+              keyboardType: TextInputType.multiline,
+              style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+              decoration: InputDecoration(
+                filled: true,
+                fillColor: editing ? Colors.white : const Color(0xfff8fafc),
+                border: const OutlineInputBorder(),
+                enabledBorder: const OutlineInputBorder(
+                  borderSide: BorderSide(color: Palette.line),
+                ),
+                focusedBorder: const OutlineInputBorder(
+                  borderSide: BorderSide(color: Palette.accent),
+                ),
+                isDense: true,
+                contentPadding: const EdgeInsets.all(10),
+              ),
             ),
           ),
         ],
@@ -6315,10 +6484,15 @@ class _CollectorRemotePathDialogState
 }
 
 class _PathListEditor extends StatelessWidget {
-  const _PathListEditor({required this.items, required this.onChanged});
+  const _PathListEditor({
+    required this.items,
+    required this.onChanged,
+    this.onPreview,
+  });
 
   final List<String> items;
   final ValueChanged<List<String>> onChanged;
+  final ValueChanged<String>? onPreview;
 
   @override
   Widget build(BuildContext context) {
@@ -6335,6 +6509,7 @@ class _PathListEditor extends StatelessWidget {
                 child: _CompactInput(
                   initialValue: entry.value,
                   placeholder: '/remote/absolute/path',
+                  onTap: () => onPreview?.call(entry.value),
                   onChanged: (value) {
                     final next = [...items];
                     next[entry.key] = value;
