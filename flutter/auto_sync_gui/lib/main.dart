@@ -4587,22 +4587,30 @@ class _CompactSelect extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
+    return Container(
       height: height,
-      child: DropdownButtonFormField<String>(
-        initialValue: value,
-        isDense: height <= _masterControlHeight,
-        alignment: Alignment.centerLeft,
-        decoration: _compactInputDecoration(height: height),
-        style: const TextStyle(
-          fontSize: 13,
-          color: Palette.text,
-          fontWeight: FontWeight.w600,
+      padding: const EdgeInsets.symmetric(horizontal: 9),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: Palette.line),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: value,
+          isExpanded: true,
+          isDense: true,
+          alignment: Alignment.centerLeft,
+          style: const TextStyle(
+            fontSize: 13,
+            color: Palette.text,
+            fontWeight: FontWeight.w600,
+          ),
+          items: items,
+          onChanged: (next) {
+            if (next != null) onChanged(next);
+          },
         ),
-        items: items,
-        onChanged: (next) {
-          if (next != null) onChanged(next);
-        },
       ),
     );
   }
@@ -4654,7 +4662,7 @@ class _MachinesDialog extends StatefulWidget {
 }
 
 class _MachinesDialogState extends State<_MachinesDialog> {
-  static const double _editorHeight = _masterControlHeight * 2;
+  static const double _editorHeight = _masterControlHeight;
 
   String message = '';
   bool busy = false;
