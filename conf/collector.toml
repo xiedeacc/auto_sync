@@ -110,6 +110,7 @@ paths = [
     "/usr/local/tbox",
 ]
 exclude = []
+deploy_script_path = "collector_deploy_nas.ps1"
 deploy_script = ""
 enabled = true
 
