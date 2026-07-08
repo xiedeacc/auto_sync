@@ -4532,44 +4532,34 @@ class _CompactInput extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final expanded = height > _masterControlHeight;
-    return SizedBox(
+    return Container(
       height: height,
-      child: TextFormField(
-        controller: controller,
-        initialValue: controller == null ? initialValue : null,
-        keyboardType: numeric ? TextInputType.number : TextInputType.text,
-        expands: expanded,
-        minLines: expanded ? null : 1,
-        maxLines: expanded ? null : 1,
-        onChanged: onChanged,
-        textAlignVertical: TextAlignVertical.center,
-        style: const TextStyle(fontSize: 12),
-        decoration: _compactInputDecoration(
-          hintText: placeholder,
-          height: height,
+      padding: const EdgeInsets.symmetric(horizontal: 9),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: Palette.line),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Center(
+        child: TextFormField(
+          controller: controller,
+          initialValue: controller == null ? initialValue : null,
+          keyboardType: numeric ? TextInputType.number : TextInputType.text,
+          maxLines: 1,
+          onChanged: onChanged,
+          style: const TextStyle(fontSize: 12),
+          decoration: InputDecoration(
+            hintText: placeholder,
+            border: InputBorder.none,
+            enabledBorder: InputBorder.none,
+            focusedBorder: InputBorder.none,
+            isCollapsed: true,
+            contentPadding: EdgeInsets.zero,
+          ),
         ),
       ),
     );
   }
-}
-
-InputDecoration _compactInputDecoration({
-  String? hintText,
-  String? labelText,
-  double height = _masterControlHeight,
-}) {
-  final expanded = height > _masterControlHeight;
-  return InputDecoration(
-    hintText: hintText,
-    labelText: labelText,
-    isDense: !expanded,
-    contentPadding: EdgeInsets.symmetric(
-      horizontal: 9,
-      vertical: expanded ? 12 : 0,
-    ),
-    constraints: BoxConstraints.tightFor(height: height),
-  );
 }
 
 class _CompactSelect extends StatelessWidget {
@@ -4662,7 +4652,7 @@ class _MachinesDialog extends StatefulWidget {
 }
 
 class _MachinesDialogState extends State<_MachinesDialog> {
-  static const double _editorHeight = _masterControlHeight;
+  static const double _editorHeight = 50;
 
   String message = '';
   bool busy = false;
