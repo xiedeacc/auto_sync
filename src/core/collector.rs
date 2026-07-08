@@ -11,6 +11,7 @@
 //! on a schedule.
 
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -163,6 +164,7 @@ fn ssh_command(conn: &SshConn) -> Command {
         cmd.arg("-i").arg(expand_tilde(conn.identity_file));
     }
     cmd.args(SSH_OPTS);
+    add_ssh_mux_options(&mut cmd, conn);
     cmd
 }
 
@@ -176,7 +178,29 @@ fn scp_command(conn: &SshConn) -> Command {
         cmd.arg("-i").arg(expand_tilde(conn.identity_file));
     }
     cmd.args(SSH_OPTS);
+    add_ssh_mux_options(&mut cmd, conn);
     cmd
+}
+
+fn add_ssh_mux_options(cmd: &mut Command, conn: &SshConn) {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    conn.hostname.hash(&mut hasher);
+    conn.user.hash(&mut hasher);
+    conn.port.hash(&mut hasher);
+    conn.identity_file.hash(&mut hasher);
+    let key = hasher.finish();
+    let control_path = std::env::temp_dir().join(format!(
+        "auto_sync_ssh_{}_{}_{}",
+        std::process::id(),
+        key,
+        "%C"
+    ));
+    cmd.arg("-o")
+        .arg("ControlMaster=auto")
+        .arg("-o")
+        .arg("ControlPersist=120")
+        .arg("-o")
+        .arg(format!("ControlPath={}", control_path.to_string_lossy()));
 }
 
 fn log(state: &Arc<Mutex<CollectorRunState>>, msg: impl Into<String>) {

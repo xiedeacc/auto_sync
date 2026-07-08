@@ -5738,7 +5738,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                           : _run,
                     ),
                     const SizedBox(width: 10),
-                    Expanded(child: _IssueSummary(_runState())),
+                    Expanded(child: Center(child: _IssueSummary(_runState()))),
                     MasterButton(
                       label: 'Config',
                       width: 78,
