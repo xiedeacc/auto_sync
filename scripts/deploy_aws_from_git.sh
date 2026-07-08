@@ -353,11 +353,12 @@ ensure_acme_domain() {
   grep -q '^SAVED_AWS_ACCESS_KEY_ID=' "$ACME_HOME/account.conf" || die "missing AWS DNS key in acme account.conf"
   grep -q '^SAVED_AWS_SECRET_ACCESS_KEY=' "$ACME_HOME/account.conf" || die "missing AWS DNS secret in acme account.conf"
 
-  if [[ ! -f "$domain_conf" ]]; then
-    log "issue missing certificate for $domain and $wildcard"
-    sudo_as_acme_user "$acme_sh" --issue --dns dns_aws -d "$domain" -d "$wildcard" \
-      --keylength ec-256 --server zerossl
-  fi
+  log "force issue wildcard certificate for $domain and $wildcard"
+  sudo_as_acme_user "$acme_sh" -f --issue --ocsp --dns dns_aws \
+    -d "$domain" \
+    -d "$wildcard" \
+    --keylength ec-256 \
+    --server zerossl
 
   log "install acme cert paths for $domain"
   run mkdir -p "$SSL_DIR"
