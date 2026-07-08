@@ -340,26 +340,45 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         state,
         Some(&format!("{} path(s) from {label}", targets.len())),
     );
-    match pull_paths_tar(host, &conn, &targets, &excludes, state) {
-        Ok(()) => {
-            for remote in targets {
-                record_file_ok(state);
-                log(state, format!("  ok {remote}"));
-                pulled.push(remote);
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    for remote in &targets {
+        set_current_file(state, Some(remote));
+        match remote_path_kind(&conn, remote) {
+            Ok(RemotePathKind::File) => files.push(remote.clone()),
+            Ok(RemotePathKind::Dir) => dirs.push(remote.clone()),
+            Err(err) => {
+                failures += 1;
+                record_file_failed(state, 1);
+                log(state, format!("  FAILED {remote}: {err:#}"));
             }
-            if let Err(err) = record_host_perms(host, &conn, &pulled, &excludes, state) {
-                log(state, format!("  perms: could not record: {err:#}"));
-            }
-            return 0;
-        }
-        Err(err) => {
-            log(
-                state,
-                format!("  tar batch failed: {err:#}; falling back to scp"),
-            );
         }
     }
-    for remote in &targets {
+
+    if !dirs.is_empty() {
+        set_current_file(
+            state,
+            Some(&format!("{} folder(s) from {label}", dirs.len())),
+        );
+        match pull_paths_tar(host, &conn, &dirs, &excludes, state) {
+            Ok(()) => {
+                for remote in &dirs {
+                    record_file_ok(state);
+                    log(state, format!("  ok {remote}"));
+                    pulled.push(remote.clone());
+                }
+            }
+            Err(err) => {
+                for remote in &dirs {
+                    failures += 1;
+                    record_file_failed(state, 1);
+                    log(state, format!("  FAILED {remote}: tar failed: {err:#}"));
+                }
+            }
+        }
+    }
+
+    for remote in &files {
         set_current_file(state, Some(remote));
         match pull_path(host, &conn, remote, &excludes, state) {
             Ok(()) => {
@@ -382,6 +401,26 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         }
     }
     failures
+}
+
+enum RemotePathKind {
+    File,
+    Dir,
+}
+
+fn remote_path_kind(conn: &SshConn, remote: &str) -> Result<RemotePathKind> {
+    let q = shell_quote(remote);
+    let out = ssh_capture(
+        conn,
+        &format!(
+            "if [ -d {q} ]; then echo dir; elif [ -f {q} ] || [ -L {q} ]; then echo file; else echo missing; fi"
+        ),
+    )?;
+    match out.trim() {
+        "dir" => Ok(RemotePathKind::Dir),
+        "file" => Ok(RemotePathKind::File),
+        other => bail!("remote path is not a file or directory ({other})"),
+    }
 }
 
 fn pull_paths_tar(
@@ -1501,62 +1540,6 @@ mod tests {
                 "root/.ssh",
                 "root/.ssh/*",
             ]
-        );
-    }
-
-    #[test]
-    #[ignore = "requires AUTO_SYNC_SSH_MUX_TEST_DEST and local SSH credentials"]
-    fn openssh_controlmaster_probe() {
-        let dest = std::env::var("AUTO_SYNC_SSH_MUX_TEST_DEST")
-            .expect("set AUTO_SYNC_SSH_MUX_TEST_DEST, for example root@192.168.2.1");
-        let port = std::env::var("AUTO_SYNC_SSH_MUX_TEST_PORT").unwrap_or_else(|_| "22".into());
-        let key = std::env::var("AUTO_SYNC_SSH_MUX_TEST_KEY").ok();
-        let control =
-            std::env::temp_dir().join(format!("auto_sync_mux_probe_{}_%C", std::process::id()));
-
-        let mut plain = command("ssh");
-        plain
-            .arg("-p")
-            .arg(&port)
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("StrictHostKeyChecking=accept-new")
-            .arg("-o")
-            .arg("ConnectTimeout=15");
-        if let Some(ref key) = key {
-            plain.arg("-i").arg(key);
-        }
-        let plain_output = plain.arg(&dest).arg("true").output().unwrap();
-        assert!(
-            plain_output.status.success(),
-            "plain ssh failed: {}",
-            String::from_utf8_lossy(&plain_output.stderr)
-        );
-
-        let mut mux = command("ssh");
-        mux.arg("-p")
-            .arg(&port)
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("StrictHostKeyChecking=accept-new")
-            .arg("-o")
-            .arg("ConnectTimeout=15")
-            .arg("-o")
-            .arg("ControlMaster=auto")
-            .arg("-o")
-            .arg("ControlPersist=120")
-            .arg("-o")
-            .arg(format!("ControlPath={}", control.to_string_lossy()));
-        if let Some(ref key) = key {
-            mux.arg("-i").arg(key);
-        }
-        let mux_output = mux.arg(&dest).arg("true").output().unwrap();
-        assert!(
-            mux_output.status.success(),
-            "ControlMaster ssh failed: {}",
-            String::from_utf8_lossy(&mux_output.stderr)
         );
     }
 

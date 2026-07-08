@@ -6173,6 +6173,7 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
               children: [
                 _PathListEditor(
                   items: showingExclude ? exclude : paths,
+                  iconFor: (path) => _collectorPathIcon(widget.host, path),
                   onPreview: _previewPath,
                   onChanged: (items) => setState(
                     () => _setList(showingExclude ? 'exclude' : 'paths', items),
@@ -6185,6 +6186,18 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
       ),
     );
   }
+}
+
+IconData _collectorPathIcon(Map<String, dynamic> host, String remotePath) {
+  final localPath = _collectorLocalPath(host, remotePath);
+  if (localPath.isEmpty) return Icons.description_outlined;
+  try {
+    final type = FileSystemEntity.typeSync(localPath);
+    if (type == FileSystemEntityType.directory) {
+      return Icons.folder_outlined;
+    }
+  } catch (_) {}
+  return Icons.description_outlined;
 }
 
 String _collectorLocalPath(Map<String, dynamic> host, String remotePath) {
@@ -6487,11 +6500,13 @@ class _PathListEditor extends StatelessWidget {
   const _PathListEditor({
     required this.items,
     required this.onChanged,
+    this.iconFor,
     this.onPreview,
   });
 
   final List<String> items;
   final ValueChanged<List<String>> onChanged;
+  final IconData Function(String value)? iconFor;
   final ValueChanged<String>? onPreview;
 
   @override
@@ -6505,6 +6520,17 @@ class _PathListEditor extends StatelessWidget {
           padding: const EdgeInsets.only(bottom: 6),
           child: Row(
             children: [
+              if (iconFor != null) ...[
+                SizedBox(
+                  width: 18,
+                  child: Icon(
+                    iconFor!(entry.value),
+                    size: 16,
+                    color: Palette.muted,
+                  ),
+                ),
+                const SizedBox(width: 6),
+              ],
               Expanded(
                 child: _CompactInput(
                   initialValue: entry.value,
