@@ -5247,10 +5247,12 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   Map<String, dynamic> cfg = {};
   Map<String, dynamic> status = {};
   Map<String, dynamic> deployStatus = {};
+  final hostDeployStatuses = <int, Map<String, dynamic>>{};
   String message = '';
   bool loading = true;
   bool busy = false;
   bool autoPush = false;
+  int? activeDeployIndex;
   Timer? saveTimer;
   Timer? deployTimer;
   final gitDir = TextEditingController();
@@ -5410,10 +5412,15 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   }
 
   Future<void> _runDeploy(int index) async {
+    if (_bool(deployStatus['running']) && activeDeployIndex != index) {
+      setState(() => message = _runState());
+      return;
+    }
     setState(() {
-      busy = true;
       message = 'Deploying...';
+      activeDeployIndex = index;
       deployStatus = {'running': true, 'log': <String>[]};
+      hostDeployStatuses[index] = Map<String, dynamic>.from(deployStatus);
     });
     try {
       await _persistNow();
@@ -5421,6 +5428,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
       if (mounted) {
         setState(() {
           deployStatus = next;
+          hostDeployStatuses[index] = Map<String, dynamic>.from(next);
           message = '';
         });
       }
@@ -5428,9 +5436,17 @@ class _CollectorDialogState extends State<_CollectorDialog> {
         _startDeployPolling();
       }
     } catch (error) {
-      if (mounted) setState(() => message = '$error');
-    } finally {
-      if (mounted) setState(() => busy = false);
+      if (mounted) {
+        setState(() {
+          message = '$error';
+          deployStatus = {
+            'running': false,
+            'ok': false,
+            'log': <String>['$error'],
+          };
+          hostDeployStatuses[index] = Map<String, dynamic>.from(deployStatus);
+        });
+      }
     }
   }
 
@@ -5446,7 +5462,13 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     try {
       final next = await widget.api.collectorDeployStatus();
       if (!mounted) return;
-      setState(() => deployStatus = next);
+      setState(() {
+        deployStatus = next;
+        final index = activeDeployIndex;
+        if (index != null) {
+          hostDeployStatuses[index] = Map<String, dynamic>.from(next);
+        }
+      });
       if (!_bool(next['running'])) {
         deployTimer?.cancel();
         deployTimer = null;
@@ -5454,13 +5476,17 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     } catch (_) {}
   }
 
-  Future<void> _showLog() async {
+  Future<void> _showHostLog(int index) async {
+    final active = activeDeployIndex == index && _bool(deployStatus['running']);
+    final initial = active
+        ? deployStatus
+        : (hostDeployStatuses[index] ?? <String, dynamic>{});
     await showDialog<void>(
       context: context,
       builder: (context) => _CollectorLogDialog(
         api: widget.api,
-        initialRunStatus: status,
-        initialDeployStatus: deployStatus,
+        initialDeployStatus: initial,
+        pollDeploy: active,
       ),
     );
   }
@@ -5485,7 +5511,15 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   String _runState() {
     if (loading) return 'Loading...';
     if (message.isNotEmpty) return message;
-    if (_bool(deployStatus['running'])) return 'Deploying...';
+    if (_bool(deployStatus['running'])) {
+      final index = activeDeployIndex;
+      if (index != null && index >= 0 && index < hosts.length) {
+        final host = hosts[index];
+        final label = _str(host['name'], _str(host['hostname'], 'host'));
+        return 'Deploying $label...';
+      }
+      return 'Deploying...';
+    }
     if (_bool(status['running'])) return 'Running...';
     if (status.containsKey('ok') && _bool(status['ok'])) return 'Done';
     if (status.containsKey('ok') && !_bool(status['ok'], true)) {
@@ -5570,8 +5604,6 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                           style: TextStyle(fontWeight: FontWeight.w600),
                         ),
                       ),
-                      MasterButton(label: 'Log', width: 64, onTap: _showLog),
-                      const SizedBox(width: 6),
                       MasterButton(
                         label: '+ Add host',
                         width: 96,
@@ -5630,7 +5662,10 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                                 ),
                               );
                             },
-                            onDeployRun: _bool(deployStatus['running'])
+                            onDeployLog: () => _showHostLog(entry.key),
+                            onDeployRun:
+                                _bool(deployStatus['running']) &&
+                                    activeDeployIndex == entry.key
                                 ? null
                                 : () => _runDeploy(entry.key),
                           ),
@@ -5667,33 +5702,33 @@ class _CollectorDialogState extends State<_CollectorDialog> {
 class _CollectorLogDialog extends StatefulWidget {
   const _CollectorLogDialog({
     required this.api,
-    required this.initialRunStatus,
     required this.initialDeployStatus,
+    required this.pollDeploy,
   });
 
   final AutoSyncApi api;
-  final Map<String, dynamic> initialRunStatus;
   final Map<String, dynamic> initialDeployStatus;
+  final bool pollDeploy;
 
   @override
   State<_CollectorLogDialog> createState() => _CollectorLogDialogState();
 }
 
 class _CollectorLogDialogState extends State<_CollectorLogDialog> {
-  late Map<String, dynamic> runStatus;
   late Map<String, dynamic> deployStatus;
   Timer? timer;
 
   @override
   void initState() {
     super.initState();
-    runStatus = Map<String, dynamic>.from(widget.initialRunStatus);
     deployStatus = Map<String, dynamic>.from(widget.initialDeployStatus);
-    timer = Timer.periodic(
-      const Duration(seconds: 1),
-      (_) => unawaited(_refresh()),
-    );
-    unawaited(_refresh());
+    if (widget.pollDeploy) {
+      timer = Timer.periodic(
+        const Duration(seconds: 1),
+        (_) => unawaited(_refresh()),
+      );
+      unawaited(_refresh());
+    }
   }
 
   @override
@@ -5704,13 +5739,13 @@ class _CollectorLogDialogState extends State<_CollectorLogDialog> {
 
   Future<void> _refresh() async {
     try {
-      final nextRun = await widget.api.collectorStatus();
       final nextDeploy = await widget.api.collectorDeployStatus();
       if (!mounted) return;
-      setState(() {
-        runStatus = nextRun;
-        deployStatus = nextDeploy;
-      });
+      setState(() => deployStatus = nextDeploy);
+      if (!_bool(nextDeploy['running'])) {
+        timer?.cancel();
+        timer = null;
+      }
     } catch (_) {}
   }
 
@@ -5730,14 +5765,9 @@ class _CollectorLogDialogState extends State<_CollectorLogDialog> {
     if (deployLog.isNotEmpty || _bool(deployStatus['running'])) {
       return deployLog.isEmpty ? 'Deploying...' : deployLog.join('\n');
     }
-    final runLog = _list(runStatus['log']).map((line) => '$line').toList();
-    if (runLog.isNotEmpty || _bool(runStatus['running'])) {
-      return runLog.isEmpty ? 'Running...' : runLog.join('\n');
-    }
     final deployState = _stateText(deployStatus, 'Deploying...');
     if (deployState.isNotEmpty) return deployState;
-    final runState = _stateText(runStatus, 'Running...');
-    return runState.isEmpty ? 'No log yet.' : runState;
+    return 'No deploy log yet.';
   }
 
   @override
@@ -5771,6 +5801,7 @@ class _CollectorHostHeader extends StatelessWidget {
         Text(''),
         Text(''),
         Text(''),
+        Text(''),
       ],
     );
   }
@@ -5785,6 +5816,7 @@ class _CollectorHostRow extends StatelessWidget {
     required this.onBrowseRoot,
     required this.onPaths,
     required this.onDeploy,
+    required this.onDeployLog,
     required this.onDeployRun,
   });
 
@@ -5795,6 +5827,7 @@ class _CollectorHostRow extends StatelessWidget {
   final VoidCallback onBrowseRoot;
   final VoidCallback onPaths;
   final VoidCallback onDeploy;
+  final VoidCallback onDeployLog;
   final VoidCallback? onDeployRun;
 
   @override
@@ -5851,6 +5884,7 @@ class _CollectorHostRow extends StatelessWidget {
           color: Palette.green,
           onTap: onDeployRun,
         ),
+        _CollectorTinyButton(label: 'Log', onTap: onDeployLog),
         _CollectorCheckCell(
           value: _bool(host['enabled'], true),
           onChanged: (value) => setField('enabled', value),
@@ -5940,14 +5974,15 @@ class _CollectorHostGrid extends StatelessWidget {
           constraints.maxWidth - _collectorTableBaseWidth,
         );
         final widths = <double>[
-          72,
-          104,
-          60,
-          54,
-          160 + extra * 0.65,
-          164 + extra * 0.35,
+          82,
+          114,
+          70,
+          64,
+          152 + extra * 0.65,
+          123 + extra * 0.35,
           42,
-          94,
+          63,
+          34,
           34,
           34,
           34,
