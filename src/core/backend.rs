@@ -241,11 +241,23 @@ impl Backend {
     /// second deploy while one is running.
     pub fn collector_deploy_run(&self, index: usize) -> Result<CollectorRunState> {
         let cfg = self.get_collector_config()?;
-        let host = cfg
+        let mut host = cfg
             .hosts
             .get(index)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no host at index {index}"))?;
+        if !host.deploy_script_path.trim().is_empty() {
+            let configured = std::path::PathBuf::from(host.deploy_script_path.trim());
+            let resolved = if configured.is_absolute() {
+                configured
+            } else {
+                self.collector_config_path()
+                    .parent()
+                    .map(|dir| dir.join(&configured))
+                    .unwrap_or(configured)
+            };
+            host.deploy_script_path = resolved.to_string_lossy().to_string();
+        }
         {
             let mut guard = self
                 .collector_deploy

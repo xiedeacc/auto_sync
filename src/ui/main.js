@@ -3335,6 +3335,7 @@ function normalizeCollectorHost(raw) {
     root: String(valueOr(src.root, "")),
     paths: Array.isArray(src.paths) ? src.paths.map((p) => String(valueOr(p, ""))) : [],
     exclude: Array.isArray(src.exclude) ? src.exclude.map((p) => String(valueOr(p, ""))) : [],
+    deploy_script_path: String(valueOr(src.deploy_script_path, "")),
     deploy_script: String(valueOr(src.deploy_script, "")),
     enabled: src.enabled !== false,
   };

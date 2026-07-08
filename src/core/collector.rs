@@ -894,12 +894,12 @@ fn deploy_inner(
         ),
     );
 
-    if host.deploy_script.trim().is_empty() {
+    if host.deploy_script_path.trim().is_empty() && host.deploy_script.trim().is_empty() {
         log(state, "no deploy script for this host — nothing to do");
         return Ok(0);
     }
 
-    match run_local_deploy_script(host, &conn, all_hosts, &host.deploy_script, state) {
+    match run_local_deploy_script(host, &conn, all_hosts, state) {
         Ok(true) => {
             log(state, "deploy script ok");
             Ok(0)
@@ -1018,13 +1018,23 @@ fn run_local_deploy_script(
     host: &CollectorHost,
     conn: &SshConn,
     all_hosts: &[CollectorHost],
-    script: &str,
     state: &Arc<Mutex<CollectorRunState>>,
 ) -> Result<bool> {
     let file_tag = env_host_suffix(&host.name).to_lowercase();
-    let script_path = std::env::temp_dir().join(format!("auto_sync_deploy_{file_tag}.ps1"));
-    fs::write(&script_path, script)
-        .with_context(|| format!("writing {}", script_path.display()))?;
+    let mut temp_script_path: Option<PathBuf> = None;
+    let script_path = if host.deploy_script_path.trim().is_empty() {
+        let path = std::env::temp_dir().join(format!("auto_sync_deploy_{file_tag}.ps1"));
+        fs::write(&path, &host.deploy_script)
+            .with_context(|| format!("writing {}", path.display()))?;
+        temp_script_path = Some(path.clone());
+        path
+    } else {
+        let path = PathBuf::from(host.deploy_script_path.trim());
+        if !path.exists() {
+            bail!("deploy script file not found: {}", path.display());
+        }
+        path
+    };
 
     #[cfg(windows)]
     let mut cmd = {
@@ -1101,7 +1111,9 @@ fn run_local_deploy_script(
     for line in String::from_utf8_lossy(&output.stderr).lines().take(200) {
         log(state, format!("  ! {line}"));
     }
-    let _ = fs::remove_file(&script_path);
+    if let Some(path) = temp_script_path {
+        let _ = fs::remove_file(path);
+    }
     if let Some(temp) = ss_conf_temp {
         let _ = fs::remove_file(&temp);
     }

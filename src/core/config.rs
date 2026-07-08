@@ -261,9 +261,12 @@ pub struct CollectorHost {
     /// living inside a collected directory.
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Host-native shell script run on the host (over ssh) during Deploy, after
-    /// the collected files are pushed back. e.g. on OpenWrt start the relevant
-    /// procd services and apply `uci` config. Empty = push files only.
+    /// PowerShell script file run on this machine during Deploy. Relative paths
+    /// are resolved next to `collector.toml`.
+    #[serde(default)]
+    pub deploy_script_path: String,
+    /// Inline PowerShell script run on this machine during Deploy. Kept for
+    /// backwards compatibility; `deploy_script_path` takes precedence.
     #[serde(default)]
     pub deploy_script: String,
     pub enabled: bool,
@@ -280,6 +283,7 @@ impl Default for CollectorHost {
             root: PathBuf::new(),
             paths: Vec::new(),
             exclude: Vec::new(),
+            deploy_script_path: String::new(),
             deploy_script: String::new(),
             enabled: true,
         }
