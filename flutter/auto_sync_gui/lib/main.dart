@@ -908,6 +908,9 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
                   )
                 : _MasterSourcePanel(
                     sources: sources,
+                    runtimeStatus: runtimeStatus,
+                    syncActivity: syncActivity,
+                    busy: busy,
                     machineIdsFor: (source) =>
                         _machineIds(_str(source['machine_id'])),
                     machineLabel: _machineLabel,
@@ -1109,6 +1112,9 @@ const double _masterStatusDotSize = 10;
 class _MasterSourcePanel extends StatelessWidget {
   const _MasterSourcePanel({
     required this.sources,
+    required this.runtimeStatus,
+    required this.syncActivity,
+    required this.busy,
     required this.machineIdsFor,
     required this.machineLabel,
     required this.statusFor,
@@ -1131,6 +1137,9 @@ class _MasterSourcePanel extends StatelessWidget {
   });
 
   final List<Map<String, dynamic>> sources;
+  final Map<String, dynamic> runtimeStatus;
+  final Map<String, dynamic> syncActivity;
+  final bool busy;
   final List<String> Function(Map<String, dynamic> source) machineIdsFor;
   final String Function(String id) machineLabel;
   final Map<String, dynamic>? Function(String sourceId, String destinationId)
@@ -1165,6 +1174,13 @@ class _MasterSourcePanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final syncDisabled = _SyncDisableState.from(
+      sources: sources,
+      runtimeStatus: runtimeStatus,
+      syncActivity: syncActivity,
+      busy: busy,
+      statusFor: statusFor,
+    );
     return LayoutBuilder(
       builder: (context, constraints) {
         final pageWidth = constraints.maxWidth < 860
@@ -1207,7 +1223,9 @@ class _MasterSourcePanel extends StatelessWidget {
                           MasterButton(
                             label: 'Sync All',
                             primary: true,
-                            onTap: onSyncAll,
+                            onTap: syncDisabled.anySyncDisabled
+                                ? null
+                                : onSyncAll,
                           ),
                           const SizedBox(width: 8),
                           MasterButton(label: 'Add Source', onTap: onAddSource),
@@ -1239,6 +1257,7 @@ class _MasterSourcePanel extends StatelessWidget {
                                   machineIds: machineIdsFor(sources[i]),
                                   machineLabel: machineLabel,
                                   statusFor: statusFor,
+                                  syncDisabled: syncDisabled,
                                   onChanged: onChanged,
                                   onMutate: onMutate,
                                   onPickSourcePath: onPickSourcePath,
@@ -1277,6 +1296,7 @@ class _MasterSourceGroup extends StatelessWidget {
     required this.machineIds,
     required this.machineLabel,
     required this.statusFor,
+    required this.syncDisabled,
     required this.onChanged,
     required this.onMutate,
     required this.onPickSourcePath,
@@ -1298,6 +1318,7 @@ class _MasterSourceGroup extends StatelessWidget {
   final String Function(String id) machineLabel;
   final Map<String, dynamic>? Function(String sourceId, String destinationId)
   statusFor;
+  final _SyncDisableState syncDisabled;
   final Future<void> Function([String label]) onChanged;
   final void Function(VoidCallback mutate) onMutate;
   final Future<void> Function(Map<String, dynamic> source) onPickSourcePath;
@@ -1330,6 +1351,7 @@ class _MasterSourceGroup extends StatelessWidget {
     source['excludes'] = _list(source['excludes']);
     final sourceId = _str(source['id'], 'source');
     final destinations = _mapRefs(source['destinations']);
+    final sourceSyncDisabled = syncDisabled.sourceDisabled(source);
     final latest = _sourceLatestCycle(
       destinations.map((dst) => statusFor(sourceId, _str(dst['id']))),
     );
@@ -1402,7 +1424,9 @@ class _MasterSourceGroup extends StatelessWidget {
                   MasterButton(
                     label: 'Sync',
                     width: 58,
-                    onTap: () => onSyncSource(sourceId),
+                    onTap: sourceSyncDisabled
+                        ? null
+                        : () => onSyncSource(sourceId),
                   ),
                   const SizedBox(width: 8),
                   MasterButton(
@@ -1420,6 +1444,7 @@ class _MasterSourceGroup extends StatelessWidget {
                   destination: dst,
                   destinations: _list(source['destinations']),
                   status: statusFor(sourceId, _str(dst['id'])),
+                  syncDisabled: syncDisabled,
                   onChanged: onChanged,
                   onMutate: onMutate,
                   onPickPath: onPickDestinationPath,
@@ -1473,6 +1498,7 @@ class _MasterDestinationRow extends StatelessWidget {
     required this.destination,
     required this.destinations,
     required this.status,
+    required this.syncDisabled,
     required this.onChanged,
     required this.onMutate,
     required this.onPickPath,
@@ -1489,6 +1515,7 @@ class _MasterDestinationRow extends StatelessWidget {
   final Map<String, dynamic> destination;
   final List<dynamic> destinations;
   final Map<String, dynamic>? status;
+  final _SyncDisableState syncDisabled;
   final Future<void> Function([String label]) onChanged;
   final void Function(VoidCallback mutate) onMutate;
   final Future<void> Function(
@@ -1513,6 +1540,11 @@ class _MasterDestinationRow extends StatelessWidget {
     destination['schedule'] = _mapRef(destination['schedule']);
     final schedule = destination['schedule'] as Map<String, dynamic>;
     final dstId = _str(destination['id'], 'dst');
+    final dstSyncDisabled = syncDisabled.destinationDisabled(
+      source,
+      destination,
+      status,
+    );
     return _MasterSplitRow(
       rightWidth: _masterRightBlockWidth,
       leftControlMarker: Container(
@@ -1586,6 +1618,7 @@ class _MasterDestinationRow extends StatelessWidget {
         MasterSelectButton(
           value: 'Sync',
           width: 104,
+          enabled: !dstSyncDisabled,
           onSelected: (mode) => onSync(sourceId, dstId, mode),
         ),
         const SizedBox(width: 8),
@@ -1783,7 +1816,7 @@ class _ExcludedDialogState extends State<_ExcludedDialog> {
     return _MasterDialogFrame(
       title: 'Excluded',
       width: 780,
-      maxHeight: 720,
+      maxHeight: 360,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -2002,11 +2035,13 @@ class MasterSelectButton extends StatelessWidget {
     required this.value,
     required this.width,
     required this.onSelected,
+    this.enabled = true,
   });
 
   final String value;
   final double width;
   final ValueChanged<String> onSelected;
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
@@ -2014,6 +2049,7 @@ class MasterSelectButton extends StatelessWidget {
       width: width,
       height: _masterControlHeight,
       child: PopupMenuButton<String>(
+        enabled: enabled,
         tooltip: 'Sync',
         padding: EdgeInsets.zero,
         color: Colors.white,
@@ -2051,7 +2087,7 @@ class MasterSelectButton extends StatelessWidget {
           height: _masterControlHeight,
           padding: const EdgeInsets.symmetric(horizontal: 10),
           decoration: BoxDecoration(
-            color: Colors.white,
+            color: enabled ? Colors.white : const Color(0xfff8fafc),
             border: Border.all(color: Palette.line),
             borderRadius: BorderRadius.circular(6),
           ),
@@ -2062,14 +2098,18 @@ class MasterSelectButton extends StatelessWidget {
                   value,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Palette.text,
+                  style: TextStyle(
+                    color: enabled ? Palette.text : Palette.muted,
                     fontSize: 13,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
               ),
-              const Icon(Icons.arrow_drop_down, size: 18, color: Palette.text),
+              Icon(
+                Icons.arrow_drop_down,
+                size: 18,
+                color: enabled ? Palette.text : Palette.muted,
+              ),
             ],
           ),
         ),
@@ -2166,6 +2206,271 @@ String _renderCompactPath(
       ? '$prefix$head'
       : prefix.replaceFirst(RegExp(r'[\\\/]$'), '');
   return '$left$separator...$separator$tail';
+}
+
+class _SyncDisableState {
+  _SyncDisableState({
+    required this.busy,
+    required this.unavailableSourceIds,
+    required this.machineSyncingKeys,
+    required this.compareKeys,
+    required this.overlapRoots,
+  });
+
+  final bool busy;
+  final Set<String> unavailableSourceIds;
+  final Set<String> machineSyncingKeys;
+  final Set<String> compareKeys;
+  final List<_PathRoot> overlapRoots;
+
+  bool get anySyncDisabled =>
+      busy || machineSyncingKeys.isNotEmpty || overlapRoots.isNotEmpty;
+
+  static _SyncDisableState from({
+    required List<Map<String, dynamic>> sources,
+    required Map<String, dynamic> runtimeStatus,
+    required Map<String, dynamic> syncActivity,
+    required bool busy,
+    required Map<String, dynamic>? Function(
+      String sourceId,
+      String destinationId,
+    )
+    statusFor,
+  }) {
+    final machineSyncingKeys = <String>{};
+    final unavailableSourceIds = <String>{};
+    final compareKeys = <String>{};
+    final overlapRoots = <_PathRoot>[];
+    final activities = _activityRows(syncActivity, runtimeStatus);
+
+    for (final source in sources) {
+      final sourceId = _str(source['id']);
+      for (final dst in _mapRefs(source['destinations'])) {
+        if (_destinationUnavailable(statusFor(sourceId, _str(dst['id'])))) {
+          unavailableSourceIds.add(sourceId);
+          break;
+        }
+      }
+    }
+
+    void collectRuntime(Map<String, dynamic> runtime, String machineId) {
+      if (_bool(runtime['syncing'])) {
+        machineSyncingKeys.add(_machineKey(machineId));
+      }
+      for (final scan in _runtimeScans(runtime)) {
+        final sourceId = _str(scan['source_id']);
+        final destinationId = _str(scan['destination_id']);
+        if (sourceId.isEmpty) continue;
+        final source = _findSource(sources, sourceId);
+        final dst = source == null
+            ? null
+            : _findDestination(source, destinationId);
+        if (_str(scan['kind']) == 'compare') {
+          if (destinationId.isNotEmpty) {
+            compareKeys.add('$sourceId/$destinationId');
+          }
+        } else {
+          _addOverlapRoots(overlapRoots, source, dst);
+        }
+      }
+      final transfer = _map(runtime['transfer']);
+      if (transfer.isNotEmpty) {
+        final sourceId = _str(transfer['source_id']);
+        final destinationId = _str(transfer['destination_id']);
+        final source = _findSource(sources, sourceId);
+        final dst = source == null
+            ? null
+            : _findDestination(source, destinationId);
+        _addOverlapRoots(overlapRoots, source, dst);
+      }
+    }
+
+    for (final activity in activities) {
+      final runtime = _bool(activity['local'])
+          ? runtimeStatus
+          : _map(activity['runtime']);
+      if (runtime.isEmpty) continue;
+      collectRuntime(
+        runtime,
+        _bool(activity['local'])
+            ? 'local'
+            : _str(activity['machine_id'], _str(activity['label'], 'local')),
+      );
+    }
+
+    return _SyncDisableState(
+      busy: busy,
+      unavailableSourceIds: unavailableSourceIds,
+      machineSyncingKeys: machineSyncingKeys,
+      compareKeys: compareKeys,
+      overlapRoots: overlapRoots,
+    );
+  }
+
+  bool sourceDisabled(Map<String, dynamic> source) {
+    if (busy) return true;
+    if (unavailableSourceIds.contains(_str(source['id']))) return true;
+    if (machineSyncingKeys.contains(
+      _machineKey(_str(source['machine_id'], 'local')),
+    )) {
+      return true;
+    }
+    return _sourceRoots(source).any(_overlapsActiveRoot);
+  }
+
+  bool destinationDisabled(
+    Map<String, dynamic> source,
+    Map<String, dynamic> destination,
+    Map<String, dynamic>? status,
+  ) {
+    if (busy) return true;
+    if (_destinationUnavailable(status)) return true;
+    if (_bool(destination['paused'])) return true;
+    final sourceId = _str(source['id']);
+    final destinationId = _str(destination['id']);
+    if (compareKeys.contains('$sourceId/$destinationId')) return true;
+    if (machineSyncingKeys.contains(
+      _machineKey(_str(source['machine_id'], 'local')),
+    )) {
+      return true;
+    }
+    return _destinationRoots(source, destination).any(_overlapsActiveRoot);
+  }
+
+  bool _overlapsActiveRoot(_PathRoot root) =>
+      overlapRoots.any((active) => root.overlaps(active));
+}
+
+class _PathRoot {
+  const _PathRoot(this.machineId, this.path);
+
+  final String machineId;
+  final String path;
+
+  bool overlaps(_PathRoot other) {
+    if (_machineKey(machineId) != _machineKey(other.machineId)) return false;
+    if (path.isEmpty || other.path.isEmpty) return false;
+    return path == other.path ||
+        path.startsWith('${other.path}/') ||
+        other.path.startsWith('$path/');
+  }
+}
+
+List<Map<String, dynamic>> _activityRows(
+  Map<String, dynamic> syncActivity,
+  Map<String, dynamic> runtimeStatus,
+) {
+  final rows = _mapRefs(syncActivity['machines']).toList();
+  final hasLocal = rows.any(
+    (row) =>
+        _bool(row['local']) || _machineKey(_str(row['machine_id'])) == 'local',
+  );
+  if (!hasLocal) {
+    rows.add({
+      'machine_id': 'local',
+      'label': 'local',
+      'local': true,
+      'runtime': runtimeStatus,
+    });
+  }
+  return rows;
+}
+
+List<Map<String, dynamic>> _runtimeScans(Map<String, dynamic> runtime) {
+  final scans = _mapRefs(runtime['scans']);
+  if (scans.isNotEmpty) return scans;
+  final scan = _map(runtime['scan']);
+  return scan.isEmpty ? const [] : [scan];
+}
+
+Map<String, dynamic>? _findSource(
+  List<Map<String, dynamic>> sources,
+  String sourceId,
+) {
+  for (final source in sources) {
+    if (_str(source['id']) == sourceId) return source;
+  }
+  return null;
+}
+
+Map<String, dynamic>? _findDestination(
+  Map<String, dynamic> source,
+  String destinationId,
+) {
+  for (final dst in _mapRefs(source['destinations'])) {
+    if (_str(dst['id']) == destinationId) return dst;
+  }
+  return null;
+}
+
+void _addOverlapRoots(
+  List<_PathRoot> roots,
+  Map<String, dynamic>? source,
+  Map<String, dynamic>? destination,
+) {
+  if (source == null) return;
+  roots.addAll(_sourceRoots(source));
+  if (destination != null) {
+    roots.addAll(_destinationRoots(source, destination));
+  }
+}
+
+List<_PathRoot> _sourceRoots(Map<String, dynamic> source) {
+  return [
+    _PathRoot(
+      _str(source['machine_id'], 'local'),
+      _pathOverlapKey(_str(source['src'])),
+    ),
+  ];
+}
+
+List<_PathRoot> _destinationRoots(
+  Map<String, dynamic> source,
+  Map<String, dynamic> destination,
+) {
+  return [
+    ..._sourceRoots(source),
+    _PathRoot(
+      _str(destination['machine_id'], 'local'),
+      _pathOverlapKey(_str(destination['path'])),
+    ),
+  ];
+}
+
+String _pathOverlapKey(String value) {
+  var path = _displayPath(value).trim().replaceAll('\\', '/');
+  path = path.replaceAll(RegExp(r'/+'), '/');
+  if (path.length > 1) path = path.replaceFirst(RegExp(r'/+$'), '');
+  return path.toLowerCase();
+}
+
+String _machineKey(String value) {
+  final key = value.trim().toLowerCase();
+  return key.isEmpty ? 'local' : key;
+}
+
+bool _destinationUnavailable(Map<String, dynamic>? status) {
+  if (status == null || _str(status['status']) != 'red') return false;
+  final reason = _str(status['status_reason']).toLowerCase();
+  return const [
+    'source path does not exist',
+    'source path is not a directory',
+    'source offline',
+    'source unavailable',
+    'destination path does not exist',
+    'destination path is not a directory',
+    'destination file path is a directory',
+    'destination file path has no parent',
+    'destination is not writable',
+    'destination offline',
+    'destination unavailable',
+    'no such file or directory',
+    'permission denied',
+    'read-only file system',
+    'transport endpoint is not connected',
+    'stale file handle',
+    'input/output error',
+  ].any(reason.contains);
 }
 
 Map<String, dynamic> _defaultDestinationSchedule() => {
@@ -3584,7 +3889,7 @@ class _FolderPathLabel extends StatelessWidget {
   }
 }
 
-class _MachineSelectButton extends StatelessWidget {
+class _MachineSelectButton extends StatefulWidget {
   const _MachineSelectButton({
     required this.width,
     required this.value,
@@ -3600,63 +3905,110 @@ class _MachineSelectButton extends StatelessWidget {
   final ValueChanged<String> onSelected;
 
   @override
+  State<_MachineSelectButton> createState() => _MachineSelectButtonState();
+}
+
+class _MachineSelectButtonState extends State<_MachineSelectButton> {
+  final MenuController _controller = MenuController();
+
+  @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: width,
+      width: widget.width,
       height: _masterControlHeight,
-      child: PopupMenuButton<String>(
-        tooltip: 'Machine',
-        padding: EdgeInsets.zero,
-        color: Colors.white,
-        elevation: 2,
-        surfaceTintColor: Colors.transparent,
-        shadowColor: const Color(0x33000000),
-        constraints: BoxConstraints.tightFor(width: width),
-        shape: RoundedRectangleBorder(
-          side: const BorderSide(color: Palette.line),
-          borderRadius: BorderRadius.circular(6),
-        ),
-        offset: const Offset(0, _masterControlHeight),
-        onSelected: onSelected,
-        itemBuilder: (context) => [
-          for (final option in options)
-            PopupMenuItem(
-              value: option,
-              height: _masterControlHeight,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Text(
-                labelFor(option),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-        ],
-        child: Container(
-          height: _masterControlHeight,
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            border: Border.all(color: Palette.line),
-            borderRadius: BorderRadius.circular(6),
+      child: MenuAnchor(
+        controller: _controller,
+        alignmentOffset: const Offset(0, 2),
+        style: MenuStyle(
+          backgroundColor: const WidgetStatePropertyAll(Colors.white),
+          surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
+          elevation: const WidgetStatePropertyAll(2),
+          shadowColor: const WidgetStatePropertyAll(Color(0x33000000)),
+          padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+          minimumSize: WidgetStatePropertyAll(
+            Size(widget.width, _masterControlHeight),
           ),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  labelFor(value),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Palette.text,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
+          maximumSize: WidgetStatePropertyAll(
+            Size(widget.width, _masterControlHeight * widget.options.length),
+          ),
+          shape: WidgetStatePropertyAll(
+            RoundedRectangleBorder(
+              side: const BorderSide(color: Palette.line),
+              borderRadius: BorderRadius.circular(6),
+            ),
+          ),
+        ),
+        menuChildren: [
+          for (final option in widget.options)
+            SizedBox(
+              width: widget.width,
+              height: _masterControlHeight,
+              child: MenuItemButton(
+                style: const ButtonStyle(
+                  padding: WidgetStatePropertyAll(
+                    EdgeInsets.symmetric(horizontal: 12),
+                  ),
+                  minimumSize: WidgetStatePropertyAll(
+                    Size(0, _masterControlHeight),
+                  ),
+                  maximumSize: WidgetStatePropertyAll(
+                    Size(double.infinity, _masterControlHeight),
+                  ),
+                  visualDensity: VisualDensity.compact,
+                ),
+                onPressed: () {
+                  _controller.close();
+                  widget.onSelected(option);
+                },
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    widget.labelFor(option),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
               ),
-              const Icon(Icons.arrow_drop_down, size: 18, color: Palette.text),
-            ],
-          ),
-        ),
+            ),
+        ],
+        builder: (context, controller, child) {
+          return InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onTap: () {
+              controller.isOpen ? controller.close() : controller.open();
+            },
+            child: Container(
+              height: _masterControlHeight,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                border: Border.all(color: Palette.line),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      widget.labelFor(widget.value),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Palette.text,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  const Icon(
+                    Icons.arrow_drop_down,
+                    size: 18,
+                    color: Palette.text,
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
       ),
     );
   }
