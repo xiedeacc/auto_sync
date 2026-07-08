@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run on the AWS host as root. Restores files from a git worktree into the
-# live AWS layout, then applies sysctl/acme/systemd state.
+# Run on the AWS host as root. Prepares rblog's backup worktree, then applies
+# sysctl/acme/systemd state.
 
 BLOG_DIR="${BLOG_DIR:-/usr/local/blog}"
 GIT_DIR="${GIT_DIR:-/usr/local/blog/.backup-worktree}"
+BACKUP_REPO_URL="${BACKUP_REPO_URL:-git@github.com:xiedeacc/blog_data.git}"
 ROOT_SNAPSHOT_DIR="${ROOT_SNAPSHOT_DIR:-}"
 RUN_USER="${RUN_USER:-ubuntu}"
 ACME_USER="${ACME_USER:-ubuntu}"
@@ -28,10 +29,12 @@ usage() {
 Usage: deploy_aws_from_git.sh [options]
 
 Options:
-  --git-dir DIR           Git worktree to restore from.
+  --git-dir DIR           rblog backup worktree directory.
                           Default: /usr/local/blog/.backup-worktree
   --blog-dir DIR          Destination rblog install dir.
                           Default: /usr/local/blog
+  --backup-repo-url URL   Backup repository URL.
+                          Default: git@github.com:xiedeacc/blog_data.git
   --root-snapshot-dir DIR Optional collected root snapshot. If it contains
                           etc/ or usr/local/*, those files are copied to the
                           matching absolute paths.
@@ -51,6 +54,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --blog-dir)
       BLOG_DIR="${2:?missing value for --blog-dir}"
+      shift 2
+      ;;
+    --backup-repo-url)
+      BACKUP_REPO_URL="${2:?missing value for --backup-repo-url}"
       shift 2
       ;;
     --root-snapshot-dir)
@@ -95,14 +102,6 @@ run() {
   "$@"
 }
 
-run_shell() {
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '+ bash -lc %q\n' "$1"
-    return 0
-  fi
-  bash -lc "$1"
-}
-
 require_root() {
   [[ "$DRY_RUN" -eq 1 ]] && return
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "run this script as root"
@@ -133,67 +132,31 @@ copy_dir_if_present() {
   run rsync -a --delete "$src/" "$dst/"
 }
 
-is_root_layout() {
-  [[ -d "$1/usr/local/blog" || -d "$1/etc" ]]
-}
-
-blog_source_dir() {
-  if [[ -d "$GIT_DIR/usr/local/blog" ]]; then
-    printf '%s/usr/local/blog\n' "$GIT_DIR"
-  else
-    printf '%s\n' "$GIT_DIR"
-  fi
-}
-
-reconstruct_split_files() {
-  local root="$1"
-  local marker
-  while IFS= read -r -d '' marker; do
-    local dir rel file base split_bytes
-    dir="$(dirname "$marker")"
-    rel="$(awk -F= '$1 == "original" {print $2; exit}' "$marker")"
-    split_bytes="$(awk -F= '$1 == "split_bytes" {print $2; exit}' "$marker")"
-    [[ -n "$rel" ]] || die "bad split marker: $marker"
-    file="$root/$rel"
-    base="$(basename "$file")"
-    log "reconstruct split file $rel (${split_bytes:-unknown} byte chunks)"
-    run_shell "cat $(printf '%q' "$dir/$base").[0-9]* > $(printf '%q' "$file")"
-    run_shell "rm -f $(printf '%q' "$dir/$base").[0-9]* $(printf '%q' "$marker")"
-  done < <(find "$root" -name '*.rblog-split' -print0)
-}
-
-restore_blog_dir() {
-  local src staging
-  src="$(blog_source_dir)"
-  [[ -d "$src" ]] || die "blog source not found: $src"
-
-  staging="$(mktemp -d)"
-  run rsync -a --exclude '/.git/' --exclude '/.git/**' "$src/" "$staging/"
-  reconstruct_split_files "$staging"
-
-  log "restore rblog files from $src to $BLOG_DIR"
+ensure_backup_worktree() {
+  log "ensure rblog backup worktree at $GIT_DIR"
   run mkdir -p "$BLOG_DIR"
-  run rsync -a --delete \
-    --exclude '/logs/' \
-    --exclude '/logs/**' \
-    --exclude '/.backup-worktree/' \
-    --exclude '/.backup-worktree/**' \
-    --exclude '/.git/' \
-    --exclude '/.git/**' \
-    "$staging/" "$BLOG_DIR/"
-  if id "$RUN_USER" >/dev/null 2>&1; then
-    run chown -R "$RUN_USER:$RUN_USER" "$BLOG_DIR"
+  if [[ -d "$GIT_DIR/.git" ]]; then
+    run git -C "$GIT_DIR" remote set-url origin "$BACKUP_REPO_URL"
+    if [[ "$PULL" -eq 1 ]]; then
+      log "git pull --ff-only in $GIT_DIR"
+      run git -C "$GIT_DIR" pull --ff-only
+    fi
+  elif [[ -e "$GIT_DIR" ]]; then
+    die "$GIT_DIR exists but is not a git worktree"
   else
-    log "user $RUN_USER does not exist; skipping chown"
+    run git clone "$BACKUP_REPO_URL" "$GIT_DIR"
   fi
-  rm -rf "$staging"
+
+  if id "$RUN_USER" >/dev/null 2>&1; then
+    run chown -R "$RUN_USER:$RUN_USER" "$GIT_DIR"
+  else
+    log "user $RUN_USER does not exist; skipping backup worktree chown"
+  fi
 }
 
 resolve_root_snapshot_dir() {
   if [[ -n "$ROOT_SNAPSHOT_DIR" ]]; then
     printf '%s\n' "$ROOT_SNAPSHOT_DIR"
-  elif is_root_layout "$GIT_DIR"; then
-    printf '%s\n' "$GIT_DIR"
   else
     printf '\n'
   fi
@@ -403,17 +366,11 @@ apply_acme() {
 
 main() {
   require_root
-  for cmd in git rsync systemctl sysctl sudo find awk grep; do
+  for cmd in git rsync systemctl sysctl sudo awk grep; do
     require_command "$cmd"
   done
 
-  [[ -d "$GIT_DIR" ]] || die "git dir not found: $GIT_DIR"
-  if [[ "$PULL" -eq 1 ]]; then
-    log "git pull --ff-only in $GIT_DIR"
-    run git -C "$GIT_DIR" pull --ff-only
-  fi
-
-  restore_blog_dir
+  ensure_backup_worktree
   restore_host_files_from_snapshot "$(resolve_root_snapshot_dir)"
   ensure_default_sysctl_file
   log "apply sysctl settings"
