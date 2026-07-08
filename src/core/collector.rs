@@ -11,7 +11,6 @@
 //! on a schedule.
 
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -164,7 +163,6 @@ fn ssh_command(conn: &SshConn) -> Command {
         cmd.arg("-i").arg(expand_tilde(conn.identity_file));
     }
     cmd.args(SSH_OPTS);
-    add_ssh_mux_options(&mut cmd, conn);
     cmd
 }
 
@@ -178,29 +176,7 @@ fn scp_command(conn: &SshConn) -> Command {
         cmd.arg("-i").arg(expand_tilde(conn.identity_file));
     }
     cmd.args(SSH_OPTS);
-    add_ssh_mux_options(&mut cmd, conn);
     cmd
-}
-
-fn add_ssh_mux_options(cmd: &mut Command, conn: &SshConn) {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    conn.hostname.hash(&mut hasher);
-    conn.user.hash(&mut hasher);
-    conn.port.hash(&mut hasher);
-    conn.identity_file.hash(&mut hasher);
-    let key = hasher.finish();
-    let control_path = std::env::temp_dir().join(format!(
-        "auto_sync_ssh_{}_{}_{}",
-        std::process::id(),
-        key,
-        "%C"
-    ));
-    cmd.arg("-o")
-        .arg("ControlMaster=auto")
-        .arg("-o")
-        .arg("ControlPersist=120")
-        .arg("-o")
-        .arg(format!("ControlPath={}", control_path.to_string_lossy()));
 }
 
 fn log(state: &Arc<Mutex<CollectorRunState>>, msg: impl Into<String>) {
@@ -350,15 +326,40 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     let excludes = normalize_excludes(&host.exclude);
     let mut failures = 0;
     let mut pulled = Vec::new();
-    for path in &host.paths {
-        let remote = path.trim_end_matches('/').trim();
-        if remote.is_empty() {
-            continue;
+    let targets: Vec<String> = host
+        .paths
+        .iter()
+        .map(|path| path.trim_end_matches('/').trim())
+        .filter(|remote| !remote.is_empty() && !is_excluded(remote, &excludes))
+        .map(str::to_string)
+        .collect();
+    if targets.is_empty() {
+        return 0;
+    }
+    set_current_file(
+        state,
+        Some(&format!("{} path(s) from {label}", targets.len())),
+    );
+    match pull_paths_tar(host, &conn, &targets, &excludes, state) {
+        Ok(()) => {
+            for remote in targets {
+                record_file_ok(state);
+                log(state, format!("  ok {remote}"));
+                pulled.push(remote);
+            }
+            if let Err(err) = record_host_perms(host, &conn, &pulled, &excludes, state) {
+                log(state, format!("  perms: could not record: {err:#}"));
+            }
+            return 0;
         }
-        if is_excluded(remote, &excludes) {
-            log(state, format!("  ignore {remote} (excluded)"));
-            continue;
+        Err(err) => {
+            log(
+                state,
+                format!("  tar batch failed: {err:#}; falling back to scp"),
+            );
         }
+    }
+    for remote in &targets {
         set_current_file(state, Some(remote));
         match pull_path(host, &conn, remote, &excludes, state) {
             Ok(()) => {
@@ -381,6 +382,87 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         }
     }
     failures
+}
+
+fn pull_paths_tar(
+    host: &CollectorHost,
+    conn: &SshConn,
+    paths: &[String],
+    excludes: &[String],
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<()> {
+    fs::create_dir_all(&host.root).with_context(|| format!("creating {}", host.root.display()))?;
+    let rel_paths: Vec<String> = paths
+        .iter()
+        .map(|path| remote_tar_path(path))
+        .collect::<Result<_>>()?;
+    for rel in &rel_paths {
+        clear_readonly_recursive(&host.root.join(local_rel_path(rel)));
+    }
+
+    let exclude_patterns = tar_exclude_patterns(excludes);
+    let mut remote_cmd = String::from("cd / && tar -cf - ");
+    if !exclude_patterns.is_empty() {
+        remote_cmd.push_str("-X - ");
+    }
+    for rel in &rel_paths {
+        remote_cmd.push_str(&shell_quote(rel));
+        remote_cmd.push(' ');
+    }
+    log(
+        state,
+        format!(
+            "  tar {} path(s) from {} -> {}",
+            rel_paths.len(),
+            conn.dest(),
+            host.root.display()
+        ),
+    );
+
+    let mut ssh = ssh_command(conn);
+    ssh.arg(conn.dest()).arg(remote_cmd);
+    ssh.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if exclude_patterns.is_empty() {
+        ssh.stdin(Stdio::null());
+    } else {
+        ssh.stdin(Stdio::piped());
+    }
+    let mut ssh_child = ssh.spawn().context("running ssh tar")?;
+    if !exclude_patterns.is_empty() {
+        if let Some(mut stdin) = ssh_child.stdin.take() {
+            stdin
+                .write_all(exclude_patterns.join("\n").as_bytes())
+                .context("writing tar exclude patterns")?;
+            stdin.write_all(b"\n").ok();
+        }
+    }
+    let ssh_stdout = ssh_child.stdout.take().context("opening ssh tar stdout")?;
+
+    let mut tar = command("tar");
+    tar.arg("-C")
+        .arg(&host.root)
+        .arg("-xf")
+        .arg("-")
+        .stdin(Stdio::from(ssh_stdout))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let tar_output = tar.output().context("extracting tar")?;
+    let ssh_output = ssh_child
+        .wait_with_output()
+        .context("waiting for ssh tar")?;
+    if !ssh_output.status.success() {
+        bail!(
+            "remote tar failed: {}",
+            String::from_utf8_lossy(&ssh_output.stderr).trim()
+        );
+    }
+    if !tar_output.status.success() {
+        bail!(
+            "local tar failed: {}",
+            String::from_utf8_lossy(&tar_output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Normalize exclude entries to absolute paths without a trailing slash.
@@ -1269,6 +1351,42 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn remote_tar_path(remote: &str) -> Result<String> {
+    let trimmed = remote.trim().trim_end_matches('/');
+    let parts: Vec<&str> = trimmed
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if parts.is_empty() {
+        bail!("refusing to archive the remote root '/'");
+    }
+    if parts.iter().any(|part| *part == "..") {
+        bail!("remote path must not contain '..'");
+    }
+    Ok(parts.join("/"))
+}
+
+fn local_rel_path(rel: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    for part in rel.split('/') {
+        if !part.is_empty() {
+            path.push(part);
+        }
+    }
+    path
+}
+
+fn tar_exclude_patterns(excludes: &[String]) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for exclude in excludes {
+        if let Ok(rel) = remote_tar_path(exclude) {
+            patterns.push(rel.clone());
+            patterns.push(format!("{rel}/*"));
+        }
+    }
+    patterns
+}
+
 fn join_remote(base: &str, name: &str) -> String {
     if base == "/" {
         format!("/{name}")
@@ -1352,6 +1470,94 @@ mod tests {
     fn remote_parent_components_rejects_escapes() {
         assert!(remote_parent_components("/").is_err());
         assert!(remote_parent_components("/a/../b").is_err());
+    }
+
+    #[test]
+    fn remote_tar_path_sanitizes_archive_entries() {
+        assert_eq!(
+            remote_tar_path("/etc/config/dhcp").unwrap(),
+            "etc/config/dhcp"
+        );
+        assert_eq!(remote_tar_path("/usr/local/bin/").unwrap(), "usr/local/bin");
+        assert!(remote_tar_path("/").is_err());
+        assert!(remote_tar_path("/a/../b").is_err());
+        assert_eq!(
+            local_rel_path("etc/config/dhcp"),
+            PathBuf::from("etc").join("config").join("dhcp")
+        );
+    }
+
+    #[test]
+    fn tar_exclude_patterns_cover_directory_contents() {
+        let patterns = tar_exclude_patterns(&[
+            "/usr/local/blog/logs/".to_string(),
+            "/root/.ssh".to_string(),
+        ]);
+        assert_eq!(
+            patterns,
+            vec![
+                "usr/local/blog/logs",
+                "usr/local/blog/logs/*",
+                "root/.ssh",
+                "root/.ssh/*",
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires AUTO_SYNC_SSH_MUX_TEST_DEST and local SSH credentials"]
+    fn openssh_controlmaster_probe() {
+        let dest = std::env::var("AUTO_SYNC_SSH_MUX_TEST_DEST")
+            .expect("set AUTO_SYNC_SSH_MUX_TEST_DEST, for example root@192.168.2.1");
+        let port = std::env::var("AUTO_SYNC_SSH_MUX_TEST_PORT").unwrap_or_else(|_| "22".into());
+        let key = std::env::var("AUTO_SYNC_SSH_MUX_TEST_KEY").ok();
+        let control =
+            std::env::temp_dir().join(format!("auto_sync_mux_probe_{}_%C", std::process::id()));
+
+        let mut plain = command("ssh");
+        plain
+            .arg("-p")
+            .arg(&port)
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=accept-new")
+            .arg("-o")
+            .arg("ConnectTimeout=15");
+        if let Some(ref key) = key {
+            plain.arg("-i").arg(key);
+        }
+        let plain_output = plain.arg(&dest).arg("true").output().unwrap();
+        assert!(
+            plain_output.status.success(),
+            "plain ssh failed: {}",
+            String::from_utf8_lossy(&plain_output.stderr)
+        );
+
+        let mut mux = command("ssh");
+        mux.arg("-p")
+            .arg(&port)
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=accept-new")
+            .arg("-o")
+            .arg("ConnectTimeout=15")
+            .arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg("ControlPersist=120")
+            .arg("-o")
+            .arg(format!("ControlPath={}", control.to_string_lossy()));
+        if let Some(ref key) = key {
+            mux.arg("-i").arg(key);
+        }
+        let mux_output = mux.arg(&dest).arg("true").output().unwrap();
+        assert!(
+            mux_output.status.success(),
+            "ControlMaster ssh failed: {}",
+            String::from_utf8_lossy(&mux_output.stderr)
+        );
     }
 
     #[test]
