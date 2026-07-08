@@ -168,6 +168,24 @@ apt-get remove -y apport || true
 apt-get autoremove -y || true
 
 cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+ensure_host_entry() {
+    addr="$1"
+    name="$2"
+    grep -Eq "^[[:space:]]*$addr[[:space:]].*([[:space:]]|^)$name([[:space:]]|$)" /etc/hosts 2>/dev/null \
+        || printf '%s %s\n' "$addr" "$name" >> /etc/hosts
+}
+for host_name in \
+    dev.xiedeacc.com \
+    code.xiedeacc.com \
+    unlock-music.xiedeacc.com \
+    coverage.xiedeacc.com \
+    immich.xiedeacc.com
+do
+    ensure_host_entry localhost "$host_name"
+    ensure_host_entry 127.0.0.1 "$host_name"
+done
+
 swapoff -a || true
 sed -i '/^\/swap\.img[[:space:]]/s/^/#/' /etc/fstab 2>/dev/null || true
 rm -f /swap.img
