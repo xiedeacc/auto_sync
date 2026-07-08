@@ -186,7 +186,8 @@ class AutoSyncApi {
       _request('POST', '/api/collector/config', body: cfg);
   Future<Map<String, dynamic>> collectorStatus() async =>
       _map(await _request('GET', '/api/collector/status'));
-  Future<void> collectorRun() async => _request('POST', '/api/collector/run');
+  Future<Map<String, dynamic>> collectorRun() async =>
+      _map(await _request('POST', '/api/collector/run'));
   Future<Map<String, dynamic>> collectorBrowse(
     Map<String, dynamic> req,
   ) async => _map(await _request('POST', '/api/collector/browse', body: req));
@@ -5241,6 +5242,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   bool autoPush = false;
   int? activeDeployIndex;
   Timer? saveTimer;
+  Timer? runTimer;
   Timer? deployTimer;
   final gitDir = TextEditingController();
   final splitMb = TextEditingController(text: '95');
@@ -5260,6 +5262,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     gitDir.removeListener(_scheduleSave);
     splitMb.removeListener(_scheduleSave);
     saveTimer?.cancel();
+    runTimer?.cancel();
     deployTimer?.cancel();
     if (cfg.isNotEmpty) {
       unawaited(_save());
@@ -5290,6 +5293,9 @@ class _CollectorDialogState extends State<_CollectorDialog> {
         });
         if (_bool(nextDeployStatus['running'])) {
           _startDeployPolling();
+        }
+        if (_bool(nextStatus['running'])) {
+          _startRunPolling();
         }
       }
     } catch (error) {
@@ -5329,17 +5335,45 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   Future<void> _run() async {
     setState(() {
       busy = true;
-      message = 'Running...';
+      message = '';
     });
     try {
       await _persistNow();
-      await widget.api.collectorRun();
-      await _load();
+      final next = await widget.api.collectorRun();
+      if (mounted) {
+        setState(() {
+          status = next;
+          message = '';
+        });
+      }
+      if (_bool(next['running'])) {
+        _startRunPolling();
+      }
     } catch (error) {
       setState(() => message = '$error');
     } finally {
       if (mounted) setState(() => busy = false);
     }
+  }
+
+  void _startRunPolling() {
+    runTimer?.cancel();
+    runTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      unawaited(_refreshRunStatus());
+    });
+    unawaited(_refreshRunStatus());
+  }
+
+  Future<void> _refreshRunStatus() async {
+    try {
+      final next = await widget.api.collectorStatus();
+      if (!mounted) return;
+      setState(() => status = next);
+      if (!_bool(next['running'])) {
+        runTimer?.cancel();
+        runTimer = null;
+      }
+    } catch (_) {}
   }
 
   void _addHost() {
@@ -5498,6 +5532,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   String _runState() {
     if (loading) return 'Loading...';
     if (message.isNotEmpty) return message;
+    if (_bool(status['running'])) return _collectorRunningText();
     if (_bool(deployStatus['running'])) {
       final index = activeDeployIndex;
       if (index != null && index >= 0 && index < hosts.length) {
@@ -5507,12 +5542,40 @@ class _CollectorDialogState extends State<_CollectorDialog> {
       }
       return 'Deploying...';
     }
-    if (_bool(status['running'])) return 'Running...';
-    if (status.containsKey('ok') && _bool(status['ok'])) return 'Done';
-    if (status.containsKey('ok') && !_bool(status['ok'], true)) {
-      return 'Finished with errors';
-    }
+    if (status['ok'] != null) return _collectorSummaryText();
     return '';
+  }
+
+  String _collectorRunningText() {
+    final current = _str(status['current_file']);
+    final total = _int(status['total_files']);
+    final done = _int(status['succeeded_files']) + _int(status['failed_files']);
+    final progress = total > 0 ? ' · $done/$total' : '';
+    if (current.isEmpty) return 'Copying...$progress';
+    return 'Copying $current$progress';
+  }
+
+  String _collectorSummaryText() {
+    final total = _int(status['total_files']);
+    final succeeded = _int(status['succeeded_files']);
+    final failed = _int(status['failed_files']);
+    final started = _str(status['started_at']);
+    final duration = _collectorDurationLabel(status['duration_ms']);
+    final parts = <String>['$total files', '$succeeded ok', '$failed failed'];
+    if (started.isNotEmpty) parts.add('started $started');
+    if (duration.isNotEmpty) parts.add(duration);
+    return parts.join(' · ');
+  }
+
+  String _collectorDurationLabel(dynamic value) {
+    if (value == null) return '';
+    final ms = value is num ? value.toDouble() : double.tryParse('$value');
+    if (ms == null) return '';
+    final seconds = ms / 1000;
+    if (seconds < 60) return 'duration ${seconds.round()}s';
+    final minutes = seconds ~/ 60;
+    if (minutes < 60) return 'duration ${minutes}m ${seconds.round() % 60}s';
+    return 'duration ${minutes ~/ 60}h ${minutes % 60}m';
   }
 
   @override
@@ -5667,7 +5730,10 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                       label: 'Run',
                       width: 72,
                       primary: true,
-                      onTap: busy || _bool(deployStatus['running'])
+                      onTap:
+                          busy ||
+                              _bool(status['running']) ||
+                              _bool(deployStatus['running'])
                           ? null
                           : _run,
                     ),

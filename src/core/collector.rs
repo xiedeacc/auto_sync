@@ -47,9 +47,15 @@ const SSH_OPTS: &[&str] = &[
 pub struct CollectorRunState {
     pub running: bool,
     pub started_at: Option<String>,
+    pub started_epoch_ms: Option<i64>,
     pub finished_at: Option<String>,
+    pub duration_ms: Option<u64>,
     /// None while running; Some(true/false) once finished.
     pub ok: Option<bool>,
+    pub current_file: Option<String>,
+    pub total_files: usize,
+    pub succeeded_files: usize,
+    pub failed_files: usize,
     pub log: Vec<String>,
 }
 
@@ -182,6 +188,43 @@ fn log(state: &Arc<Mutex<CollectorRunState>>, msg: impl Into<String>) {
     }
 }
 
+fn set_total_files(state: &Arc<Mutex<CollectorRunState>>, total: usize) {
+    if let Ok(mut guard) = state.lock() {
+        guard.total_files = total;
+    }
+}
+
+fn set_current_file(state: &Arc<Mutex<CollectorRunState>>, path: Option<&str>) {
+    if let Ok(mut guard) = state.lock() {
+        guard.current_file = path.map(str::to_string);
+    }
+}
+
+fn record_file_ok(state: &Arc<Mutex<CollectorRunState>>) {
+    if let Ok(mut guard) = state.lock() {
+        guard.succeeded_files = guard.succeeded_files.saturating_add(1);
+    }
+}
+
+fn record_file_failed(state: &Arc<Mutex<CollectorRunState>>, count: usize) {
+    if let Ok(mut guard) = state.lock() {
+        guard.failed_files = guard.failed_files.saturating_add(count);
+    }
+}
+
+fn finish_state(state: &Arc<Mutex<CollectorRunState>>, ok: bool) {
+    if let Ok(mut guard) = state.lock() {
+        let now = chrono::Local::now();
+        guard.running = false;
+        guard.ok = Some(ok);
+        guard.current_file = None;
+        guard.finished_at = Some(now.format("%Y-%m-%d %H:%M:%S").to_string());
+        guard.duration_ms = guard
+            .started_epoch_ms
+            .map(|started| now.timestamp_millis().saturating_sub(started).max(0) as u64);
+    }
+}
+
 /// Entry point for a background run. Drives the whole pipeline and records the
 /// final status into `state`. Never panics — every failure becomes a log line.
 pub fn run(cfg: CollectorConfig, state: Arc<Mutex<CollectorRunState>>) {
@@ -202,11 +245,7 @@ pub fn run(cfg: CollectorConfig, state: Arc<Mutex<CollectorRunState>>) {
             false
         }
     };
-    if let Ok(mut guard) = state.lock() {
-        guard.running = false;
-        guard.ok = Some(ok);
-        guard.finished_at = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-    }
+    finish_state(&state, ok);
 }
 
 /// Runs the pipeline, returning the number of remote paths that failed to
@@ -227,11 +266,14 @@ fn run_inner(cfg: &CollectorConfig, state: &Arc<Mutex<CollectorRunState>>) -> Re
     if enabled.is_empty() {
         bail!("no enabled hosts to pull from");
     }
+    let total_files = enabled.iter().map(|host| count_collect_paths(host)).sum();
+    set_total_files(state, total_files);
 
     let mut failures = 0;
     for host in enabled {
         failures += pull_host(host, state);
     }
+    set_current_file(state, None);
 
     if cfg.split_threshold_mb > 0 {
         split_large_files(&git_dir, cfg.split_threshold_mb, state)?;
@@ -249,6 +291,15 @@ fn run_inner(cfg: &CollectorConfig, state: &Arc<Mutex<CollectorRunState>>) -> Re
     Ok(failures)
 }
 
+fn count_collect_paths(host: &CollectorHost) -> usize {
+    let excludes = normalize_excludes(&host.exclude);
+    host.paths
+        .iter()
+        .map(|path| path.trim_end_matches('/').trim())
+        .filter(|path| !path.is_empty() && !is_excluded(path, &excludes))
+        .count()
+}
+
 /// Pull every configured path for one host, returning the failure count. Host
 /// setup problems degrade to logged failures rather than aborting the run.
 fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usize {
@@ -259,11 +310,15 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     };
     if host.hostname.trim().is_empty() {
         log(state, format!("host '{label}': no hostname, skipping"));
-        return host.paths.len();
+        let failed = count_collect_paths(host);
+        record_file_failed(state, failed);
+        return failed;
     }
     if host.root.as_os_str().is_empty() {
         log(state, format!("host '{label}': no local root, skipping"));
-        return host.paths.len();
+        let failed = count_collect_paths(host);
+        record_file_failed(state, failed);
+        return failed;
     }
     let conn = SshConn::from_host(host);
     log(state, format!("=== host {label} ({}) ===", conn.dest()));
@@ -280,13 +335,16 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
             log(state, format!("  ignore {remote} (excluded)"));
             continue;
         }
+        set_current_file(state, Some(remote));
         match pull_path(host, &conn, remote, &excludes, state) {
             Ok(()) => {
+                record_file_ok(state);
                 log(state, format!("  ok {remote}"));
                 pulled.push(remote.to_string());
             }
             Err(err) => {
                 failures += 1;
+                record_file_failed(state, 1);
                 log(state, format!("  FAILED {remote}: {err:#}"));
             }
         }
@@ -544,6 +602,7 @@ fn pull_dir_excluding(
             log(state, format!("  ignore {child} (excluded)"));
             continue;
         }
+        set_current_file(state, Some(&child));
         if has_exclude_under(&child, excludes) {
             pull_dir_excluding(conn, &child, &local_dir.join(&name), excludes, state)?;
         } else {
@@ -599,11 +658,7 @@ pub fn deploy(
             false
         }
     };
-    if let Ok(mut guard) = state.lock() {
-        guard.running = false;
-        guard.ok = Some(ok);
-        guard.finished_at = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-    }
+    finish_state(&state, ok);
 }
 
 fn deploy_inner(

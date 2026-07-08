@@ -215,9 +215,11 @@ impl Backend {
             if guard.running {
                 anyhow::bail!("a collector run is already in progress");
             }
+            let now = chrono::Local::now();
             *guard = CollectorRunState {
                 running: true,
-                started_at: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+                started_at: Some(now.format("%Y-%m-%d %H:%M:%S").to_string()),
+                started_epoch_ms: Some(now.timestamp_millis()),
                 ..Default::default()
             };
         }
@@ -252,9 +254,11 @@ impl Backend {
             if guard.running {
                 anyhow::bail!("a deploy is already in progress");
             }
+            let now = chrono::Local::now();
             *guard = CollectorRunState {
                 running: true,
-                started_at: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+                started_at: Some(now.format("%Y-%m-%d %H:%M:%S").to_string()),
+                started_epoch_ms: Some(now.timestamp_millis()),
                 ..Default::default()
             };
         }
