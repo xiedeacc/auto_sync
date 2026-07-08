@@ -56,12 +56,16 @@ ensure_linux_build_environment() {
     git
     libssl-dev
     pkg-config
+    unzip
+    xz-utils
   )
 
   command -v cc >/dev/null 2>&1 || need_apt=1
   command -v curl >/dev/null 2>&1 || need_apt=1
   command -v git >/dev/null 2>&1 || need_apt=1
   command -v pkg-config >/dev/null 2>&1 || need_apt=1
+  command -v unzip >/dev/null 2>&1 || need_apt=1
+  command -v xz >/dev/null 2>&1 || need_apt=1
   pkg-config --exists openssl >/dev/null 2>&1 || need_apt=1
 
   if [[ "$need_apt" -eq 1 ]]; then
@@ -98,6 +102,40 @@ ensure_linux_build_environment() {
   fi
 }
 
+ensure_flutter_web_environment() {
+  if command -v flutter >/dev/null 2>&1; then
+    return
+  fi
+
+  local flutter_root="${FLUTTER_ROOT:-$HOME/flutter}"
+  if [[ ! -x "$flutter_root/bin/flutter" ]]; then
+    echo "Installing Flutter stable to $flutter_root ..."
+    mkdir -p "$(dirname "$flutter_root")"
+    git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$flutter_root"
+  fi
+  export PATH="$flutter_root/bin:$PATH"
+  if ! command -v flutter >/dev/null 2>&1; then
+    echo "flutter is unavailable after setup." >&2
+    exit 1
+  fi
+}
+
+build_flutter_web() {
+  ensure_flutter_web_environment
+  local flutter_project="$ROOT_DIR/flutter/auto_sync_gui"
+  if [[ ! -f "$flutter_project/pubspec.yaml" ]]; then
+    echo "Missing Flutter project: $flutter_project" >&2
+    exit 1
+  fi
+  export PUB_HOSTED_URL="${PUB_HOSTED_URL:-https://pub.flutter-io.cn}"
+  export FLUTTER_STORAGE_BASE_URL="${FLUTTER_STORAGE_BASE_URL:-https://storage.flutter-io.cn}"
+  (
+    cd "$flutter_project"
+    flutter pub get
+    flutter build web --release --base-href /
+  )
+}
+
 install_if_different() {
   local mode="$1"
   local src="$2"
@@ -110,6 +148,7 @@ install_if_different() {
 }
 
 ensure_linux_build_environment
+build_flutter_web
 
 # One unified backend binary. The desktop GUI is the separate Flutter
 # auto_sync_gui app on Windows; Linux/NAS deploys only the backend and web UI.
@@ -123,7 +162,8 @@ install -m 0755 target/release/auto_syncctl bin/auto_syncctl
   "$INSTALL_DIR/bin" \
   "$INSTALL_DIR/conf" \
   "$INSTALL_DIR/conf/state" \
-  "$INSTALL_DIR/logs"
+  "$INSTALL_DIR/logs" \
+  "$INSTALL_DIR/web"
 
 # Retire the old split layout (separate daemon + web service/binaries).
 "${SUDO[@]}" systemctl disable --now auto_sync_web.service 2>/dev/null || true
@@ -135,6 +175,9 @@ install -m 0755 target/release/auto_syncctl bin/auto_syncctl
 
 install_if_different 0755 bin/auto_sync "$INSTALL_DIR/bin/auto_sync"
 install_if_different 0755 bin/auto_syncctl "$INSTALL_DIR/bin/auto_syncctl"
+"${SUDO[@]}" rm -rf "$INSTALL_DIR/web"
+"${SUDO[@]}" install -d -m 0755 "$INSTALL_DIR/web"
+"${SUDO[@]}" cp -a "$ROOT_DIR/flutter/auto_sync_gui/build/web/." "$INSTALL_DIR/web/"
 
 if "${SUDO[@]}" test -f "$INSTALL_DIR/conf/auto_sync.toml"; then
   echo "Preserved existing local config $INSTALL_DIR/conf/auto_sync.toml"

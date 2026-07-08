@@ -213,6 +213,7 @@ function Copy-FlutterGuiBinaries {
         try {
             & $flutterExe pub get
             & $flutterExe build windows --release
+            & $flutterExe build web --release --base-href /
         }
         finally {
             Pop-Location
@@ -225,6 +226,16 @@ function Copy-FlutterGuiBinaries {
         throw "Missing Flutter GUI artifact: $guiExe"
     }
     Copy-Item -Path (Join-Path $releaseDir "*") -Destination $BinDir -Recurse -Force
+
+    $webReleaseDir = Join-Path $flutterProject "build\web"
+    $installDir = Split-Path -Parent $BinDir
+    $webDir = Join-Path $installDir "web"
+    if (-not (Test-Path -LiteralPath (Join-Path $webReleaseDir "index.html"))) {
+        throw "Missing Flutter Web artifact: $webReleaseDir"
+    }
+    Remove-DirectoryUnder -Path $webDir -Parent $installDir
+    New-Item -ItemType Directory -Force -Path $webDir | Out-Null
+    Copy-Item -Path (Join-Path $webReleaseDir "*") -Destination $webDir -Recurse -Force
 }
 
 function Stop-AutoSyncProcesses {

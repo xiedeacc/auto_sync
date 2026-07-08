@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 use axum::body::Bytes;
@@ -7,7 +7,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::extract::Path as AxumPath;
 use axum::extract::Query;
 use axum::extract::State as AxumState;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Request, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -17,7 +17,8 @@ use tracing::info;
 
 use crate::core::backend::{
     Backend, BrowseResponse, CancelActivityRequest, CancelOutcome, CollectorConfigFile,
-    DelegatedSourceGroupsRequest, RuntimeStatus, SyncActivityStatus,
+    DelegatedSourceGroupsRequest, LocalFilePreview, LocalFileTextRequest, RuntimeStatus,
+    SyncActivityStatus,
 };
 use crate::core::collector::{CollectorBrowseResponse, CollectorRunState};
 use crate::core::config::{AppConfig, CollectorConfig, MachineConfig};
@@ -67,6 +68,7 @@ async fn require_peer_token(req: Request<axum::body::Body>, next: Next) -> Respo
 pub fn router(backend: Backend) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/legacy", get(legacy_index))
         .route("/main.js", get(main_js))
         .route("/styles.css", get(styles_css))
         .route("/api/config", get(api_get_config).post(api_save_config))
@@ -158,6 +160,8 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/transfer/push-file", post(api_transfer_push_file))
         .route("/api/browse-dirs", get(api_browse_paths))
         .route("/api/browse-paths", get(api_browse_paths))
+        .route("/api/local-file/preview", get(api_local_file_preview))
+        .route("/api/local-file/text", post(api_local_file_text))
         .route("/api/collector/run", post(api_collector_run))
         .route("/api/collector/status", get(api_collector_status))
         .route("/api/collector/browse", post(api_collector_browse))
@@ -176,6 +180,7 @@ pub fn router(backend: Backend) -> Router {
         // are 16MiB transfer chunks and (worst case) a whole-file delta.
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .with_state(backend)
+        .fallback(get(web_asset))
 }
 
 /// How often the LAN-address watcher re-detects the preferred local IP.
@@ -248,11 +253,124 @@ pub async fn serve(backend: Backend, port: u16) -> Result<()> {
 const NO_STORE: &str = "no-store";
 
 async fn index() -> Response {
+    if let Some(response) = flutter_web_response("index.html") {
+        return response;
+    }
+    legacy_index().await
+}
+
+async fn legacy_index() -> Response {
     (
         [(header::CACHE_CONTROL, NO_STORE)],
         Html(include_str!("../ui/index.html")),
     )
         .into_response()
+}
+
+async fn web_asset(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    if path.starts_with("api/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Some(response) = flutter_web_response(path) {
+        return response;
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+fn flutter_web_response(request_path: &str) -> Option<Response> {
+    let root = flutter_web_root()?;
+    let rel = safe_web_asset_path(request_path)?;
+    let path = root.join(&rel);
+    let (bytes, content_path) = match std::fs::read(&path) {
+        Ok(bytes) => (bytes, path),
+        Err(_) if rel.extension().is_none() => {
+            let index = root.join("index.html");
+            (std::fs::read(&index).ok()?, index)
+        }
+        Err(_) => return None,
+    };
+    Some(
+        (
+            [
+                (header::CONTENT_TYPE, content_type_for_path(&content_path)),
+                (header::CACHE_CONTROL, NO_STORE),
+            ],
+            bytes,
+        )
+            .into_response(),
+    )
+}
+
+fn flutter_web_root() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("AUTO_SYNC_WEB_DIR") {
+        let path = PathBuf::from(path);
+        if path.join("index.html").is_file() {
+            return Some(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            if let Some(install_dir) = bin_dir.parent() {
+                let path = install_dir.join("web");
+                if path.join("index.html").is_file() {
+                    return Some(path);
+                }
+            }
+            let path = bin_dir.join("web");
+            if path.join("index.html").is_file() {
+                return Some(path);
+            }
+        }
+    }
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("flutter")
+        .join("auto_sync_gui")
+        .join("build")
+        .join("web");
+    if dev.join("index.html").is_file() {
+        return Some(dev);
+    }
+    None
+}
+
+fn safe_web_asset_path(request_path: &str) -> Option<PathBuf> {
+    let request_path = if request_path.is_empty() {
+        "index.html"
+    } else {
+        request_path
+    };
+    let mut rel = PathBuf::new();
+    for component in Path::new(request_path).components() {
+        match component {
+            Component::Normal(part) => rel.push(part),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        rel.push("index.html");
+    }
+    Some(rel)
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "application/javascript",
+        "css" => "text/css",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "wasm" => "application/wasm",
+        "ico" => "image/x-icon",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn main_js() -> Response {
@@ -726,6 +844,29 @@ async fn api_browse_paths(
     Query(query): Query<BrowseQuery>,
 ) -> Result<Json<BrowseResponse>, ApiError> {
     blocking(move || Ok(Json(backend.browse_paths(query.path, query.machine_id)?))).await
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalFilePreviewQuery {
+    path: PathBuf,
+}
+
+async fn api_local_file_preview(
+    AxumState(backend): AxumState<Backend>,
+    Query(query): Query<LocalFilePreviewQuery>,
+) -> Result<Json<LocalFilePreview>, ApiError> {
+    blocking(move || Ok(Json(backend.local_file_preview(query.path)?))).await
+}
+
+async fn api_local_file_text(
+    AxumState(backend): AxumState<Backend>,
+    Json(req): Json<LocalFileTextRequest>,
+) -> Result<StatusCode, ApiError> {
+    blocking(move || {
+        backend.save_local_file_text(&req)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
 }
 
 async fn api_collector_run(

@@ -906,6 +906,21 @@ impl Backend {
         browse_paths_inner(path.unwrap_or_else(|| PathBuf::from("/")))
     }
 
+    pub fn local_file_preview(&self, path: PathBuf) -> Result<LocalFilePreview> {
+        local_file_preview_inner(path)
+    }
+
+    pub fn save_local_file_text(&self, req: &LocalFileTextRequest) -> Result<()> {
+        let path = req.path.clone();
+        let metadata =
+            std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
+        if !metadata.is_file() {
+            anyhow::bail!("not a file: {}", path.display());
+        }
+        std::fs::write(&path, &req.text).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
     fn spawn_machine_discovery_worker(&self) {
         let backend = self.clone();
         let result = thread::Builder::new()
@@ -1913,6 +1928,22 @@ pub struct BrowseResponse {
     pub entries: Vec<BrowseEntry>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LocalFilePreview {
+    pub path: String,
+    pub kind: String,
+    pub size: u64,
+    pub previewable: bool,
+    pub text: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalFileTextRequest {
+    pub path: PathBuf,
+    pub text: String,
+}
+
 /// Path and raw text of the collector config file (for the UI's Config view).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CollectorConfigFile {
@@ -2016,6 +2047,51 @@ fn browse_paths_inner(requested: PathBuf) -> Result<BrowseResponse> {
         parent,
         entries,
     })
+}
+
+const LOCAL_FILE_PREVIEW_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+fn local_file_preview_inner(path: PathBuf) -> Result<LocalFilePreview> {
+    let metadata =
+        std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
+    let kind = if metadata.is_dir() {
+        "dir"
+    } else if metadata.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    let mut preview = LocalFilePreview {
+        path: path.to_string_lossy().to_string(),
+        kind: kind.to_string(),
+        size: metadata.len(),
+        previewable: false,
+        text: None,
+        reason: None,
+    };
+    if kind != "file" {
+        preview.reason = Some("not_file".to_string());
+        return Ok(preview);
+    }
+    if metadata.len() > LOCAL_FILE_PREVIEW_MAX_BYTES {
+        preview.reason = Some("too_large".to_string());
+        return Ok(preview);
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    if bytes.contains(&0) {
+        preview.reason = Some("binary".to_string());
+        return Ok(preview);
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => {
+            preview.previewable = true;
+            preview.text = Some(text);
+        }
+        Err(_) => {
+            preview.reason = Some("non_utf8".to_string());
+        }
+    }
+    Ok(preview)
 }
 
 fn normalize_browse_dir(path: &Path) -> Result<PathBuf> {

@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+
+import 'platform_support.dart';
 
 void main(List<String> args) {
   runApp(AutoSyncNativeApp(api: AutoSyncApi.fromArgs(args)));
@@ -37,18 +38,9 @@ class AutoSyncApi {
     var port = valueOf('--port');
     final configPath = valueOf('--config');
     if ((port == null || port.isEmpty) && configPath != null) {
-      try {
-        final text = File(configPath).readAsStringSync();
-        final match = RegExp(
-          r'^\s*port\s*=\s*([0-9]+)\s*(#.*)?$',
-          multiLine: true,
-        ).firstMatch(text);
-        port = match?.group(1);
-      } catch (_) {
-        port = null;
-      }
+      port = readPortFromConfig(configPath);
     }
-    return AutoSyncApi('http://127.0.0.1:${port ?? "18765"}');
+    return AutoSyncApi(_trimSlash(defaultApiBaseUrl(port)));
   }
 
   static String _trimSlash(String value) =>
@@ -196,6 +188,14 @@ class AutoSyncApi {
   );
   Future<Map<String, dynamic>> collectorDeployStatus() async =>
       _map(await _request('GET', '/api/collector/deploy-status'));
+  Future<Map<String, dynamic>> localFilePreview(String path) async => _map(
+    await _request('GET', '/api/local-file/preview', query: {'path': path}),
+  );
+  Future<void> saveLocalFileText(String path, String text) async => _request(
+    'POST',
+    '/api/local-file/text',
+    body: {'path': path, 'text': text},
+  );
 }
 
 Map<String, dynamic> _map(dynamic value) =>
@@ -268,7 +268,7 @@ class AutoSyncNativeApp extends StatelessWidget {
           surface: Palette.panel,
         ),
         scaffoldBackgroundColor: Palette.bg,
-        fontFamily: Platform.isWindows ? 'Segoe UI' : null,
+        fontFamily: hostPlatformIsWindows ? 'Segoe UI' : null,
         textTheme: const TextTheme(
           bodyMedium: TextStyle(fontSize: 13, color: Palette.text),
           bodySmall: TextStyle(fontSize: 12, color: Palette.muted),
@@ -558,7 +558,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
         return _str(machine['os']).toLowerCase() == 'windows' ? r'C:\' : '/';
       }
     }
-    return machineId == 'local' && Platform.isWindows ? r'C:\' : '/';
+    return machineId == 'local' && hostPlatformIsWindows ? r'C:\' : '/';
   }
 
   String _nextSourceId() {
@@ -4137,7 +4137,9 @@ class _PathPickerDialogState extends State<_PathPickerDialog> {
                     machineId = value;
                     selectedPath = '';
                   });
-                  _load(value == 'local' && Platform.isWindows ? r'C:\' : '/');
+                  _load(
+                    value == 'local' && hostPlatformIsWindows ? r'C:\' : '/',
+                  );
                 },
               ),
               const SizedBox(width: 8),
@@ -5561,7 +5563,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
         machineIds: const ['local'],
         machineLabel: (id) => id,
         initialMachineId: 'local',
-        initialPath: _str(host['root'], Platform.isWindows ? r'C:\' : '/'),
+        initialPath: _str(host['root'], hostPlatformIsWindows ? r'C:\' : '/'),
         showAddDirectory: false,
         initialAddDirectory: false,
       ),
@@ -5580,7 +5582,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
         machineLabel: (id) => id,
         initialMachineId: 'local',
         initialPath: gitDir.text.trim().isEmpty
-            ? (Platform.isWindows ? r'C:\' : '/')
+            ? (hostPlatformIsWindows ? r'C:\' : '/')
             : gitDir.text.trim(),
         showAddDirectory: false,
         initialAddDirectory: false,
@@ -6496,18 +6498,16 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
   Future<void> _previewPath(String remotePath) async {
     final filePath = _collectorLocalPath(widget.host, remotePath);
     if (filePath.isEmpty) return;
-    final file = File(filePath);
     try {
-      final stat = await file.stat();
-      if (stat.type != FileSystemEntityType.file) return;
-      if (stat.size > 2 * 1024 * 1024) return;
-      final bytes = await file.readAsBytes();
-      if (bytes.contains(0)) return;
-      final text = utf8.decode(bytes);
+      final preview = await widget.api.localFilePreview(filePath);
+      if (_str(preview['kind']) != 'file') return;
+      if (!_bool(preview['previewable'])) return;
+      final text = _str(preview['text']);
       if (!mounted) return;
       await showDialog<void>(
         context: context,
         builder: (context) => _CollectorFilePreviewDialog(
+          api: widget.api,
           filePath: filePath,
           remotePath: remotePath,
           initialText: text,
@@ -6583,12 +6583,7 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
 IconData _collectorPathIcon(Map<String, dynamic> host, String remotePath) {
   final localPath = _collectorLocalPath(host, remotePath);
   if (localPath.isEmpty) return Icons.description_outlined;
-  try {
-    final type = FileSystemEntity.typeSync(localPath);
-    if (type == FileSystemEntityType.directory) {
-      return Icons.folder_outlined;
-    }
-  } catch (_) {}
+  if (localPathIsDirectory(localPath)) return Icons.folder_outlined;
   return Icons.description_outlined;
 }
 
@@ -6605,18 +6600,20 @@ String _collectorLocalPath(Map<String, dynamic> host, String remotePath) {
   var path = root;
   for (final part in parts) {
     final needsSeparator = !path.endsWith('\\') && !path.endsWith('/');
-    path = '$path${needsSeparator ? Platform.pathSeparator : ''}$part';
+    path = '$path${needsSeparator ? hostPathSeparator : ''}$part';
   }
   return path;
 }
 
 class _CollectorFilePreviewDialog extends StatefulWidget {
   const _CollectorFilePreviewDialog({
+    required this.api,
     required this.filePath,
     required this.remotePath,
     required this.initialText,
   });
 
+  final AutoSyncApi api;
   final String filePath;
   final String remotePath;
   final String initialText;
@@ -6652,9 +6649,7 @@ class _CollectorFilePreviewDialogState
       message = '';
     });
     try {
-      await File(
-        widget.filePath,
-      ).writeAsString(controller.text, encoding: utf8);
+      await widget.api.saveLocalFileText(widget.filePath, controller.text);
       if (!mounted) return;
       setState(() {
         editing = false;
