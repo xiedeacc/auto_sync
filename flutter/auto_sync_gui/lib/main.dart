@@ -212,6 +212,24 @@ List<dynamic> _list(dynamic value) => value is List ? value : <dynamic>[];
 String _str(dynamic value, [String fallback = '']) =>
     value == null ? fallback : '$value';
 
+List<String> _cleanStringList(Iterable<dynamic> values) {
+  final seen = <String>{};
+  final cleaned = <String>[];
+  for (final value in values) {
+    final text = _str(value).trim();
+    if (text.isNotEmpty && seen.add(text)) {
+      cleaned.add(text);
+    }
+  }
+  cleaned.sort();
+  return cleaned;
+}
+
+String _excludeButtonLabel(dynamic excludes) {
+  final count = _cleanStringList(_list(excludes)).length;
+  return count == 0 ? 'Excluded' : 'Excluded ($count)';
+}
+
 bool _bool(dynamic value, [bool fallback = false]) =>
     value is bool ? value : fallback;
 
@@ -474,6 +492,18 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
         setState(() => saving = false);
       }
     }
+  }
+
+  Future<void> _saveSourceExcludes(String sourceId, List<String> excludes) {
+    setState(() {
+      for (final source in _mapRefs(cfg['source_groups'])) {
+        if (_str(source['id']) == sourceId) {
+          source['excludes'] = _cleanStringList(excludes);
+          break;
+        }
+      }
+    });
+    return _saveConfig('Excludes saved');
   }
 
   List<Map<String, dynamic>> get sources =>
@@ -928,6 +958,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
                     onDestinationSyncSettings: _openDestinationSyncSettings,
                     onDestinationSchedule: _openDestinationSchedule,
                     onPickExcludePath: _pickExcludePath,
+                    onExcludesChanged: _saveSourceExcludes,
                     onRemoveSource: _removeSource,
                     onSyncAll: () => _run('Sync all', widget.api.syncAll),
                     onSyncSource: (id) => _run(
@@ -1128,6 +1159,7 @@ class _MasterSourcePanel extends StatelessWidget {
     required this.onDestinationSyncSettings,
     required this.onDestinationSchedule,
     required this.onPickExcludePath,
+    required this.onExcludesChanged,
     required this.onRemoveSource,
     required this.onSyncAll,
     required this.onSyncSource,
@@ -1164,6 +1196,8 @@ class _MasterSourcePanel extends StatelessWidget {
   final Future<void> Function(Map<String, dynamic> destination)
   onDestinationSchedule;
   final Future<String?> Function(Map<String, dynamic> source) onPickExcludePath;
+  final Future<void> Function(String sourceId, List<String> excludes)
+  onExcludesChanged;
   final void Function(String sourceId) onRemoveSource;
   final VoidCallback onSyncAll;
   final void Function(String id) onSyncSource;
@@ -1268,6 +1302,7 @@ class _MasterSourcePanel extends StatelessWidget {
                                       onDestinationSyncSettings,
                                   onDestinationSchedule: onDestinationSchedule,
                                   onPickExcludePath: onPickExcludePath,
+                                  onExcludesChanged: onExcludesChanged,
                                   onRemoveSource: onRemoveSource,
                                   onSyncSource: onSyncSource,
                                   onSyncDestination: onSyncDestination,
@@ -1306,6 +1341,7 @@ class _MasterSourceGroup extends StatelessWidget {
     required this.onDestinationSyncSettings,
     required this.onDestinationSchedule,
     required this.onPickExcludePath,
+    required this.onExcludesChanged,
     required this.onRemoveSource,
     required this.onSyncSource,
     required this.onSyncDestination,
@@ -1338,6 +1374,8 @@ class _MasterSourceGroup extends StatelessWidget {
   final Future<void> Function(Map<String, dynamic> destination)
   onDestinationSchedule;
   final Future<String?> Function(Map<String, dynamic> source) onPickExcludePath;
+  final Future<void> Function(String sourceId, List<String> excludes)
+  onExcludesChanged;
   final void Function(String sourceId) onRemoveSource;
   final void Function(String id) onSyncSource;
   final void Function(String sourceId, String destinationId, String mode)
@@ -1416,7 +1454,7 @@ class _MasterSourceGroup extends StatelessWidget {
                   ),
                   const SizedBox(width: 8),
                   MasterButton(
-                    label: 'Excluded ${_list(source['excludes']).length}',
+                    label: _excludeButtonLabel(source['excludes']),
                     width: 112,
                     onTap: () => _showExcludes(context),
                   ),
@@ -1472,7 +1510,7 @@ class _MasterSourceGroup extends StatelessWidget {
   }
 
   Future<void> _showExcludes(BuildContext context) async {
-    final result = await showDialog<List<String>>(
+    await showDialog<void>(
       context: context,
       builder: (context) => _ExcludedDialog(
         sourceId: _str(source['id'], 'source'),
@@ -1482,12 +1520,9 @@ class _MasterSourceGroup extends StatelessWidget {
         ),
         initialItems: _list(source['excludes']).map((item) => '$item').toList(),
         onAddPath: () => onPickExcludePath(source),
+        onChanged: (items) => onExcludesChanged(_str(source['id']), items),
       ),
     );
-    if (result != null) {
-      source['excludes'] = result;
-      onChanged('Excludes saved');
-    }
   }
 }
 
@@ -1753,12 +1788,14 @@ class _ExcludedDialog extends StatefulWidget {
     required this.sourceId,
     required this.sourcePath,
     required this.initialItems,
+    required this.onChanged,
     this.onAddPath,
   });
 
   final String sourceId;
   final String sourcePath;
   final List<String> initialItems;
+  final Future<void> Function(List<String> items) onChanged;
   final Future<String?> Function()? onAddPath;
 
   @override
@@ -1766,49 +1803,42 @@ class _ExcludedDialog extends StatefulWidget {
 }
 
 class _ExcludedDialogState extends State<_ExcludedDialog> {
-  late final List<TextEditingController> controllers;
+  late List<String> items;
+  bool saving = false;
 
   @override
   void initState() {
     super.initState();
-    controllers = widget.initialItems
-        .map((item) => TextEditingController(text: item))
-        .toList();
+    items = _cleanStringList(widget.initialItems);
   }
 
-  @override
-  void dispose() {
-    for (final controller in controllers) {
-      controller.dispose();
-    }
-    super.dispose();
-  }
-
-  List<String> _cleanItems() {
-    final seen = <String>{};
-    final next = <String>[];
-    for (final controller in controllers) {
-      final value = controller.text.trim();
-      if (value.isNotEmpty && seen.add(value)) {
-        next.add(value);
+  Future<void> _persist(List<String> next) async {
+    final cleaned = _cleanStringList(next);
+    setState(() {
+      items = cleaned;
+      saving = true;
+    });
+    try {
+      await widget.onChanged(cleaned);
+    } finally {
+      if (mounted) {
+        setState(() => saving = false);
       }
     }
-    next.sort();
-    return next;
   }
 
   Future<void> _add() async {
+    if (saving) return;
     final picked = await widget.onAddPath?.call();
     if (picked == null && widget.onAddPath != null) {
       return;
     }
-    setState(() => controllers.add(TextEditingController(text: picked ?? '')));
+    await _persist([...items, picked ?? '']);
   }
 
-  void _remove(int index) {
-    final controller = controllers.removeAt(index);
-    controller.dispose();
-    setState(() {});
+  Future<void> _remove(String path) async {
+    if (saving) return;
+    await _persist(items.where((item) => item != path).toList());
   }
 
   @override
@@ -1827,48 +1857,47 @@ class _ExcludedDialogState extends State<_ExcludedDialog> {
               decoration: const BoxDecoration(
                 border: Border(top: BorderSide(color: Palette.line)),
               ),
-              child: controllers.isEmpty
-                  ? const SizedBox.shrink()
+              child: items.isEmpty
+                  ? const EmptyLine('No excluded paths')
                   : ListView.builder(
-                      itemCount: controllers.length,
-                      itemBuilder: (context, index) => Container(
-                        constraints: const BoxConstraints(minHeight: 42),
-                        decoration: const BoxDecoration(
-                          border: Border(
-                            bottom: BorderSide(color: Palette.line),
+                      itemCount: items.length,
+                      itemBuilder: (context, index) {
+                        final path = items[index];
+                        return Container(
+                          constraints: const BoxConstraints(minHeight: 42),
+                          decoration: const BoxDecoration(
+                            border: Border(
+                              bottom: BorderSide(color: Palette.line),
+                            ),
                           ),
-                        ),
-                        padding: const EdgeInsets.symmetric(vertical: 4),
-                        child: Row(
-                          children: [
-                            Expanded(
-                              child: TextField(
-                                controller: controllers[index],
-                                maxLines: 1,
-                                style: const TextStyle(
-                                  fontFamily: 'Consolas',
-                                  fontSize: 12,
-                                  color: Palette.text,
-                                ),
-                                decoration: const InputDecoration(
-                                  hintText: 'relative/path',
-                                  border: InputBorder.none,
-                                  contentPadding: EdgeInsets.symmetric(
-                                    horizontal: 2,
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  path,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontFamily: 'Consolas',
+                                    fontSize: 12,
+                                    color: Palette.text,
                                   ),
                                 ),
                               ),
-                            ),
-                            const SizedBox(width: _masterControlGap),
-                            MasterButton(
-                              label: 'x',
-                              square: true,
-                              danger: true,
-                              onTap: () => _remove(index),
-                            ),
-                          ],
-                        ),
-                      ),
+                              const SizedBox(width: _masterControlGap),
+                              MasterButton(
+                                label: 'x',
+                                square: true,
+                                danger: true,
+                                onTap: saving
+                                    ? null
+                                    : () => unawaited(_remove(path)),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
                     ),
             ),
           ),
@@ -1880,13 +1909,7 @@ class _ExcludedDialogState extends State<_ExcludedDialog> {
                 label: 'Add',
                 width: 72,
                 primary: true,
-                onTap: () => unawaited(_add()),
-              ),
-              const SizedBox(width: 8),
-              MasterButton(
-                label: 'Save',
-                width: 72,
-                onTap: () => Navigator.pop(context, _cleanItems()),
+                onTap: saving ? null : () => unawaited(_add()),
               ),
             ],
           ),
@@ -2743,7 +2766,7 @@ class _SourceCard extends StatelessWidget {
               ),
               MiniButton(
                 icon: Icons.block_outlined,
-                label: 'Excluded ${_list(source['excludes']).length}',
+                label: _excludeButtonLabel(source['excludes']),
                 onTap: () => _showExcludes(context, source, onChanged),
               ),
             ],
@@ -2781,7 +2804,7 @@ class _SourceCard extends StatelessWidget {
     Map<String, dynamic> source,
     Future<void> Function([String label]) onChanged,
   ) async {
-    final result = await showDialog<List<String>>(
+    await showDialog<void>(
       context: context,
       builder: (context) => _ExcludedDialog(
         sourceId: _str(source['id'], 'source'),
@@ -2790,12 +2813,12 @@ class _SourceCard extends StatelessWidget {
           _str(source['src'], '-'),
         ),
         initialItems: _list(source['excludes']).map((item) => '$item').toList(),
+        onChanged: (items) async {
+          source['excludes'] = items;
+          await onChanged('Excludes saved');
+        },
       ),
     );
-    if (result != null) {
-      source['excludes'] = result;
-      await onChanged('Excludes saved');
-    }
   }
 }
 
@@ -4509,13 +4532,18 @@ class _CompactInput extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final expanded = height > _masterControlHeight;
     return SizedBox(
       height: height,
       child: TextFormField(
         controller: controller,
         initialValue: controller == null ? initialValue : null,
         keyboardType: numeric ? TextInputType.number : TextInputType.text,
+        expands: expanded,
+        minLines: expanded ? null : 1,
+        maxLines: expanded ? null : 1,
         onChanged: onChanged,
+        textAlignVertical: TextAlignVertical.center,
         style: const TextStyle(fontSize: 12),
         decoration: _compactInputDecoration(
           hintText: placeholder,
@@ -4531,11 +4559,15 @@ InputDecoration _compactInputDecoration({
   String? labelText,
   double height = _masterControlHeight,
 }) {
+  final expanded = height > _masterControlHeight;
   return InputDecoration(
     hintText: hintText,
     labelText: labelText,
-    isDense: true,
-    contentPadding: const EdgeInsets.symmetric(horizontal: 9, vertical: 0),
+    isDense: !expanded,
+    contentPadding: EdgeInsets.symmetric(
+      horizontal: 9,
+      vertical: expanded ? 12 : 0,
+    ),
     constraints: BoxConstraints.tightFor(height: height),
   );
 }
@@ -4559,7 +4591,8 @@ class _CompactSelect extends StatelessWidget {
       height: height,
       child: DropdownButtonFormField<String>(
         initialValue: value,
-        isDense: true,
+        isDense: height <= _masterControlHeight,
+        alignment: Alignment.centerLeft,
         decoration: _compactInputDecoration(height: height),
         style: const TextStyle(
           fontSize: 13,
