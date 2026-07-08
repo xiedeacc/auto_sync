@@ -387,6 +387,8 @@ apply_acme() {
 
   log "enable acme.sh auto-upgrade"
   sudo_as_acme_user "$acme_sh" --upgrade --auto-upgrade
+  log "install acme.sh renewal cronjob"
+  sudo_as_acme_user "$acme_sh" --install-cronjob
   ensure_acme_domain xiedeacc.com "*.xiedeacc.com"
   ensure_acme_domain youkechat.net "*.youkechat.net"
 
