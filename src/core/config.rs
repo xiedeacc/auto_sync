@@ -198,17 +198,16 @@ impl Default for WakeSchedule {
 
 /// File-collector configuration. Pulls files/directories from SSH hosts (via
 /// the system `ssh`/`scp`) into a single local git repository, preserving each
-/// remote path under a per-host local root, splitting oversized files so they
-/// fit git hosting limits, and committing/pushing the result.
+/// remote path under a per-host local root, tracking oversized files with Git
+/// LFS, and committing/pushing the result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CollectorConfig {
     /// Local git repository the pulled files are committed into. `git init` is
     /// run automatically if it is not yet a repo.
     pub git_dir: PathBuf,
-    /// Files at least this many MiB are split into `<name>.autosplit.NNN`
-    /// parts; the original is added to `.gitignore` and the parts committed.
-    /// Kept under GitHub's 100 MiB hard limit by default. 0 disables splitting.
+    /// Files larger than this many MiB are tracked with Git LFS. 0 disables the
+    /// large-file pass.
     pub split_threshold_mb: u64,
     /// Run `git add -A && git commit && git push` after a successful pull.
     pub auto_commit_push: bool,
@@ -219,7 +218,7 @@ impl Default for CollectorConfig {
     fn default() -> Self {
         Self {
             git_dir: PathBuf::new(),
-            split_threshold_mb: 95,
+            split_threshold_mb: 100,
             auto_commit_push: true,
             hosts: Vec::new(),
         }

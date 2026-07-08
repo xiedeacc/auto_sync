@@ -1,6 +1,6 @@
 //! File collector: pull files/directories from arbitrary SSH hosts into a
-//! single local git repository, split oversized files so they fit git-hosting
-//! limits, then commit and push.
+//! single local git repository, track oversized files with Git LFS, then commit
+//! and push.
 //!
 //! Everything shells out to the system `ssh`/`scp`/`git` — there is no SSH
 //! client crate — so it works with the built-in OpenSSH on Windows and the
@@ -10,8 +10,8 @@
 //! The whole feature is UI-driven (the "Collector" button): nothing here runs
 //! on a schedule.
 
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -22,8 +22,8 @@ use walkdir::WalkDir;
 
 use crate::core::config::{CollectorConfig, CollectorHost};
 
-/// Marker inserted between a split file's name and its part index, e.g.
-/// `big.bin.autosplit.000`. Files carrying it are skipped by later splits.
+/// Legacy marker inserted between a split file's name and its part index, e.g.
+/// `big.bin.autosplit.000`. New runs use Git LFS, but old parts are cleaned up.
 const AUTOSPLIT_MARKER: &str = ".autosplit.";
 
 /// Per-host permission cache written under the host's local root at collect
@@ -303,7 +303,7 @@ fn run_inner(cfg: &CollectorConfig, state: &Arc<Mutex<CollectorRunState>>) -> Re
     set_current_file(state, None);
 
     if cfg.split_threshold_mb > 0 {
-        split_large_files(&git_dir, cfg.split_threshold_mb, state)?;
+        track_large_files_with_lfs(&git_dir, cfg.split_threshold_mb, state)?;
     }
 
     if cfg.auto_commit_push {
@@ -377,7 +377,7 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     let mut failures = 0;
     let mut pulled = Vec::new();
     let excludes = normalize_excludes(&host.exclude);
-    let targets = collect_targets(host);
+    let mut targets = collect_targets(host);
     if targets.is_empty() {
         return 0;
     }
@@ -390,6 +390,26 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         let failed = targets.len();
         record_file_failed(state, failed);
         return failed;
+    }
+    match prepare_database_dumps(host, &conn, &label, state) {
+        Ok(dump_paths) => {
+            for dump_path in dump_paths {
+                if !is_excluded(&dump_path, &excludes) && !targets.iter().any(|p| p == &dump_path) {
+                    log(state, format!("  dump ready {dump_path}"));
+                    targets.push(dump_path);
+                }
+            }
+        }
+        Err(err) => {
+            log(state, format!("  database dump skipped/failed: {err:#}"));
+            record_run_issue(
+                state,
+                "dump_failed",
+                &label,
+                "/root/auto_sync_db_dumps",
+                format!("{err:#}"),
+            );
+        }
     }
     set_current_file(
         state,
@@ -464,6 +484,107 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         }
     }
     failures
+}
+
+fn prepare_database_dumps(
+    host: &CollectorHost,
+    conn: &SshConn,
+    label: &str,
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<Vec<String>> {
+    let host_name = host.name.trim().to_ascii_lowercase();
+    if host_name == "aws" || host_name == "openwrt" {
+        return Ok(Vec::new());
+    }
+
+    let os_release = ssh_capture(
+        conn,
+        "if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\\n%s\\n' \"${ID:-}\" \"${ID_LIKE:-}\"; fi",
+    )
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    if !os_release.lines().any(|line| line.trim() == "ubuntu") {
+        return Ok(Vec::new());
+    }
+
+    log(state, "  database dumps: preparing MySQL/PostgreSQL dumps");
+    let script = r#"
+set -o pipefail
+dump_dir=/tmp/auto_sync_db_dumps
+if [ "$(id -u)" = "0" ]; then
+    dump_dir=/root/auto_sync_db_dumps
+fi
+mkdir -p "$dump_dir"
+chmod 700 "$dump_dir" 2>/dev/null || true
+
+if ! command -v gzip >/dev/null 2>&1; then
+    echo "DUMP_FAIL common gzip not found"
+    exit 0
+fi
+
+if command -v mysqldump >/dev/null 2>&1; then
+    tmp="$dump_dir/mysql-all.sql.gz.tmp"
+    out="$dump_dir/mysql-all.sql.gz"
+    err="$dump_dir/mysql-all.err"
+    rm -f "$tmp"
+    if mysqldump --all-databases --single-transaction --routines --events --triggers --hex-blob --default-character-set=utf8mb4 2>"$err" | gzip -c > "$tmp"; then
+        mv -f "$tmp" "$out"
+        chmod 600 "$out" 2>/dev/null || true
+        echo "DUMP_PATH $out"
+    else
+        rm -f "$tmp"
+        echo "DUMP_FAIL mysql $(head -n 1 "$err" 2>/dev/null)"
+    fi
+else
+    echo "DUMP_SKIP mysql mysqldump not found"
+fi
+
+if command -v pg_dumpall >/dev/null 2>&1; then
+    tmp="$dump_dir/postgres-all.sql.gz.tmp"
+    out="$dump_dir/postgres-all.sql.gz"
+    err="$dump_dir/postgres-all.err"
+    rm -f "$tmp"
+    if command -v sudo >/dev/null 2>&1; then
+        pg_cmd='sudo -n -u postgres pg_dumpall'
+    elif command -v runuser >/dev/null 2>&1; then
+        pg_cmd='runuser -u postgres -- pg_dumpall'
+    else
+        pg_cmd='pg_dumpall'
+    fi
+    if eval "$pg_cmd" 2>"$err" | gzip -c > "$tmp"; then
+        mv -f "$tmp" "$out"
+        chmod 600 "$out" 2>/dev/null || true
+        echo "DUMP_PATH $out"
+    else
+        rm -f "$tmp"
+        echo "DUMP_FAIL postgres $(head -n 1 "$err" 2>/dev/null)"
+    fi
+else
+    echo "DUMP_SKIP postgres pg_dumpall not found"
+fi
+"#;
+    let remote_cmd = format!("bash -lc {}", shell_quote(script));
+    let out = ssh_capture(conn, &remote_cmd)?;
+    let mut dump_paths = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        log(state, format!("  dump | {line}"));
+        if let Some(path) = line.strip_prefix("DUMP_PATH ") {
+            dump_paths.push(path.trim().to_string());
+        } else if let Some(reason) = line.strip_prefix("DUMP_FAIL ") {
+            record_run_issue(
+                state,
+                "dump_failed",
+                label,
+                "/root/auto_sync_db_dumps",
+                reason.trim().to_string(),
+            );
+        }
+    }
+    Ok(dump_paths)
 }
 
 enum RemotePathKind {
@@ -1186,9 +1307,9 @@ fn prepare_ss_client_conf(
     }
 }
 
-/// Split every file at or above `threshold_mb` MiB under `git_dir` into
-/// `<name>.autosplit.NNN` parts, git-ignore the original, and keep the parts.
-fn split_large_files(
+/// Track every file at or above `threshold_mb` MiB under `git_dir` with Git LFS.
+/// Also removes stale legacy `.autosplit.*` parts from older collector runs.
+fn track_large_files_with_lfs(
     git_dir: &Path,
     threshold_mb: u64,
     state: &Arc<Mutex<CollectorRunState>>,
@@ -1197,7 +1318,11 @@ fn split_large_files(
     if threshold == 0 {
         return Ok(());
     }
+    run_git(git_dir, &["lfs", "install", "--local"], state)
+        .context("initializing git lfs for collector repository")?;
+
     let mut ignore = GitignoreEditor::load(git_dir)?;
+    let mut large_files = Vec::new();
     for entry in WalkDir::new(git_dir)
         .into_iter()
         .filter_entry(|e| e.file_name() != ".git")
@@ -1215,62 +1340,41 @@ fn split_large_files(
             .map(|n| n.to_string_lossy())
             .unwrap_or_default();
         if name.contains(AUTOSPLIT_MARKER) {
-            continue; // already a part
+            let _ = fs::remove_file(path);
+            log(
+                state,
+                format!("  removed legacy split part {}", path.display()),
+            );
+            continue;
         }
         let len = match entry.metadata() {
             Ok(meta) => meta.len(),
             Err(_) => continue,
         };
-        if len < threshold {
+        if len <= threshold {
             continue;
         }
-        let parts = split_file(path, threshold)?;
         if let Ok(rel) = path.strip_prefix(git_dir) {
-            ignore.add(rel);
+            remove_existing_parts(path)?;
+            ignore.remove(rel);
+            let rel_text = rel.to_string_lossy().replace('\\', "/");
+            run_git(git_dir, &["lfs", "track", "--", &rel_text], state)
+                .with_context(|| format!("git lfs track {rel_text}"))?;
+            large_files.push(rel_text.clone());
+            log(
+                state,
+                format!("  lfs track {rel_text} ({} MiB)", len / 1024 / 1024),
+            );
         }
-        log(
-            state,
-            format!(
-                "  split {} ({} MiB) into {} part(s)",
-                name,
-                len / 1024 / 1024,
-                parts
-            ),
-        );
     }
     ignore.save()?;
-    Ok(())
-}
-
-/// Split one file into fixed-size parts, returning the part count. Any stale
-/// parts from a previous run are removed first so the set stays consistent.
-fn split_file(path: &Path, part_size: u64) -> Result<usize> {
-    remove_existing_parts(path)?;
-    let mut input = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let total = input.metadata()?.len();
-    let part_count = total.div_ceil(part_size).max(1) as usize;
-    let width = format!("{}", part_count.saturating_sub(1)).len().max(3);
-
-    let mut buf = vec![0u8; 8 * 1024 * 1024];
-    for index in 0..part_count {
-        let mut part_name = path.as_os_str().to_owned();
-        part_name.push(format!("{AUTOSPLIT_MARKER}{index:0width$}"));
-        let part_path = PathBuf::from(part_name);
-        let mut out = File::create(&part_path)
-            .with_context(|| format!("creating {}", part_path.display()))?;
-        let mut written = 0u64;
-        while written < part_size {
-            let want = std::cmp::min(buf.len() as u64, part_size - written) as usize;
-            let read = input.read(&mut buf[..want])?;
-            if read == 0 {
-                break;
-            }
-            out.write_all(&buf[..read])?;
-            written += read as u64;
+    if !large_files.is_empty() {
+        for rel in &large_files {
+            run_git(git_dir, &["add", "--renormalize", "--", rel], state)
+                .with_context(|| format!("git add --renormalize {rel}"))?;
         }
-        out.flush()?;
     }
-    Ok(part_count)
+    Ok(())
 }
 
 /// Remove any `<name>.autosplit.*` siblings of `path` (stale parts).
@@ -1550,12 +1654,12 @@ impl GitignoreEditor {
         })
     }
 
-    /// Add a repo-relative path (anchored, forward-slashed) if not already present.
-    fn add(&mut self, rel: &Path) {
+    fn remove(&mut self, rel: &Path) {
         let mut entry = String::from("/");
         entry.push_str(&rel.to_string_lossy().replace('\\', "/"));
-        if !self.lines.iter().any(|l| l.trim() == entry) {
-            self.lines.push(entry);
+        let before = self.lines.len();
+        self.lines.retain(|line| line.trim() != entry);
+        if self.lines.len() != before {
             self.dirty = true;
         }
     }
@@ -1757,38 +1861,35 @@ mod tests {
     }
 
     #[test]
-    fn split_and_parts_roundtrip() {
+    fn legacy_split_parts_are_removed() {
         let dir = std::env::temp_dir().join(format!("collector_split_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let file = dir.join("blob.bin");
-        let data: Vec<u8> = (0..1000u32).map(|i| (i % 256) as u8).collect();
-        fs::write(&file, &data).unwrap();
-        // part size 256 => 4 parts (256*3 + 232)
-        let parts = split_file(&file, 256).unwrap();
-        assert_eq!(parts, 4);
-        let mut rejoined = Vec::new();
-        for i in 0..parts {
-            let part = dir.join(format!("blob.bin.autosplit.{i:03}"));
-            rejoined.extend(fs::read(&part).unwrap());
-        }
-        assert_eq!(rejoined, data);
-        // Re-splitting removes stale parts (fewer parts with a bigger size).
-        let parts2 = split_file(&file, 600).unwrap();
-        assert_eq!(parts2, 2);
-        assert!(!dir.join("blob.bin.autosplit.003").exists());
+        fs::write(&file, b"data").unwrap();
+        fs::write(dir.join("blob.bin.autosplit.000"), b"part0").unwrap();
+        fs::write(dir.join("blob.bin.autosplit.001"), b"part1").unwrap();
+        remove_existing_parts(&file).unwrap();
+        assert!(!dir.join("blob.bin.autosplit.000").exists());
+        assert!(!dir.join("blob.bin.autosplit.001").exists());
+        assert!(file.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn gitignore_editor_anchors_and_dedups() {
+    fn gitignore_editor_removes_anchored_path() {
         let dir = std::env::temp_dir().join(format!("collector_ignore_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
+        fs::write(
+            dir.join(".gitignore"),
+            "/aws/usr/local/big.bin\n/other/path\n",
+        )
+        .unwrap();
         let mut editor = GitignoreEditor::load(&dir).unwrap();
-        editor.add(Path::new("aws/usr/local/big.bin"));
-        editor.add(Path::new("aws/usr/local/big.bin")); // duplicate
+        editor.remove(Path::new("aws/usr/local/big.bin"));
         editor.save().unwrap();
         let body = fs::read_to_string(dir.join(".gitignore")).unwrap();
-        assert_eq!(body.matches("/aws/usr/local/big.bin").count(), 1);
+        assert_eq!(body.matches("/aws/usr/local/big.bin").count(), 0);
+        assert!(body.contains("/other/path"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
