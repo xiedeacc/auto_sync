@@ -5246,11 +5246,13 @@ class _CollectorDialog extends StatefulWidget {
 class _CollectorDialogState extends State<_CollectorDialog> {
   Map<String, dynamic> cfg = {};
   Map<String, dynamic> status = {};
+  Map<String, dynamic> deployStatus = {};
   String message = '';
   bool loading = true;
   bool busy = false;
   bool autoPush = false;
   Timer? saveTimer;
+  Timer? deployTimer;
   final gitDir = TextEditingController();
   final splitMb = TextEditingController(text: '95');
 
@@ -5269,6 +5271,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     gitDir.removeListener(_scheduleSave);
     splitMb.removeListener(_scheduleSave);
     saveTimer?.cancel();
+    deployTimer?.cancel();
     if (cfg.isNotEmpty) {
       unawaited(_save());
     }
@@ -5281,6 +5284,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     try {
       final nextCfg = await widget.api.collectorConfig();
       final nextStatus = await widget.api.collectorStatus();
+      final nextDeployStatus = await widget.api.collectorDeployStatus();
       if (mounted) {
         setState(() {
           cfg = Map<String, dynamic>.from(nextCfg);
@@ -5288,12 +5292,16 @@ class _CollectorDialogState extends State<_CollectorDialog> {
             nextCfg['hosts'],
           ).map((host) => Map<String, dynamic>.from(host)).toList();
           status = nextStatus;
+          deployStatus = nextDeployStatus;
           gitDir.text = _str(cfg['git_dir']);
           splitMb.text = _str(cfg['split_threshold_mb'], '95');
           autoPush = _bool(cfg['auto_commit_push']);
           loading = false;
           message = '';
         });
+        if (_bool(nextDeployStatus['running'])) {
+          _startDeployPolling();
+        }
       }
     } catch (error) {
       if (mounted) {
@@ -5405,11 +5413,20 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     setState(() {
       busy = true;
       message = 'Deploying...';
+      deployStatus = {'running': true, 'log': <String>[]};
     });
     try {
       await _persistNow();
       final next = await widget.api.collectorDeploy(index);
-      if (mounted) setState(() => status = next);
+      if (mounted) {
+        setState(() {
+          deployStatus = next;
+          message = '';
+        });
+      }
+      if (_bool(next['running'])) {
+        _startDeployPolling();
+      }
     } catch (error) {
       if (mounted) setState(() => message = '$error');
     } finally {
@@ -5417,19 +5434,33 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     }
   }
 
+  void _startDeployPolling() {
+    deployTimer?.cancel();
+    deployTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      unawaited(_refreshDeployStatus());
+    });
+    unawaited(_refreshDeployStatus());
+  }
+
+  Future<void> _refreshDeployStatus() async {
+    try {
+      final next = await widget.api.collectorDeployStatus();
+      if (!mounted) return;
+      setState(() => deployStatus = next);
+      if (!_bool(next['running'])) {
+        deployTimer?.cancel();
+        deployTimer = null;
+      }
+    } catch (_) {}
+  }
+
   Future<void> _showLog() async {
-    final log = _list(status['log']).map((line) => '$line').join('\n');
     await showDialog<void>(
       context: context,
-      builder: (context) => _MasterDialogFrame(
-        title: 'Collector Log',
-        width: 900,
-        maxHeight: 720,
-        child: _MasterPre(
-          text: log.isEmpty ? _runState().trim() : log,
-          minHeight: 320,
-          maxHeight: 640,
-        ),
+      builder: (context) => _CollectorLogDialog(
+        api: widget.api,
+        initialRunStatus: status,
+        initialDeployStatus: deployStatus,
       ),
     );
   }
@@ -5454,6 +5485,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   String _runState() {
     if (loading) return 'Loading...';
     if (message.isNotEmpty) return message;
+    if (_bool(deployStatus['running'])) return 'Deploying...';
     if (_bool(status['running'])) return 'Running...';
     if (status.containsKey('ok') && _bool(status['ok'])) return 'Done';
     if (status.containsKey('ok') && !_bool(status['ok'], true)) {
@@ -5598,7 +5630,9 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                                 ),
                               );
                             },
-                            onDeployRun: () => _runDeploy(entry.key),
+                            onDeployRun: _bool(deployStatus['running'])
+                                ? null
+                                : () => _runDeploy(entry.key),
                           ),
                         ),
                     ],
@@ -5611,7 +5645,9 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                       label: 'Run',
                       width: 72,
                       primary: true,
-                      onTap: busy ? null : _run,
+                      onTap: busy || _bool(deployStatus['running'])
+                          ? null
+                          : _run,
                     ),
                     const SizedBox(width: 10),
                     Expanded(child: _IssueSummary(_runState())),
@@ -5624,6 +5660,93 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                 ),
               ],
             ),
+    );
+  }
+}
+
+class _CollectorLogDialog extends StatefulWidget {
+  const _CollectorLogDialog({
+    required this.api,
+    required this.initialRunStatus,
+    required this.initialDeployStatus,
+  });
+
+  final AutoSyncApi api;
+  final Map<String, dynamic> initialRunStatus;
+  final Map<String, dynamic> initialDeployStatus;
+
+  @override
+  State<_CollectorLogDialog> createState() => _CollectorLogDialogState();
+}
+
+class _CollectorLogDialogState extends State<_CollectorLogDialog> {
+  late Map<String, dynamic> runStatus;
+  late Map<String, dynamic> deployStatus;
+  Timer? timer;
+
+  @override
+  void initState() {
+    super.initState();
+    runStatus = Map<String, dynamic>.from(widget.initialRunStatus);
+    deployStatus = Map<String, dynamic>.from(widget.initialDeployStatus);
+    timer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => unawaited(_refresh()),
+    );
+    unawaited(_refresh());
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _refresh() async {
+    try {
+      final nextRun = await widget.api.collectorStatus();
+      final nextDeploy = await widget.api.collectorDeployStatus();
+      if (!mounted) return;
+      setState(() {
+        runStatus = nextRun;
+        deployStatus = nextDeploy;
+      });
+    } catch (_) {}
+  }
+
+  String _stateText(Map<String, dynamic> state, String runningText) {
+    if (_bool(state['running'])) return runningText;
+    if (state.containsKey('ok') && _bool(state['ok'])) return 'Done';
+    if (state.containsKey('ok') && !_bool(state['ok'], true)) {
+      return 'Finished with errors';
+    }
+    return '';
+  }
+
+  String _logText() {
+    final deployLog = _list(
+      deployStatus['log'],
+    ).map((line) => '$line').toList();
+    if (deployLog.isNotEmpty || _bool(deployStatus['running'])) {
+      return deployLog.isEmpty ? 'Deploying...' : deployLog.join('\n');
+    }
+    final runLog = _list(runStatus['log']).map((line) => '$line').toList();
+    if (runLog.isNotEmpty || _bool(runStatus['running'])) {
+      return runLog.isEmpty ? 'Running...' : runLog.join('\n');
+    }
+    final deployState = _stateText(deployStatus, 'Deploying...');
+    if (deployState.isNotEmpty) return deployState;
+    final runState = _stateText(runStatus, 'Running...');
+    return runState.isEmpty ? 'No log yet.' : runState;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _MasterDialogFrame(
+      title: 'Collector Log',
+      width: 900,
+      maxHeight: 720,
+      child: _MasterPre(text: _logText(), minHeight: 320, maxHeight: 640),
     );
   }
 }
@@ -5672,7 +5795,7 @@ class _CollectorHostRow extends StatelessWidget {
   final VoidCallback onBrowseRoot;
   final VoidCallback onPaths;
   final VoidCallback onDeploy;
-  final VoidCallback onDeployRun;
+  final VoidCallback? onDeployRun;
 
   @override
   Widget build(BuildContext context) {
@@ -5720,7 +5843,7 @@ class _CollectorHostRow extends StatelessWidget {
           child: _MasterReadOnlyInput(value: _str(host['root'])),
         ),
         MasterButton(label: '$pathCount', onTap: onPaths),
-        MasterButton(label: 'Exclude $excludeCount', onTap: onPaths),
+        MasterButton(label: '$excludeCount', onTap: onPaths),
         _CollectorTinyButton(label: '📝', onTap: onDeploy),
         _CollectorTinyButton(
           label: '▶',
@@ -5763,7 +5886,10 @@ class _CollectorTinyButton extends StatelessWidget {
           minimumSize: const Size(0, _masterControlHeight),
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           visualDensity: VisualDensity.compact,
+          backgroundColor: Colors.white,
+          disabledBackgroundColor: const Color(0xffe2e8f0),
           foregroundColor: color ?? (accent ? Palette.accent : Palette.text),
+          disabledForegroundColor: const Color(0xff64748b),
           side: const BorderSide(color: Palette.line),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
           textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
