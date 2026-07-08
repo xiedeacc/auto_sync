@@ -268,7 +268,12 @@ class AutoSyncNativeApp extends StatelessWidget {
           surface: Palette.panel,
         ),
         scaffoldBackgroundColor: Palette.bg,
-        fontFamily: hostPlatformIsWindows ? 'Segoe UI' : null,
+        fontFamily: 'Segoe UI',
+        fontFamilyFallback: const [
+          'Microsoft YaHei UI',
+          'Microsoft YaHei',
+          'Arial',
+        ],
         textTheme: const TextTheme(
           bodyMedium: TextStyle(fontSize: 13, color: Palette.text),
           bodySmall: TextStyle(fontSize: 12, color: Palette.muted),
