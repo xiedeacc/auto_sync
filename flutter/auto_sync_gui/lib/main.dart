@@ -6083,12 +6083,16 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
             ],
           ),
           const SizedBox(height: 8),
-          _IssueSummary(
-            showingExclude
-                ? 'Ignore (skip these and everything under them)'
-                : 'Collect these paths',
+          Align(
+            alignment: Alignment.centerRight,
+            child: MasterButton(
+              label: 'Browse',
+              width: 72,
+              onTap: () =>
+                  unawaited(_browse(showingExclude ? 'exclude' : 'paths')),
+            ),
           ),
-          const SizedBox(height: 6),
+          const SizedBox(height: 8),
           Expanded(
             child: ListView(
               children: [
@@ -6099,16 +6103,6 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
                   ),
                 ),
               ],
-            ),
-          ),
-          const SizedBox(height: 8),
-          Align(
-            alignment: Alignment.centerRight,
-            child: MasterButton(
-              label: 'Browse',
-              width: 72,
-              onTap: () =>
-                  unawaited(_browse(showingExclude ? 'exclude' : 'paths')),
             ),
           ),
         ],
@@ -6282,7 +6276,7 @@ class _PathListEditor extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (items.isEmpty) {
-      return const EmptyLine('(empty)');
+      return const SizedBox.shrink();
     }
     return Column(
       children: items.asMap().entries.map((entry) {
