@@ -6489,21 +6489,23 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
 
   Future<void> _browse(String key) async {
     final current = key == 'exclude' ? exclude : paths;
-    final selected = await showDialog<String>(
+    final selected = current
+        .map((path) => path.trim())
+        .where((path) => path.isNotEmpty)
+        .toSet();
+    await showDialog<void>(
       context: context,
       builder: (context) => _CollectorRemotePathDialog(
         api: widget.api,
         host: widget.host,
         title: key == 'exclude' ? 'Ignore' : 'Collect',
         initialPath: current.isNotEmpty ? current.last : '/',
+        selectedPaths: selected,
+        onSelectionChanged: (items) {
+          setState(() => _setList(key, _sortRemotePaths(items)));
+        },
       ),
     );
-    if (selected == null || selected.trim().isEmpty) return;
-    final next = [...current];
-    if (!next.contains(selected)) {
-      next.add(selected);
-    }
-    setState(() => _setList(key, next));
   }
 
   Future<void> _previewPath(String remotePath) async {
@@ -6752,12 +6754,16 @@ class _CollectorRemotePathDialog extends StatefulWidget {
     required this.host,
     required this.title,
     required this.initialPath,
+    required this.selectedPaths,
+    required this.onSelectionChanged,
   });
 
   final AutoSyncApi api;
   final Map<String, dynamic> host;
   final String title;
   final String initialPath;
+  final Set<String> selectedPaths;
+  final ValueChanged<List<String>> onSelectionChanged;
 
   @override
   State<_CollectorRemotePathDialog> createState() =>
@@ -6771,6 +6777,8 @@ class _CollectorRemotePathDialogState
   String error = '';
   bool loading = true;
   List<Map<String, dynamic>> entries = [];
+  late final Set<String> selected = {...widget.selectedPaths};
+  final pageCache = <String, Map<String, dynamic>>{};
 
   @override
   void initState() {
@@ -6788,6 +6796,17 @@ class _CollectorRemotePathDialogState
   };
 
   Future<void> _load(String nextPath) async {
+    final cached = pageCache[nextPath];
+    if (cached != null) {
+      setState(() {
+        path = _str(cached['path'], nextPath);
+        parent = cached['parent'] == null ? null : _str(cached['parent']);
+        entries = _mapRefs(cached['entries']);
+        loading = false;
+        error = '';
+      });
+      return;
+    }
     setState(() {
       loading = true;
       error = '';
@@ -6795,6 +6814,8 @@ class _CollectorRemotePathDialogState
     try {
       final response = await widget.api.collectorBrowse(_request(nextPath));
       if (!mounted) return;
+      pageCache[nextPath] = response;
+      pageCache[_str(response['path'], nextPath)] = response;
       setState(() {
         path = _str(response['path'], nextPath);
         parent = response['parent'] == null ? null : _str(response['parent']);
@@ -6808,6 +6829,17 @@ class _CollectorRemotePathDialogState
         loading = false;
       });
     }
+  }
+
+  void _togglePath(String itemPath, bool value) {
+    setState(() {
+      if (value) {
+        selected.add(itemPath);
+      } else {
+        selected.remove(itemPath);
+      }
+    });
+    widget.onSelectionChanged(_sortRemotePaths(selected));
   }
 
   @override
@@ -6833,11 +6865,9 @@ class _CollectorRemotePathDialogState
                 onTap: parent == null ? null : () => _load(parent!),
               ),
               const SizedBox(width: 8),
-              MasterButton(
-                label: 'Choose',
-                width: 82,
-                primary: true,
-                onTap: () => Navigator.pop(context, path),
+              Text(
+                '${selected.length} selected',
+                style: const TextStyle(color: Palette.muted, fontSize: 12),
               ),
             ],
           ),
@@ -6860,29 +6890,76 @@ class _CollectorRemotePathDialogState
                       itemBuilder: (context, index) {
                         final entry = entries[index];
                         final isDir = _bool(entry['is_dir']);
-                        return InkWell(
-                          onTap: () => isDir
-                              ? _load(_str(entry['path']))
-                              : Navigator.pop(context, _str(entry['path'])),
-                          onDoubleTap: () =>
-                              Navigator.pop(context, _str(entry['path'])),
-                          child: Container(
-                            height: 34,
-                            alignment: Alignment.centerLeft,
-                            padding: const EdgeInsets.symmetric(horizontal: 2),
-                            decoration: const BoxDecoration(
-                              border: Border(
-                                bottom: BorderSide(color: Palette.line),
-                              ),
-                            ),
-                            child: _FileListEntryLabel(
-                              name: _str(entry['name']),
-                              isDir: isDir,
-                            ),
-                          ),
+                        final itemPath = _str(entry['path']);
+                        return _CollectorRemoteEntryRow(
+                          name: _str(entry['name']),
+                          isDir: isDir,
+                          selected: selected.contains(itemPath),
+                          onSelected: (value) => _togglePath(itemPath, value),
+                          onOpen: isDir ? () => _load(itemPath) : null,
                         );
                       },
                     ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+List<String> _sortRemotePaths(Iterable<String> items) {
+  final paths = items
+      .map((path) => path.trim())
+      .where((path) => path.isNotEmpty)
+      .toSet()
+      .toList();
+  paths.sort();
+  return paths;
+}
+
+class _CollectorRemoteEntryRow extends StatelessWidget {
+  const _CollectorRemoteEntryRow({
+    required this.name,
+    required this.isDir,
+    required this.selected,
+    required this.onSelected,
+    required this.onOpen,
+  });
+
+  final String name;
+  final bool isDir;
+  final bool selected;
+  final ValueChanged<bool> onSelected;
+  final VoidCallback? onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 34,
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: Palette.line)),
+      ),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 30,
+            child: Checkbox(
+              value: selected,
+              onChanged: (value) => onSelected(value ?? false),
+              visualDensity: VisualDensity.compact,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+          Expanded(
+            child: InkWell(
+              onTap: onOpen,
+              child: Container(
+                height: 34,
+                alignment: Alignment.centerLeft,
+                padding: const EdgeInsets.symmetric(horizontal: 2),
+                child: _FileListEntryLabel(name: name, isDir: isDir),
+              ),
             ),
           ),
         ],
