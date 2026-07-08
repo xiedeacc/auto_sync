@@ -1283,20 +1283,7 @@ class _MasterSourcePanel extends StatelessWidget {
                     Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: sources.isEmpty
-                          ? const [
-                              SizedBox(
-                                height: 58,
-                                child: Center(
-                                  child: Text(
-                                    'No sources configured',
-                                    style: TextStyle(
-                                      color: Palette.muted,
-                                      fontSize: 13,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ]
+                          ? const []
                           : [
                               for (var i = 0; i < sources.length; i += 1) ...[
                                 _MasterSourceGroup(
@@ -1890,7 +1877,7 @@ class _ExcludedDialogState extends State<_ExcludedDialog> {
                 border: Border(top: BorderSide(color: Palette.line)),
               ),
               child: items.isEmpty
-                  ? const EmptyLine('No excluded paths')
+                  ? const SizedBox.shrink()
                   : ListView.builder(
                       itemCount: items.length,
                       itemBuilder: (context, index) {
@@ -2915,7 +2902,7 @@ class _SourceCard extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           if (destinations.isEmpty)
-            const EmptyLine('No destinations')
+            const SizedBox.shrink()
           else
             Column(
               children: destinations
@@ -3981,7 +3968,7 @@ class _PathPickerDialogState extends State<_PathPickerDialog> {
               child: loading
                   ? const Center(child: CircularProgressIndicator())
                   : entries.isEmpty
-                  ? const EmptyLine('No entries')
+                  ? const SizedBox.shrink()
                   : ListView.builder(
                       itemCount: entries.length,
                       itemBuilder: (context, index) {
@@ -4909,7 +4896,7 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                 children: [
                   const _MachineHeaderRow(),
                   if (rows.isEmpty)
-                    const EmptyLine('No machines discovered')
+                    const SizedBox.shrink()
                   else
                     ...rows.map((machine) {
                       final machineId = _str(machine['id']);
@@ -5620,7 +5607,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                     children: [
                       const _CollectorHostHeader(),
                       if (hosts.isEmpty)
-                        const EmptyLine('No hosts yet - click "+ Add host".')
+                        const SizedBox.shrink()
                       else
                         ...hosts.asMap().entries.map(
                           (entry) => _CollectorHostRow(
@@ -5767,7 +5754,7 @@ class _CollectorLogDialogState extends State<_CollectorLogDialog> {
     }
     final deployState = _stateText(deployStatus, 'Deploying...');
     if (deployState.isNotEmpty) return deployState;
-    return 'No deploy log yet.';
+    return '';
   }
 
   @override
@@ -5796,7 +5783,6 @@ class _CollectorHostHeader extends StatelessWidget {
         Text('IdentityFile'),
         Text('Root dir'),
         Text('Files'),
-        Text('Exclude'),
         Text(''),
         Text(''),
         Text(''),
@@ -5834,9 +5820,6 @@ class _CollectorHostRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final pathCount = _list(
       host['paths'],
-    ).where((path) => _str(path).trim().isNotEmpty).length;
-    final excludeCount = _list(
-      host['exclude'],
     ).where((path) => _str(path).trim().isNotEmpty).length;
     void setField(String key, dynamic value) {
       host[key] = value;
@@ -5876,7 +5859,6 @@ class _CollectorHostRow extends StatelessWidget {
           child: _MasterReadOnlyInput(value: _str(host['root'])),
         ),
         MasterButton(label: '$pathCount', onTap: onPaths),
-        MasterButton(label: '$excludeCount', onTap: onPaths),
         _CollectorTinyButton(label: '📝', onTap: onDeploy),
         _CollectorTinyButton(
           label: '▶',
@@ -5975,12 +5957,11 @@ class _CollectorHostGrid extends StatelessWidget {
         );
         final widths = <double>[
           82,
-          114,
+          126,
           70,
           64,
           152 + extra * 0.65,
-          144 + extra * 0.35,
-          42,
+          180 + extra * 0.35,
           42,
           34,
           34,
@@ -6219,7 +6200,7 @@ class _CollectorRemotePathDialogState
               child: loading
                   ? const Center(child: CircularProgressIndicator())
                   : entries.isEmpty
-                  ? const EmptyLine('(empty)')
+                  ? const SizedBox.shrink()
                   : ListView.builder(
                       itemCount: entries.length,
                       itemBuilder: (context, index) {
@@ -6388,7 +6369,7 @@ class _TasksTabbedViewState extends State<_TasksTabbedView> {
   @override
   Widget build(BuildContext context) {
     if (widget.machines.isEmpty) {
-      return const EmptyLine('No tasks');
+      return const SizedBox.shrink();
     }
     final index = math.min(selected, widget.machines.length - 1);
     final machine = widget.machines[index];
@@ -6417,7 +6398,7 @@ class _TasksTabbedViewState extends State<_TasksTabbedView> {
             children: [
               const _TaskHeaderRow(),
               if (tasks.isEmpty)
-                const EmptyLine('No tasks')
+                const SizedBox.shrink()
               else
                 ...tasks.map((task) => _TaskRow(task: _map(task))),
             ],
