@@ -8,7 +8,7 @@ $root = $env:AS_ROOT
 
 $opts    = @('-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=20')
 $sshArgs = @() + $opts
-$scpArgs = @('-r') + $opts
+$scpArgs = @('-r','-p') + $opts
 if (-not [string]::IsNullOrEmpty($env:AS_PORT)) { $sshArgs += @('-p', $env:AS_PORT); $scpArgs += @('-P', $env:AS_PORT) }
 if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KEY);  $scpArgs += @('-i', $env:AS_KEY) }
 
@@ -98,6 +98,11 @@ try {
     foreach ($p in $collectPaths) {
         Copy-CollectedPathToStage $p $localStage
     }
+    foreach ($p in @('/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps')) {
+        if (Test-Path -LiteralPath (Get-LocalCollectedPath $p)) {
+            Copy-CollectedPathToStage $p $localStage
+        }
+    }
 
     foreach ($entry in Get-ChildItem -LiteralPath $localStage -Force) {
         & $scp @scpArgs -- $entry.FullName ('{0}:~/.auto_sync_stage/' -f $dest)
@@ -153,7 +158,7 @@ apt-get update
 apt-get purge -y vim || true
 apt-get autoremove -y || true
 apt-get install -y \
-    dialog zfsutils-linux openssh-server zsh net-tools curl iputils-ping iftop cron ca-certificates xfonts-utils dnsutils \
+    dialog zfsutils-linux openssh-server zsh net-tools curl iputils-ping iftop cron ca-certificates xfonts-utils dnsutils hdparm \
     autoconf libtool libtool-bin cmake make gcc g++ texinfo bison flex gdb build-essential automake pkg-config help2man gettext \
     python3-pip ruby luajit netcat-openbsd gperf cscope exuberant-ctags vim-nox git git-lfs lcov graphviz \
     libgeoip-dev libxml2 libxml2-dev libxslt1.1 libxslt1-dev libatomic-ops-dev libgd-dev libperl-dev libluajit-5.1-dev tcl-dev ruby-dev libncurses-dev \
@@ -347,6 +352,130 @@ EOF_BACKUP_MYSQL
 fi
 chmod +x /root/src/share/ubuntu/backup_pg.sh /root/src/share/ubuntu/backup_mysql.sh
 
+wake_zfs() {
+    if [ ! -d /zfs ]; then
+        log "skip /zfs wake: /zfs not found"
+        return 1
+    fi
+    log "wake /zfs before database restore"
+    ls -ald /zfs >/dev/null 2>&1 || true
+    find /zfs/backup -maxdepth 2 -type d -print -quit >/dev/null 2>&1 || true
+    return 0
+}
+
+zfs_pool_for_mount() {
+    src="$(findmnt -T /zfs -no SOURCE 2>/dev/null | head -1 || true)"
+    if [ -n "$src" ] && printf '%s' "$src" | grep -qv '^/dev/'; then
+        printf '%s\n' "$src" | cut -d/ -f1
+        return 0
+    fi
+    src="$(df -P /zfs 2>/dev/null | awk 'NR==2 {print $1}' || true)"
+    if [ -n "$src" ] && printf '%s' "$src" | grep -qv '^/dev/'; then
+        printf '%s\n' "$src" | cut -d/ -f1
+    fi
+}
+
+normalize_block_device() {
+    dev="$1"
+    [ -b "$dev" ] || return 0
+    parent="$(lsblk -no PKNAME "$dev" 2>/dev/null | head -1 || true)"
+    if [ -n "$parent" ]; then
+        printf '/dev/%s\n' "$parent"
+        return 0
+    fi
+    readlink -f "$dev" 2>/dev/null || printf '%s\n' "$dev"
+}
+
+zfs_block_devices() {
+    pool="$(zfs_pool_for_mount || true)"
+    if [ -n "$pool" ] && command -v zpool >/dev/null 2>&1; then
+        zpool status -P "$pool" 2>/dev/null | awk '/\/dev\// {print $1}' | while IFS= read -r dev; do normalize_block_device "$dev"; done | sort -u
+        return 0
+    fi
+    findmnt -T /zfs -no SOURCE 2>/dev/null | awk '/^\/dev\// {print $1}' | while IFS= read -r dev; do normalize_block_device "$dev"; done | sort -u
+}
+
+standby_zfs() {
+    if [ ! -d /zfs ]; then
+        return 0
+    fi
+    if ! command -v hdparm >/dev/null 2>&1; then
+        log "skip /zfs standby: hdparm not installed"
+        return 0
+    fi
+    devices="$(zfs_block_devices | sort -u || true)"
+    if [ -z "$devices" ]; then
+        log "skip /zfs standby: no block devices found"
+        return 0
+    fi
+    log "set /zfs devices to standby"
+    printf '%s\n' "$devices" | while IFS= read -r dev; do
+        [ -n "$dev" ] || continue
+        if [ -b "$dev" ]; then
+            hdparm -y "$dev" >/dev/null 2>&1 && log "standby $dev" || log "WARN: standby $dev failed"
+        fi
+    done
+}
+
+newest_dump() {
+    kind="$1"
+    shift
+    [ "$#" -gt 0 ] || return 0
+    case "$kind" in
+        mysql)
+            find "$@" -type f \( \
+                -name 'mysql_full_backup_*.sql' -o \
+                -name 'mysql_full_backup_*.sql.gz' -o \
+                -name 'mysql-all.sql' -o \
+                -name 'mysql-all.sql.gz' -o \
+                -name '*mysql*.sql' -o \
+                -name '*mysql*.sql.gz' \
+            \) -print0 2>/dev/null | score_dumps | sort -nr | head -1 | cut -f2-
+            ;;
+        postgres)
+            find "$@" -type f \( \
+                -name 'pg_full_backup_*.sql' -o \
+                -name 'pg_full_backup_*.sql.gz' -o \
+                -name 'postgres-all.sql' -o \
+                -name 'postgres-all.sql.gz' -o \
+                -name '*postgres*.sql' -o \
+                -name '*postgres*.sql.gz' -o \
+                -name '*pg*.sql' -o \
+                -name '*pg*.sql.gz' \
+            \) -print0 2>/dev/null | score_dumps | sort -nr | head -1 | cut -f2-
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+score_dumps() {
+    while IFS= read -r -d '' path; do
+        base="$(basename "$path")"
+        stamp="$(printf '%s\n' "$base" | sed -n 's/.*_\([0-9]\{8\}_[0-9]\{6\}\)\.sql\(\.gz\)\?$/\1/p')"
+        score=""
+        if [ -n "$stamp" ]; then
+            score="$(date -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2} ${stamp:9:2}:${stamp:11:2}:${stamp:13:2}" +%s 2>/dev/null || true)"
+        fi
+        [ -n "$score" ] || score="$(stat -c %Y "$path" 2>/dev/null || echo 0)"
+        printf '%s\t%s\n' "$score" "$path"
+    done
+}
+
+dump_search_roots() {
+    for dir in \
+        /zfs/backup \
+        /root/auto_sync_db_dumps \
+        /tmp/auto_sync_db_dumps \
+        /root/src/share/ubuntu \
+        /root/src/share/nas \
+        /root/src/share
+    do
+        [ -d "$dir" ] && printf '%s\n' "$dir"
+    done
+}
+
 restore_once() {
     kind="$1"
     latest="$2"
@@ -369,10 +498,19 @@ restore_once() {
             ;;
     esac && printf '%s' "$latest" > "$marker" || log "WARN: $kind restore failed"
 }
-mysql_dump="$(ls -1t /zfs/backup/mysql_backup/mysql_full_backup_*.sql /zfs/backup/mysql_backup/*.sql.gz 2>/dev/null | head -1 || true)"
-pg_dump="$(ls -1t /zfs/backup/pg_backup/pg_full_backup_*.sql /zfs/backup/pg_backup/*.sql.gz 2>/dev/null | head -1 || true)"
+zfs_woken=0
+wake_zfs && zfs_woken=1 || true
+dump_roots="$(dump_search_roots)"
+mysql_dump="$(newest_dump mysql $dump_roots 2>/dev/null || true)"
+pg_dump="$(newest_dump postgres $dump_roots 2>/dev/null || true)"
+[ -n "$mysql_dump" ] && log "selected mysql dump: $mysql_dump"
+[ -n "$pg_dump" ] && log "selected postgres dump: $pg_dump"
 restore_once mysql "$mysql_dump"
 restore_once postgres "$pg_dump"
+rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
+if [ "$zfs_woken" = "1" ]; then
+    standby_zfs
+fi
 
 systemctl daemon-reload
 for s in auto_sync auto_sync_web halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server privoxy; do
