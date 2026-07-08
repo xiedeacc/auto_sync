@@ -2183,6 +2183,7 @@ class _MasterMenuSelect extends StatefulWidget {
     this.background = Colors.white,
     this.border = Palette.line,
     this.foreground = Palette.text,
+    this.openUp = false,
   });
 
   final String value;
@@ -2195,6 +2196,7 @@ class _MasterMenuSelect extends StatefulWidget {
   final Color background;
   final Color border;
   final Color foreground;
+  final bool openUp;
 
   @override
   State<_MasterMenuSelect> createState() => _MasterMenuSelectState();
@@ -2215,15 +2217,21 @@ class _MasterMenuSelectState extends State<_MasterMenuSelect> {
             : 180.0;
         final menuHeight = widget.height * widget.options.length;
         final menuWidth = width.isFinite ? width : 180.0;
+        final menuOffset = widget.openUp
+            ? Offset(0, -menuHeight - 2)
+            : const Offset(0, 2);
         final menu = MenuAnchor(
           controller: _controller,
-          alignmentOffset: const Offset(0, 2),
+          alignmentOffset: menuOffset,
           style: MenuStyle(
             backgroundColor: const WidgetStatePropertyAll(Colors.white),
             surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
             elevation: const WidgetStatePropertyAll(2),
             shadowColor: const WidgetStatePropertyAll(Color(0x33000000)),
             padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+            alignment: widget.openUp
+                ? AlignmentDirectional.topStart
+                : AlignmentDirectional.bottomStart,
             minimumSize: WidgetStatePropertyAll(Size(menuWidth, widget.height)),
             maximumSize: WidgetStatePropertyAll(Size(menuWidth, menuHeight)),
             shape: WidgetStatePropertyAll(
@@ -4831,12 +4839,14 @@ class _CompactSelect extends StatelessWidget {
     required this.options,
     required this.onChanged,
     this.height = _masterControlHeight,
+    this.openUp = false,
   });
 
   final String value;
   final List<String> options;
   final ValueChanged<String> onChanged;
   final double height;
+  final bool openUp;
 
   @override
   Widget build(BuildContext context) {
@@ -4846,6 +4856,7 @@ class _CompactSelect extends StatelessWidget {
         value: value,
         options: options,
         height: height,
+        openUp: openUp,
         onSelected: onChanged,
       ),
     );
@@ -4997,8 +5008,10 @@ class _MachinesDialogState extends State<_MachinesDialog> {
     return _MasterDialogFrame(
       title: 'Machines',
       width: 880,
-      maxHeight: 650,
+      maxHeight: 560,
+      shrinkWrap: true,
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
           ConstrainedBox(
             constraints: const BoxConstraints(maxHeight: 330),
@@ -5149,6 +5162,7 @@ class _MachineEditorGrid extends StatelessWidget {
         height: height,
         value: os,
         options: const ['linux', 'windows'],
+        openUp: true,
         onChanged: onOsChanged,
       ),
     ];
