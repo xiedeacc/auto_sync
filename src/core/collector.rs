@@ -56,7 +56,18 @@ pub struct CollectorRunState {
     pub total_files: usize,
     pub succeeded_files: usize,
     pub failed_files: usize,
+    pub errors: Vec<CollectorRunIssue>,
     pub log: Vec<String>,
+}
+
+/// Structured details for the UI's Collector Error dialog. `folder` entries are
+/// not failures; they identify paths copied through the directory/tar path.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CollectorRunIssue {
+    pub kind: String,
+    pub host: String,
+    pub path: String,
+    pub message: String,
 }
 
 /// One entry returned by the remote path browser.
@@ -212,6 +223,23 @@ fn record_file_failed(state: &Arc<Mutex<CollectorRunState>>, count: usize) {
     }
 }
 
+fn record_run_issue(
+    state: &Arc<Mutex<CollectorRunState>>,
+    kind: &str,
+    host: &str,
+    path: &str,
+    message: impl Into<String>,
+) {
+    if let Ok(mut guard) = state.lock() {
+        guard.errors.push(CollectorRunIssue {
+            kind: kind.to_string(),
+            host: host.to_string(),
+            path: path.to_string(),
+            message: message.into(),
+        });
+    }
+}
+
 fn finish_state(state: &Arc<Mutex<CollectorRunState>>, ok: bool) {
     if let Ok(mut guard) = state.lock() {
         let now = chrono::Local::now();
@@ -309,13 +337,17 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         host.name.clone()
     };
     if host.hostname.trim().is_empty() {
-        log(state, format!("host '{label}': no hostname, skipping"));
+        let message = "no hostname, skipping";
+        log(state, format!("host '{label}': {message}"));
+        record_run_issue(state, "failed", &label, "", message);
         let failed = count_collect_paths(host);
         record_file_failed(state, failed);
         return failed;
     }
     if host.root.as_os_str().is_empty() {
-        log(state, format!("host '{label}': no local root, skipping"));
+        let message = "no local root, skipping";
+        log(state, format!("host '{label}': {message}"));
+        record_run_issue(state, "failed", &label, "", message);
         let failed = count_collect_paths(host);
         record_file_failed(state, failed);
         return failed;
@@ -346,10 +378,14 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         set_current_file(state, Some(remote));
         match remote_path_kind(&conn, remote) {
             Ok(RemotePathKind::File) => files.push(remote.clone()),
-            Ok(RemotePathKind::Dir) => dirs.push(remote.clone()),
+            Ok(RemotePathKind::Dir) => {
+                record_run_issue(state, "folder", &label, remote, "copied as folder");
+                dirs.push(remote.clone());
+            }
             Err(err) => {
                 failures += 1;
                 record_file_failed(state, 1);
+                record_run_issue(state, "failed", &label, remote, format!("{err:#}"));
                 log(state, format!("  FAILED {remote}: {err:#}"));
             }
         }
@@ -372,6 +408,13 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
                 for remote in &dirs {
                     failures += 1;
                     record_file_failed(state, 1);
+                    record_run_issue(
+                        state,
+                        "failed",
+                        &label,
+                        remote,
+                        format!("tar failed: {err:#}"),
+                    );
                     log(state, format!("  FAILED {remote}: tar failed: {err:#}"));
                 }
             }
@@ -389,6 +432,7 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
             Err(err) => {
                 failures += 1;
                 record_file_failed(state, 1);
+                record_run_issue(state, "failed", &label, remote, format!("{err:#}"));
                 log(state, format!("  FAILED {remote}: {err:#}"));
             }
         }

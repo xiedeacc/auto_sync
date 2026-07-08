@@ -5373,6 +5373,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   final splitMb = TextEditingController(text: '95');
 
   List<Map<String, dynamic>> get hosts => _mapRefs(cfg['hosts']);
+  List<Map<String, dynamic>> get runIssues => _mapRefs(status['errors']);
 
   @override
   void initState() {
@@ -5637,6 +5638,15 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     );
   }
 
+  Future<void> _showCollectorErrors() async {
+    final issues = runIssues;
+    if (issues.isEmpty) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => _CollectorErrorDialog(issues: issues),
+    );
+  }
+
   Future<void> _showConfig() async {
     await _persistNow();
     if (!mounted) return;
@@ -5780,6 +5790,15 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                         ),
                       ),
                       MasterButton(
+                        label: 'Error',
+                        width: 76,
+                        danger: runIssues.any(
+                          (issue) => _str(issue['kind']) != 'folder',
+                        ),
+                        onTap: runIssues.isEmpty ? null : _showCollectorErrors,
+                      ),
+                      const SizedBox(width: 8),
+                      MasterButton(
                         label: '+ Add host',
                         width: 96,
                         onTap: busy ? null : _addHost,
@@ -5873,6 +5892,162 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                 ),
               ],
             ),
+    );
+  }
+}
+
+class _CollectorErrorDialog extends StatelessWidget {
+  const _CollectorErrorDialog({required this.issues});
+
+  final List<Map<String, dynamic>> issues;
+
+  @override
+  Widget build(BuildContext context) {
+    final failed = issues
+        .where((issue) => _str(issue['kind']) != 'folder')
+        .length;
+    final folders = issues
+        .where((issue) => _str(issue['kind']) == 'folder')
+        .length;
+    final summary = [
+      if (failed > 0) '$failed failed',
+      if (folders > 0) '$folders folders',
+    ].join(' · ');
+    return _MasterDialogFrame(
+      title: 'Collector Error',
+      width: 900,
+      maxHeight: 620,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (summary.isNotEmpty) _IssueSummary(summary),
+          const SizedBox(height: 8),
+          Expanded(
+            child: Container(
+              decoration: BoxDecoration(
+                border: Border.all(color: Palette.line),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: ListView(
+                children: [
+                  const _CollectorErrorHeader(),
+                  for (final issue in issues) _CollectorErrorRow(issue: issue),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CollectorErrorHeader extends StatelessWidget {
+  const _CollectorErrorHeader();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 34,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: Palette.line)),
+      ),
+      child: const Row(
+        children: [
+          SizedBox(width: 76, child: _CollectorErrorHead('Type')),
+          SizedBox(width: 120, child: _CollectorErrorHead('Host')),
+          SizedBox(width: 280, child: _CollectorErrorHead('Path')),
+          Expanded(child: _CollectorErrorHead('Message')),
+        ],
+      ),
+    );
+  }
+}
+
+class _CollectorErrorHead extends StatelessWidget {
+  const _CollectorErrorHead(this.text);
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Text(
+        text,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(
+          color: Palette.muted,
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+}
+
+class _CollectorErrorRow extends StatelessWidget {
+  const _CollectorErrorRow({required this.issue});
+
+  final Map<String, dynamic> issue;
+
+  @override
+  Widget build(BuildContext context) {
+    final kind = _str(issue['kind']);
+    final isFolder = kind == 'folder';
+    final color = isFolder ? Palette.accent : Palette.red;
+    return Container(
+      constraints: const BoxConstraints(minHeight: 38),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: Palette.line)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 76,
+            child: Text(
+              isFolder ? 'Folder' : 'Failed',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: color,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 120,
+            child: Text(
+              _str(issue['host']),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+          SizedBox(
+            width: 280,
+            child: Text(
+              _str(issue['path']),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              _str(issue['message']),
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 12, color: Palette.muted),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
