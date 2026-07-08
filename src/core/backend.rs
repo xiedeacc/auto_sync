@@ -236,6 +236,30 @@ impl Backend {
             .unwrap_or_default()
     }
 
+    pub fn collector_deploy_script(&self, index: usize) -> Result<CollectorDeployScript> {
+        let cfg = self.get_collector_config()?;
+        let host = cfg
+            .hosts
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("no host at index {index}"))?;
+        let configured = host.deploy_script_path.trim();
+        if configured.is_empty() {
+            return Ok(CollectorDeployScript {
+                path: String::new(),
+                script: host.deploy_script.clone(),
+                from_file: false,
+            });
+        }
+        let path = self.resolve_collector_deploy_script_path(configured);
+        let script = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading deploy script {}", path.display()))?;
+        Ok(CollectorDeployScript {
+            path: path.to_string_lossy().to_string(),
+            script,
+            from_file: true,
+        })
+    }
+
     /// Deploy the host at `index` (push its collected files back, then run its
     /// deploy script on the host) in a background thread. Refuses to start a
     /// second deploy while one is running.
@@ -247,15 +271,8 @@ impl Backend {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no host at index {index}"))?;
         if !host.deploy_script_path.trim().is_empty() {
-            let configured = std::path::PathBuf::from(host.deploy_script_path.trim());
-            let resolved = if configured.is_absolute() {
-                configured
-            } else {
-                self.collector_config_path()
-                    .parent()
-                    .map(|dir| dir.join(&configured))
-                    .unwrap_or(configured)
-            };
+            let resolved =
+                self.resolve_collector_deploy_script_path(host.deploy_script_path.trim());
             host.deploy_script_path = resolved.to_string_lossy().to_string();
         }
         {
@@ -278,6 +295,18 @@ impl Backend {
         let all_hosts = cfg.hosts.clone();
         thread::spawn(move || collector::deploy(host, all_hosts, state));
         Ok(self.collector_deploy_status())
+    }
+
+    fn resolve_collector_deploy_script_path(&self, configured: &str) -> PathBuf {
+        let path = PathBuf::from(configured);
+        if path.is_absolute() {
+            path
+        } else {
+            self.collector_config_path()
+                .parent()
+                .map(|dir| dir.join(&path))
+                .unwrap_or(path)
+        }
     }
 
     /// Browse a remote host over ssh for the Collector path picker.
@@ -1961,6 +1990,13 @@ pub struct LocalFileTextRequest {
 pub struct CollectorConfigFile {
     pub path: String,
     pub toml: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CollectorDeployScript {
+    pub path: String,
+    pub script: String,
+    pub from_file: bool,
 }
 
 pub fn default_path_for_os(os: &str) -> PathBuf {

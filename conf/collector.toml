@@ -67,6 +67,7 @@ paths = [
     "/usr/share/applications/google-chrome.desktop",
 ]
 exclude = []
+deploy_script_path = "collector_deploy_dev.ps1"
 deploy_script = ""
 enabled = true
 
@@ -158,4 +159,3 @@ exclude = [
 deploy_script_path = "collector_deploy_aws.ps1"
 deploy_script = ""
 enabled = true
-

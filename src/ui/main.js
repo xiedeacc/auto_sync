@@ -3663,17 +3663,33 @@ function onCollectorListClick(kind, event) {
 
 // Per-host deploy (push files back + run host script) --------------------------
 
-function openCollectorDeploy(hostIndex) {
+async function openCollectorDeploy(hostIndex) {
   const host = collectorDraft.hosts[hostIndex];
   if (!host) return;
   collectorDeployIndex = hostIndex;
   const label = host.name.trim() || host.hostname.trim() || `host ${hostIndex + 1}`;
+  const scriptPath = String(host.deploy_script_path || "").trim();
   el.collectorDeployTitle.textContent = `Deploy — ${label}`;
-  el.collectorDeployScript.value = host.deploy_script || "";
-  el.collectorDeployState.textContent = "";
+  el.collectorDeployScript.readOnly = Boolean(scriptPath);
+  el.collectorDeployScript.value = scriptPath ? "Loading…" : (host.deploy_script || "");
+  el.collectorDeployState.textContent = scriptPath ? `Script file: ${scriptPath}` : "";
   el.collectorDeployLog.hidden = true;
   el.collectorDeployLog.textContent = "";
   el.collectorDeployModal.hidden = false;
+  if (scriptPath) {
+    try {
+      const info = await invoke("collector_deploy_script", { index: hostIndex });
+      if (collectorDeployIndex === hostIndex) {
+        el.collectorDeployScript.value = info.script || "";
+        el.collectorDeployState.textContent = info.path ? `Script file: ${info.path}` : "";
+      }
+    } catch (error) {
+      if (collectorDeployIndex === hostIndex) {
+        el.collectorDeployScript.value = "";
+        el.collectorDeployState.textContent = String(error);
+      }
+    }
+  }
   refreshCollectorDeployStatus();
 }
 
@@ -3700,7 +3716,7 @@ async function runCollectorDeploy(hostIndex) {
     return;
   }
   // Open the deploy modal so the live log is visible.
-  openCollectorDeploy(hostIndex);
+  await openCollectorDeploy(hostIndex);
   try {
     await collectorPersistNow();
     const state = await invoke("collector_deploy", { index: hostIndex });
@@ -4038,6 +4054,7 @@ async function invokeWeb(command, payload = {}) {
     collector_get_config: ["GET", "/api/collector/config"],
     collector_save_config: ["POST", "/api/collector/config"],
     collector_config_file: ["GET", "/api/collector/config-file"],
+    collector_deploy_script: ["GET", "/api/collector/deploy-script"],
     collector_deploy: ["POST", "/api/collector/deploy"],
     collector_deploy_status: ["GET", "/api/collector/deploy-status"],
   };
@@ -4058,6 +4075,8 @@ async function invokeWeb(command, payload = {}) {
     url = `${path}?source_id=${encodeURIComponent(sourceId)}&destination_id=${encodeURIComponent(destinationId)}`;
   } else if (command === "get_all_tasks") {
     url = `${path}?limit=${encodeURIComponent(payload.limit || 100)}`;
+  } else if (command === "collector_deploy_script") {
+    url = `${path}?index=${encodeURIComponent(payload.index || 0)}`;
   } else if (command === "remove_machine") {
     const machineId = payload.machineId || payload.machine_id;
     url = `${path}/${encodeURIComponent(machineId || "")}`;

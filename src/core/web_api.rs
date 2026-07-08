@@ -17,8 +17,8 @@ use tracing::info;
 
 use crate::core::backend::{
     Backend, BrowseResponse, CancelActivityRequest, CancelOutcome, CollectorConfigFile,
-    DelegatedSourceGroupsRequest, LocalFilePreview, LocalFileTextRequest, RuntimeStatus,
-    SyncActivityStatus,
+    CollectorDeployScript, DelegatedSourceGroupsRequest, LocalFilePreview, LocalFileTextRequest,
+    RuntimeStatus, SyncActivityStatus,
 };
 use crate::core::collector::{CollectorBrowseResponse, CollectorRunState};
 use crate::core::config::{AppConfig, CollectorConfig, MachineConfig};
@@ -169,6 +169,10 @@ pub fn router(backend: Backend) -> Router {
         .route(
             "/api/collector/deploy-status",
             get(api_collector_deploy_status),
+        )
+        .route(
+            "/api/collector/deploy-script",
+            get(api_collector_deploy_script),
         )
         .route(
             "/api/collector/config",
@@ -904,6 +908,18 @@ async fn api_collector_deploy_status(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<CollectorRunState>, ApiError> {
     blocking(move || Ok(Json(backend.collector_deploy_status()))).await
+}
+
+#[derive(Deserialize)]
+struct CollectorDeployScriptQuery {
+    index: usize,
+}
+
+async fn api_collector_deploy_script(
+    AxumState(backend): AxumState<Backend>,
+    Query(req): Query<CollectorDeployScriptQuery>,
+) -> Result<Json<CollectorDeployScript>, ApiError> {
+    blocking(move || Ok(Json(backend.collector_deploy_script(req.index)?))).await
 }
 
 async fn api_collector_get_config(
