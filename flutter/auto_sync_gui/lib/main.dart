@@ -6023,6 +6023,8 @@ class _CollectorPathsDialog extends StatefulWidget {
 }
 
 class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
+  bool showingExclude = false;
+
   List<String> get paths =>
       _list(widget.host['paths']).map((p) => '$p').toList();
   List<String> get exclude =>
@@ -6062,35 +6064,51 @@ class _CollectorPathsDialogState extends State<_CollectorPathsDialog> {
       title: 'Files & folders - $label',
       width: 780,
       maxHeight: 720,
-      child: ListView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const _IssueSummary('Collect these paths'),
-          const SizedBox(height: 6),
-          _PathListEditor(
-            items: paths,
-            onChanged: (items) => setState(() => _setList('paths', items)),
+          Row(
+            children: [
+              _TaskMachineTab(
+                label: 'Collect (${paths.length})',
+                selected: !showingExclude,
+                onTap: () => setState(() => showingExclude = false),
+              ),
+              const SizedBox(width: 6),
+              _TaskMachineTab(
+                label: 'Ignore (${exclude.length})',
+                selected: showingExclude,
+                onTap: () => setState(() => showingExclude = true),
+              ),
+            ],
           ),
-          Align(
-            alignment: Alignment.centerRight,
-            child: MasterButton(
-              label: 'Browse',
-              width: 72,
-              onTap: () => unawaited(_browse('paths')),
+          const SizedBox(height: 8),
+          _IssueSummary(
+            showingExclude
+                ? 'Ignore (skip these and everything under them)'
+                : 'Collect these paths',
+          ),
+          const SizedBox(height: 6),
+          Expanded(
+            child: ListView(
+              children: [
+                _PathListEditor(
+                  items: showingExclude ? exclude : paths,
+                  onChanged: (items) => setState(
+                    () => _setList(showingExclude ? 'exclude' : 'paths', items),
+                  ),
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 12),
-          const _IssueSummary('Ignore (skip these and everything under them)'),
-          const SizedBox(height: 6),
-          _PathListEditor(
-            items: exclude,
-            onChanged: (items) => setState(() => _setList('exclude', items)),
-          ),
+          const SizedBox(height: 8),
           Align(
             alignment: Alignment.centerRight,
             child: MasterButton(
               label: 'Browse',
               width: 72,
-              onTap: () => unawaited(_browse('exclude')),
+              onTap: () =>
+                  unawaited(_browse(showingExclude ? 'exclude' : 'paths')),
             ),
           ),
         ],
