@@ -2150,67 +2150,258 @@ class MasterSelectButton extends StatelessWidget {
     return SizedBox(
       width: width,
       height: _masterControlHeight,
-      child: PopupMenuButton<String>(
+      child: _MasterMenuSelect(
+        value: value,
+        options: const ['incremental', 'full', 'scan'],
+        labelFor: (option) => switch (option) {
+          'incremental' => 'Incremental',
+          'full' => 'Full',
+          'scan' => 'Compare',
+          _ => option,
+        },
         enabled: enabled,
         tooltip: 'Sync',
-        padding: EdgeInsets.zero,
-        color: Colors.white,
-        elevation: 2,
-        surfaceTintColor: Colors.transparent,
-        shadowColor: const Color(0x33000000),
-        constraints: BoxConstraints.tightFor(width: width),
-        shape: RoundedRectangleBorder(
-          side: const BorderSide(color: Palette.line),
-          borderRadius: BorderRadius.circular(6),
-        ),
-        offset: const Offset(0, _masterControlHeight),
+        height: _masterControlHeight,
+        background: background,
+        border: border,
+        foreground: foreground,
         onSelected: onSelected,
-        itemBuilder: (context) => const [
-          PopupMenuItem(
-            value: 'incremental',
-            height: _masterControlHeight,
-            padding: EdgeInsets.symmetric(horizontal: 12),
-            child: Text('Incremental'),
+      ),
+    );
+  }
+}
+
+class _MasterMenuSelect extends StatefulWidget {
+  const _MasterMenuSelect({
+    required this.value,
+    required this.options,
+    required this.onSelected,
+    this.labelFor,
+    this.enabled = true,
+    this.tooltip,
+    this.height = _masterControlHeight,
+    this.background = Colors.white,
+    this.border = Palette.line,
+    this.foreground = Palette.text,
+  });
+
+  final String value;
+  final List<String> options;
+  final String Function(String value)? labelFor;
+  final ValueChanged<String> onSelected;
+  final bool enabled;
+  final String? tooltip;
+  final double height;
+  final Color background;
+  final Color border;
+  final Color foreground;
+
+  @override
+  State<_MasterMenuSelect> createState() => _MasterMenuSelectState();
+}
+
+class _MasterMenuSelectState extends State<_MasterMenuSelect> {
+  final MenuController _controller = MenuController();
+
+  String _label(String value) =>
+      widget.labelFor == null ? value : widget.labelFor!(value);
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.hasBoundedWidth && constraints.maxWidth > 0
+            ? constraints.maxWidth
+            : 180.0;
+        final menuHeight = widget.height * widget.options.length;
+        final menuWidth = width.isFinite ? width : 180.0;
+        final menu = MenuAnchor(
+          controller: _controller,
+          alignmentOffset: const Offset(0, 2),
+          style: MenuStyle(
+            backgroundColor: const WidgetStatePropertyAll(Colors.white),
+            surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
+            elevation: const WidgetStatePropertyAll(2),
+            shadowColor: const WidgetStatePropertyAll(Color(0x33000000)),
+            padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+            minimumSize: WidgetStatePropertyAll(Size(menuWidth, widget.height)),
+            maximumSize: WidgetStatePropertyAll(Size(menuWidth, menuHeight)),
+            shape: WidgetStatePropertyAll(
+              RoundedRectangleBorder(
+                side: const BorderSide(color: Palette.line),
+                borderRadius: BorderRadius.circular(6),
+              ),
+            ),
           ),
-          PopupMenuItem(
-            value: 'full',
-            height: _masterControlHeight,
-            padding: EdgeInsets.symmetric(horizontal: 12),
-            child: Text('Full'),
-          ),
-          PopupMenuItem(
-            value: 'scan',
-            height: _masterControlHeight,
-            padding: EdgeInsets.symmetric(horizontal: 12),
-            child: Text('Compare'),
-          ),
-        ],
-        child: Container(
-          height: _masterControlHeight,
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          decoration: BoxDecoration(
-            color: background,
-            border: Border.all(color: border),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  value,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: foreground,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
+          menuChildren: [
+            for (final option in widget.options)
+              SizedBox(
+                width: menuWidth,
+                height: widget.height,
+                child: MenuItemButton(
+                  style: ButtonStyle(
+                    padding: const WidgetStatePropertyAll(
+                      EdgeInsets.symmetric(horizontal: 12),
+                    ),
+                    minimumSize: WidgetStatePropertyAll(Size(0, widget.height)),
+                    maximumSize: WidgetStatePropertyAll(
+                      Size(double.infinity, widget.height),
+                    ),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  onPressed: () {
+                    _controller.close();
+                    widget.onSelected(option);
+                  },
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      _label(option),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
                   ),
                 ),
               ),
-              Icon(Icons.arrow_drop_down, size: 18, color: foreground),
-            ],
+          ],
+          builder: (context, controller, child) {
+            return InkWell(
+              borderRadius: BorderRadius.circular(6),
+              onTap: widget.enabled
+                  ? () {
+                      controller.isOpen
+                          ? controller.close()
+                          : controller.open();
+                    }
+                  : null,
+              child: Container(
+                height: widget.height,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                decoration: BoxDecoration(
+                  color: widget.background,
+                  border: Border.all(color: widget.border),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _label(widget.value),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: widget.foreground,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    Icon(
+                      Icons.arrow_drop_down,
+                      size: 18,
+                      color: widget.foreground,
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+        if (widget.tooltip == null) {
+          return menu;
+        }
+        return Tooltip(message: widget.tooltip!, child: menu);
+      },
+    );
+  }
+}
+
+class _MasterIconMenuButton extends StatefulWidget {
+  const _MasterIconMenuButton({
+    required this.icon,
+    required this.tooltip,
+    required this.options,
+    required this.labelFor,
+    required this.onSelected,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final List<String> options;
+  final String Function(String value) labelFor;
+  final ValueChanged<String> onSelected;
+
+  @override
+  State<_MasterIconMenuButton> createState() => _MasterIconMenuButtonState();
+}
+
+class _MasterIconMenuButtonState extends State<_MasterIconMenuButton> {
+  final MenuController _controller = MenuController();
+
+  @override
+  Widget build(BuildContext context) {
+    const menuWidth = 116.0;
+    return MenuAnchor(
+      controller: _controller,
+      alignmentOffset: const Offset(0, 2),
+      style: MenuStyle(
+        backgroundColor: const WidgetStatePropertyAll(Colors.white),
+        surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
+        elevation: const WidgetStatePropertyAll(2),
+        shadowColor: const WidgetStatePropertyAll(Color(0x33000000)),
+        padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+        minimumSize: const WidgetStatePropertyAll(
+          Size(menuWidth, _masterControlHeight),
+        ),
+        maximumSize: WidgetStatePropertyAll(
+          Size(menuWidth, _masterControlHeight * widget.options.length),
+        ),
+        shape: WidgetStatePropertyAll(
+          RoundedRectangleBorder(
+            side: const BorderSide(color: Palette.line),
+            borderRadius: BorderRadius.circular(6),
           ),
         ),
+      ),
+      menuChildren: [
+        for (final option in widget.options)
+          SizedBox(
+            width: menuWidth,
+            height: _masterControlHeight,
+            child: MenuItemButton(
+              style: const ButtonStyle(
+                padding: WidgetStatePropertyAll(
+                  EdgeInsets.symmetric(horizontal: 12),
+                ),
+                minimumSize: WidgetStatePropertyAll(
+                  Size(0, _masterControlHeight),
+                ),
+                maximumSize: WidgetStatePropertyAll(
+                  Size(double.infinity, _masterControlHeight),
+                ),
+                visualDensity: VisualDensity.compact,
+              ),
+              onPressed: () {
+                _controller.close();
+                widget.onSelected(option);
+              },
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  widget.labelFor(option),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ),
+          ),
+      ],
+      builder: (context, controller, child) => IconButton(
+        tooltip: widget.tooltip,
+        icon: Icon(widget.icon, size: 21),
+        onPressed: () {
+          controller.isOpen ? controller.close() : controller.open();
+        },
       ),
     );
   }
@@ -2676,6 +2867,25 @@ String _normalizeWeekday(String value) {
   return weekdays.contains(lower) ? lower : 'monday';
 }
 
+String _scheduleModeLabel(String value) => switch (value) {
+  'realtime' => 'Realtime',
+  'daily' => 'Daily',
+  'weekly' => 'Weekly',
+  'manual' => 'Manual',
+  _ => value,
+};
+
+String _weekdayLabel(String value) => switch (value) {
+  'monday' => 'Monday',
+  'tuesday' => 'Tuesday',
+  'wednesday' => 'Wednesday',
+  'thursday' => 'Thursday',
+  'friday' => 'Friday',
+  'saturday' => 'Saturday',
+  'sunday' => 'Sunday',
+  _ => value,
+};
+
 String _scheduleLabel(Map<String, dynamic> schedule) {
   final next = _cloneSchedule(schedule);
   final mode = _str(next['mode'], 'realtime');
@@ -3026,18 +3236,17 @@ class _DestinationRow extends StatelessWidget {
                 color: state == 'ok' ? Palette.green : Palette.warn,
               ),
               const SizedBox(width: 6),
-              PopupMenuButton<String>(
+              _MasterIconMenuButton(
+                icon: Icons.play_arrow_outlined,
                 tooltip: 'Sync',
+                options: const ['incremental', 'full', 'repair'],
+                labelFor: (mode) => switch (mode) {
+                  'incremental' => 'Incremental',
+                  'full' => 'Full',
+                  'repair' => 'Repair',
+                  _ => mode,
+                },
                 onSelected: (mode) => onSync(sourceId, destinationId, mode),
-                itemBuilder: (context) => const [
-                  PopupMenuItem(
-                    value: 'incremental',
-                    child: Text('Incremental'),
-                  ),
-                  PopupMenuItem(value: 'full', child: Text('Full')),
-                  PopupMenuItem(value: 'repair', child: Text('Repair')),
-                ],
-                child: const Icon(Icons.play_arrow_outlined, size: 21),
               ),
               IconButton(
                 tooltip: 'Compare',
@@ -3644,17 +3853,11 @@ class _ScheduleDialogState extends State<_ScheduleDialog> {
           const _MasterLabel('Mode'),
           SizedBox(
             height: _masterControlHeight,
-            child: DropdownButtonFormField<String>(
-              initialValue: mode,
-              decoration: const InputDecoration(),
-              items: const [
-                DropdownMenuItem(value: 'realtime', child: Text('Realtime')),
-                DropdownMenuItem(value: 'daily', child: Text('Daily')),
-                DropdownMenuItem(value: 'weekly', child: Text('Weekly')),
-              ],
-              onChanged: (value) {
-                if (value != null) setState(() => mode = value);
-              },
+            child: _MasterMenuSelect(
+              value: mode,
+              options: const ['realtime', 'daily', 'weekly'],
+              labelFor: _scheduleModeLabel,
+              onSelected: (value) => setState(() => mode = value),
             ),
           ),
           if (scheduled) ...[
@@ -3667,24 +3870,19 @@ class _ScheduleDialogState extends State<_ScheduleDialog> {
             const _MasterLabel('Weekday'),
             SizedBox(
               height: _masterControlHeight,
-              child: DropdownButtonFormField<String>(
-                initialValue: weekday,
-                decoration: const InputDecoration(),
-                items: const [
-                  DropdownMenuItem(value: 'monday', child: Text('Monday')),
-                  DropdownMenuItem(value: 'tuesday', child: Text('Tuesday')),
-                  DropdownMenuItem(
-                    value: 'wednesday',
-                    child: Text('Wednesday'),
-                  ),
-                  DropdownMenuItem(value: 'thursday', child: Text('Thursday')),
-                  DropdownMenuItem(value: 'friday', child: Text('Friday')),
-                  DropdownMenuItem(value: 'saturday', child: Text('Saturday')),
-                  DropdownMenuItem(value: 'sunday', child: Text('Sunday')),
+              child: _MasterMenuSelect(
+                value: weekday,
+                options: const [
+                  'monday',
+                  'tuesday',
+                  'wednesday',
+                  'thursday',
+                  'friday',
+                  'saturday',
+                  'sunday',
                 ],
-                onChanged: (value) {
-                  if (value != null) setState(() => weekday = value);
-                },
+                labelFor: _weekdayLabel,
+                onSelected: (value) => setState(() => weekday = value),
               ),
             ),
           ],
@@ -4031,7 +4229,7 @@ class _FolderPathLabel extends StatelessWidget {
   }
 }
 
-class _MachineSelectButton extends StatefulWidget {
+class _MachineSelectButton extends StatelessWidget {
   const _MachineSelectButton({
     required this.width,
     required this.value,
@@ -4047,110 +4245,15 @@ class _MachineSelectButton extends StatefulWidget {
   final ValueChanged<String> onSelected;
 
   @override
-  State<_MachineSelectButton> createState() => _MachineSelectButtonState();
-}
-
-class _MachineSelectButtonState extends State<_MachineSelectButton> {
-  final MenuController _controller = MenuController();
-
-  @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: widget.width,
+      width: width,
       height: _masterControlHeight,
-      child: MenuAnchor(
-        controller: _controller,
-        alignmentOffset: const Offset(0, 2),
-        style: MenuStyle(
-          backgroundColor: const WidgetStatePropertyAll(Colors.white),
-          surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
-          elevation: const WidgetStatePropertyAll(2),
-          shadowColor: const WidgetStatePropertyAll(Color(0x33000000)),
-          padding: const WidgetStatePropertyAll(EdgeInsets.zero),
-          minimumSize: WidgetStatePropertyAll(
-            Size(widget.width, _masterControlHeight),
-          ),
-          maximumSize: WidgetStatePropertyAll(
-            Size(widget.width, _masterControlHeight * widget.options.length),
-          ),
-          shape: WidgetStatePropertyAll(
-            RoundedRectangleBorder(
-              side: const BorderSide(color: Palette.line),
-              borderRadius: BorderRadius.circular(6),
-            ),
-          ),
-        ),
-        menuChildren: [
-          for (final option in widget.options)
-            SizedBox(
-              width: widget.width,
-              height: _masterControlHeight,
-              child: MenuItemButton(
-                style: const ButtonStyle(
-                  padding: WidgetStatePropertyAll(
-                    EdgeInsets.symmetric(horizontal: 12),
-                  ),
-                  minimumSize: WidgetStatePropertyAll(
-                    Size(0, _masterControlHeight),
-                  ),
-                  maximumSize: WidgetStatePropertyAll(
-                    Size(double.infinity, _masterControlHeight),
-                  ),
-                  visualDensity: VisualDensity.compact,
-                ),
-                onPressed: () {
-                  _controller.close();
-                  widget.onSelected(option);
-                },
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    widget.labelFor(option),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ),
-            ),
-        ],
-        builder: (context, controller, child) {
-          return InkWell(
-            borderRadius: BorderRadius.circular(6),
-            onTap: () {
-              controller.isOpen ? controller.close() : controller.open();
-            },
-            child: Container(
-              height: _masterControlHeight,
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                border: Border.all(color: Palette.line),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      widget.labelFor(widget.value),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Palette.text,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                  const Icon(
-                    Icons.arrow_drop_down,
-                    size: 18,
-                    color: Palette.text,
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
+      child: _MasterMenuSelect(
+        value: value,
+        options: options,
+        labelFor: labelFor,
+        onSelected: onSelected,
       ),
     );
   }
@@ -4725,42 +4828,25 @@ class _CompactInput extends StatelessWidget {
 class _CompactSelect extends StatelessWidget {
   const _CompactSelect({
     required this.value,
-    required this.items,
+    required this.options,
     required this.onChanged,
     this.height = _masterControlHeight,
   });
 
   final String value;
-  final List<DropdownMenuItem<String>> items;
+  final List<String> options;
   final ValueChanged<String> onChanged;
   final double height;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return SizedBox(
       height: height,
-      padding: const EdgeInsets.symmetric(horizontal: 9),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        border: Border.all(color: Palette.line),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: DropdownButtonHideUnderline(
-        child: DropdownButton<String>(
-          value: value,
-          isExpanded: true,
-          isDense: true,
-          alignment: Alignment.centerLeft,
-          style: const TextStyle(
-            fontSize: 13,
-            color: Palette.text,
-            fontWeight: FontWeight.w600,
-          ),
-          items: items,
-          onChanged: (next) {
-            if (next != null) onChanged(next);
-          },
-        ),
+      child: _MasterMenuSelect(
+        value: value,
+        options: options,
+        height: height,
+        onSelected: onChanged,
       ),
     );
   }
@@ -5064,10 +5150,7 @@ class _MachineEditorGrid extends StatelessWidget {
       _CompactSelect(
         height: height,
         value: os,
-        items: const [
-          DropdownMenuItem(value: 'linux', child: Text('linux')),
-          DropdownMenuItem(value: 'windows', child: Text('windows')),
-        ],
+        options: const ['linux', 'windows'],
         onChanged: onOsChanged,
       ),
     ];
@@ -7271,22 +7354,21 @@ class EnumField extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final items = {...values, value}.where((item) => item.isNotEmpty).toList();
-    return DropdownButtonFormField<String>(
-      initialValue: value.isEmpty ? null : value,
-      decoration: InputDecoration(labelText: label),
-      items: items
-          .map(
-            (item) => DropdownMenuItem(
-              value: item,
-              child: Text(labelOf == null ? item : labelOf!(item)),
-            ),
-          )
-          .toList(),
-      onChanged: (value) {
-        if (value != null) {
-          onChanged(value);
-        }
-      },
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(color: Palette.muted, fontSize: 12)),
+        const SizedBox(height: 4),
+        SizedBox(
+          height: _masterControlHeight,
+          child: _MasterMenuSelect(
+            value: value,
+            options: items,
+            labelFor: labelOf,
+            onSelected: onChanged,
+          ),
+        ),
+      ],
     );
   }
 }
