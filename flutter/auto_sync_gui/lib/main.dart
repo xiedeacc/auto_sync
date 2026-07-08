@@ -4497,6 +4497,7 @@ class _CompactInput extends StatelessWidget {
     this.placeholder,
     this.onChanged,
     this.numeric = false,
+    this.height = _masterControlHeight,
   });
 
   final TextEditingController? controller;
@@ -4504,30 +4505,38 @@ class _CompactInput extends StatelessWidget {
   final String? placeholder;
   final ValueChanged<String>? onChanged;
   final bool numeric;
+  final double height;
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: _masterControlHeight,
+      height: height,
       child: TextFormField(
         controller: controller,
         initialValue: controller == null ? initialValue : null,
         keyboardType: numeric ? TextInputType.number : TextInputType.text,
         onChanged: onChanged,
         style: const TextStyle(fontSize: 12),
-        decoration: _compactInputDecoration(hintText: placeholder),
+        decoration: _compactInputDecoration(
+          hintText: placeholder,
+          height: height,
+        ),
       ),
     );
   }
 }
 
-InputDecoration _compactInputDecoration({String? hintText, String? labelText}) {
+InputDecoration _compactInputDecoration({
+  String? hintText,
+  String? labelText,
+  double height = _masterControlHeight,
+}) {
   return InputDecoration(
     hintText: hintText,
     labelText: labelText,
     isDense: true,
     contentPadding: const EdgeInsets.symmetric(horizontal: 9, vertical: 0),
-    constraints: const BoxConstraints.tightFor(height: _masterControlHeight),
+    constraints: BoxConstraints.tightFor(height: height),
   );
 }
 
@@ -4536,20 +4545,22 @@ class _CompactSelect extends StatelessWidget {
     required this.value,
     required this.items,
     required this.onChanged,
+    this.height = _masterControlHeight,
   });
 
   final String value;
   final List<DropdownMenuItem<String>> items;
   final ValueChanged<String> onChanged;
+  final double height;
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: _masterControlHeight,
+      height: height,
       child: DropdownButtonFormField<String>(
         initialValue: value,
         isDense: true,
-        decoration: _compactInputDecoration(),
+        decoration: _compactInputDecoration(height: height),
         style: const TextStyle(
           fontSize: 13,
           color: Palette.text,
@@ -4610,6 +4621,8 @@ class _MachinesDialog extends StatefulWidget {
 }
 
 class _MachinesDialogState extends State<_MachinesDialog> {
+  static const double _editorHeight = _masterControlHeight * 2;
+
   String message = '';
   bool busy = false;
   List<Map<String, dynamic>> rows = [];
@@ -4707,15 +4720,19 @@ class _MachinesDialogState extends State<_MachinesDialog> {
     return _MasterDialogFrame(
       title: 'Machines',
       width: 880,
-      maxHeight: 760,
+      maxHeight: 560,
+      shrinkWrap: true,
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Expanded(
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 330),
             child: Container(
               decoration: const BoxDecoration(
                 border: Border(top: BorderSide(color: Palette.line)),
               ),
               child: ListView(
+                shrinkWrap: true,
                 children: [
                   const _MachineHeaderRow(),
                   if (rows.isEmpty)
@@ -4765,38 +4782,62 @@ class _MachinesDialogState extends State<_MachinesDialog> {
                 ),
                 const SizedBox(height: 6),
                 Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    SizedBox(width: 96, child: _CompactInput(controller: name)),
+                    SizedBox(
+                      width: 96,
+                      child: _CompactInput(
+                        controller: name,
+                        height: _editorHeight,
+                      ),
+                    ),
                     const SizedBox(width: 6),
                     SizedBox(
                       width: 96,
-                      child: _CompactInput(controller: alias),
+                      child: _CompactInput(
+                        controller: alias,
+                        height: _editorHeight,
+                      ),
                     ),
                     const SizedBox(width: 6),
                     SizedBox(
                       width: 210,
-                      child: _CompactInput(controller: host),
+                      child: _CompactInput(
+                        controller: host,
+                        height: _editorHeight,
+                      ),
                     ),
                     const SizedBox(width: 6),
                     SizedBox(
                       width: 72,
-                      child: _CompactInput(controller: port, numeric: true),
+                      child: _CompactInput(
+                        controller: port,
+                        numeric: true,
+                        height: _editorHeight,
+                      ),
                     ),
                     const SizedBox(width: 6),
                     SizedBox(
                       width: 96,
-                      child: _CompactInput(controller: sshUser),
+                      child: _CompactInput(
+                        controller: sshUser,
+                        height: _editorHeight,
+                      ),
                     ),
                     const SizedBox(width: 6),
                     SizedBox(
                       width: 68,
-                      child: _CompactInput(controller: sshPort, numeric: true),
+                      child: _CompactInput(
+                        controller: sshPort,
+                        numeric: true,
+                        height: _editorHeight,
+                      ),
                     ),
                     const SizedBox(width: 6),
                     SizedBox(
                       width: 88,
                       child: _CompactSelect(
+                        height: _editorHeight,
                         value: os == 'windows' ? 'windows' : 'linux',
                         items: const [
                           DropdownMenuItem(
