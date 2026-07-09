@@ -176,3 +176,65 @@ exclude = [
 deploy_script_path = "collector_deploy_aws.ps1"
 deploy_script = ""
 enabled = true
+
+[[hosts]]
+name = "test"
+hostname = "192.168.255.131"
+user = "root"
+port = 10022
+identity_file = "~/.ssh/id_ed25519"
+root = 'D:\share\test'
+paths = [
+    "/etc/gitlab",
+    "/etc/immich",
+    "/etc/mysql",
+    "/etc/nginx/nginx.conf",
+    "/etc/nginx/ssl",
+    "/etc/postgresql",
+    "/etc/ssh/sshd_config",
+    "/etc/systemd/system/auto_sync.service",
+    "/etc/systemd/system/halo2.service",
+    "/etc/systemd/system/immich-ml.service",
+    "/etc/systemd/system/immich.service",
+    "/etc/systemd/system/rblog-backup.service",
+    "/etc/systemd/system/rblog-backup.timer",
+    "/etc/systemd/system/rblog.service",
+    "/etc/systemd/system/tbox-logrotate.service",
+    "/etc/systemd/system/tbox-logrotate.timer",
+    "/etc/systemd/system/tbox_client.service",
+    "/etc/systemd/system/waiwei-puller.service",
+    "/etc/systemd/system/waiwei-web.service",
+    "/etc/systemd/system/xray.service",
+    "/root/.bashrc",
+    "/root/.claude.json",
+    "/root/.claude/.credentials.json",
+    "/root/.claude/settings.json",
+    "/root/.codex/auth.json",
+    "/root/.codex/config.toml",
+    "/root/.gitconfig",
+    "/root/.profile",
+    "/root/.ssh",
+    "/root/.vimrc",
+    "/root/.wget-hsts",
+    "/root/.zprofile",
+    "/root/.zshenv",
+    "/root/.zshrc",
+    "/usr/local/auto_sync",
+    "/usr/local/blog",
+    "/usr/local/halo",
+    "/usr/local/tbox",
+    "/usr/local/waiwei",
+    "/usr/local/xray",
+]
+exclude = [
+    "/etc/mysql/my.cnf",
+    "/usr/local/auto_sync/logs",
+    "/usr/local/blog/.backup-worktree",
+    "/usr/local/blog/logs",
+    "/usr/local/tbox/log",
+    "/usr/local/waiwei/logs",
+    "/usr/local/xray/logs",
+]
+deploy_script_path = "collector_deploy_test.ps1"
+deploy_script = ""
+enabled = true
