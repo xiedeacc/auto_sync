@@ -97,14 +97,11 @@ function Invoke-Remote([string]$Script) {
     if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
 }
 
-# 0. Provision the router: repoint apk at the TUNA mirror, swap busybox
-#    dnsmasq/vi for dnsmasq-full/vim without dropping DNS, and install the
-#    required packages. The heavy apk work runs once, guarded by a marker
-#    (`rm /etc/auto_sync.provisioned` on the router to re-run); the cheap
-#    mirror rewrite runs every time and is idempotent.
+# 0. Provision the router before any local files are transferred: repoint apk
+#    at the TUNA mirror, refresh indexes, swap busybox dnsmasq for dnsmasq-full
+#    without dropping DNS, and ensure every required package is installed.
 $provision = @'
 set -u
-MARKER=/etc/auto_sync.provisioned
 TUNA=http://mirrors.tuna.tsinghua.edu.cn/openwrt
 FEEDS=/etc/apk/repositories.d/distfeeds.list
 
@@ -116,36 +113,31 @@ else
     echo "feeds already on tuna mirror"
 fi
 
-if [ -f "$MARKER" ]; then
-    echo "already provisioned; skipping apk update/installs (rm $MARKER to redo)"
+apk update || echo "!! apk update failed"
+
+# busybox dnsmasq -> dnsmasq-full. Removing dnsmasq kills the router's own
+# DNS (resolv.conf -> 127.0.0.1), so point the resolver at a public server
+# for the swap, then let netifd restore it.
+if apk list -I 2>/dev/null | grep -q "^dnsmasq-full-[0-9]"; then
+    echo "dnsmasq-full already installed"
 else
-    apk update || echo "!! apk update failed"
-
-    # busybox dnsmasq -> dnsmasq-full. Removing dnsmasq kills the router's own
-    # DNS (resolv.conf -> 127.0.0.1), so point the resolver at a public server
-    # for the swap, then let netifd restore it.
-    if apk list -I 2>/dev/null | grep -q "^dnsmasq-full-[0-9]"; then
-        echo "dnsmasq-full already installed"
-    else
-        echo "swapping busybox dnsmasq -> dnsmasq-full (keeping DNS up)"
-        RESOLV=$(readlink -f /etc/resolv.conf 2>/dev/null); [ -n "$RESOLV" ] || RESOLV=/tmp/resolv.conf
-        printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" > "$RESOLV"
-        apk del dnsmasq 2>/dev/null || true
-        apk add dnsmasq-full || echo "!! dnsmasq-full install FAILED"
-        /etc/init.d/dnsmasq restart 2>/dev/null || true
-        /etc/init.d/network reload 2>/dev/null || true
-    fi
-
-    # busybox `vi` is a builtin applet (cannot be apk-removed); install vim instead
-    apk add vim-full 2>/dev/null || echo "!! vim-full failed"
-
-    apk add losetup resize2fs usbutils block-mount fdisk e2fsprogs blkid hdparm ipset libnettle8 libnetfilter-conntrack3 || echo "!! pkg set 1 partial"
-    apk add kmod-fs-ext4 kmod-fs-vfat kmod-usb-storage kmod-usb-storage-uas grep diffutils dnsmasq-full coreutils-stat kmod-tcp-bbr || echo "!! pkg set 2 partial"
-    apk add coreutils-base64 ca-certificates ca-bundle ip-full curl wget grep nftables kmod-nft-core kmod-nft-nat kmod-nft-tproxy kmod-nft-socket vim-full || echo "!! pkg set 3 partial"
-
-    touch "$MARKER"
-    echo "provisioning complete"
+    echo "swapping busybox dnsmasq -> dnsmasq-full (keeping DNS up)"
+    RESOLV=$(readlink -f /etc/resolv.conf 2>/dev/null); [ -n "$RESOLV" ] || RESOLV=/tmp/resolv.conf
+    printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" > "$RESOLV"
+    apk del dnsmasq 2>/dev/null || true
+    apk add dnsmasq-full || echo "!! dnsmasq-full install FAILED"
+    /etc/init.d/dnsmasq restart 2>/dev/null || true
+    /etc/init.d/network reload 2>/dev/null || true
 fi
+
+# busybox `vi` is a builtin applet (cannot be apk-removed); install vim instead.
+apk add vim-full 2>/dev/null || echo "!! vim-full failed"
+
+apk add losetup resize2fs usbutils block-mount fdisk e2fsprogs blkid hdparm ipset libnettle8 libnetfilter-conntrack3 || echo "!! pkg set 1 partial"
+apk add kmod-fs-ext4 kmod-fs-vfat kmod-usb-storage kmod-usb-storage-uas grep diffutils dnsmasq-full coreutils-stat kmod-tcp-bbr || echo "!! pkg set 2 partial"
+apk add coreutils-base64 ca-certificates ca-bundle ip-full curl wget grep nftables kmod-nft-core kmod-nft-nat kmod-nft-tproxy kmod-nft-socket vim-full || echo "!! pkg set 3 partial"
+
+echo "provisioning complete"
 '@
 Write-Host 'provisioning router (apk mirror + packages)'
 Invoke-Remote $provision
