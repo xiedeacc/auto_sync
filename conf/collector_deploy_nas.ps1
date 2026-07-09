@@ -171,7 +171,7 @@ cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
 reset_xiedeacc_hosts() {
     tmp="$(mktemp)"
-    grep -Ev '(^|[[:space:]])(dev|code|unlock-music|coverage|immich)\.xiedeacc\.com([[:space:]]|$)' /etc/hosts > "$tmp" 2>/dev/null || true
+    grep -Ev '(^|[[:space:]])(dev|code|unlock-music|coverage|immich|halo)\.xiedeacc\.com([[:space:]]|$)' /etc/hosts > "$tmp" 2>/dev/null || true
     cat "$tmp" > /etc/hosts
     rm -f "$tmp"
 }
@@ -179,9 +179,11 @@ set_host_entry() {
     printf '%s %s\n' "$1" "$2" >> /etc/hosts
 }
 reset_xiedeacc_hosts
-set_host_entry 192.168.2.126 dev.xiedeacc.com
 set_host_entry 127.0.0.1 code.xiedeacc.com
 set_host_entry 127.0.0.1 unlock-music.xiedeacc.com
+set_host_entry 127.0.0.1 immich.xiedeacc.com
+set_host_entry 127.0.0.1 halo.xiedeacc.com
+set_host_entry 192.168.2.126 dev.xiedeacc.com
 set_host_entry 192.168.2.126 coverage.xiedeacc.com
 
 swapoff -a || true
