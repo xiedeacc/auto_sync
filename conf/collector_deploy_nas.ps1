@@ -163,7 +163,7 @@ apt-get install -y \
     python3-pip ruby luajit netcat-openbsd gperf cscope exuberant-ctags vim-nox git git-lfs lcov graphviz \
     libgeoip-dev libxml2 libxml2-dev libxslt1.1 libxslt1-dev libatomic-ops-dev libgd-dev libperl-dev libluajit-5.1-dev tcl-dev ruby-dev libncurses-dev \
     mysql-server postgresql postgresql-client libpq-dev postgresql-contrib sysstat nginx-full \
-    ffmpeg libimage-exiftool-perl postgresql-server-dev-16 redis quota privoxy
+    ffmpeg libimage-exiftool-perl postgresql-server-dev-16 redis quota
 apt-get remove -y apport || true
 apt-get autoremove -y || true
 
@@ -529,7 +529,7 @@ if [ "$zfs_woken" = "1" ]; then
 fi
 
 systemctl daemon-reload
-for s in auto_sync auto_sync_web halo2 immich immich-ml rblog rblog-backup.timer tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server privoxy; do
+for s in auto_sync auto_sync_web halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server; do
     restart_if_exists "$s"
 done
 for s in waiwei waiwei-web waiwei-puller xray; do
@@ -540,7 +540,7 @@ done
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_mysql.sh'; echo '5 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_mysql.sh > /dev/null 2>&1') | crontab -
 
 echo '--- final states ---'
-for s in auto_sync auto_sync_web halo2 immich immich-ml rblog rblog-backup.timer tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server privoxy waiwei xray; do
+for s in auto_sync auto_sync_web halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei xray; do
     printf '  %s: ' "$s"; systemctl is-enabled "$s" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$s" 2>/dev/null | tr -d '\n'; echo
 done
 '@
