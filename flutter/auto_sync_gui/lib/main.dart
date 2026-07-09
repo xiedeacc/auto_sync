@@ -186,6 +186,13 @@ class AutoSyncApi {
   Future<Map<String, dynamic>> collectorDeploy(int index) async => _map(
     await _request('POST', '/api/collector/deploy', body: {'index': index}),
   );
+  Future<Map<String, dynamic>> collectorDeployScript(int index) async => _map(
+    await _request(
+      'GET',
+      '/api/collector/deploy-script',
+      query: {'index': '$index'},
+    ),
+  );
   Future<Map<String, dynamic>> collectorDeployStatus() async =>
       _map(await _request('GET', '/api/collector/deploy-status'));
   Future<Map<String, dynamic>> localFilePreview(String path) async => _map(
@@ -5886,6 +5893,8 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                               await showDialog<void>(
                                 context: context,
                                 builder: (context) => _CollectorDeployDialog(
+                                  api: widget.api,
+                                  hostIndex: entry.key,
                                   host: entry.value,
                                   onChanged: () {
                                     setState(() {});
@@ -7131,8 +7140,15 @@ class _PathListEditor extends StatelessWidget {
 }
 
 class _CollectorDeployDialog extends StatefulWidget {
-  const _CollectorDeployDialog({required this.host, required this.onChanged});
+  const _CollectorDeployDialog({
+    required this.api,
+    required this.hostIndex,
+    required this.host,
+    required this.onChanged,
+  });
 
+  final AutoSyncApi api;
+  final int hostIndex;
   final Map<String, dynamic> host;
   final VoidCallback onChanged;
 
@@ -7142,17 +7158,47 @@ class _CollectorDeployDialog extends StatefulWidget {
 
 class _CollectorDeployDialogState extends State<_CollectorDeployDialog> {
   late final TextEditingController script;
+  late final bool scriptFromFile;
+  String status = '';
 
   @override
   void initState() {
     super.initState();
-    script = TextEditingController(text: _str(widget.host['deploy_script']));
+    final scriptPath = _str(widget.host['deploy_script_path']).trim();
+    scriptFromFile = scriptPath.isNotEmpty;
+    status = scriptFromFile ? 'Script file: $scriptPath' : '';
+    script = TextEditingController(
+      text: scriptFromFile ? 'Loading...' : _str(widget.host['deploy_script']),
+    );
+    if (scriptFromFile) {
+      unawaited(_loadScriptFile());
+    }
+  }
+
+  Future<void> _loadScriptFile() async {
+    try {
+      final info = await widget.api.collectorDeployScript(widget.hostIndex);
+      if (!mounted) return;
+      setState(() {
+        script.text = _str(info['script']);
+        final path = _str(info['path']).trim();
+        status = path.isEmpty ? '' : 'Script file: $path';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        script.text = '';
+        status = 'Failed to load script: $error';
+      });
+    }
   }
 
   @override
   void dispose() {
-    widget.host['deploy_script'] = script.text;
-    widget.onChanged();
+    if (!scriptFromFile) {
+      widget.host['deploy_script'] = script.text;
+      widget.onChanged();
+    }
     script.dispose();
     super.dispose();
   }
@@ -7173,10 +7219,18 @@ class _CollectorDeployDialogState extends State<_CollectorDeployDialog> {
           const _IssueSummary(
             'This script runs on this machine and deploys collected files back to the host.',
           ),
+          if (status.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              status,
+              style: const TextStyle(fontSize: 12, color: Palette.muted),
+            ),
+          ],
           const SizedBox(height: 8),
           Expanded(
             child: TextField(
               controller: script,
+              readOnly: scriptFromFile,
               expands: true,
               maxLines: null,
               minLines: null,
