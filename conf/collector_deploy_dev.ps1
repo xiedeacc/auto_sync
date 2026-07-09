@@ -508,7 +508,7 @@ if [ "$zfs_woken" = "1" ]; then
 fi
 
 systemctl daemon-reload
-for s in auto_sync auto_sync_web halo2 tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server; do
+for s in auto_sync halo2 tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server; do
     restart_if_exists "$s"
 done
 for s in waiwei waiwei-web waiwei-puller xray; do
@@ -519,7 +519,7 @@ done
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_mysql.sh'; echo '5 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_mysql.sh > /dev/null 2>&1') | crontab -
 
 echo '--- final states ---'
-for s in auto_sync auto_sync_web halo2 tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei xray; do
+for s in auto_sync halo2 tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei xray; do
     printf '  %s: ' "$s"; systemctl is-enabled "$s" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$s" 2>/dev/null | tr -d '\n'; echo
 done
 '@
