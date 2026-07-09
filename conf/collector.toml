@@ -89,6 +89,9 @@ paths = [
     "/etc/systemd/system/halo2.service",
     "/etc/systemd/system/immich-ml.service",
     "/etc/systemd/system/immich.service",
+    "/etc/systemd/system/rblog-backup.service",
+    "/etc/systemd/system/rblog-backup.timer",
+    "/etc/systemd/system/rblog.service",
     "/etc/systemd/system/tbox-logrotate.service",
     "/etc/systemd/system/tbox-logrotate.timer",
     "/etc/systemd/system/tbox_client.service",
@@ -107,11 +110,15 @@ paths = [
     "/root/.zshenv",
     "/root/.zshrc",
     "/usr/local/auto_sync",
+    "/usr/local/blog",
     "/usr/local/halo",
     "/usr/local/java",
     "/usr/local/tbox",
 ]
-exclude = []
+exclude = [
+    "/usr/local/blog/.backup-worktree",
+    "/usr/local/blog/logs",
+]
 deploy_script_path = "collector_deploy_nas.ps1"
 deploy_script = ""
 enabled = true
