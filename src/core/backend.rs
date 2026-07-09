@@ -228,6 +228,32 @@ impl Backend {
         Ok(self.collector_status())
     }
 
+    pub fn collector_run_host(&self, index: usize) -> Result<CollectorRunState> {
+        let cfg = self.get_collector_config()?;
+        cfg.hosts
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("no host at index {index}"))?;
+        {
+            let mut guard = self
+                .collector_run
+                .lock()
+                .map_err(|_| anyhow::anyhow!("collector state poisoned"))?;
+            if guard.running {
+                anyhow::bail!("a collector run is already in progress");
+            }
+            let now = chrono::Local::now();
+            *guard = CollectorRunState {
+                running: true,
+                started_at: Some(now.format("%Y-%m-%d %H:%M:%S").to_string()),
+                started_epoch_ms: Some(now.timestamp_millis()),
+                ..Default::default()
+            };
+        }
+        let state = self.collector_run.clone();
+        thread::spawn(move || collector::run_host(cfg, index, state));
+        Ok(self.collector_status())
+    }
+
     /// Current deploy run state (running flag + log), polled by the UI.
     pub fn collector_deploy_status(&self) -> CollectorRunState {
         self.collector_deploy

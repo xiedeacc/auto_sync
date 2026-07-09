@@ -163,6 +163,7 @@ pub fn router(backend: Backend) -> Router {
         .route("/api/local-file/preview", get(api_local_file_preview))
         .route("/api/local-file/text", post(api_local_file_text))
         .route("/api/collector/run", post(api_collector_run))
+        .route("/api/collector/run-host", post(api_collector_run_host))
         .route("/api/collector/status", get(api_collector_status))
         .route("/api/collector/browse", post(api_collector_browse))
         .route("/api/collector/deploy", post(api_collector_deploy))
@@ -877,6 +878,18 @@ async fn api_collector_run(
     AxumState(backend): AxumState<Backend>,
 ) -> Result<Json<CollectorRunState>, ApiError> {
     blocking(move || Ok(Json(backend.collector_run()?))).await
+}
+
+#[derive(Deserialize)]
+struct CollectorRunHostRequest {
+    index: usize,
+}
+
+async fn api_collector_run_host(
+    AxumState(backend): AxumState<Backend>,
+    Json(req): Json<CollectorRunHostRequest>,
+) -> Result<Json<CollectorRunState>, ApiError> {
+    blocking(move || Ok(Json(backend.collector_run_host(req.index)?))).await
 }
 
 async fn api_collector_status(

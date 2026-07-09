@@ -275,9 +275,54 @@ pub fn run(cfg: CollectorConfig, state: Arc<Mutex<CollectorRunState>>) {
     finish_state(&state, ok);
 }
 
+pub fn run_host(cfg: CollectorConfig, host_index: usize, state: Arc<Mutex<CollectorRunState>>) {
+    let ok = match run_host_inner(&cfg, host_index, &state) {
+        Ok(0) => {
+            log(&state, "Collector finished: all paths pulled.");
+            true
+        }
+        Ok(failures) => {
+            log(
+                &state,
+                format!("Collector finished with {failures} failed path(s)."),
+            );
+            false
+        }
+        Err(err) => {
+            log(&state, format!("ERROR: {err:#}"));
+            false
+        }
+    };
+    finish_state(&state, ok);
+}
+
 /// Runs the pipeline, returning the number of remote paths that failed to
 /// pull (a hard/setup error still returns `Err`).
 fn run_inner(cfg: &CollectorConfig, state: &Arc<Mutex<CollectorRunState>>) -> Result<usize> {
+    let enabled: Vec<&CollectorHost> = cfg.hosts.iter().filter(|h| h.enabled).collect();
+    if enabled.is_empty() {
+        bail!("no enabled hosts to pull from");
+    }
+    run_hosts_inner(cfg, enabled, state)
+}
+
+fn run_host_inner(
+    cfg: &CollectorConfig,
+    host_index: usize,
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<usize> {
+    let host = cfg
+        .hosts
+        .get(host_index)
+        .ok_or_else(|| anyhow::anyhow!("no host at index {host_index}"))?;
+    run_hosts_inner(cfg, vec![host], state)
+}
+
+fn run_hosts_inner(
+    cfg: &CollectorConfig,
+    hosts: Vec<&CollectorHost>,
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<usize> {
     let git_dir = cfg.git_dir.clone();
     if git_dir.as_os_str().is_empty() {
         bail!("git repository directory is not set");
@@ -289,15 +334,11 @@ fn run_inner(cfg: &CollectorConfig, state: &Arc<Mutex<CollectorRunState>>) -> Re
         run_git(&git_dir, &["init"], state)?;
     }
 
-    let enabled: Vec<&CollectorHost> = cfg.hosts.iter().filter(|h| h.enabled).collect();
-    if enabled.is_empty() {
-        bail!("no enabled hosts to pull from");
-    }
-    let total_files = enabled.iter().map(|host| count_collect_paths(host)).sum();
+    let total_files = hosts.iter().map(|host| count_collect_paths(host)).sum();
     set_total_files(state, total_files);
 
     let mut failures = 0;
-    for host in enabled {
+    for host in hosts {
         failures += pull_host(host, state);
     }
     set_current_file(state, None);

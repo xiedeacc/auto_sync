@@ -1508,10 +1508,10 @@ th {
 /* Fixed, content-hugging columns (no fr stretching) so every row and the
    header line up on the same left edges; the table left-aligns and any extra
    modal width stays empty on the right.
-   Host | HostName | User | Port | IdentityFile | Root | Files | edit | run | on | x */
+   Host | HostName | User | Port | IdentityFile | Root | Files | edit | collect | run | x */
 .collector-host-row {
   display: grid;
-  grid-template-columns: 80px 112px 68px 72px 132px 150px 72px 30px 30px 24px 24px;
+  grid-template-columns: 80px 112px 68px 72px 132px 150px 72px 30px 30px 30px 24px;
   gap: 6px;
   align-items: center;
   width: max-content;

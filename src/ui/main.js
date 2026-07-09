@@ -3354,8 +3354,10 @@ async function openCollectorModal(event) {
   // while the modal is open; then load the collector's own config file.
   collectorDraft = defaultCollector();
   collectorPopulateForm();
-  el.collectorLog.hidden = true;
-  el.collectorLog.textContent = "";
+  if (el.collectorLog) {
+    el.collectorLog.hidden = true;
+    el.collectorLog.textContent = "";
+  }
   setCollectorRunState("Loading…");
   el.collectorModal.hidden = false;
   try {
@@ -3399,7 +3401,6 @@ function renderCollectorHosts() {
       <span></span>
       <span></span>
       <span></span>
-      <span></span>
     </div>`;
   const rows = hosts.map((host, i) => {
     const pathCount = (host.paths || []).filter((p) => String(p).trim()).length;
@@ -3416,8 +3417,8 @@ function renderCollectorHosts() {
         </div>
         <button type="button" data-action="edit-paths" data-index="${i}" class="collector-paths-btn">Files (${pathCount})</button>
         <button type="button" data-action="deploy-edit" data-index="${i}" class="collector-icon-btn" title="Edit deploy script">📝</button>
+        <button type="button" data-action="collect-run" data-index="${i}" class="collector-icon-btn" title="Collect this host">⤓</button>
         <button type="button" data-action="deploy-run" data-index="${i}" class="collector-icon-btn collector-run-icon" title="Run deploy (copy files back + run the script on the host)">▶</button>
-        <label class="check-row collector-host-on" title="Enabled"><input type="checkbox" data-field="enabled" data-index="${i}" ${host.enabled ? "checked" : ""}></label>
         <button type="button" data-action="remove-host" data-index="${i}" class="collector-host-remove" title="Remove host">✕</button>
       </div>`;
   }).join("");
@@ -3462,6 +3463,8 @@ function onCollectorHostClick(event) {
     openCollectorPaths(ref.i);
   } else if (action === "deploy-edit") {
     openCollectorDeploy(ref.i);
+  } else if (action === "collect-run") {
+    runCollector(ref.i);
   } else if (action === "deploy-run") {
     runCollectorDeploy(ref.i);
   }
@@ -3533,10 +3536,10 @@ async function collectorPersistNow() {
   await invoke("collector_save_config", { cfg: collectorCleanDraft() });
 }
 
-async function runCollector() {
+async function runCollector(hostIndex) {
   try {
     await collectorPersistNow();
-    const state = await invoke("collector_run");
+    const state = await invoke("collector_run_host", { index: hostIndex });
     applyCollectorState(state);
     startCollectorPolling();
   } catch (error) {
@@ -3554,12 +3557,6 @@ function applyCollectorState(state) {
     setCollectorRunState("Finished with errors ✗");
   } else {
     setCollectorRunState("");
-  }
-  const log = Array.isArray(state.log) ? state.log : [];
-  if (log.length) {
-    el.collectorLog.hidden = false;
-    el.collectorLog.textContent = log.join("\n");
-    el.collectorLog.scrollTop = el.collectorLog.scrollHeight;
   }
   return state;
 }
@@ -3902,7 +3899,9 @@ bindButtonClick(el.collector, openCollectorModal);
 el.collectorClose.onclick = closeCollectorModal;
 el.collectorConfig.onclick = () => openCollectorConfigFile();
 el.collectorConfigClose.onclick = () => { el.collectorConfigModal.hidden = true; };
-el.collectorRun.onclick = () => runCollector();
+if (el.collectorRun) {
+  el.collectorRun.onclick = () => runCollector(0);
+}
 el.collectorAddHost.onclick = () => {
   if (!collectorDraft) return;
   collectorDraft.hosts.push(normalizeCollectorHost({}));
@@ -4055,6 +4054,7 @@ async function invokeWeb(command, payload = {}) {
     collector_save_config: ["POST", "/api/collector/config"],
     collector_config_file: ["GET", "/api/collector/config-file"],
     collector_deploy_script: ["GET", "/api/collector/deploy-script"],
+    collector_run_host: ["POST", "/api/collector/run-host"],
     collector_deploy: ["POST", "/api/collector/deploy"],
     collector_deploy_status: ["GET", "/api/collector/deploy-status"],
   };
@@ -4112,6 +4112,8 @@ async function invokeWeb(command, payload = {}) {
       options.body = JSON.stringify(payload.machine);
     } else if (command === "collector_run") {
       options.body = JSON.stringify({});
+    } else if (command === "collector_run_host") {
+      options.body = JSON.stringify({ index: payload.index });
     } else if (command === "collector_browse") {
       options.body = JSON.stringify({
         hostname: payload.hostname || "",

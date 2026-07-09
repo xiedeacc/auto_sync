@@ -180,6 +180,9 @@ class AutoSyncApi {
       _map(await _request('GET', '/api/collector/status'));
   Future<Map<String, dynamic>> collectorRun() async =>
       _map(await _request('POST', '/api/collector/run'));
+  Future<Map<String, dynamic>> collectorRunHost(int index) async => _map(
+    await _request('POST', '/api/collector/run-host', body: {'index': index}),
+  );
   Future<Map<String, dynamic>> collectorBrowse(
     Map<String, dynamic> req,
   ) async => _map(await _request('POST', '/api/collector/browse', body: req));
@@ -5407,11 +5410,13 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   Map<String, dynamic> cfg = {};
   Map<String, dynamic> status = {};
   Map<String, dynamic> deployStatus = {};
+  final hostRunStatuses = <int, Map<String, dynamic>>{};
   final hostDeployStatuses = <int, Map<String, dynamic>>{};
   String message = '';
   bool loading = true;
   bool busy = false;
   bool autoPush = false;
+  int? activeRunIndex;
   int? activeDeployIndex;
   Timer? saveTimer;
   Timer? runTimer;
@@ -5420,7 +5425,6 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   final splitMb = TextEditingController(text: '95');
 
   List<Map<String, dynamic>> get hosts => _mapRefs(cfg['hosts']);
-  List<Map<String, dynamic>> get runIssues => _mapRefs(status['errors']);
 
   @override
   void initState() {
@@ -5505,17 +5509,25 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     await _save();
   }
 
-  Future<void> _run() async {
+  Future<void> _runHost(int index) async {
+    if (_bool(status['running']) && activeRunIndex != index) {
+      setState(() => message = _runState());
+      return;
+    }
     setState(() {
       busy = true;
       message = '';
+      activeRunIndex = index;
+      status = {'running': true, 'log': <String>[]};
+      hostRunStatuses[index] = Map<String, dynamic>.from(status);
     });
     try {
       await _persistNow();
-      final next = await widget.api.collectorRun();
+      final next = await widget.api.collectorRunHost(index);
       if (mounted) {
         setState(() {
           status = next;
+          hostRunStatuses[index] = Map<String, dynamic>.from(next);
           message = '';
         });
       }
@@ -5541,7 +5553,13 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     try {
       final next = await widget.api.collectorStatus();
       if (!mounted) return;
-      setState(() => status = next);
+      setState(() {
+        status = next;
+        final index = activeRunIndex;
+        if (index != null) {
+          hostRunStatuses[index] = Map<String, dynamic>.from(next);
+        }
+      });
       if (!_bool(next['running'])) {
         runTimer?.cancel();
         runTimer = null;
@@ -5671,26 +5689,24 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   }
 
   Future<void> _showHostLog(int index) async {
-    final active = activeDeployIndex == index && _bool(deployStatus['running']);
-    final initial = active
+    final activeRun = activeRunIndex == index && _bool(status['running']);
+    final activeDeploy =
+        activeDeployIndex == index && _bool(deployStatus['running']);
+    final initialRun = activeRun
+        ? status
+        : (hostRunStatuses[index] ?? <String, dynamic>{});
+    final initialDeploy = activeDeploy
         ? deployStatus
         : (hostDeployStatuses[index] ?? <String, dynamic>{});
     await showDialog<void>(
       context: context,
       builder: (context) => _CollectorLogDialog(
         api: widget.api,
-        initialDeployStatus: initial,
-        pollDeploy: active,
+        initialRunStatus: initialRun,
+        initialDeployStatus: initialDeploy,
+        pollRun: activeRun,
+        pollDeploy: activeDeploy,
       ),
-    );
-  }
-
-  Future<void> _showCollectorErrors() async {
-    final issues = runIssues;
-    if (issues.isEmpty) return;
-    await showDialog<void>(
-      context: context,
-      builder: (context) => _CollectorErrorDialog(status: status),
     );
   }
 
@@ -5837,13 +5853,6 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                         ),
                       ),
                       MasterButton(
-                        label: 'Error',
-                        width: 76,
-                        danger: runIssues.isNotEmpty,
-                        onTap: runIssues.isEmpty ? null : _showCollectorErrors,
-                      ),
-                      const SizedBox(width: 8),
-                      MasterButton(
                         label: '+ Add host',
                         width: 96,
                         onTap: busy ? null : _addHost,
@@ -5904,6 +5913,9 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                               );
                             },
                             onDeployLog: () => _showHostLog(entry.key),
+                            onCollect: _bool(status['running'])
+                                ? null
+                                : () => _runHost(entry.key),
                             onDeployRun:
                                 _bool(deployStatus['running']) &&
                                     activeDeployIndex == entry.key
@@ -5917,18 +5929,6 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                 const SizedBox(height: 10),
                 Row(
                   children: [
-                    MasterButton(
-                      label: 'Run',
-                      width: 72,
-                      primary: true,
-                      onTap:
-                          busy ||
-                              _bool(status['running']) ||
-                              _bool(deployStatus['running'])
-                          ? null
-                          : _run,
-                    ),
-                    const SizedBox(width: 10),
                     Expanded(child: Center(child: _IssueSummary(_runState()))),
                     MasterButton(
                       label: 'Config',
@@ -5943,226 +5943,19 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   }
 }
 
-class _CollectorErrorDialog extends StatelessWidget {
-  const _CollectorErrorDialog({required this.status});
-
-  final Map<String, dynamic> status;
-
-  @override
-  Widget build(BuildContext context) {
-    final issues = _mapRefs(status['errors']);
-    final sortedIssues = [...issues]..sort(_compareCollectorIssues);
-    final dirFailed = sortedIssues
-        .where((issue) => _str(issue['kind']) == 'dir_failed')
-        .length;
-    final hostFailed = sortedIssues
-        .where((issue) => _str(issue['kind']) == 'host_failed')
-        .length;
-    final fileFailed = sortedIssues
-        .where((issue) => _str(issue['kind']) == 'file_failed')
-        .length;
-    final otherFailed =
-        sortedIssues.length - dirFailed - hostFailed - fileFailed;
-    final summary = [
-      if (dirFailed > 0) '$dirFailed dir copy failed',
-      if (fileFailed > 0) '$fileFailed file copy failed',
-      if (hostFailed > 0) '$hostFailed host failed',
-      if (otherFailed > 0) '$otherFailed failed',
-    ].join(' · ');
-    final total = _int(status['total_files']);
-    final succeeded = _int(status['succeeded_files']);
-    final failed = _int(status['failed_files']);
-    final started = _str(status['started_at']);
-    final duration = _collectorDurationText(status['duration_ms']);
-    final footer = [
-      '$total paths',
-      '$succeeded ok',
-      '$failed failed',
-      if (started.isNotEmpty) 'started $started',
-      if (duration.isNotEmpty) duration,
-    ].join(' · ');
-    return _MasterDialogFrame(
-      title: 'Collector Error',
-      width: 900,
-      maxHeight: 620,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (summary.isNotEmpty) _IssueSummary(summary),
-          const SizedBox(height: 8),
-          Expanded(
-            child: Container(
-              decoration: BoxDecoration(
-                border: Border.all(color: Palette.line),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: ListView(
-                children: [
-                  const _CollectorErrorHeader(),
-                  for (final issue in sortedIssues)
-                    _CollectorErrorRow(issue: issue),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
-          _IssueSummary(footer),
-        ],
-      ),
-    );
-  }
-}
-
-int _compareCollectorIssues(Map<String, dynamic> a, Map<String, dynamic> b) {
-  final weightA = _collectorIssueWeight(_str(a['kind']));
-  final weightB = _collectorIssueWeight(_str(b['kind']));
-  if (weightA != weightB) return weightA.compareTo(weightB);
-  final hostCompare = _str(a['host']).compareTo(_str(b['host']));
-  if (hostCompare != 0) return hostCompare;
-  return _str(a['path']).compareTo(_str(b['path']));
-}
-
-int _collectorIssueWeight(String kind) {
-  if (kind == 'dir_failed') return 0;
-  if (kind == 'file_failed') return 1;
-  if (kind == 'host_failed') return 2;
-  return 3;
-}
-
-String _collectorDurationText(dynamic value) {
-  if (value == null) return '';
-  final ms = value is num ? value.toDouble() : double.tryParse('$value');
-  if (ms == null) return '';
-  final seconds = ms / 1000;
-  if (seconds < 60) return 'duration ${seconds.round()}s';
-  final minutes = seconds ~/ 60;
-  if (minutes < 60) return 'duration ${minutes}m ${seconds.round() % 60}s';
-  return 'duration ${minutes ~/ 60}h ${minutes % 60}m';
-}
-
-class _CollectorErrorHeader extends StatelessWidget {
-  const _CollectorErrorHeader();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      height: 34,
-      padding: const EdgeInsets.symmetric(horizontal: 10),
-      decoration: const BoxDecoration(
-        border: Border(bottom: BorderSide(color: Palette.line)),
-      ),
-      child: const Row(
-        children: [
-          SizedBox(width: 76, child: _CollectorErrorHead('Type')),
-          SizedBox(width: 120, child: _CollectorErrorHead('Host')),
-          SizedBox(width: 280, child: _CollectorErrorHead('Path')),
-          Expanded(child: _CollectorErrorHead('Message')),
-        ],
-      ),
-    );
-  }
-}
-
-class _CollectorErrorHead extends StatelessWidget {
-  const _CollectorErrorHead(this.text);
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Text(
-        text,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(
-          color: Palette.muted,
-          fontSize: 12,
-          fontWeight: FontWeight.w700,
-        ),
-      ),
-    );
-  }
-}
-
-class _CollectorErrorRow extends StatelessWidget {
-  const _CollectorErrorRow({required this.issue});
-
-  final Map<String, dynamic> issue;
-
-  @override
-  Widget build(BuildContext context) {
-    final kind = _str(issue['kind']);
-    final isDirFailed = kind == 'dir_failed';
-    final isHostFailed = kind == 'host_failed';
-    return Container(
-      constraints: const BoxConstraints(minHeight: 38),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-      decoration: const BoxDecoration(
-        border: Border(bottom: BorderSide(color: Palette.line)),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 76,
-            child: Text(
-              isDirFailed
-                  ? 'Dir Failed'
-                  : isHostFailed
-                  ? 'Host Failed'
-                  : 'File Failed',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: Palette.red,
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ),
-          SizedBox(
-            width: 120,
-            child: Text(
-              _str(issue['host']),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 12),
-            ),
-          ),
-          SizedBox(
-            width: 280,
-            child: Text(
-              _str(issue['path']),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontFamily: 'Consolas', fontSize: 12),
-            ),
-          ),
-          Expanded(
-            child: Text(
-              _str(issue['message']),
-              maxLines: 3,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 12, color: Palette.muted),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 class _CollectorLogDialog extends StatefulWidget {
   const _CollectorLogDialog({
     required this.api,
+    required this.initialRunStatus,
     required this.initialDeployStatus,
+    required this.pollRun,
     required this.pollDeploy,
   });
 
   final AutoSyncApi api;
+  final Map<String, dynamic> initialRunStatus;
   final Map<String, dynamic> initialDeployStatus;
+  final bool pollRun;
   final bool pollDeploy;
 
   @override
@@ -6170,14 +5963,16 @@ class _CollectorLogDialog extends StatefulWidget {
 }
 
 class _CollectorLogDialogState extends State<_CollectorLogDialog> {
+  late Map<String, dynamic> runStatus;
   late Map<String, dynamic> deployStatus;
   Timer? timer;
 
   @override
   void initState() {
     super.initState();
+    runStatus = Map<String, dynamic>.from(widget.initialRunStatus);
     deployStatus = Map<String, dynamic>.from(widget.initialDeployStatus);
-    if (widget.pollDeploy) {
+    if (widget.pollRun || widget.pollDeploy) {
       timer = Timer.periodic(
         const Duration(seconds: 1),
         (_) => unawaited(_refresh()),
@@ -6194,10 +5989,18 @@ class _CollectorLogDialogState extends State<_CollectorLogDialog> {
 
   Future<void> _refresh() async {
     try {
-      final nextDeploy = await widget.api.collectorDeployStatus();
+      final nextRun = widget.pollRun
+          ? await widget.api.collectorStatus()
+          : runStatus;
+      final nextDeploy = widget.pollDeploy
+          ? await widget.api.collectorDeployStatus()
+          : deployStatus;
       if (!mounted) return;
-      setState(() => deployStatus = nextDeploy);
-      if (!_bool(nextDeploy['running'])) {
+      setState(() {
+        runStatus = nextRun;
+        deployStatus = nextDeploy;
+      });
+      if (!_bool(nextRun['running']) && !_bool(nextDeploy['running'])) {
         timer?.cancel();
         timer = null;
       }
@@ -6213,16 +6016,34 @@ class _CollectorLogDialogState extends State<_CollectorLogDialog> {
     return '';
   }
 
-  String _logText() {
-    final deployLog = _list(
-      deployStatus['log'],
-    ).map((line) => '$line').toList();
-    if (deployLog.isNotEmpty || _bool(deployStatus['running'])) {
-      return deployLog.isEmpty ? 'Deploying...' : deployLog.join('\n');
+  List<String> _stateLog(Map<String, dynamic> state, String runningText) {
+    final lines = _list(state['log']).map((line) => '$line').toList();
+    for (final issue in _mapRefs(state['errors'])) {
+      final kind = _str(issue['kind']);
+      final host = _str(issue['host']);
+      final path = _str(issue['path']);
+      final message = _str(issue['message']);
+      lines.add('[$kind] $host $path :: $message'.trim());
     }
-    final deployState = _stateText(deployStatus, 'Deploying...');
-    if (deployState.isNotEmpty) return deployState;
-    return '';
+    if (lines.isNotEmpty) return lines;
+    final stateText = _stateText(state, runningText);
+    return stateText.isEmpty ? <String>[] : <String>[stateText];
+  }
+
+  String _logText() {
+    final parts = <String>[];
+    final runLines = _stateLog(runStatus, 'Collecting...');
+    if (runLines.isNotEmpty) {
+      parts.add('Collect');
+      parts.addAll(runLines);
+    }
+    final deployLines = _stateLog(deployStatus, 'Deploying...');
+    if (deployLines.isNotEmpty) {
+      if (parts.isNotEmpty) parts.add('');
+      parts.add('Deploy');
+      parts.addAll(deployLines);
+    }
+    return parts.join('\n');
   }
 
   @override
@@ -6271,6 +6092,7 @@ class _CollectorHostRow extends StatelessWidget {
     required this.onPaths,
     required this.onDeploy,
     required this.onDeployLog,
+    required this.onCollect,
     required this.onDeployRun,
   });
 
@@ -6282,6 +6104,7 @@ class _CollectorHostRow extends StatelessWidget {
   final VoidCallback onPaths;
   final VoidCallback onDeploy;
   final VoidCallback onDeployLog;
+  final VoidCallback? onCollect;
   final VoidCallback? onDeployRun;
 
   @override
@@ -6329,16 +6152,18 @@ class _CollectorHostRow extends StatelessWidget {
         MasterButton(label: '$pathCount', onTap: onPaths),
         _CollectorTinyButton(label: '📝', onTap: onDeploy),
         _CollectorTinyButton(
+          label: '⤓',
+          accent: true,
+          color: Palette.accent,
+          onTap: onCollect,
+        ),
+        _CollectorTinyButton(
           label: '▶',
           accent: true,
           color: Palette.green,
           onTap: onDeployRun,
         ),
         _CollectorTinyButton(label: 'Log', onTap: onDeployLog),
-        _CollectorCheckCell(
-          value: _bool(host['enabled'], true),
-          onChanged: (value) => setField('enabled', value),
-        ),
         _CollectorTinyButton(label: 'x', color: Palette.red, onTap: onRemove),
       ],
     );
@@ -6379,25 +6204,6 @@ class _CollectorTinyButton extends StatelessWidget {
           textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
         ),
         child: Text(label, maxLines: 1, overflow: TextOverflow.clip),
-      ),
-    );
-  }
-}
-
-class _CollectorCheckCell extends StatelessWidget {
-  const _CollectorCheckCell({required this.value, required this.onChanged});
-
-  final bool value;
-  final ValueChanged<bool> onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Checkbox(
-        value: value,
-        visualDensity: VisualDensity.compact,
-        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        onChanged: (next) => onChanged(next ?? false),
       ),
     );
   }
