@@ -109,33 +109,54 @@ function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
 }
 
 function Invoke-Remote([string]$Script) {
+    $Script = $Script -replace "`r`n", "`n"
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Script))
-    & $ssh @sshArgs $dest "echo $b64 | base64 -d | bash"
+    $b64 | & $ssh @sshArgs $dest 'tmp=$(mktemp /tmp/auto_sync_remote.XXXXXX); base64 -d > "$tmp" && bash "$tmp" </dev/null; rc=$?; rm -f "$tmp"; exit "$rc"'
     if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
 }
 
-Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
-$localStage = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_nas_deploy_stage_" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $localStage | Out-Null
-try {
-    foreach ($p in $collectPaths) {
-        Copy-CollectedPathToStage $p $localStage
-    }
-    foreach ($p in @('/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps')) {
-        if (Test-Path -LiteralPath (Get-LocalCollectedPath $p)) {
-            Copy-CollectedPathToStage $p $localStage
+function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$OptionalPaths, [string]$RemoteStage) {
+    $tarPaths = New-Object System.Collections.Generic.List[string]
+    foreach ($p in @($RequiredPaths + $OptionalPaths)) {
+        $remote = Normalize-RemotePath $p
+        if (Test-RemoteExcluded $remote) {
+            Write-Host "skip excluded $remote"
+            continue
         }
+
+        $local = Get-LocalCollectedPath $remote
+        if (-not (Test-Path -LiteralPath $local)) {
+            if ($RequiredPaths -contains $p) {
+                Write-Host "! missing local $local"
+                $script:errCount++
+            }
+            continue
+        }
+
+        [void]$tarPaths.Add($remote.TrimStart([char[]]"/"))
+        Write-Host "stage $remote"
     }
 
-    foreach ($entry in Get-ChildItem -LiteralPath $localStage -Force) {
-        & $scp @scpArgs -- $entry.FullName ('{0}:~/.auto_sync_stage/' -f $dest)
-        if ($LASTEXITCODE -ne 0) { Write-Host "! scp failed for staged $($entry.Name)"; $errCount++ }
+    if ($tarPaths.Count -eq 0) { return }
+
+    $excludeArgs = @()
+    foreach ($exclude in $excludePaths) {
+        $rel = (Normalize-RemotePath $exclude).TrimStart([char[]]"/")
+        if ($rel -ne '') { $excludeArgs += "--exclude=$rel" }
     }
-} finally {
-    Remove-Item -LiteralPath $localStage -Recurse -Force -ErrorAction SilentlyContinue
+
+    $tarArgs = @('-C', $root, '-cf', '-') + $excludeArgs + @($tarPaths)
+    & tar @tarArgs | & $ssh @sshArgs $dest "tar -C $RemoteStage -xf -"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "! tar stage transfer failed"
+        $script:errCount++
+    }
 }
 
-Invoke-Remote 'rsync -rlptD ~/.auto_sync_stage/ / && rm -rf ~/.auto_sync_stage && echo "installed collected paths"'
+Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
+Transfer-CollectedPathsToStage $collectPaths @('/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') '~/.auto_sync_stage'
+
+Invoke-Remote 'rsync -rltD --no-perms ~/.auto_sync_stage/ /; rc=$?; if [ -f /tmp/auto_sync_root_key.pub ]; then mkdir -p /root/.ssh; touch /root/.ssh/authorized_keys; grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys; fi; chmod 755 / /etc /usr /usr/bin 2>/dev/null || true; chmod 700 /root/.ssh 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true; rm -rf ~/.auto_sync_stage; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
 
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
     $chmods = New-Object System.Collections.Generic.List[string]
@@ -157,16 +178,34 @@ GITLAB_CE_VERSION="17.11.7-ce.0"
 
 log() { printf '[nas-deploy] %s\n' "$*"; }
 try() { "$@" && return 0; log "WARN: command failed: $*"; return 0; }
-unit_exists() { systemctl list-unit-files "$1" >/dev/null 2>&1 || [ -e "/etc/systemd/system/$1" ] || [ -e "/lib/systemd/system/$1" ]; }
-restart_if_exists() {
+unit_name() {
     unit="$1"
+    if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q . || [ -e "/etc/systemd/system/$unit" ] || [ -e "/lib/systemd/system/$unit" ] || [ -e "/usr/lib/systemd/system/$unit" ]; then
+        printf '%s\n' "$unit"
+        return 0
+    fi
+    case "$unit" in
+        *.service|*.timer|*.socket) return 1 ;;
+        *) unit="${unit}.service" ;;
+    esac
+    if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q . || [ -e "/etc/systemd/system/$unit" ] || [ -e "/lib/systemd/system/$unit" ] || [ -e "/usr/lib/systemd/system/$unit" ]; then
+        printf '%s\n' "$unit"
+        return 0
+    fi
+    return 1
+}
+unit_exists() { unit_name "$1" >/dev/null; }
+restart_if_exists() {
+    unit="$(unit_name "$1" 2>/dev/null || true)"
+    [ -n "$unit" ] || return 0
     if unit_exists "$unit"; then
         systemctl enable "$unit" >/dev/null 2>&1 || true
         systemctl restart "$unit" && log "restarted $unit" || log "WARN: restart $unit failed"
     fi
 }
 disable_if_exists() {
-    unit="$1"
+    unit="$(unit_name "$1" 2>/dev/null || true)"
+    [ -n "$unit" ] || return 0
     if unit_exists "$unit"; then
         systemctl disable "$unit" >/dev/null 2>&1 || true
         systemctl stop "$unit" >/dev/null 2>&1 || true
@@ -174,6 +213,11 @@ disable_if_exists() {
         log "disabled+stopped $unit"
     fi
 }
+
+if [ -f /etc/apt/sources.list.d/gitlab_gitlab-ce.list ] && grep -q '/ubuntu/resolute\| resolute ' /etc/apt/sources.list.d/gitlab_gitlab-ce.list; then
+    log "GitLab CE has no resolute repo yet; use noble package repo"
+    sed -i 's#/ubuntu/resolute#/ubuntu/noble#g; s/ resolute / noble /g' /etc/apt/sources.list.d/gitlab_gitlab-ce.list
+fi
 
 if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
     sed -i 's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' /etc/apt/sources.list.d/ubuntu.sources
@@ -185,9 +229,9 @@ apt-get install -y \
     dialog zfsutils-linux openssh-server zsh net-tools curl iputils-ping iftop cron ca-certificates xfonts-utils dnsutils hdparm \
     autoconf libtool libtool-bin cmake make gcc g++ texinfo bison flex gdb build-essential automake pkg-config help2man gettext \
     python3-pip ruby luajit netcat-openbsd gperf cscope exuberant-ctags vim-nox git git-lfs lcov graphviz \
-    libgeoip-dev libxml2 libxml2-dev libxslt1.1 libxslt1-dev libatomic-ops-dev libgd-dev libperl-dev libluajit-5.1-dev tcl-dev ruby-dev libncurses-dev \
+    libgeoip-dev libxml2-dev libxslt1.1 libxslt1-dev libatomic-ops-dev libgd-dev libperl-dev libluajit-5.1-dev tcl-dev ruby-dev libncurses-dev \
     mysql-server postgresql postgresql-client libpq-dev postgresql-contrib sysstat nginx-full \
-    ffmpeg libimage-exiftool-perl postgresql-server-dev-16 redis quota
+    ffmpeg libimage-exiftool-perl postgresql-server-dev-all redis quota
 apt-get remove -y apport || true
 apt-get autoremove -y || true
 
@@ -257,10 +301,13 @@ if [ ! -x /usr/local/go/go1.25.1/bin/go ]; then
     mkdir -p /usr/local/go
     cd /usr/local/go
     rm -rf go go1.25.1 go1.25.1.linux-amd64.tar.gz
-    curl -L -O https://go.dev/dl/go1.25.1.linux-amd64.tar.gz
-    tar zxf go1.25.1.linux-amd64.tar.gz
-    mv go go1.25.1
-    rm -f go1.25.1.linux-amd64.tar.gz
+    if curl --retry 5 --retry-all-errors -L -O https://go.dev/dl/go1.25.1.linux-amd64.tar.gz || curl --retry 5 --retry-all-errors -L -O https://dl.google.com/go/go1.25.1.linux-amd64.tar.gz; then
+        tar zxf go1.25.1.linux-amd64.tar.gz
+        mv go go1.25.1
+        rm -f go1.25.1.linux-amd64.tar.gz
+    else
+        log "WARN: go download failed"
+    fi
 fi
 export PATH="/usr/local/go/go1.25.1/bin:/root/go/bin:$PATH"
 if command -v go >/dev/null 2>&1; then
@@ -271,13 +318,21 @@ if [ ! -x /root/.cargo/bin/rustup ]; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y || log "WARN: rustup install failed"
 fi
 
-if [ ! -s /root/.nvm/nvm.sh ]; then
+mkdir -p /opt/software/src/tools
+if [ -L /opt/software/src/tools/nvm ]; then
+    rm -f /opt/software/src/tools/nvm
+fi
+export NVM_DIR=/opt/software/src/tools/nvm
+if [ ! -s "$NVM_DIR/nvm.sh" ]; then
     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash || log "WARN: nvm install failed"
 fi
-if [ -s /root/.nvm/nvm.sh ]; then
-    . /root/.nvm/nvm.sh
-    nvm install 24 || log "WARN: nvm install 24 failed"
-    nvm use 24 || true
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+    . "$NVM_DIR/nvm.sh"
+    nvm install 24.18.0 || nvm install 24 || log "WARN: nvm install 24 failed"
+    nvm use 24.18.0 || nvm use 24 || true
+fi
+if [ -d "$NVM_DIR" ]; then
+    chmod -R a+rX "$NVM_DIR" || true
 fi
 
 if [ ! -x /usr/local/bin/buildifier ]; then
@@ -301,7 +356,7 @@ if [ ! -d /root/.vim/bundle/Vundle.vim ]; then
     git clone https://github.com/VundleVim/Vundle.vim.git /root/.vim/bundle/Vundle.vim || true
 fi
 if command -v vim >/dev/null 2>&1; then
-    vim +PluginInstall +qall </dev/null || log "WARN: vim PluginInstall failed"
+    timeout --kill-after=10s 180s vim +PluginInstall +qall </dev/null || log "WARN: vim PluginInstall failed"
 fi
 if [ ! -d /root/.vim/bundle/vim-airline-fonts ]; then
     git clone https://github.com/powerline/fonts /root/.vim/bundle/vim-airline-fonts || true
@@ -387,10 +442,20 @@ EOF_GITLAB_ZFS
     fi
 }
 
+ensure_gitlab_repo_compatible() {
+    list="/etc/apt/sources.list.d/gitlab_gitlab-ce.list"
+    [ -f "$list" ] || return 0
+    if grep -q '/ubuntu/resolute\| resolute ' "$list"; then
+        log "GitLab CE has no resolute repo yet; use noble package repo"
+        sed -i 's#/ubuntu/resolute#/ubuntu/noble#g; s/ resolute / noble /g' "$list"
+    fi
+}
+
 ensure_zfs_for_gitlab
 installed_gitlab_version="$(dpkg-query -W -f='${Version}' gitlab-ce 2>/dev/null || true)"
 if [ "$installed_gitlab_version" != "$GITLAB_CE_VERSION" ]; then
     curl -s https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh | bash || log "WARN: gitlab repo install failed"
+    ensure_gitlab_repo_compatible
     apt-get update || true
     apt-get install -y --allow-downgrades "gitlab-ce=$GITLAB_CE_VERSION" || log "WARN: gitlab-ce $GITLAB_CE_VERSION install failed"
 fi
@@ -601,6 +666,51 @@ dump_search_roots() {
     done
 }
 
+ensure_postgresql_ready() {
+    if command -v pg_lsclusters >/dev/null 2>&1; then
+        pg_lsclusters -h 2>/dev/null | awk '$4 ~ /binaries_missing/ { print $1 }' | while read -r old_version; do
+            [ -n "$old_version" ] || continue
+            [ -d "/etc/postgresql/$old_version" ] && mv "/etc/postgresql/$old_version" "/etc/postgresql/${old_version}.disabled-by-auto-sync" 2>/dev/null || true
+        done
+    fi
+    systemctl restart postgresql 2>/dev/null || true
+    if command -v pg_lsclusters >/dev/null 2>&1; then
+        if ! pg_lsclusters 2>/dev/null | awk '$4 == "online" { found = 1 } END { exit found ? 0 : 1 }'; then
+            version="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -1)"
+            if [ -n "$version" ]; then
+                [ -d "/etc/postgresql/$version/main" ] || pg_createcluster "$version" main --start || true
+                pg_ctlcluster "$version" main start 2>/dev/null || true
+            fi
+        fi
+        if ! pg_lsclusters 2>/dev/null | awk '$3 == "5432" && $4 == "online" { found = 1 } END { exit found ? 0 : 1 }'; then
+            version="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -1)"
+            if [ -n "$version" ] && [ -f "/etc/postgresql/$version/main/postgresql.conf" ]; then
+                pg_ctlcluster "$version" main stop 2>/dev/null || true
+                sed -i -E "s/^#?[[:space:]]*port[[:space:]]*=.*/port = 5432/" "/etc/postgresql/$version/main/postgresql.conf"
+                pg_ctlcluster "$version" main start 2>/dev/null || true
+            fi
+        fi
+    fi
+    systemctl restart postgresql 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+        pg_isready -q 2>/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
+configure_postgresql_peer_maps() {
+    for hba in /etc/postgresql/[0-9]*/main/pg_hba.conf; do
+        [ -f "$hba" ] || continue
+        dir="$(dirname "$hba")"
+        ident="$dir/pg_ident.conf"
+        sed -i -E 's/^(local[[:space:]]+all[[:space:]]+all[[:space:]]+peer)([[:space:]].*)?$/\1 map=gitlab/' "$hba"
+        touch "$ident"
+        grep -Eq '^[[:space:]]*gitlab[[:space:]]+tiger[[:space:]]+immich([[:space:]]|$)' "$ident" || printf '\ngitlab  tiger  immich\n' >> "$ident"
+    done
+    systemctl reload postgresql 2>/dev/null || true
+}
+
 restore_once() {
     kind="$1"
     latest="$2"
@@ -618,8 +728,9 @@ restore_once() {
             if printf '%s' "$latest" | grep -q '\.gz$'; then zcat "$latest" | mysql; else mysql < "$latest"; fi
             ;;
         postgres)
-            systemctl restart postgresql 2>/dev/null || true
-            if printf '%s' "$latest" | grep -q '\.gz$'; then zcat "$latest" | sudo -u postgres psql -v ON_ERROR_STOP=1; else sudo -u postgres psql -v ON_ERROR_STOP=1 -f "$latest"; fi
+            ensure_postgresql_ready || log "WARN: postgresql is not ready before restore"
+            configure_postgresql_peer_maps
+            if printf '%s' "$latest" | grep -q '\.gz$'; then zcat "$latest" | sudo -u postgres psql -v ON_ERROR_STOP=0; else sudo -u postgres psql -v ON_ERROR_STOP=0 -f "$latest"; fi
             ;;
     esac && printf '%s' "$latest" > "$marker" || log "WARN: $kind restore failed"
 }
@@ -637,7 +748,19 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
+id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
+mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf
+for d in backups encoded-video library profile thumbs upload; do
+    mkdir -p "/opt/immich/upload/$d"
+    touch "/opt/immich/upload/$d/.immich"
+done
+for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /opt/immich; do
+    [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
+done
+find /opt/immich/server/bin /opt/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
+chmod a+rx /opt/software/src/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/null || true
 systemctl daemon-reload
+rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
 for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server; do
     restart_if_exists "$s"
 done
@@ -650,7 +773,14 @@ done
 
 echo '--- final states ---'
 for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei xray; do
-    printf '  %s: ' "$s"; systemctl is-enabled "$s" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$s" 2>/dev/null | tr -d '\n'; echo
+    resolved="$(unit_name "$s" 2>/dev/null || true)"
+    if [ -n "$resolved" ]; then
+        printf '  %s: ' "$s"; systemctl is-enabled "$resolved" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$resolved" 2>/dev/null | tr -d '\n'; echo
+    elif [ "$s" = "gitlab" ] && command -v gitlab-ctl >/dev/null 2>&1 && gitlab-ctl status >/dev/null 2>&1; then
+        printf '  %s: enabled / active\n' "$s"
+    else
+        printf '  %s: not-found / inactive\n' "$s"
+    fi
 done
 '@
 Invoke-Remote $remote

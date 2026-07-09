@@ -113,30 +113,56 @@ function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
 # Remote commands run as the ubuntu user; root actions use `sudo` inline
 # (passwordless). base64 stdin avoids the Windows-PowerShell UTF-8 BOM.
 function Invoke-Remote([string]$Script) {
+    $Script = $Script -replace "`r`n", "`n"
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Script))
-    & $ssh @sshArgs $dest "echo $b64 | base64 -d | sh"
+    $b64 | & $ssh @sshArgs $dest 'tmp=$(mktemp /tmp/auto_sync_remote.XXXXXX); base64 -d > "$tmp" && sh "$tmp" </dev/null; rc=$?; rm -f "$tmp"; exit "$rc"'
     if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
+}
+
+function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$OptionalPaths, [string]$RemoteStage) {
+    $tarPaths = New-Object System.Collections.Generic.List[string]
+    foreach ($p in @($RequiredPaths + $OptionalPaths)) {
+        $remote = Normalize-RemotePath $p
+        if (Test-RemoteExcluded $remote) {
+            Write-Host "skip excluded $remote"
+            continue
+        }
+
+        $local = Get-LocalCollectedPath $remote
+        if (-not (Test-Path -LiteralPath $local)) {
+            if ($RequiredPaths -contains $p) {
+                Write-Host "! missing local $local"
+                $script:errCount++
+            }
+            continue
+        }
+
+        [void]$tarPaths.Add($remote.TrimStart([char[]]"/"))
+        Write-Host "stage $remote"
+    }
+
+    if ($tarPaths.Count -eq 0) { return }
+
+    $excludeArgs = @()
+    foreach ($exclude in $excludePaths) {
+        $rel = (Normalize-RemotePath $exclude).TrimStart([char[]]"/")
+        if ($rel -ne '') { $excludeArgs += "--exclude=$rel" }
+    }
+
+    $tarArgs = @('-C', $root, '-cf', '-') + $excludeArgs + @($tarPaths)
+    & tar @tarArgs | & $ssh @sshArgs $dest "tar -C $RemoteStage -xf -"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "! tar stage transfer failed"
+        $script:errCount++
+    }
 }
 
 # 1. Stage every path in the Collector list, excluding anything in Ignore, then
 #    install with sudo rsync.
 Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
-$localStage = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_deploy_stage_" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $localStage | Out-Null
-try {
-    foreach ($p in $collectPaths) {
-        Copy-CollectedPathToStage $p $localStage
-    }
-
-    foreach ($entry in Get-ChildItem -LiteralPath $localStage -Force) {
-        & $scp @scpArgs -- $entry.FullName ('{0}:~/.auto_sync_stage/' -f $dest)
-        if ($LASTEXITCODE -ne 0) { Write-Host "! scp failed for staged $($entry.Name)"; $errCount++ }
-    }
-} finally {
-    Remove-Item -LiteralPath $localStage -Recurse -Force -ErrorAction SilentlyContinue
-}
+Transfer-CollectedPathsToStage $collectPaths @() '~/.auto_sync_stage'
 # rsync without -o/-g; ownership for ubuntu-owned trees is fixed below.
-Invoke-Remote 'sudo rsync -rlptD ~/.auto_sync_stage/ / && rm -rf ~/.auto_sync_stage && echo "installed collected paths"'
+Invoke-Remote 'sudo rsync -rltD --no-perms ~/.auto_sync_stage/ / && rm -rf ~/.auto_sync_stage && echo "installed collected paths"'
 
 # 2. Restore recorded permissions for the pushed /etc files.
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
