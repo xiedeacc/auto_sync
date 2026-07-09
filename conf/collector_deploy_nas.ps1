@@ -169,22 +169,57 @@ apt-get autoremove -y || true
 
 cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
-reset_xiedeacc_hosts() {
+ensure_host_entry() {
+    expected_ip="$1"
+    host="$2"
     tmp="$(mktemp)"
-    grep -Ev '(^|[[:space:]])(dev|code|unlock-music|coverage|immich|halo)\.xiedeacc\.com([[:space:]]|$)' /etc/hosts > "$tmp" 2>/dev/null || true
+    touch /etc/hosts
+    awk -v expected_ip="$expected_ip" -v host="$host" '
+        /^[[:space:]]*#/ || NF == 0 { print; next }
+        {
+            has_host = 0
+            for (i = 2; i <= NF; i++) {
+                if ($i == host) {
+                    has_host = 1
+                    break
+                }
+            }
+            if (!has_host) {
+                print
+                next
+            }
+            if ($1 == expected_ip && found == 0) {
+                print
+                found = 1
+                next
+            }
+            out = $1
+            kept = 0
+            for (i = 2; i <= NF; i++) {
+                if ($i != host) {
+                    out = out " " $i
+                    kept = 1
+                }
+            }
+            if (kept) {
+                print out
+            }
+        }
+        END {
+            if (found == 0) {
+                print expected_ip " " host
+            }
+        }
+    ' /etc/hosts > "$tmp"
     cat "$tmp" > /etc/hosts
     rm -f "$tmp"
 }
-set_host_entry() {
-    printf '%s %s\n' "$1" "$2" >> /etc/hosts
-}
-reset_xiedeacc_hosts
-set_host_entry 127.0.0.1 code.xiedeacc.com
-set_host_entry 127.0.0.1 unlock-music.xiedeacc.com
-set_host_entry 127.0.0.1 immich.xiedeacc.com
-set_host_entry 127.0.0.1 halo.xiedeacc.com
-set_host_entry 192.168.2.126 dev.xiedeacc.com
-set_host_entry 192.168.2.126 coverage.xiedeacc.com
+ensure_host_entry 127.0.0.1 code.xiedeacc.com
+ensure_host_entry 127.0.0.1 unlock-music.xiedeacc.com
+ensure_host_entry 127.0.0.1 immich.xiedeacc.com
+ensure_host_entry 127.0.0.1 halo.xiedeacc.com
+ensure_host_entry 192.168.2.126 dev.xiedeacc.com
+ensure_host_entry 192.168.2.126 coverage.xiedeacc.com
 
 swapoff -a || true
 sed -i '/^\/swap\.img[[:space:]]/s/^/#/' /etc/fstab 2>/dev/null || true
