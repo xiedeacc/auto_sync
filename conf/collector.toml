@@ -81,16 +81,23 @@ paths = [
     "/etc/gitlab",
     "/etc/immich",
     "/etc/mysql",
-    "/etc/nginx",
+    "/etc/nginx/nginx.conf",
+    "/etc/nginx/ssl",
     "/etc/postgresql",
     "/etc/ssh/sshd_config",
     "/etc/systemd/system/auto_sync.service",
     "/etc/systemd/system/halo2.service",
     "/etc/systemd/system/immich-ml.service",
     "/etc/systemd/system/immich.service",
+    "/etc/systemd/system/rblog-backup.service",
+    "/etc/systemd/system/rblog-backup.timer",
+    "/etc/systemd/system/rblog.service",
     "/etc/systemd/system/tbox-logrotate.service",
     "/etc/systemd/system/tbox-logrotate.timer",
     "/etc/systemd/system/tbox_client.service",
+    "/etc/systemd/system/waiwei-puller.service",
+    "/etc/systemd/system/waiwei-web.service",
+    "/etc/systemd/system/xray.service",
     "/root/.bashrc",
     "/root/.claude.json",
     "/root/.claude/.credentials.json",
@@ -106,11 +113,21 @@ paths = [
     "/root/.zshenv",
     "/root/.zshrc",
     "/usr/local/auto_sync",
+    "/usr/local/blog",
     "/usr/local/halo",
-    "/usr/local/java",
     "/usr/local/tbox",
+    "/usr/local/waiwei",
+    "/usr/local/xray",
 ]
-exclude = []
+exclude = [
+    "/etc/mysql/my.cnf",
+    "/usr/local/auto_sync/logs",
+    "/usr/local/blog/.backup-worktree",
+    "/usr/local/blog/logs",
+    "/usr/local/tbox/log",
+    "/usr/local/waiwei/logs",
+    "/usr/local/xray/logs",
+]
 deploy_script_path = "collector_deploy_nas.ps1"
 deploy_script = ""
 enabled = true

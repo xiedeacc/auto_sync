@@ -463,17 +463,54 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         Some(&format!("{} path(s) from {label}", targets.len())),
     );
     let mut files = Vec::new();
+    let mut symlink_files = Vec::new();
     let mut dirs = Vec::new();
     for remote in &targets {
         set_current_file(state, Some(remote));
         match remote_path_kind(&conn, remote) {
             Ok(RemotePathKind::File) => files.push(remote.clone()),
             Ok(RemotePathKind::Dir) => dirs.push(remote.clone()),
+            Ok(RemotePathKind::SymlinkFile) => symlink_files.push(remote.clone()),
             Err(err) => {
                 failures += 1;
                 record_file_failed(state, 1);
                 record_run_issue(state, "file_failed", &label, remote, format!("{err:#}"));
                 log(state, format!("  FAILED {remote}: {err:#}"));
+            }
+        }
+    }
+
+    if !symlink_files.is_empty() {
+        set_current_file(
+            state,
+            Some(&format!(
+                "{} symlink file(s) from {label}",
+                symlink_files.len()
+            )),
+        );
+        for remote in &symlink_files {
+            set_current_file(state, Some(remote));
+            match pull_paths_tar(host, &conn, std::slice::from_ref(remote), &excludes, state) {
+                Ok(()) => {
+                    record_file_ok(state);
+                    log(state, format!("  ok {remote}"));
+                    pulled.push(remote.clone());
+                }
+                Err(err) => {
+                    failures += 1;
+                    record_file_failed(state, 1);
+                    record_run_issue(
+                        state,
+                        "file_failed",
+                        &label,
+                        remote,
+                        format!("tar dereference failed: {err:#}"),
+                    );
+                    log(
+                        state,
+                        format!("  FAILED {remote}: tar dereference failed: {err:#}"),
+                    );
+                }
             }
         }
     }
@@ -679,6 +716,7 @@ fn cleanup_database_dumps(conn: &SshConn, state: &Arc<Mutex<CollectorRunState>>)
 enum RemotePathKind {
     File,
     Dir,
+    SymlinkFile,
 }
 
 fn remote_path_kind(conn: &SshConn, remote: &str) -> Result<RemotePathKind> {
@@ -686,12 +724,15 @@ fn remote_path_kind(conn: &SshConn, remote: &str) -> Result<RemotePathKind> {
     let out = ssh_capture(
         conn,
         &format!(
-            "if [ -d {q} ]; then echo dir; elif [ -f {q} ] || [ -L {q} ]; then echo file; else echo missing; fi"
+            "if [ -L {q} ]; then \
+if [ -d {q} ]; then echo dir; elif [ -f {q} ]; then echo symlink_file; else echo broken_symlink; fi; \
+elif [ -d {q} ]; then echo dir; elif [ -f {q} ]; then echo file; else echo missing; fi"
         ),
     )?;
     match out.trim() {
         "dir" => Ok(RemotePathKind::Dir),
         "file" => Ok(RemotePathKind::File),
+        "symlink_file" => Ok(RemotePathKind::SymlinkFile),
         other => bail!("remote path is not a file or directory ({other})"),
     }
 }
@@ -709,11 +750,13 @@ fn pull_paths_tar(
         .map(|path| remote_tar_path(path))
         .collect::<Result<_>>()?;
     for rel in &rel_paths {
-        clear_readonly_recursive(&host.root.join(local_rel_path(rel)));
+        let local_path = host.root.join(local_rel_path(rel));
+        clear_readonly_recursive(&local_path);
+        remove_symlinks_recursive(&local_path);
     }
 
     let exclude_patterns = tar_exclude_patterns(&rel_paths, excludes);
-    let mut remote_cmd = String::from("cd / && tar -cf - ");
+    let mut remote_cmd = String::from("cd / && tar -chf - ");
     if !exclude_patterns.is_empty() {
         remote_cmd.push_str("-X - ");
     }
@@ -817,9 +860,9 @@ fn record_host_perms(
         let q = shell_quote(path);
         let cmd = format!(
             "if command -v stat >/dev/null 2>&1; then \
-find {q} \\( -type f -o -type d \\) -exec stat -c '%a %n' {{}} \\; 2>/dev/null; \
+find -L {q} \\( -type f -o -type d \\) -exec stat -c '%a %n' {{}} \\; 2>/dev/null; \
 else \
-find {q} \\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null; \
+find -L {q} \\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null; \
 fi"
         );
         let out = match ssh_capture(conn, &cmd) {
@@ -968,7 +1011,9 @@ fn pull_path(
 /// pulls are cleared first so they can still be overwritten.
 fn scp_recursive(conn: &SshConn, remote: &str, local_dest: &Path) -> Result<()> {
     if let Some(leaf) = remote.trim_end_matches('/').rsplit('/').next() {
-        clear_readonly_recursive(&local_dest.join(leaf));
+        let local_path = local_dest.join(leaf);
+        clear_readonly_recursive(&local_path);
+        remove_symlinks_recursive(&local_path);
     }
 
     let mut cmd = scp_command(conn);
@@ -999,6 +1044,46 @@ fn clear_readonly_recursive(path: &Path) {
                 let _ = fs::set_permissions(entry.path(), perms);
             }
         }
+    }
+}
+
+/// Remove symlinks/junctions under `path` before copying real data over them.
+/// This keeps extraction/copy from writing through an old local link target.
+fn remove_symlinks_recursive(path: &Path) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        let _ = remove_symlink_path(path);
+        return;
+    }
+    if !meta.is_dir() {
+        return;
+    }
+    let mut links: Vec<PathBuf> = WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_symlink())
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    links.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for link in links {
+        let _ = remove_symlink_path(&link);
+    }
+}
+
+fn remove_symlink_path(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+            return fs::remove_dir(path);
+        }
+        return fs::remove_file(path);
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(path)
     }
 }
 

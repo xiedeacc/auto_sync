@@ -47,6 +47,51 @@ function Join-RemotePath([string]$Base, [string]$Relative) {
     return $b + '/' + $r
 }
 
+function Resolve-ReparseTarget([IO.FileSystemInfo]$Item) {
+    if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { return $Item.FullName }
+    $target = @($Item.Target | Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace($target)) { return $Item.FullName }
+    if (-not [IO.Path]::IsPathRooted($target)) {
+        $target = Join-Path (Split-Path -Parent $Item.FullName) $target
+    }
+    return [IO.Path]::GetFullPath($target)
+}
+
+function Copy-ResolvedTree([string]$Source, [string]$Target, [string]$RemotePath, [hashtable]$SeenDirs) {
+    if (Test-RemoteExcluded $RemotePath) {
+        Write-Host "skip excluded $RemotePath"
+        return
+    }
+    $item = Get-Item -LiteralPath $Source -Force
+    $resolved = Resolve-ReparseTarget $item
+    if ($resolved -ne $item.FullName) {
+        if (-not (Test-Path -LiteralPath $resolved)) {
+            Write-Host "! broken symlink $Source -> $resolved"
+            return
+        }
+        $item = Get-Item -LiteralPath $resolved -Force
+    }
+    if (-not $item.PSIsContainer) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Target) | Out-Null
+        Copy-Item -LiteralPath $item.FullName -Destination $Target -Force
+        return
+    }
+
+    $resolvedDir = [IO.Path]::GetFullPath($item.FullName).TrimEnd([char[]]"\/")
+    if ($SeenDirs.ContainsKey($resolvedDir)) {
+        Write-Host "skip symlink cycle $RemotePath -> $resolvedDir"
+        return
+    }
+    $SeenDirs[$resolvedDir] = $true
+    New-Item -ItemType Directory -Force -Path $Target | Out-Null
+    Get-ChildItem -LiteralPath $item.FullName -Force | ForEach-Object {
+        $remoteChild = Join-RemotePath $RemotePath $_.Name
+        $childTarget = Join-Path $Target $_.Name
+        Copy-ResolvedTree $_.FullName $childTarget $remoteChild $SeenDirs
+    }
+    $SeenDirs.Remove($resolvedDir)
+}
+
 function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
     $remote = Normalize-RemotePath $RemotePath
     if (Test-RemoteExcluded $remote) {
@@ -61,30 +106,8 @@ function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
     }
 
     $target = Join-Path $StageRoot ($remote.TrimStart([char[]]"/") -replace '/','\')
-    $item = Get-Item -LiteralPath $local -Force
-    if (-not $item.PSIsContainer) {
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
-        Copy-Item -LiteralPath $local -Destination $target -Force
-        Write-Host "stage $remote"
-        return
-    }
-
-    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    Copy-ResolvedTree $local $target $remote @{}
     Write-Host "stage $remote"
-    $baseLen = $item.FullName.TrimEnd([char[]]"\/").Length
-    Get-ChildItem -LiteralPath $local -Force -Recurse | ForEach-Object {
-        $rel = $_.FullName.Substring($baseLen).TrimStart([char[]]"\/")
-        $remoteChild = Join-RemotePath $remote $rel
-        if (-not (Test-RemoteExcluded $remoteChild)) {
-            $childTarget = Join-Path $target ($rel -replace '/','\')
-            if ($_.PSIsContainer) {
-                New-Item -ItemType Directory -Force -Path $childTarget | Out-Null
-            } else {
-                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $childTarget) | Out-Null
-                Copy-Item -LiteralPath $_.FullName -Destination $childTarget -Force
-            }
-        }
-    }
 }
 
 # Remote commands run as the ubuntu user; root actions use `sudo` inline
