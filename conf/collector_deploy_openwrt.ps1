@@ -142,13 +142,9 @@ echo "provisioning complete"
 Write-Host 'provisioning router (apk mirror + packages)'
 Invoke-Remote $provision
 
-# 1. Stop shadowsocks first so its binaries (sslocal + the xray-plugin child)
-#    are not busy when we overwrite them, and make sure the parent dirs exist.
+# 1. Prepare parent directories before file transfer. Do not stop services here:
+#    keep the router running while collected files are copied back.
 Invoke-Remote @'
-/etc/init.d/shadowsocks stop 2>/dev/null || true
-/etc/init.d/shadowsocks-rust stop 2>/dev/null || true
-killall sslocal sslocal-master xray-plugin 2>/dev/null || true
-sleep 1
 mkdir -p /etc/init.d /etc/sysctl.d /etc/config /usr/local
 '@
 
