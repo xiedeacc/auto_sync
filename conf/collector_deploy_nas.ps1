@@ -130,6 +130,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
 $remote = @'
 set -u
 export DEBIAN_FRONTEND=noninteractive
+GITLAB_CE_VERSION="17.11.7-ce.0"
 
 log() { printf '[nas-deploy] %s\n' "$*"; }
 try() { "$@" && return 0; log "WARN: command failed: $*"; return 0; }
@@ -322,15 +323,63 @@ for u in tiger git gitlab immich; do
     id "$u" >/dev/null 2>&1 && setquota -u "$u" 1000000 1000000 0 0 / 2>/dev/null || true
 done
 
-if ! dpkg -s gitlab-ce >/dev/null 2>&1; then
+ensure_zfs_for_gitlab() {
+    if ! command -v zpool >/dev/null 2>&1; then
+        log "WARN: zpool not installed; cannot ensure GitLab /zfs storage"
+        return 0
+    fi
+    log "ensure /zfs is imported and mounted before GitLab setup"
+    for pool in zfs zfs_pool ssd; do
+        if ! zpool list -H "$pool" >/dev/null 2>&1; then
+            zpool import "$pool" >/dev/null 2>&1 || true
+        fi
+    done
+    zfs mount zfs >/dev/null 2>&1 || zfs mount -a >/dev/null 2>&1 || true
+    zpool status zfs >/dev/null 2>&1 || log "WARN: zfs pool is not online"
+    if ! findmnt -T /zfs >/dev/null 2>&1; then
+        log "WARN: /zfs is not mounted"
+    fi
+    ls -ald /zfs >/dev/null 2>&1 || true
+}
+
+ensure_gitlab_zfs_config() {
+    [ -f /etc/gitlab/gitlab.rb ] || return 0
+    if ! grep -q '/zfs/gitlab_data' /etc/gitlab/gitlab.rb 2>/dev/null; then
+        log "add GitLab /zfs data storage config"
+        cat >> /etc/gitlab/gitlab.rb <<'EOF_GITLAB_ZFS'
+
+# Managed by auto_sync NAS deployment: keep GitLab repository/LFS data on /zfs.
+gitlab_rails['lfs_enabled'] = true
+gitlab_rails['lfs_storage_path'] = "/zfs/gitlab_data/lfs-objects"
+git_data_dirs({
+   "default" => {"path" => "/zfs/gitlab_data"},
+})
+gitlab_rails['repository_storages'] = {
+  'default' => {
+    'path' => '/zfs/gitlab_data',
+    'gitaly_address' => 'unix:/var/opt/gitlab/gitaly/gitaly.socket'
+  }
+}
+EOF_GITLAB_ZFS
+    fi
+}
+
+ensure_zfs_for_gitlab
+installed_gitlab_version="$(dpkg-query -W -f='${Version}' gitlab-ce 2>/dev/null || true)"
+if [ "$installed_gitlab_version" != "$GITLAB_CE_VERSION" ]; then
     curl -s https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh | bash || log "WARN: gitlab repo install failed"
     apt-get update || true
-    apt-get install -y gitlab-ce=17.11.7-ce.0 || log "WARN: gitlab-ce install failed"
+    apt-get install -y --allow-downgrades "gitlab-ce=$GITLAB_CE_VERSION" || log "WARN: gitlab-ce $GITLAB_CE_VERSION install failed"
 fi
+ensure_zfs_for_gitlab
+mkdir -p /zfs/gitlab_data /zfs/gitlab_data/lfs-objects 2>/dev/null || true
 passwd -S git 2>/dev/null || true
 passwd -u git 2>/dev/null || true
+[ -d /zfs/gitlab_data ] && chown -R git:git /zfs/gitlab_data 2>/dev/null || true
+[ -d /zfs/gitlab_data ] && chmod 2770 /zfs/gitlab_data 2>/dev/null || true
 [ -d /etc/gitlab ] && chown -R git:git /etc/gitlab 2>/dev/null || true
 [ -d /etc/gitlab ] && chmod 700 /etc/gitlab 2>/dev/null || true
+ensure_gitlab_zfs_config
 if command -v gitlab-ctl >/dev/null 2>&1; then
     gitlab-ctl reconfigure || log "WARN: gitlab reconfigure failed"
     gitlab-ctl restart || log "WARN: gitlab restart failed"
