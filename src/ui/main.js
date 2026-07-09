@@ -3672,7 +3672,7 @@ async function openCollectorDeploy(hostIndex) {
   el.collectorDeployTitle.textContent = `Deploy — ${label}`;
   el.collectorDeployScript.readOnly = Boolean(scriptPath);
   el.collectorDeployScript.value = scriptPath ? "Loading…" : (host.deploy_script || "");
-  el.collectorDeployState.textContent = scriptPath ? `Script file: ${scriptPath}` : "";
+  el.collectorDeployState.textContent = scriptPath ? `Script file: ${displayPath(scriptPath)}` : "";
   el.collectorDeployLog.hidden = true;
   el.collectorDeployLog.textContent = "";
   el.collectorDeployModal.hidden = false;
@@ -3681,7 +3681,7 @@ async function openCollectorDeploy(hostIndex) {
       const info = await invoke("collector_deploy_script", { index: hostIndex });
       if (collectorDeployIndex === hostIndex) {
         el.collectorDeployScript.value = info.script || "";
-        el.collectorDeployState.textContent = info.path ? `Script file: ${info.path}` : "";
+        el.collectorDeployState.textContent = info.path ? `Script file: ${displayPath(info.path)}` : "";
       }
     } catch (error) {
       if (collectorDeployIndex === hostIndex) {
@@ -3890,7 +3890,7 @@ async function openCollectorConfigFile() {
     // Persist the current form first so the file reflects what's on screen.
     await collectorPersistNow();
     const info = await invoke("collector_config_file");
-    el.collectorConfigPath.textContent = info.path || "";
+    el.collectorConfigPath.textContent = displayPath(info.path || "");
     el.collectorConfigView.textContent = info.toml || "";
   } catch (error) {
     el.collectorConfigView.textContent = String(error);

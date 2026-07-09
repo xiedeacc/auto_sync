@@ -7166,7 +7166,7 @@ class _CollectorDeployDialogState extends State<_CollectorDeployDialog> {
     super.initState();
     final scriptPath = _str(widget.host['deploy_script_path']).trim();
     scriptFromFile = scriptPath.isNotEmpty;
-    status = scriptFromFile ? 'Script file: $scriptPath' : '';
+    status = scriptFromFile ? 'Script file: ${_displayPath(scriptPath)}' : '';
     script = TextEditingController(
       text: scriptFromFile ? 'Loading...' : _str(widget.host['deploy_script']),
     );
@@ -7182,7 +7182,7 @@ class _CollectorDeployDialogState extends State<_CollectorDeployDialog> {
       setState(() {
         script.text = _str(info['script']);
         final path = _str(info['path']).trim();
-        status = path.isEmpty ? '' : 'Script file: $path';
+        status = path.isEmpty ? '' : 'Script file: ${_displayPath(path)}';
       });
     } catch (error) {
       if (!mounted) return;
@@ -7216,11 +7216,7 @@ class _CollectorDeployDialogState extends State<_CollectorDeployDialog> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const _IssueSummary(
-            'This script runs on this machine and deploys collected files back to the host.',
-          ),
           if (status.isNotEmpty) ...[
-            const SizedBox(height: 6),
             Text(
               status,
               style: const TextStyle(fontSize: 12, color: Palette.muted),
