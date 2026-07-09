@@ -124,10 +124,23 @@ else
     echo "swapping busybox dnsmasq -> dnsmasq-full (keeping DNS up)"
     RESOLV=$(readlink -f /etc/resolv.conf 2>/dev/null); [ -n "$RESOLV" ] || RESOLV=/tmp/resolv.conf
     printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" > "$RESOLV"
-    apk del dnsmasq 2>/dev/null || true
-    apk add dnsmasq-full || echo "!! dnsmasq-full install FAILED"
-    /etc/init.d/dnsmasq restart 2>/dev/null || true
-    /etc/init.d/network reload 2>/dev/null || true
+    PKGDIR=/tmp/auto_sync_apk
+    rm -rf "$PKGDIR"
+    mkdir -p "$PKGDIR"
+    if apk fetch -o "$PKGDIR" dnsmasq-full 2>/dev/null || apk fetch --output "$PKGDIR" dnsmasq-full 2>/dev/null; then
+        PKG=$(ls "$PKGDIR"/dnsmasq-full-*.apk 2>/dev/null | head -1)
+        if [ -n "$PKG" ]; then
+            apk del dnsmasq 2>/dev/null || true
+            apk add "$PKG" 2>/dev/null || apk add --allow-untrusted "$PKG" 2>/dev/null || apk add dnsmasq-full || echo "!! dnsmasq-full install FAILED"
+            /etc/init.d/dnsmasq restart 2>/dev/null || true
+            /etc/init.d/network reload 2>/dev/null || true
+        else
+            echo "!! dnsmasq-full fetch produced no local package; keeping busybox dnsmasq"
+        fi
+    else
+        echo "!! dnsmasq-full fetch FAILED; keeping busybox dnsmasq"
+    fi
+    rm -rf "$PKGDIR"
 fi
 
 # busybox `vi` is a builtin applet (cannot be apk-removed); install vim instead.
