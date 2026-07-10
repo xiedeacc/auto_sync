@@ -120,6 +120,8 @@ function Ensure-TestRootSsh {
     if ([string]::IsNullOrWhiteSpace($bootstrapUser) -or [string]::IsNullOrWhiteSpace($bootstrapPassword)) {
         throw "root SSH is not ready and no bootstrap SSH password is configured"
     }
+    $bootstrapWaitSeconds = $env:AS_BOOTSTRAP_WAIT_SECONDS
+    if ([string]::IsNullOrWhiteSpace($bootstrapWaitSeconds)) { $bootstrapWaitSeconds = '1800' }
 
     Write-Host "root SSH not ready; bootstrapping root SSH over normal SSH as $bootstrapUser"
     $pubKey = ''
@@ -160,11 +162,13 @@ import paramiko
         @"
 import pathlib
 import sys
+import time
 
 sys.path.insert(0, r'$paramikoRoot')
 import paramiko
 
 host = r'$($env:AS_HOSTNAME)'
+wait_seconds = int(r'$bootstrapWaitSeconds')
 target_port = int(r'$($env:AS_PORT)' or '22')
 port_candidates = []
 for text in (r'$($env:AS_PORT)', '22'):
@@ -181,14 +185,20 @@ sshd_path = pathlib.Path(r'$sshd')
 client = paramiko.SSHClient()
 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 last_error = None
-for port in port_candidates:
-    try:
-        client.connect(hostname=host, port=port, username=user, password=password, look_for_keys=False, allow_agent=False, timeout=20, auth_timeout=20)
-        break
-    except Exception as exc:
-        last_error = exc
-else:
-    raise SystemExit(f"password SSH bootstrap failed on ports {port_candidates}: {last_error}")
+deadline = time.monotonic() + wait_seconds
+while True:
+    for port in port_candidates:
+        try:
+            client.connect(hostname=host, port=port, username=user, password=password, look_for_keys=False, allow_agent=False, timeout=20, auth_timeout=20)
+            break
+        except Exception as exc:
+            last_error = exc
+    else:
+        if time.monotonic() >= deadline:
+            raise SystemExit(f"password SSH bootstrap failed on ports {port_candidates}: {last_error}")
+        time.sleep(10)
+        continue
+    break
 sftp = client.open_sftp()
 sftp.put(str(pub_path), '/tmp/auto_sync_root_key.pub')
 sftp.put(str(sshd_path), '/tmp/auto_sync_sshd_config')
