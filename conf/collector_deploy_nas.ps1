@@ -966,11 +966,21 @@ EOF_GITLAB_ZFS
 
 # Managed by auto_sync GitLab frontend ports.
 # Workhorse serves nginx on 10080. Puma must not bind TCP 8080 because waiwei-web uses it.
+gitlab_rails['gitlab_shell_ssh_port'] = 10022
 gitlab_workhorse['listen_network'] = "tcp"
 gitlab_workhorse['listen_addr'] = "127.0.0.1:10080"
 puma['listen'] = ""
 puma['port'] = nil
 EOF_GITLAB_FRONTEND
+    fi
+    if grep -q "gitlab_rails\['gitlab_shell_ssh_port'\]" /etc/gitlab/gitlab.rb 2>/dev/null; then
+        sed -i -E "s/^#?[[:space:]]*gitlab_rails\['gitlab_shell_ssh_port'\].*/gitlab_rails['gitlab_shell_ssh_port'] = 10022/" /etc/gitlab/gitlab.rb
+    else
+        cat >> /etc/gitlab/gitlab.rb <<'EOF_GITLAB_SSH_PORT'
+
+# Managed by auto_sync GitLab SSH clone port.
+gitlab_rails['gitlab_shell_ssh_port'] = 10022
+EOF_GITLAB_SSH_PORT
     fi
 }
 
