@@ -6,7 +6,7 @@ $scp  = $env:AS_SCP
 $dest = $env:AS_DEST
 $root = $env:AS_ROOT
 
-$opts    = @('-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new','-o','LogLevel=ERROR','-o','ConnectTimeout=20')
+$opts    = @('-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new','-o','LogLevel=ERROR','-o','ConnectTimeout=20','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=20')
 $sshArgs = @() + $opts
 $scpArgs = @('-r','-p') + $opts
 if (-not [string]::IsNullOrEmpty($env:AS_PORT)) { $sshArgs += @('-p', $env:AS_PORT); $scpArgs += @('-P', $env:AS_PORT) }
@@ -338,7 +338,12 @@ function Invoke-Remote([string]$Script) {
             return
         }
         & $ssh @sshArgs $dest "bash '$remoteTmp' </dev/null; rc=`$?; rm -f '$remoteTmp'; exit `$rc"
-        if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
+        if ($LASTEXITCODE -ne 0) {
+            $exitCode = $LASTEXITCODE
+            Write-Host "! remote step exit $exitCode"
+            $script:errCount++
+            throw "remote step failed with exit code $exitCode"
+        }
     } finally {
         Remove-Item -LiteralPath $localTmp -Force -ErrorAction SilentlyContinue
     }
@@ -890,9 +895,15 @@ if grep -Rqs '/usr/local/java/.*/bin/java' /etc/systemd/system; then
     systemctl daemon-reload || true
 fi
 
+cat > /usr/local/sbin/auto_sync_install_vim_tools.sh <<'EOF_VIM_TOOLS'
+#!/bin/bash
+set -u
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+log() { printf '[vim-tools] %s\n' "$*"; }
 if [ -f /root/src/share/ubuntu/conf/.vimrc ]; then
     cp /root/src/share/ubuntu/conf/.vimrc /root/.vimrc
 fi
+mkdir -p /root/.vim/bundle
 if [ ! -d /root/.vim/bundle/Vundle.vim ]; then
     git clone https://github.com/VundleVim/Vundle.vim.git /root/.vim/bundle/Vundle.vim || true
 fi
@@ -903,7 +914,7 @@ if command -v vim >/dev/null 2>&1 && [ -f /root/.vimrc ]; then
         sed -n '1,2p' /root/.vimrc > "$vundle_rc"
         sed -n '/^filetype off$/,/^call vundle#end()/p' /root/.vimrc >> "$vundle_rc"
         vundle_exit=0
-        timeout --kill-after=10s 300s vim -Nu "$vundle_rc" -n -es -i NONE '+set nomore' '+PluginInstall' '+qall' </dev/null || vundle_exit=$?
+        timeout --kill-after=10s 600s vim -Nu "$vundle_rc" -n -es -i NONE '+set nomore' '+PluginInstall' '+qall' </dev/null || vundle_exit=$?
         declared_plugins="$(grep -Ec "^[[:space:]]*Plugin[[:space:]]+'" /root/.vimrc || true)"
         installed_plugins="$(find /root/.vim/bundle -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
         if [ "$installed_plugins" -ge "$declared_plugins" ] &&
@@ -911,7 +922,7 @@ if command -v vim >/dev/null 2>&1 && [ -f /root/.vimrc ]; then
            [ -d /root/.vim/bundle/YouCompleteMe ] &&
            [ -d /root/.vim/bundle/vim-glaive ]; then
             printf '%s\n' "$vimrc_hash" > /root/.vim/.auto_sync_vundle_hash
-            [ "$vundle_exit" -eq 0 ] || log "vim PluginInstall returned $vundle_exit; all $declared_plugins declared plugins are present"
+            [ "$vundle_exit" -eq 0 ] || log "PluginInstall returned $vundle_exit; all $declared_plugins declared plugins are present"
         else
             log "WARN: vim plugins incomplete (declared=$declared_plugins installed=$installed_plugins exit=$vundle_exit)"
         fi
@@ -945,6 +956,12 @@ if [ -d /root/.vim/bundle/YouCompleteMe ]; then
             log "WARN: YouCompleteMe install failed"
         fi
     fi
+fi
+EOF_VIM_TOOLS
+chmod 0755 /usr/local/sbin/auto_sync_install_vim_tools.sh
+if ! pgrep -f '/usr/local/sbin/auto_sync_install_vim_tools.sh' >/dev/null 2>&1; then
+    log "start Vim plugin/YouCompleteMe installation in background"
+    nohup /usr/local/sbin/auto_sync_install_vim_tools.sh >> /var/log/auto_sync_vim_tools.log 2>&1 &
 fi
 
 grep -q '^\*[[:space:]]\+soft[[:space:]]\+core[[:space:]]\+unlimited' /etc/security/limits.conf || cat >> /etc/security/limits.conf <<'EOF_LIMITS'
