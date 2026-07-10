@@ -14,6 +14,10 @@ if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KE
 
 $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+$platformDefaultCollectPaths = @('/opt/www/gitlab_cleaner', '/opt/www/unlock-music')
+foreach ($defaultPath in $platformDefaultCollectPaths) {
+    if ($collectPaths -notcontains $defaultPath) { $collectPaths += $defaultPath }
+}
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
 
 function New-FinalSshdConfig([string]$Port) {
