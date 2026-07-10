@@ -562,8 +562,8 @@ fi
 [ -x "$JAVA_HOME/bin/java" ] || { log "ERROR: OpenJDK 21 is not installed at $JAVA_HOME"; exit 1; }
 [ ! -L /usr/local/java/jdk/jdk-21.0.3 ] || rm -f /usr/local/java/jdk/jdk-21.0.3
 [ ! -L /opt/software/src/tools/mise/installs/java/21.0.2 ] || rm -f /opt/software/src/tools/mise/installs/java/21.0.2
-if grep -Rqs '/usr/local/java/.*/bin/java' /etc/systemd/system; then
-    grep -Rl '/usr/local/java/.*/bin/java' /etc/systemd/system |
+if find /etc/systemd/system -type f -exec grep -q '/usr/local/java/.*/bin/java' {} \; -print -quit | grep -q .; then
+    find /etc/systemd/system -type f -exec grep -l '/usr/local/java/.*/bin/java' {} + |
         xargs -r sed -i -E "s#/usr/local/java/[^[:space:]]*/bin/java#$JAVA_HOME/bin/java#g"
     systemctl daemon-reload || true
 fi
