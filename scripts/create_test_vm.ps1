@@ -56,13 +56,29 @@ function Remove-TestVmDir([string]$Path) {
     if ($resolved -ne 'D:\test_vmware') {
         throw "Refusing to delete unexpected VM directory: $resolved"
     }
-    for ($i = 1; $i -le 8; $i++) {
-        try {
-            Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
-            return
-        } catch {
-            if ($i -eq 8) { throw }
-            Start-Sleep -Seconds 2
+    $vmArtifacts = @(
+        '*.vmdk',
+        '*.vmem',
+        '*.vmss',
+        '*.vmsd',
+        '*.vmxf',
+        '*.vmx',
+        '*.scoreboard',
+        '*.nvram',
+        'nvram',
+        '*.lck'
+    )
+    foreach ($pattern in $vmArtifacts) {
+        Get-ChildItem -LiteralPath $resolved -Force -Filter $pattern -ErrorAction SilentlyContinue | ForEach-Object {
+            for ($i = 1; $i -le 8; $i++) {
+                try {
+                    Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+                    break
+                } catch {
+                    if ($i -eq 8) { throw }
+                    Start-Sleep -Seconds 2
+                }
+            }
         }
     }
 }
