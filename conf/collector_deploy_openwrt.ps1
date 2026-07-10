@@ -214,13 +214,34 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_SS_CLIENT_CONF) -and (Test-Path -L
 
 # 4. Restore the Unix permissions recorded at collect time (Windows dropped
 #    them). The engine hands us the per-host cache via AS_PERMS_FILE.
+function Quote-ShellArg([string]$Value) {
+    return "'" + $Value.Replace("'", "'""'""'") + "'"
+}
+
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
+    $links = New-Object System.Collections.Generic.List[string]
     $chmods = New-Object System.Collections.Generic.List[string]
     foreach ($line in [IO.File]::ReadAllLines($env:AS_PERMS_FILE)) {
         $t = $line.Trim(); if ($t -eq '') { continue }
+        if ($t.StartsWith('symlink ')) {
+            $rest = $t.Substring(8)
+            $sp = $rest.IndexOf(' '); if ($sp -lt 1) { continue }
+            $targetB64 = $rest.Substring(0, $sp); $path = $rest.Substring($sp + 1)
+            if (-not ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/'))) { continue }
+            try { $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($targetB64)) } catch { continue }
+            $qPath = Quote-ShellArg $path
+            $qTarget = Quote-ShellArg $target
+            $links.Add("mkdir -p -- `$(dirname -- $qPath) 2>/dev/null || true; rm -rf -- $qPath 2>/dev/null || true; ln -s -- $qTarget $qPath 2>/dev/null || true")
+            continue
+        }
         $sp = $t.IndexOf(' '); if ($sp -lt 1) { continue }
         $mode = $t.Substring(0, $sp); $path = $t.Substring($sp + 1)
-        $chmods.Add("chmod $mode '$path'")
+        if (-not ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/'))) { continue }
+        $chmods.Add("chmod $mode $(Quote-ShellArg $path)")
+    }
+    if ($links.Count -gt 0) {
+        Write-Host "restoring $($links.Count) recorded symlink(s)"
+        Invoke-Remote ($links -join "`n")
     }
     if ($chmods.Count -gt 0) {
         Write-Host "restoring $($chmods.Count) recorded permissions"

@@ -165,14 +165,31 @@ Transfer-CollectedPathsToStage $collectPaths @() '~/.auto_sync_stage'
 Invoke-Remote 'sudo rsync -rltD --no-perms ~/.auto_sync_stage/ / && rm -rf ~/.auto_sync_stage && echo "installed collected paths"'
 
 # 2. Restore recorded permissions for the pushed /etc files.
+function Quote-ShellArg([string]$Value) {
+    return "'" + $Value.Replace("'", "'""'""'") + "'"
+}
+
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
+    $links = New-Object System.Collections.Generic.List[string]
     $chmods = New-Object System.Collections.Generic.List[string]
     foreach ($line in [IO.File]::ReadAllLines($env:AS_PERMS_FILE)) {
         $t = $line.Trim(); if ($t -eq '') { continue }
+        if ($t.StartsWith('symlink ')) {
+            $rest = $t.Substring(8)
+            $sp = $rest.IndexOf(' '); if ($sp -lt 1) { continue }
+            $targetB64 = $rest.Substring(0, $sp); $path = $rest.Substring($sp + 1)
+            if (-not $path.StartsWith('/etc/')) { continue }
+            try { $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($targetB64)) } catch { continue }
+            $qPath = Quote-ShellArg $path
+            $qTarget = Quote-ShellArg $target
+            $links.Add("sudo mkdir -p -- `$(dirname -- $qPath) 2>/dev/null || true; sudo rm -rf -- $qPath 2>/dev/null || true; sudo ln -s -- $qTarget $qPath 2>/dev/null || true")
+            continue
+        }
         $sp = $t.IndexOf(' '); if ($sp -lt 1) { continue }
         $mode = $t.Substring(0, $sp); $path = $t.Substring($sp + 1)
-        if ($path.StartsWith('/etc/')) { $chmods.Add("sudo chmod $mode '$path' 2>/dev/null || true") }
+        if ($path.StartsWith('/etc/')) { $chmods.Add("sudo chmod $mode $(Quote-ShellArg $path) 2>/dev/null || true") }
     }
+    if ($links.Count -gt 0) { Write-Host "restoring $($links.Count) /etc symlink(s)"; Invoke-Remote ($links -join "`n") }
     if ($chmods.Count -gt 0) { Write-Host "restoring $($chmods.Count) /etc permissions"; Invoke-Remote ($chmods -join "`n") }
 }
 

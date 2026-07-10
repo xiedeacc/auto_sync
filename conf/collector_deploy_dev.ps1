@@ -158,16 +158,33 @@ Transfer-CollectedPathsToStage $collectPaths @('/root/auto_sync_db_dumps', '/tmp
 
 Invoke-Remote 'rsync -rltD --no-perms ~/.auto_sync_stage/ /; rc=$?; if [ -f /tmp/auto_sync_root_key.pub ]; then mkdir -p /root/.ssh; touch /root/.ssh/authorized_keys; grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys; fi; chmod 755 / /etc /usr /usr/bin 2>/dev/null || true; chmod 700 /root/.ssh 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true; rm -rf ~/.auto_sync_stage; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
 
+function Quote-ShellArg([string]$Value) {
+    return "'" + $Value.Replace("'", "'""'""'") + "'"
+}
+
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
+    $links = New-Object System.Collections.Generic.List[string]
     $chmods = New-Object System.Collections.Generic.List[string]
     foreach ($line in [IO.File]::ReadAllLines($env:AS_PERMS_FILE)) {
         $t = $line.Trim(); if ($t -eq '') { continue }
+        if ($t.StartsWith('symlink ')) {
+            $rest = $t.Substring(8)
+            $sp = $rest.IndexOf(' '); if ($sp -lt 1) { continue }
+            $targetB64 = $rest.Substring(0, $sp); $path = $rest.Substring($sp + 1)
+            if (-not ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/'))) { continue }
+            try { $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($targetB64)) } catch { continue }
+            $qPath = Quote-ShellArg $path
+            $qTarget = Quote-ShellArg $target
+            $links.Add("mkdir -p -- `$(dirname -- $qPath) 2>/dev/null || true; rm -rf -- $qPath 2>/dev/null || true; ln -s -- $qTarget $qPath 2>/dev/null || true")
+            continue
+        }
         $sp = $t.IndexOf(' '); if ($sp -lt 1) { continue }
         $mode = $t.Substring(0, $sp); $path = $t.Substring($sp + 1)
-        if ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/')) {
-            $chmods.Add("chmod $mode '$path' 2>/dev/null || true")
+        if ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/')) {
+            $chmods.Add("chmod $mode $(Quote-ShellArg $path) 2>/dev/null || true")
         }
     }
+    if ($links.Count -gt 0) { Write-Host "restoring $($links.Count) recorded symlink(s)"; Invoke-Remote ($links -join "`n") }
     if ($chmods.Count -gt 0) { Write-Host "restoring $($chmods.Count) recorded permissions"; Invoke-Remote ($chmods -join "`n") }
 }
 

@@ -352,16 +352,33 @@ systemctl disable --now ssh.socket 2>/dev/null || true
 systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service
 "@
 
+function Quote-ShellArg([string]$Value) {
+    return "'" + $Value.Replace("'", "'""'""'") + "'"
+}
+
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
+    $links = New-Object System.Collections.Generic.List[string]
     $chmods = New-Object System.Collections.Generic.List[string]
     foreach ($line in [IO.File]::ReadAllLines($env:AS_PERMS_FILE)) {
         $t = $line.Trim(); if ($t -eq '') { continue }
+        if ($t.StartsWith('symlink ')) {
+            $rest = $t.Substring(8)
+            $sp = $rest.IndexOf(' '); if ($sp -lt 1) { continue }
+            $targetB64 = $rest.Substring(0, $sp); $path = $rest.Substring($sp + 1)
+            if (-not ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/'))) { continue }
+            try { $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($targetB64)) } catch { continue }
+            $qPath = Quote-ShellArg $path
+            $qTarget = Quote-ShellArg $target
+            $links.Add("mkdir -p -- `$(dirname -- $qPath) 2>/dev/null || true; rm -rf -- $qPath 2>/dev/null || true; ln -s -- $qTarget $qPath 2>/dev/null || true")
+            continue
+        }
         $sp = $t.IndexOf(' '); if ($sp -lt 1) { continue }
         $mode = $t.Substring(0, $sp); $path = $t.Substring($sp + 1)
-        if ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/')) {
-            $chmods.Add("chmod $mode '$path' 2>/dev/null || true")
+        if ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/')) {
+            $chmods.Add("chmod $mode $(Quote-ShellArg $path) 2>/dev/null || true")
         }
     }
+    if ($links.Count -gt 0) { Write-Host "restoring $($links.Count) recorded symlink(s)"; Invoke-Remote ($links -join "`n") }
     if ($chmods.Count -gt 0) { Write-Host "restoring $($chmods.Count) recorded permissions"; Invoke-Remote ($chmods -join "`n") }
 }
 
@@ -584,11 +601,33 @@ if [ -d /root/src/software/pgvector ]; then
     (cd /root/src/software/pgvector && make && make install) || log "WARN: pgvector build/install failed"
 fi
 
-if [ -x /opt/software/src/immich/install.sh ]; then
-    /opt/software/src/immich/install.sh || log "WARN: immich install failed"
-else
-    log "skip immich install: /opt/software/src/immich/install.sh not found"
-fi
+deploy_immich_from_git() {
+    mkdir -p /opt/software/src
+    repo=/opt/software/src/immich
+    if [ -e "$repo" ] && [ ! -d "$repo/.git" ]; then
+        mv "$repo" "${repo}.before-git-$(date +%Y%m%d%H%M%S)" || return 1
+    fi
+    if [ ! -d "$repo/.git" ]; then
+        git clone --branch deploy git@github.com:xiedeacc/immich.git "$repo" || return 1
+    fi
+    (
+        cd "$repo" &&
+        git remote set-url origin git@github.com:xiedeacc/immich.git &&
+        git fetch origin deploy &&
+        git checkout deploy &&
+        git pull --ff-only origin deploy
+    ) || return 1
+    for script in deploy.sh scripts/deploy.sh install.sh; do
+        if [ -f "$repo/$script" ]; then
+            chmod +x "$repo/$script" 2>/dev/null || true
+            (cd "$repo" && bash "$script") || return 1
+            return 0
+        fi
+    done
+    log "WARN: immich deploy script not found in $repo"
+    return 1
+}
+deploy_immich_from_git || log "WARN: immich deploy from git failed"
 
 setquota -u root 20000000 20000000 0 0 /dev/mmcblk0p2 2>/dev/null || true
 for u in tiger git gitlab immich; do

@@ -843,9 +843,11 @@ fn has_exclude_under(dir: &str, excludes: &[String]) -> bool {
     excludes.iter().any(|e| e.starts_with(&prefix))
 }
 
-/// Capture the Unix mode of every file/dir under each pulled path and write a
-/// per-host cache `<root>/.auto_sync_perms` of `mode path` lines. `deploy`
-/// replays these because Windows can't hold the modes on the local copies.
+/// Capture the Unix mode of every file/dir and every symlink target under each
+/// pulled path. The per-host cache `<root>/.auto_sync_perms` uses compatible
+/// `mode path` lines plus `symlink <base64-target> path` lines. `deploy`
+/// replays these because Windows can't hold Unix modes or Linux symlinks on the
+/// local copies.
 /// Prefers `stat -c '%a %n'` (gives the octal mode directly); falls back to
 /// parsing `ls -ldn` on hosts where `stat` is not installed yet.
 fn record_host_perms(
@@ -860,10 +862,11 @@ fn record_host_perms(
         let q = shell_quote(path);
         let cmd = format!(
             "if command -v stat >/dev/null 2>&1; then \
-find -L {q} \\( -type f -o -type d \\) -exec stat -c '%a %n' {{}} \\; 2>/dev/null; \
+find {q} \\( -type f -o -type d \\) -exec stat -c '%a %n' {{}} \\; 2>/dev/null; \
 else \
-find -L {q} \\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null; \
-fi"
+find {q} \\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null; \
+fi; \
+find {q} -type l -exec sh -c 'for p do t=$(readlink \"$p\") || continue; b=$(printf %s \"$t\" | base64 | tr -d \"\\n\"); printf \"symlink %s %s\\n\" \"$b\" \"$p\"; done' sh {{}} + 2>/dev/null"
         );
         let out = match ssh_capture(conn, &cmd) {
             Ok(out) => out,
@@ -873,11 +876,11 @@ fi"
             }
         };
         for line in out.lines() {
-            if let Some((mode, entry_path)) = parse_perm_line(line) {
+            if let Some(entry_path) = perm_record_path(line) {
                 if is_excluded(&entry_path, excludes) {
                     continue;
                 }
-                lines.push(format!("{mode} {entry_path}"));
+                lines.push(line.trim().to_string());
             }
         }
     }
@@ -889,6 +892,19 @@ fi"
     fs::write(&file, body).with_context(|| format!("writing {}", file.display()))?;
     log(state, format!("  perms: recorded {} entries", lines.len()));
     Ok(())
+}
+
+fn perm_record_path(line: &str) -> Option<String> {
+    let line = line.trim();
+    if let Some(rest) = line.strip_prefix("symlink ") {
+        let (_, path) = rest.split_once(char::is_whitespace)?;
+        let path = path.trim();
+        if path.starts_with('/') {
+            return Some(path.to_string());
+        }
+        return None;
+    }
+    parse_perm_line(line).map(|(_, path)| path)
 }
 
 /// Parse one permission line into (octal_mode, absolute_path). Accepts both
@@ -1985,6 +2001,20 @@ mod tests {
         let sticky = "drwxrwxrwt 2 0 0 1 Jan 1 00:00 /tmp";
         assert_eq!(parse_perm_line(sticky).unwrap().0, "1777");
         assert_eq!(parse_perm_line("garbage"), None);
+    }
+
+    #[test]
+    fn perm_record_path_handles_modes_and_symlinks() {
+        assert_eq!(
+            perm_record_path("755 /usr/local/bin/tool"),
+            Some("/usr/local/bin/tool".to_string())
+        );
+        assert_eq!(
+            perm_record_path("symlink Li4vc2hhcmVkL3RhcmdldA== /usr/local/bin/tool link"),
+            Some("/usr/local/bin/tool link".to_string())
+        );
+        assert_eq!(perm_record_path("symlink Li4vc2hhcmVkL3RhcmdldA== relative"), None);
+        assert_eq!(perm_record_path("symlink missing-path"), None);
     }
 
     #[test]
