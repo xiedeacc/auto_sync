@@ -110,9 +110,21 @@ function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
 
 function Invoke-Remote([string]$Script) {
     $Script = $Script -replace "`r`n", "`n"
-    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Script))
-    $b64 | & $ssh @sshArgs $dest 'tmp=$(mktemp /tmp/auto_sync_remote.XXXXXX); base64 -d > "$tmp" && bash "$tmp" </dev/null; rc=$?; rm -f "$tmp"; exit "$rc"'
-    if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
+    $localTmp = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_remote_" + [guid]::NewGuid().ToString('N') + ".sh")
+    $remoteTmp = "/tmp/" + [IO.Path]::GetFileName($localTmp)
+    try {
+        [IO.File]::WriteAllText($localTmp, $Script, [Text.UTF8Encoding]::new($false))
+        & $scp @scpArgs $localTmp "$($dest):$remoteTmp"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "! remote script upload failed"
+            $script:errCount++
+            return
+        }
+        & $ssh @sshArgs $dest "bash '$remoteTmp' </dev/null; rc=`$?; rm -f '$remoteTmp'; exit `$rc"
+        if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
+    } finally {
+        Remove-Item -LiteralPath $localTmp -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$OptionalPaths, [string]$RemoteStage) {
@@ -145,22 +157,81 @@ function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$Opt
         if ($rel -ne '') { $excludeArgs += "--exclude=$rel" }
     }
 
-    $tarArgs = @('-C', $root, '-cf', '-') + $excludeArgs + @($tarPaths)
-    & tar @tarArgs | & $ssh @sshArgs $dest "tar -C $RemoteStage -xf -"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "! tar stage transfer failed"
-        $script:errCount++
+    $localTar = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_stage_" + [guid]::NewGuid().ToString('N') + ".tar")
+    $remoteTar = "/tmp/" + [IO.Path]::GetFileName($localTar)
+    try {
+        $tarArgs = @('-C', $root, '-cf', $localTar) + $excludeArgs + @($tarPaths)
+        & tar @tarArgs
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "! local tar stage creation failed"
+            $script:errCount++
+            return
+        }
+        & $scp @scpArgs $localTar "$($dest):$remoteTar"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "! tar stage upload failed"
+            $script:errCount++
+            return
+        }
+        Invoke-Remote "mkdir -p $RemoteStage; tar -C $RemoteStage -xf '$remoteTar'; rc=`$?; rm -f '$remoteTar'; exit `$rc"
+    } finally {
+        Remove-Item -LiteralPath $localTar -Force -ErrorAction SilentlyContinue
     }
 }
-
-Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
-Transfer-CollectedPathsToStage $collectPaths @('/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') '~/.auto_sync_stage'
-
-Invoke-Remote 'rsync -rltD --no-perms ~/.auto_sync_stage/ /; rc=$?; if [ -f /tmp/auto_sync_root_key.pub ]; then mkdir -p /root/.ssh; touch /root/.ssh/authorized_keys; grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys; fi; chmod 755 / /etc /usr /usr/bin 2>/dev/null || true; chmod 700 /root/.ssh 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true; rm -rf ~/.auto_sync_stage; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
 
 function Quote-ShellArg([string]$Value) {
     return "'" + $Value.Replace("'", "'""'""'") + "'"
 }
+
+function Prepare-StagedSymlinks([string]$PermsFile) {
+    if ([string]::IsNullOrWhiteSpace($PermsFile) -or -not (Test-Path -LiteralPath $PermsFile)) { return }
+    $commands = New-Object System.Collections.Generic.List[string]
+    $commands.Add('stage="$HOME/.auto_sync_stage"')
+    foreach ($line in [IO.File]::ReadAllLines($PermsFile)) {
+        $t = $line.Trim()
+        if (-not $t.StartsWith('symlink ')) { continue }
+        $rest = $t.Substring(8)
+        $sp = $rest.IndexOf(' ')
+        if ($sp -lt 1) { continue }
+        try { $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($rest.Substring(0, $sp))) } catch { continue }
+        $path = $rest.Substring($sp + 1)
+        if (-not $path.StartsWith('/')) { continue }
+        $qPath = Quote-ShellArg $path
+        $qTarget = Quote-ShellArg $target
+        $commands.Add(@"
+path=$qPath
+target=$qTarget
+case "`$target" in /*) resolved="`$target" ;; *) resolved="`$(dirname -- "`$path")/`$target" ;; esac
+resolved="`$(realpath -m -- "`$resolved")"
+src="`$stage`$path"
+dst="`$stage`$resolved"
+if [ -e "`$src" ] || [ -L "`$src" ]; then
+    mkdir -p -- "`$(dirname -- "`$dst")" "`$(dirname -- "`$src")"
+    if [ -d "`$src" ] && [ ! -L "`$src" ]; then
+        mkdir -p -- "`$dst"
+        rsync -a "`$src/" "`$dst/"
+        rm -rf -- "`$src"
+    else
+        rm -rf -- "`$dst"
+        mv -- "`$src" "`$dst"
+    fi
+    ln -s -- "`$target" "`$src"
+fi
+"@)
+    }
+    if ($commands.Count -gt 1) {
+        Write-Host "preparing $($commands.Count - 1) staged symlink(s)"
+        Invoke-Remote ($commands -join "`n")
+    }
+}
+
+Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
+$generatedOptionalPaths = @('/opt/immich/conf', '/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps')
+$requiredCollectPaths = @($collectPaths | Where-Object { (Normalize-RemotePath $_) -ne '/opt/immich/conf' })
+Transfer-CollectedPathsToStage $requiredCollectPaths $generatedOptionalPaths '~/.auto_sync_stage'
+Prepare-StagedSymlinks $env:AS_PERMS_FILE
+
+Invoke-Remote 'rsync -rltD --no-perms ~/.auto_sync_stage/ /; rc=$?; if [ -f /tmp/auto_sync_root_key.pub ]; then mkdir -p /root/.ssh; touch /root/.ssh/authorized_keys; grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys; fi; chmod 755 / /etc /usr /usr/bin 2>/dev/null || true; chmod 700 /root/.ssh 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true; rm -rf ~/.auto_sync_stage; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
 
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
     $links = New-Object System.Collections.Generic.List[string]
@@ -171,7 +242,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
             $rest = $t.Substring(8)
             $sp = $rest.IndexOf(' '); if ($sp -lt 1) { continue }
             $targetB64 = $rest.Substring(0, $sp); $path = $rest.Substring($sp + 1)
-            if (-not ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/'))) { continue }
+            if (-not ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/') -or $path.StartsWith('/home/'))) { continue }
             try { $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($targetB64)) } catch { continue }
             $qPath = Quote-ShellArg $path
             $qTarget = Quote-ShellArg $target
@@ -180,7 +251,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
         }
         $sp = $t.IndexOf(' '); if ($sp -lt 1) { continue }
         $mode = $t.Substring(0, $sp); $path = $t.Substring($sp + 1)
-        if ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/')) {
+        if ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/') -or $path.StartsWith('/home/')) {
             $chmods.Add("chmod $mode $(Quote-ShellArg $path) 2>/dev/null || true")
         }
     }
@@ -240,17 +311,150 @@ if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
     sed -i 's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' /etc/apt/sources.list.d/ubuntu.sources
 fi
 apt-get update
-apt-get purge -y vim || true
+policy_created=0
+if [ ! -e /usr/sbin/policy-rc.d ]; then
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+    chmod 0755 /usr/sbin/policy-rc.d
+    policy_created=1
+fi
+apt-get -o Dpkg::Options::=--force-confold purge -y vim || true
 apt-get autoremove -y || true
-apt-get install -y \
-    dialog zfsutils-linux openssh-server zsh net-tools curl iputils-ping iftop cron ca-certificates xfonts-utils dnsutils hdparm \
+curl_dev_version="$(apt-cache policy libcurl4-openssl-dev 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+if [ -n "$curl_dev_version" ] && [ "$curl_dev_version" != "(none)" ]; then
+    apt-get install -y --allow-downgrades "curl=$curl_dev_version" "libcurl4t64=$curl_dev_version" "libcurl4-openssl-dev=$curl_dev_version" 2>/dev/null ||
+        apt-get install -y --allow-downgrades "curl=$curl_dev_version" "libcurl4=$curl_dev_version" "libcurl4-openssl-dev=$curl_dev_version" 2>/dev/null ||
+        log "WARN: libcurl dev version alignment failed"
+fi
+apt_result=0
+apt-get -o Dpkg::Options::=--force-confold install -y \
+    dialog zfsutils-linux openssh-server zsh net-tools curl aria2 iputils-ping iftop cron ca-certificates xfonts-utils dnsutils hdparm unzip \
     autoconf libtool libtool-bin cmake make gcc g++ texinfo bison flex gdb build-essential automake pkg-config help2man gettext \
     python3-pip ruby luajit netcat-openbsd gperf cscope exuberant-ctags vim-nox git git-lfs lcov graphviz \
     libgeoip-dev libxml2-dev libxslt1.1 libxslt1-dev libatomic-ops-dev libgd-dev libperl-dev libluajit-5.1-dev tcl-dev ruby-dev libncurses-dev \
-    mysql-server postgresql postgresql-client libpq-dev postgresql-contrib sysstat nginx-full \
-    ffmpeg libimage-exiftool-perl postgresql-server-dev-all redis quota
+    mysql-server postgresql postgresql-client libpq-dev postgresql-contrib sysstat nginx-full libnginx-mod-stream \
+    ffmpeg libimage-exiftool-perl libvips-dev libvips-tools postgresql-server-dev-all redis quota || apt_result=1
+DEBIAN_FRONTEND=noninteractive dpkg --force-confold --configure -a || apt_result=1
+[ "$policy_created" -eq 0 ] || rm -f /usr/sbin/policy-rc.d
+[ "$apt_result" -eq 0 ] || { log "ERROR: package installation/configuration failed"; exit 1; }
 apt-get remove -y apport || true
 apt-get autoremove -y || true
+rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+
+id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
+ensure_opt_link() {
+    path="$1"
+    target="$2"
+    kind="$3"
+    owner="$4"
+    if [ -L "$path" ] && [ "$(readlink "$path")" = "$target" ]; then
+        if [ "$kind" = dir ]; then mkdir -p "$target"; else touch "$target"; fi
+        return 0
+    fi
+    mkdir -p "$(dirname "$path")" "$(dirname "$target")"
+    if [ "$kind" = dir ]; then
+        mkdir -p "$target"
+        if [ -d "$path" ] && [ ! -L "$path" ]; then
+            rsync -a "$path/" "$target/"
+        elif [ -L "$path" ] && [ -d "$path" ]; then
+            rsync -aL "$path/" "$target/"
+        fi
+    else
+        if [ -f "$path" ] || { [ -L "$path" ] && [ -f "$path" ]; }; then
+            cp -aL "$path" "$target"
+        elif [ ! -e "$target" ]; then
+            touch "$target"
+        fi
+    fi
+    rm -rf "$path"
+    ln -s "$target" "$path"
+    chown -h "$owner" "$path" 2>/dev/null || true
+    case "$target" in /opt/user/*) chown -h "$owner" "$target" 2>/dev/null || true ;; esac
+}
+while IFS='|' read -r path target kind owner; do
+    [ -n "$path" ] && ensure_opt_link "$path" "$target" "$kind" "$owner"
+done <<'EOF_OPT_LINKS'
+/root/.bashrc|/opt/user/root/.bashrc|file|root:root
+/root/.cache|/opt/user/root/.cache|dir|root:root
+/root/.cargo|/opt/user/root/.cargo|dir|root:root
+/root/.codex|/opt/user/root/.codex|dir|root:root
+/root/.config|/opt/user/root/.config|dir|root:root
+/root/.cscope.vim|/opt/user/root/.cscope.vim|file|root:root
+/root/.dotnet|/opt/user/root/.dotnet|dir|root:root
+/root/.launchpadlib|/opt/user/root/.launchpadlib|dir|root:root
+/root/.local|/opt/user/root/.local|dir|root:root
+/root/.npm|/opt/user/root/.npm|dir|root:root
+/root/.npmrc|/opt/user/root/.npmrc|file|root:root
+/root/.nvm|/opt/software/src/tools/nvm|dir|root:root
+/root/.oh-my-zsh|/opt/user/root/.oh-my-zsh|dir|root:root
+/root/.profile|/opt/user/root/.profile|file|root:root
+/root/.rustup|/opt/user/root/.rustup|dir|root:root
+/root/.vim|/opt/user/root/.vim|dir|root:root
+/root/.vimbackup|/opt/user/root/.vimbackup|dir|root:root
+/root/.vimswap|/opt/user/root/.vimswap|dir|root:root
+/root/.vimundo|/opt/user/root/.vimundo|dir|root:root
+/root/.vimviews|/opt/user/root/.vimviews|dir|root:root
+/root/.vscode-server|/opt/user/root/.vscode-server|dir|root:root
+/root/.zprofile|/opt/user/root/.zprofile|file|root:root
+/root/.zshenv|/opt/user/root/.zshenv|file|root:root
+/root/.zshrc|/opt/user/root/.zshrc|file|root:root
+/root/src|/opt/user/root/src|dir|root:root
+/home/tiger/.bashrc|/opt/user/tiger/.bashrc|file|tiger:tiger
+/home/tiger/.halo2|/opt/user/tiger/.halo2|dir|tiger:tiger
+/home/tiger/.npm|/opt/user/tiger/.npm|dir|tiger:tiger
+/home/tiger/.npmrc|/opt/user/tiger/.npmrc|file|tiger:tiger
+/home/tiger/.nvm|/opt/software/src/tools/nvm|dir|tiger:tiger
+/home/tiger/.oh-my-zsh|/opt/user/tiger/.oh-my-zsh|dir|tiger:tiger
+/home/tiger/.profile|/opt/user/tiger/.profile|file|tiger:tiger
+/home/tiger/.zprofile|/opt/user/tiger/.zprofile|file|tiger:tiger
+/home/tiger/.zshenv|/opt/user/tiger/.zshenv|file|tiger:tiger
+/home/tiger/.zshrc|/opt/user/tiger/.zshrc|file|tiger:tiger
+EOF_OPT_LINKS
+
+if [ -f /usr/share/nginx/modules-available/mod-stream.conf ]; then
+    mkdir -p /etc/nginx/modules-enabled
+    ln -sfn /usr/share/nginx/modules-available/mod-stream.conf /etc/nginx/modules-enabled/50-mod-stream.conf
+fi
+if [ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ] || [ ! -e /etc/nginx/modules-enabled/50-mod-stream.conf ]; then
+    log "ERROR: nginx stream module is not installed or enabled"
+    exit 1
+fi
+
+ensure_postgresql_cluster() {
+    pg_major="$(pg_config --version | sed -n 's/^PostgreSQL \([0-9][0-9]*\).*/\1/p')"
+    [ -n "$pg_major" ] || { log "ERROR: cannot detect PostgreSQL major version"; return 1; }
+    if [ -s "/var/lib/postgresql/$pg_major/main/PG_VERSION" ]; then
+        pg_ctlcluster "$pg_major" main start 2>/dev/null || true
+        pg_isready -q && return 0
+    fi
+
+    source_major="$(find /etc/postgresql -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$' | sort -V | tail -1)"
+    source_copy="$(mktemp -d)"
+    if [ -n "$source_major" ] && [ -d "/etc/postgresql/$source_major/main" ]; then
+        cp -a "/etc/postgresql/$source_major/main/." "$source_copy/"
+    fi
+    for old_dir in /etc/postgresql/[0-9]*; do
+        [ -d "$old_dir" ] || continue
+        old_major="${old_dir##*/}"
+        [ "$old_major" = "$pg_major" ] && continue
+        mv "$old_dir" "/etc/postgresql/.auto_sync_saved_$old_major" 2>/dev/null || true
+    done
+    pg_dropcluster --stop "$pg_major" main 2>/dev/null || true
+    rm -rf "/etc/postgresql/$pg_major/main" "/var/lib/postgresql/$pg_major/main"
+    pg_createcluster --port 5432 "$pg_major" main --start
+    if [ -f "$source_copy/postgresql.conf" ]; then
+        for config in postgresql.conf pg_hba.conf pg_ident.conf pg_ctl.conf start.conf environment; do
+            [ -f "$source_copy/$config" ] && cp -a "$source_copy/$config" "/etc/postgresql/$pg_major/main/$config"
+        done
+        if [ -n "$source_major" ] && [ "$source_major" != "$pg_major" ]; then
+            sed -i "s#/postgresql/$source_major/#/postgresql/$pg_major/#g; s#postgresql-$source_major#postgresql-$pg_major#g" /etc/postgresql/$pg_major/main/*.conf 2>/dev/null || true
+        fi
+    fi
+    rm -rf "$source_copy"
+    chown -R postgres:postgres "/etc/postgresql/$pg_major" "/var/lib/postgresql/$pg_major"
+    systemctl restart "postgresql@$pg_major-main.service"
+    pg_isready -q || { log "ERROR: PostgreSQL cluster $pg_major/main is not ready"; return 1; }
+}
+ensure_postgresql_cluster || exit 1
 
 cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
@@ -340,6 +544,7 @@ if [ -L /opt/software/src/tools/nvm ]; then
     rm -f /opt/software/src/tools/nvm
 fi
 export NVM_DIR=/opt/software/src/tools/nvm
+mkdir -p "$NVM_DIR"
 if [ ! -s "$NVM_DIR/nvm.sh" ]; then
     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash || log "WARN: nvm install failed"
 fi
@@ -347,6 +552,17 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
     . "$NVM_DIR/nvm.sh"
     nvm install 24.18.0 || nvm install 24 || log "WARN: nvm install 24 failed"
     nvm use 24.18.0 || nvm use 24 || true
+    node_bin_dir="$(dirname "$(command -v node 2>/dev/null || true)")"
+    if [ -n "$node_bin_dir" ] && [ -x "$node_bin_dir/node" ]; then
+        export PATH="$node_bin_dir:$PATH"
+        if command -v corepack >/dev/null 2>&1; then
+            corepack enable || log "WARN: corepack enable failed"
+            corepack prepare pnpm@latest --activate || log "WARN: corepack prepare pnpm failed"
+        fi
+        if ! command -v pnpm >/dev/null 2>&1; then
+            npm install -g pnpm || log "WARN: npm install pnpm failed"
+        fi
+    fi
 fi
 if [ -d "$NVM_DIR" ]; then
     chmod -R a+rX "$NVM_DIR" || true
@@ -372,8 +588,27 @@ fi
 if [ ! -d /root/.vim/bundle/Vundle.vim ]; then
     git clone https://github.com/VundleVim/Vundle.vim.git /root/.vim/bundle/Vundle.vim || true
 fi
-if command -v vim >/dev/null 2>&1; then
-    timeout --kill-after=10s 180s vim +PluginInstall +qall </dev/null || log "WARN: vim PluginInstall failed"
+if command -v vim >/dev/null 2>&1 && [ -f /root/.vimrc ]; then
+    vimrc_hash="$(sha256sum /root/.vimrc | awk '{print $1}')"
+    if [ "$(cat /root/.vim/.auto_sync_vundle_hash 2>/dev/null || true)" != "$vimrc_hash" ]; then
+        vundle_rc="$(mktemp)"
+        sed -n '1,2p' /root/.vimrc > "$vundle_rc"
+        sed -n '/^filetype off$/,/^call vundle#end()/p' /root/.vimrc >> "$vundle_rc"
+        vundle_exit=0
+        timeout --kill-after=10s 300s vim -Nu "$vundle_rc" -n -es -i NONE '+set nomore' '+PluginInstall' '+qall' </dev/null || vundle_exit=$?
+        declared_plugins="$(grep -Ec "^[[:space:]]*Plugin[[:space:]]+'" /root/.vimrc || true)"
+        installed_plugins="$(find /root/.vim/bundle -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+        if [ "$installed_plugins" -ge "$declared_plugins" ] &&
+           [ -d /root/.vim/bundle/Vundle.vim ] &&
+           [ -d /root/.vim/bundle/YouCompleteMe ] &&
+           [ -d /root/.vim/bundle/vim-glaive ]; then
+            printf '%s\n' "$vimrc_hash" > /root/.vim/.auto_sync_vundle_hash
+            [ "$vundle_exit" -eq 0 ] || log "vim PluginInstall returned $vundle_exit; all $declared_plugins declared plugins are present"
+        else
+            log "WARN: vim plugins incomplete (declared=$declared_plugins installed=$installed_plugins exit=$vundle_exit)"
+        fi
+        rm -f "$vundle_rc"
+    fi
 fi
 if [ ! -d /root/.vim/bundle/vim-airline-fonts ]; then
     git clone https://github.com/powerline/fonts /root/.vim/bundle/vim-airline-fonts || true
@@ -382,7 +617,26 @@ if [ -x /root/.vim/bundle/vim-airline-fonts/install.sh ]; then
     (cd /root/.vim/bundle/vim-airline-fonts && ./install.sh) || true
 fi
 if [ -d /root/.vim/bundle/YouCompleteMe ]; then
-    (cd /root/.vim/bundle/YouCompleteMe && git submodule update --init --recursive && ./install.py --all) || log "WARN: YouCompleteMe install failed"
+    ycm_commit="$(git -C /root/.vim/bundle/YouCompleteMe rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "$ycm_commit" ] && [ "$(cat /root/.vim/bundle/YouCompleteMe/.auto_sync_installed 2>/dev/null || true)" != "$ycm_commit" ]; then
+        ycm_path="/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/usr/local/java/jdk/jdk-21.0.3/bin:/opt/software/src/tools/nvm/versions/node/v24.18.0/bin:$PATH"
+        ycmd_build=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/build.py
+        jdt_milestone="$(sed -n "s/^JDTLS_MILESTONE = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
+        jdt_stamp="$(sed -n "s/^JDTLS_BUILD_STAMP = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
+        if command -v aria2c >/dev/null 2>&1 && [ -n "$jdt_milestone" ] && [ -n "$jdt_stamp" ]; then
+            jdt_package="jdt-language-server-$jdt_milestone-$jdt_stamp.tar.gz"
+            jdt_cache=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/third_party/eclipse.jdt.ls/target/cache
+            mkdir -p "$jdt_cache"
+            aria2c --allow-overwrite=true --auto-file-renaming=false --continue=true -x 16 -s 16 -k 1M \
+                -d "$jdt_cache" -o "$jdt_package" \
+                "https://download.eclipse.org/jdtls/milestones/$jdt_milestone/$jdt_package" || log "WARN: JDT.LS cache prefetch failed"
+        fi
+        if (cd /root/.vim/bundle/YouCompleteMe && git submodule update --init --recursive && PATH="$ycm_path" python3 install.py --all --force-sudo); then
+            printf '%s\n' "$ycm_commit" > /root/.vim/bundle/YouCompleteMe/.auto_sync_installed
+        else
+            log "WARN: YouCompleteMe install failed"
+        fi
+    fi
 fi
 
 grep -q '^\*[[:space:]]\+soft[[:space:]]\+core[[:space:]]\+unlimited' /etc/security/limits.conf || cat >> /etc/security/limits.conf <<'EOF_LIMITS'
@@ -409,6 +663,20 @@ fi
 
 deploy_immich_from_git() {
     mkdir -p /opt/software/src
+    mkdir -p /opt/immich/server /opt/immich/web /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf
+    if [ ! -s /opt/immich/conf/immich-ml.env ]; then
+        cat > /opt/immich/conf/immich-ml.env <<'EOF_IMMICH_ML_ENV'
+IMMICH_HOST=0.0.0.0
+IMMICH_PORT=3003
+IMMICH_LOG_LEVEL=log
+MACHINE_LEARNING_CACHE_FOLDER=/opt/immich/machine-learning/.cache
+TRANSFORMERS_CACHE=/opt/immich/machine-learning/.cache
+EOF_IMMICH_ML_ENV
+        chmod 0640 /opt/immich/conf/immich-ml.env
+    fi
+    mkdir -p /root/.ssh
+    ssh-keyscan -T 10 github.com >> /root/.ssh/known_hosts 2>/dev/null || true
+    export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'
     repo=/opt/software/src/immich
     if [ -e "$repo" ] && [ ! -d "$repo/.git" ]; then
         mv "$repo" "${repo}.before-git-$(date +%Y%m%d%H%M%S)" || return 1
@@ -419,14 +687,51 @@ deploy_immich_from_git() {
     (
         cd "$repo" &&
         git remote set-url origin git@github.com:xiedeacc/immich.git &&
+        (git checkout -- deploy.sh 2>/dev/null || true) &&
+        (git checkout -- scripts/deploy.sh 2>/dev/null || true) &&
+        (git checkout -- install.sh 2>/dev/null || true) &&
         git fetch origin deploy &&
         git checkout deploy &&
         git pull --ff-only origin deploy
     ) || return 1
+    patch_immich_deploy_script() {
+        script_path="$1"
+        command -v python3 >/dev/null 2>&1 || return 0
+        python3 - "$script_path" <<'PY_PATCH_IMMICH'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+needle = '  cd "$server_dir/node_modules/sharp"\n'
+insert = '''  node_gyp_pkg="$(find "$server_dir/node_modules/.pnpm" -maxdepth 1 -type d -name 'node-gyp@*' 2>/dev/null | head -1)"
+  if [ -n "$node_gyp_pkg" ]; then
+    node_gyp_base="$(basename "$node_gyp_pkg")"
+    node_gyp_link="$STAGING_DIR/$node_gyp_base"
+    if [ ! -e "$node_gyp_link" ]; then
+      ln -s "server/node_modules/.pnpm/$node_gyp_base" "$node_gyp_link" 2>/dev/null || true
+    fi
+  fi
+'''
+if insert not in text and needle in text:
+    text = text.replace(needle, insert + needle, 1)
+text = text.replace(
+    'MISE_TRUSTED_CONFIG_PATHS="$BUILD_DIR/mise.toml" MISE_DISABLE_TOOLS=flutter "$TOOL_BIN/mise" //:plugins',
+    'MISE_TRUSTED_CONFIG_PATHS="$REPO_DIR/mise.toml:$BUILD_DIR/mise.toml" MISE_DISABLE_TOOLS=flutter "$TOOL_BIN/mise" //:plugins',
+)
+text = text.replace(
+    'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --locked --extra cpu --no-dev --compile-bytecode',
+    'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --extra cpu --no-dev --compile-bytecode',
+)
+path.write_text(text)
+PY_PATCH_IMMICH
+    }
     for script in deploy.sh scripts/deploy.sh install.sh; do
         if [ -f "$repo/$script" ]; then
+            patch_immich_deploy_script "$repo/$script"
             chmod +x "$repo/$script" 2>/dev/null || true
-            (cd "$repo" && bash "$script") || return 1
+            immich_node_home="${IMMICH_NODE_HOME:-/opt/software/src/tools/nvm/versions/node/v24.18.0}"
+            (cd "$repo" && VERSION="${IMMICH_VERSION:-deploy}" UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" bash "$script") || return 1
             return 0
         fi
     done
@@ -483,18 +788,16 @@ EOF_GITLAB_ZFS
 
 ensure_gitlab_repo_compatible() {
     list="/etc/apt/sources.list.d/gitlab_gitlab-ce.list"
-    [ -f "$list" ] || return 0
-    if grep -q '/ubuntu/resolute\| resolute ' "$list"; then
-        log "GitLab CE has no resolute repo yet; use noble package repo"
-        sed -i 's#/ubuntu/resolute#/ubuntu/noble#g; s/ resolute / noble /g' "$list"
-    fi
+    key=/etc/apt/keyrings/gitlab_gitlab-ce-archive-keyring.asc
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://packages.gitlab.com/gitlab/gitlab-ce/gpgkey -o "$key" || return 1
+    printf 'deb [signed-by=%s] https://packages.gitlab.com/gitlab/gitlab-ce/ubuntu/ noble main\n' "$key" > "$list"
 }
 
 ensure_zfs_for_gitlab
 installed_gitlab_version="$(dpkg-query -W -f='${Version}' gitlab-ce 2>/dev/null || true)"
 if [ "$installed_gitlab_version" != "$GITLAB_CE_VERSION" ]; then
-    curl -s https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh | bash || log "WARN: gitlab repo install failed"
-    ensure_gitlab_repo_compatible
+    ensure_gitlab_repo_compatible || log "WARN: gitlab repo setup failed"
     apt-get update || true
     apt-get install -y --allow-downgrades "gitlab-ce=$GITLAB_CE_VERSION" || log "WARN: gitlab-ce $GITLAB_CE_VERSION install failed"
 fi
@@ -788,12 +1091,29 @@ if [ "$zfs_woken" = "1" ]; then
 fi
 
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf
+mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
 done
-for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /opt/immich; do
+if [ -d /opt/user/tiger/.halo2 ]; then
+    rm -rf /home/tiger/.halo2
+    ln -s /opt/user/tiger/.halo2 /home/tiger/.halo2
+    chown -h tiger:tiger /home/tiger/.halo2 2>/dev/null || true
+fi
+python3 - <<'PY_TIGER_LINK_OWNERS'
+import os
+import pwd
+import grp
+from pathlib import Path
+
+uid = pwd.getpwnam('tiger').pw_uid
+gid = grp.getgrnam('tiger').gr_gid
+for entry in Path('/home/tiger').iterdir():
+    if entry.is_symlink():
+        os.lchown(entry, uid, gid)
+PY_TIGER_LINK_OWNERS
+for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /opt/immich /opt/user/tiger; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
 done
 find /opt/immich/server/bin /opt/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
@@ -821,6 +1141,7 @@ for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx
         printf '  %s: not-found / inactive\n' "$s"
     fi
 done
+pg_isready -q || { log "ERROR: PostgreSQL is not accepting connections"; exit 1; }
 '@
 Invoke-Remote $remote
 

@@ -195,6 +195,24 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
 
 # 3. Operational setup: services, acme/ssl, backup.
 $remote = @'
+policy_created=0
+if [ ! -e /usr/sbin/policy-rc.d ]; then
+    printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+    sudo chmod 0755 /usr/sbin/policy-rc.d
+    policy_created=1
+fi
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confold install -y libnginx-mod-stream
+[ "$policy_created" -eq 0 ] || sudo rm -f /usr/sbin/policy-rc.d
+if [ -f /usr/share/nginx/modules-available/mod-stream.conf ]; then
+    sudo mkdir -p /etc/nginx/modules-enabled
+    sudo ln -sfn /usr/share/nginx/modules-available/mod-stream.conf /etc/nginx/modules-enabled/50-mod-stream.conf
+fi
+if [ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ] || [ ! -e /etc/nginx/modules-enabled/50-mod-stream.conf ]; then
+    echo "!! nginx stream module is not installed or enabled"
+    exit 1
+fi
+
 # Files installed by sudo rsync may be root-owned when they were created fresh.
 # rblog and acme.sh run as ubuntu, so restore ownership for those trees.
 for p in /home/ubuntu /usr/local/blog; do

@@ -112,6 +112,9 @@ paths = [
     "/root/.zprofile",
     "/root/.zshenv",
     "/root/.zshrc",
+    "/home/tiger/.halo2",
+    "/opt/immich/conf",
+    "/opt/user/tiger/.halo2",
     "/usr/local/auto_sync",
     "/usr/local/blog",
     "/usr/local/halo",
@@ -120,10 +123,10 @@ paths = [
     "/usr/local/xray",
 ]
 exclude = [
-    "/etc/mysql/my.cnf",
     "/usr/local/auto_sync/logs",
     "/usr/local/blog/.backup-worktree",
     "/usr/local/blog/logs",
+    "/opt/user/tiger/.halo2/logs",
     "/usr/local/tbox/log",
     "/usr/local/waiwei/logs",
     "/usr/local/xray/logs",
@@ -219,6 +222,9 @@ paths = [
     "/root/.zprofile",
     "/root/.zshenv",
     "/root/.zshrc",
+    "/home/tiger/.halo2",
+    "/opt/immich/conf",
+    "/opt/user/tiger/.halo2",
     "/usr/local/auto_sync",
     "/usr/local/blog",
     "/usr/local/halo",
@@ -227,10 +233,10 @@ paths = [
     "/usr/local/xray",
 ]
 exclude = [
-    "/etc/mysql/my.cnf",
     "/usr/local/auto_sync/logs",
     "/usr/local/blog/.backup-worktree",
     "/usr/local/blog/logs",
+    "/opt/user/tiger/.halo2/logs",
     "/usr/local/tbox/log",
     "/usr/local/waiwei/logs",
     "/usr/local/xray/logs",

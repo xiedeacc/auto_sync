@@ -110,9 +110,21 @@ function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
 
 function Invoke-Remote([string]$Script) {
     $Script = $Script -replace "`r`n", "`n"
-    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Script))
-    $b64 | & $ssh @sshArgs $dest 'tmp=$(mktemp /tmp/auto_sync_remote.XXXXXX); base64 -d > "$tmp" && bash "$tmp" </dev/null; rc=$?; rm -f "$tmp"; exit "$rc"'
-    if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
+    $localTmp = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_remote_" + [guid]::NewGuid().ToString('N') + ".sh")
+    $remoteTmp = "/tmp/" + [IO.Path]::GetFileName($localTmp)
+    try {
+        [IO.File]::WriteAllText($localTmp, $Script, [Text.UTF8Encoding]::new($false))
+        & $scp @scpArgs $localTmp "$($dest):$remoteTmp"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "! remote script upload failed"
+            $script:errCount++
+            return
+        }
+        & $ssh @sshArgs $dest "bash '$remoteTmp' </dev/null; rc=`$?; rm -f '$remoteTmp'; exit `$rc"
+        if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
+    } finally {
+        Remove-Item -LiteralPath $localTmp -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$OptionalPaths, [string]$RemoteStage) {
@@ -145,22 +157,79 @@ function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$Opt
         if ($rel -ne '') { $excludeArgs += "--exclude=$rel" }
     }
 
-    $tarArgs = @('-C', $root, '-cf', '-') + $excludeArgs + @($tarPaths)
-    & tar @tarArgs | & $ssh @sshArgs $dest "tar -C $RemoteStage -xf -"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "! tar stage transfer failed"
-        $script:errCount++
+    $localTar = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_stage_" + [guid]::NewGuid().ToString('N') + ".tar")
+    $remoteTar = "/tmp/" + [IO.Path]::GetFileName($localTar)
+    try {
+        $tarArgs = @('-C', $root, '-cf', $localTar) + $excludeArgs + @($tarPaths)
+        & tar @tarArgs
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "! local tar stage creation failed"
+            $script:errCount++
+            return
+        }
+        & $scp @scpArgs $localTar "$($dest):$remoteTar"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "! tar stage upload failed"
+            $script:errCount++
+            return
+        }
+        Invoke-Remote "mkdir -p $RemoteStage; tar -C $RemoteStage -xf '$remoteTar'; rc=`$?; rm -f '$remoteTar'; exit `$rc"
+    } finally {
+        Remove-Item -LiteralPath $localTar -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Quote-ShellArg([string]$Value) {
+    return "'" + $Value.Replace("'", "'""'""'") + "'"
+}
+
+function Prepare-StagedSymlinks([string]$PermsFile) {
+    if ([string]::IsNullOrWhiteSpace($PermsFile) -or -not (Test-Path -LiteralPath $PermsFile)) { return }
+    $commands = New-Object System.Collections.Generic.List[string]
+    $commands.Add('stage="$HOME/.auto_sync_stage"')
+    foreach ($line in [IO.File]::ReadAllLines($PermsFile)) {
+        $t = $line.Trim()
+        if (-not $t.StartsWith('symlink ')) { continue }
+        $rest = $t.Substring(8)
+        $sp = $rest.IndexOf(' ')
+        if ($sp -lt 1) { continue }
+        try { $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($rest.Substring(0, $sp))) } catch { continue }
+        $path = $rest.Substring($sp + 1)
+        if (-not $path.StartsWith('/')) { continue }
+        $qPath = Quote-ShellArg $path
+        $qTarget = Quote-ShellArg $target
+        $commands.Add(@"
+path=$qPath
+target=$qTarget
+case "`$target" in /*) resolved="`$target" ;; *) resolved="`$(dirname -- "`$path")/`$target" ;; esac
+resolved="`$(realpath -m -- "`$resolved")"
+src="`$stage`$path"
+dst="`$stage`$resolved"
+if [ -e "`$src" ] || [ -L "`$src" ]; then
+    mkdir -p -- "`$(dirname -- "`$dst")" "`$(dirname -- "`$src")"
+    if [ -d "`$src" ] && [ ! -L "`$src" ]; then
+        mkdir -p -- "`$dst"
+        rsync -a "`$src/" "`$dst/"
+        rm -rf -- "`$src"
+    else
+        rm -rf -- "`$dst"
+        mv -- "`$src" "`$dst"
+    fi
+    ln -s -- "`$target" "`$src"
+fi
+"@)
+    }
+    if ($commands.Count -gt 1) {
+        Write-Host "preparing $($commands.Count - 1) staged symlink(s)"
+        Invoke-Remote ($commands -join "`n")
     }
 }
 
 Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
 Transfer-CollectedPathsToStage $collectPaths @('/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') '~/.auto_sync_stage'
+Prepare-StagedSymlinks $env:AS_PERMS_FILE
 
 Invoke-Remote 'rsync -rltD --no-perms ~/.auto_sync_stage/ /; rc=$?; if [ -f /tmp/auto_sync_root_key.pub ]; then mkdir -p /root/.ssh; touch /root/.ssh/authorized_keys; grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys; fi; chmod 755 / /etc /usr /usr/bin 2>/dev/null || true; chmod 700 /root/.ssh 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true; rm -rf ~/.auto_sync_stage; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
-
-function Quote-ShellArg([string]$Value) {
-    return "'" + $Value.Replace("'", "'""'""'") + "'"
-}
 
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
     $links = New-Object System.Collections.Generic.List[string]
@@ -171,7 +240,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
             $rest = $t.Substring(8)
             $sp = $rest.IndexOf(' '); if ($sp -lt 1) { continue }
             $targetB64 = $rest.Substring(0, $sp); $path = $rest.Substring($sp + 1)
-            if (-not ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/'))) { continue }
+            if (-not ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/') -or $path.StartsWith('/home/'))) { continue }
             try { $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($targetB64)) } catch { continue }
             $qPath = Quote-ShellArg $path
             $qTarget = Quote-ShellArg $target
@@ -180,7 +249,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
         }
         $sp = $t.IndexOf(' '); if ($sp -lt 1) { continue }
         $mode = $t.Substring(0, $sp); $path = $t.Substring($sp + 1)
-        if ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/')) {
+        if ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/local/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/') -or $path.StartsWith('/home/')) {
             $chmods.Add("chmod $mode $(Quote-ShellArg $path) 2>/dev/null || true")
         }
     }
@@ -234,17 +303,68 @@ if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
     sed -i 's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' /etc/apt/sources.list.d/ubuntu.sources
 fi
 apt-get update
-apt-get purge -y vim || true
+policy_created=0
+if [ ! -e /usr/sbin/policy-rc.d ]; then
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+    chmod 0755 /usr/sbin/policy-rc.d
+    policy_created=1
+fi
+apt-get -o Dpkg::Options::=--force-confold purge -y vim || true
 apt-get autoremove -y || true
-apt-get install -y \
-    dialog zfsutils-linux openssh-server zsh net-tools curl iputils-ping iftop cron ca-certificates xfonts-utils dnsutils hdparm \
+apt_result=0
+apt-get -o Dpkg::Options::=--force-confold install -y \
+    dialog zfsutils-linux openssh-server zsh net-tools curl aria2 iputils-ping iftop cron ca-certificates xfonts-utils dnsutils hdparm \
     autoconf libtool libtool-bin cmake make gcc g++ texinfo bison flex gdb build-essential automake pkg-config help2man gettext \
     python3-pip ruby luajit netcat-openbsd gperf cscope exuberant-ctags vim-nox git git-lfs lcov graphviz \
     libgeoip-dev libxml2-dev libxslt1.1 libxslt1-dev libatomic-ops-dev libgd-dev libperl-dev libluajit-5.1-dev tcl-dev ruby-dev libncurses-dev \
-    mysql-server postgresql postgresql-client libpq-dev postgresql-contrib sysstat nginx-full \
-    ffmpeg libimage-exiftool-perl postgresql-server-dev-all redis quota
+    mysql-server postgresql postgresql-client libpq-dev postgresql-contrib sysstat nginx-full libnginx-mod-stream \
+    ffmpeg libimage-exiftool-perl postgresql-server-dev-all redis quota || apt_result=1
+DEBIAN_FRONTEND=noninteractive dpkg --force-confold --configure -a || apt_result=1
+[ "$policy_created" -eq 0 ] || rm -f /usr/sbin/policy-rc.d
+[ "$apt_result" -eq 0 ] || { log "ERROR: package installation/configuration failed"; exit 1; }
 apt-get remove -y apport || true
 apt-get autoremove -y || true
+rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+
+if [ -f /usr/share/nginx/modules-available/mod-stream.conf ]; then
+    mkdir -p /etc/nginx/modules-enabled
+    ln -sfn /usr/share/nginx/modules-available/mod-stream.conf /etc/nginx/modules-enabled/50-mod-stream.conf
+fi
+if [ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ] || [ ! -e /etc/nginx/modules-enabled/50-mod-stream.conf ]; then
+    log "ERROR: nginx stream module is not installed or enabled"
+    exit 1
+fi
+
+ensure_postgresql_cluster() {
+    pg_major="$(pg_config --version | sed -n 's/^PostgreSQL \([0-9][0-9]*\).*/\1/p')"
+    [ -n "$pg_major" ] || { log "ERROR: cannot detect PostgreSQL major version"; return 1; }
+    if [ -s "/var/lib/postgresql/$pg_major/main/PG_VERSION" ]; then
+        pg_ctlcluster "$pg_major" main start 2>/dev/null || true
+        pg_isready -q && return 0
+    fi
+    source_major="$(find /etc/postgresql -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$' | sort -V | tail -1)"
+    source_copy="$(mktemp -d)"
+    [ -n "$source_major" ] && [ -d "/etc/postgresql/$source_major/main" ] && cp -a "/etc/postgresql/$source_major/main/." "$source_copy/"
+    for old_dir in /etc/postgresql/[0-9]*; do
+        [ -d "$old_dir" ] || continue
+        old_major="${old_dir##*/}"
+        [ "$old_major" = "$pg_major" ] || mv "$old_dir" "/etc/postgresql/.auto_sync_saved_$old_major" 2>/dev/null || true
+    done
+    pg_dropcluster --stop "$pg_major" main 2>/dev/null || true
+    rm -rf "/etc/postgresql/$pg_major/main" "/var/lib/postgresql/$pg_major/main"
+    pg_createcluster --port 5432 "$pg_major" main --start
+    if [ -f "$source_copy/postgresql.conf" ]; then
+        for config in postgresql.conf pg_hba.conf pg_ident.conf pg_ctl.conf start.conf environment; do
+            [ -f "$source_copy/$config" ] && cp -a "$source_copy/$config" "/etc/postgresql/$pg_major/main/$config"
+        done
+        [ -n "$source_major" ] && [ "$source_major" != "$pg_major" ] && sed -i "s#/postgresql/$source_major/#/postgresql/$pg_major/#g; s#postgresql-$source_major#postgresql-$pg_major#g" /etc/postgresql/$pg_major/main/*.conf 2>/dev/null || true
+    fi
+    rm -rf "$source_copy"
+    chown -R postgres:postgres "/etc/postgresql/$pg_major" "/var/lib/postgresql/$pg_major"
+    systemctl restart "postgresql@$pg_major-main.service"
+    pg_isready -q
+}
+ensure_postgresql_cluster || exit 1
 
 cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
@@ -334,6 +454,7 @@ if [ -L /opt/software/src/tools/nvm ]; then
     rm -f /opt/software/src/tools/nvm
 fi
 export NVM_DIR=/opt/software/src/tools/nvm
+mkdir -p "$NVM_DIR"
 if [ ! -s "$NVM_DIR/nvm.sh" ]; then
     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash || log "WARN: nvm install failed"
 fi
@@ -341,6 +462,17 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
     . "$NVM_DIR/nvm.sh"
     nvm install 24.18.0 || nvm install 24 || log "WARN: nvm install 24 failed"
     nvm use 24.18.0 || nvm use 24 || true
+    node_bin_dir="$(dirname "$(command -v node 2>/dev/null || true)")"
+    if [ -n "$node_bin_dir" ] && [ -x "$node_bin_dir/node" ]; then
+        export PATH="$node_bin_dir:$PATH"
+        if command -v corepack >/dev/null 2>&1; then
+            corepack enable || log "WARN: corepack enable failed"
+            corepack prepare pnpm@latest --activate || log "WARN: corepack prepare pnpm failed"
+        fi
+        if ! command -v pnpm >/dev/null 2>&1; then
+            npm install -g pnpm || log "WARN: npm install pnpm failed"
+        fi
+    fi
 fi
 if [ -d "$NVM_DIR" ]; then
     chmod -R a+rX "$NVM_DIR" || true
@@ -366,8 +498,27 @@ fi
 if [ ! -d /root/.vim/bundle/Vundle.vim ]; then
     git clone https://github.com/VundleVim/Vundle.vim.git /root/.vim/bundle/Vundle.vim || true
 fi
-if command -v vim >/dev/null 2>&1; then
-    timeout --kill-after=10s 180s vim +PluginInstall +qall </dev/null || log "WARN: vim PluginInstall failed"
+if command -v vim >/dev/null 2>&1 && [ -f /root/.vimrc ]; then
+    vimrc_hash="$(sha256sum /root/.vimrc | awk '{print $1}')"
+    if [ "$(cat /root/.vim/.auto_sync_vundle_hash 2>/dev/null || true)" != "$vimrc_hash" ]; then
+        vundle_rc="$(mktemp)"
+        sed -n '1,2p' /root/.vimrc > "$vundle_rc"
+        sed -n '/^filetype off$/,/^call vundle#end()/p' /root/.vimrc >> "$vundle_rc"
+        vundle_exit=0
+        timeout --kill-after=10s 300s vim -Nu "$vundle_rc" -n -es -i NONE '+set nomore' '+PluginInstall' '+qall' </dev/null || vundle_exit=$?
+        declared_plugins="$(grep -Ec "^[[:space:]]*Plugin[[:space:]]+'" /root/.vimrc || true)"
+        installed_plugins="$(find /root/.vim/bundle -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+        if [ "$installed_plugins" -ge "$declared_plugins" ] &&
+           [ -d /root/.vim/bundle/Vundle.vim ] &&
+           [ -d /root/.vim/bundle/YouCompleteMe ] &&
+           [ -d /root/.vim/bundle/vim-glaive ]; then
+            printf '%s\n' "$vimrc_hash" > /root/.vim/.auto_sync_vundle_hash
+            [ "$vundle_exit" -eq 0 ] || log "vim PluginInstall returned $vundle_exit; all $declared_plugins declared plugins are present"
+        else
+            log "WARN: vim plugins incomplete (declared=$declared_plugins installed=$installed_plugins exit=$vundle_exit)"
+        fi
+        rm -f "$vundle_rc"
+    fi
 fi
 if [ ! -d /root/.vim/bundle/vim-airline-fonts ]; then
     git clone https://github.com/powerline/fonts /root/.vim/bundle/vim-airline-fonts || true
@@ -376,7 +527,26 @@ if [ -x /root/.vim/bundle/vim-airline-fonts/install.sh ]; then
     (cd /root/.vim/bundle/vim-airline-fonts && ./install.sh) || true
 fi
 if [ -d /root/.vim/bundle/YouCompleteMe ]; then
-    (cd /root/.vim/bundle/YouCompleteMe && git submodule update --init --recursive && ./install.py --all) || log "WARN: YouCompleteMe install failed"
+    ycm_commit="$(git -C /root/.vim/bundle/YouCompleteMe rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "$ycm_commit" ] && [ "$(cat /root/.vim/bundle/YouCompleteMe/.auto_sync_installed 2>/dev/null || true)" != "$ycm_commit" ]; then
+        ycm_path="/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/usr/local/java/jdk/jdk-21.0.3/bin:/opt/software/src/tools/nvm/versions/node/v24.18.0/bin:$PATH"
+        ycmd_build=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/build.py
+        jdt_milestone="$(sed -n "s/^JDTLS_MILESTONE = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
+        jdt_stamp="$(sed -n "s/^JDTLS_BUILD_STAMP = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
+        if command -v aria2c >/dev/null 2>&1 && [ -n "$jdt_milestone" ] && [ -n "$jdt_stamp" ]; then
+            jdt_package="jdt-language-server-$jdt_milestone-$jdt_stamp.tar.gz"
+            jdt_cache=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/third_party/eclipse.jdt.ls/target/cache
+            mkdir -p "$jdt_cache"
+            aria2c --allow-overwrite=true --auto-file-renaming=false --continue=true -x 16 -s 16 -k 1M \
+                -d "$jdt_cache" -o "$jdt_package" \
+                "https://download.eclipse.org/jdtls/milestones/$jdt_milestone/$jdt_package" || log "WARN: JDT.LS cache prefetch failed"
+        fi
+        if (cd /root/.vim/bundle/YouCompleteMe && git submodule update --init --recursive && PATH="$ycm_path" python3 install.py --all --force-sudo); then
+            printf '%s\n' "$ycm_commit" > /root/.vim/bundle/YouCompleteMe/.auto_sync_installed
+        else
+            log "WARN: YouCompleteMe install failed"
+        fi
+    fi
 fi
 
 grep -q '^\*[[:space:]]\+soft[[:space:]]\+core[[:space:]]\+unlimited' /etc/security/limits.conf || cat >> /etc/security/limits.conf <<'EOF_LIMITS'
@@ -681,12 +851,17 @@ if [ "$zfs_woken" = "1" ]; then
 fi
 
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf
+mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
 done
-for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /opt/immich; do
+if [ -d /opt/user/tiger/.halo2 ]; then
+    rm -rf /home/tiger/.halo2
+    ln -s /opt/user/tiger/.halo2 /home/tiger/.halo2
+    chown -h tiger:tiger /home/tiger/.halo2 2>/dev/null || true
+fi
+for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /opt/immich /opt/user/tiger; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
 done
 find /opt/immich/server/bin /opt/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
@@ -714,6 +889,7 @@ for s in auto_sync halo2 tbox_client tbox-logrotate.timer nginx cron mysql postg
         printf '  %s: not-found / inactive\n' "$s"
     fi
 done
+pg_isready -q || { log "ERROR: PostgreSQL is not accepting connections"; exit 1; }
 '@
 Invoke-Remote $remote
 

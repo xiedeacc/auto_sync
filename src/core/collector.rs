@@ -862,11 +862,14 @@ fn record_host_perms(
         let q = shell_quote(path);
         let cmd = format!(
             "if command -v stat >/dev/null 2>&1; then \
-find {q} \\( -type f -o -type d \\) -exec stat -c '%a %n' {{}} \\; 2>/dev/null; \
+find -H {q} \\( -type f -o -type d \\) -exec stat -c '%a %n' {{}} \\; 2>/dev/null; \
 else \
-find {q} \\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null; \
+find -H {q} \\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null; \
 fi; \
-find {q} -type l -exec sh -c 'for p do t=$(readlink \"$p\") || continue; b=$(printf %s \"$t\" | base64 | tr -d \"\\n\"); printf \"symlink %s %s\\n\" \"$b\" \"$p\"; done' sh {{}} + 2>/dev/null"
+if [ -L {q} ]; then \
+t=$(readlink {q}) && b=$(printf %s \"$t\" | base64 | tr -d \"\\n\") && printf \"symlink %s %s\\n\" \"$b\" {q}; \
+fi; \
+find -H {q} -mindepth 1 -type l -exec sh -c 'for p do t=$(readlink \"$p\") || continue; b=$(printf %s \"$t\" | base64 | tr -d \"\\n\"); printf \"symlink %s %s\\n\" \"$b\" \"$p\"; done' sh {{}} + 2>/dev/null"
         );
         let out = match ssh_capture(conn, &cmd) {
             Ok(out) => out,
