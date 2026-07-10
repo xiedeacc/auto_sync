@@ -925,7 +925,7 @@ find /opt/immich/server/bin /opt/immich/machine-learning/.venv/bin -type f -exec
 chmod a+rx /opt/software/src/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/null || true
 systemctl daemon-reload
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for s in auto_sync halo2 tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server; do
+for s in mysql postgresql redis-server auto_sync halo2 tbox_client tbox-logrotate.timer nginx cron; do
     restart_if_exists "$s"
 done
 for s in waiwei waiwei-web waiwei-puller xray; do

@@ -1315,7 +1315,7 @@ chmod a+rx /opt/software/src/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/nu
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server; do
+for s in mysql postgresql redis-server immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer nginx cron; do
     restart_if_exists "$s"
 done
 for s in waiwei waiwei-web waiwei-puller xray; do
