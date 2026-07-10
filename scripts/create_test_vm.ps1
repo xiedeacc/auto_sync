@@ -181,7 +181,7 @@ tmp = out.with_suffix(out.suffix + '.tmp')
 if tmp.exists():
     tmp.unlink()
 iso = pycdlib.PyCdlib()
-iso.new(interchange_level=4, vol_ident='cidata', joliet=3, rock_ridge='1.09')
+iso.new(interchange_level=4, vol_ident='CIDATA', joliet=3, rock_ridge='1.09')
 iso.add_file(str(root / 'user-data'), '/USER-DATA.;1', joliet_path='/user-data', rr_name='user-data')
 iso.add_file(str(root / 'meta-data'), '/META-DATA.;1', joliet_path='/meta-data', rr_name='meta-data')
 iso.write(str(tmp))
