@@ -1131,16 +1131,24 @@ ensure_gitlab_repo_compatible() {
     list="/etc/apt/sources.list.d/gitlab_gitlab-ce.list"
     key=/etc/apt/keyrings/gitlab_gitlab-ce-archive-keyring.asc
     mkdir -p /etc/apt/keyrings
-    curl -fsSL https://packages.gitlab.com/gitlab/gitlab-ce/gpgkey -o "$key" || return 1
+    for attempt in 1 2 3 4 5; do
+        if curl -fsSL --connect-timeout 30 --retry 5 --retry-delay 5 --retry-all-errors \
+            https://packages.gitlab.com/gitlab/gitlab-ce/gpgkey -o "$key"; then
+            break
+        fi
+        log "WARN: GitLab repo key download failed, attempt $attempt"
+        sleep $((attempt * 5))
+    done
+    [ -s "$key" ] || { log "ERROR: GitLab repo key download failed"; return 1; }
     printf 'deb [signed-by=%s] https://packages.gitlab.com/gitlab/gitlab-ce/ubuntu/ noble main\n' "$key" > "$list"
 }
 
 ensure_zfs_for_gitlab
 installed_gitlab_version="$(dpkg-query -W -f='${Version}' gitlab-ce 2>/dev/null || true)"
 if [ "$installed_gitlab_version" != "$GITLAB_CE_VERSION" ]; then
-    ensure_gitlab_repo_compatible || log "WARN: gitlab repo setup failed"
-    apt-get update || true
-    apt-get install -y --allow-downgrades "gitlab-ce=$GITLAB_CE_VERSION" || log "WARN: gitlab-ce $GITLAB_CE_VERSION install failed"
+    ensure_gitlab_repo_compatible || exit 1
+    apt-get update || exit 1
+    apt-get install -y --allow-downgrades "gitlab-ce=$GITLAB_CE_VERSION" || exit 1
 fi
 ensure_zfs_for_gitlab
 mkdir -p /zfs/gitlab_data /zfs/gitlab_data/lfs-objects 2>/dev/null || true
