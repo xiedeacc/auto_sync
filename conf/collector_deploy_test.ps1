@@ -16,6 +16,53 @@ $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
 
+function New-FinalSshdConfig([string]$Port) {
+    if ([string]::IsNullOrWhiteSpace($Port)) { $Port = '10022' }
+    return @"
+Include /etc/ssh/sshd_config.d/*.conf
+Port $Port
+ClientAliveInterval 360
+ClientAliveCountMax 0
+AllowUsers root tiger git
+
+#AuthenticationMethods publickey password
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin yes
+KbdInteractiveAuthentication no
+StrictModes yes
+MaxAuthTries 3
+
+HostbasedAuthentication no
+UsePAM no
+X11Forwarding no
+PrintMotd no
+IgnoreRhosts yes
+UseDNS no
+
+AcceptEnv LANG LC_*
+Subsystem sftp  /usr/lib/openssh/sftp-server
+"@
+}
+
+function Copy-AwsSslIntoCollectedRoot {
+    if ([string]::IsNullOrWhiteSpace($root)) { return }
+    $shareRoot = Split-Path -Parent $root
+    if ([string]::IsNullOrWhiteSpace($shareRoot)) { return }
+    $awsSsl = Join-Path $shareRoot 'aws\etc\nginx\ssl'
+    if (-not (Test-Path -LiteralPath $awsSsl)) {
+        Write-Host "! missing AWS SSL source $awsSsl"
+        $script:errCount++
+        return
+    }
+    $target = Join-Path $root 'etc\nginx\ssl'
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    Get-ChildItem -LiteralPath $awsSsl -File -Force | Copy-Item -Destination $target -Force
+    Write-Host "stage AWS SSL certificates from $awsSsl"
+}
+
 function Reset-TestKnownHost {
     if ([string]::IsNullOrWhiteSpace($env:AS_HOSTNAME)) { return }
     $sshKeygen = Get-Command ssh-keygen -ErrorAction SilentlyContinue
@@ -105,12 +152,7 @@ import paramiko
         $sshd = Join-Path $tmpDir 'sshd_config'
         $helper = Join-Path $tmpDir 'bootstrap_root_ssh.py'
         Set-Content -LiteralPath $pub -Value $pubKey -NoNewline -Encoding ascii
-        $localSshd = Get-LocalCollectedPath '/etc/ssh/sshd_config'
-        if (Test-Path -LiteralPath $localSshd) {
-            Copy-Item -LiteralPath $localSshd -Destination $sshd -Force
-        } else {
-            Set-Content -LiteralPath $sshd -Value "Port $($env:AS_PORT)`nPubkeyAuthentication yes`nPasswordAuthentication no`nPermitRootLogin yes`n" -NoNewline -Encoding ascii
-        }
+        Set-Content -LiteralPath $sshd -Value (New-FinalSshdConfig $env:AS_PORT) -NoNewline -Encoding ascii
         @"
 import pathlib
 import sys
@@ -150,15 +192,8 @@ sftp.put(str(sshd_path), '/tmp/auto_sync_sshd_config')
 script = f'''
 set -e
 cp /tmp/auto_sync_sshd_config /etc/ssh/sshd_config
-sed -i -E 's/^([[:space:]]*)(Port|PermitRootLogin|PubkeyAuthentication|PasswordAuthentication)([[:space:]].*)/# auto_sync test disabled: \1\2\3/' /etc/ssh/sshd_config
-grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config || printf '\nInclude /etc/ssh/sshd_config.d/*.conf\n' >> /etc/ssh/sshd_config
 mkdir -p /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/99-auto-sync-test.conf <<'SSHD'
-Port {target_port}
-PubkeyAuthentication yes
-PasswordAuthentication yes
-PermitRootLogin yes
-SSHD
+rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/99-auto-sync-test.conf
 mkdir -p /root/.ssh
 cat /tmp/auto_sync_root_key.pub > /root/.ssh/authorized_keys
 chown root:root /root /root/.ssh /root/.ssh/authorized_keys
@@ -409,32 +444,39 @@ fi
 
 Reset-TestKnownHost
 Ensure-TestRootSsh
+Copy-AwsSslIntoCollectedRoot
 Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
 $generatedOptionalPaths = @('/opt/immich/conf', '/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps')
 $requiredCollectPaths = @($collectPaths | Where-Object { (Normalize-RemotePath $_) -ne '/opt/immich/conf' })
 Transfer-CollectedPathsToStage $requiredCollectPaths $generatedOptionalPaths '~/.auto_sync_stage'
 Prepare-StagedSymlinks $env:AS_PERMS_FILE
 
-Invoke-Remote 'rsync -rltD --no-perms ~/.auto_sync_stage/ /; rc=$?; if [ -f /tmp/auto_sync_root_key.pub ]; then mkdir -p /root/.ssh; touch /root/.ssh/authorized_keys; grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys; fi; chmod 755 / /etc /usr /usr/bin 2>/dev/null || true; chmod 700 /root/.ssh 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true; rm -rf ~/.auto_sync_stage; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
+Invoke-Remote 'rsync -rltD --no-perms ~/.auto_sync_stage/ /; rc=$?; if [ -f /tmp/auto_sync_root_key.pub ]; then mkdir -p /root/.ssh; touch /root/.ssh/authorized_keys; grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys; fi; chmod 755 / /etc /usr /usr/bin 2>/dev/null || true; chown -R root:root /root/.ssh 2>/dev/null || true; chmod 700 /root/.ssh 2>/dev/null || true; find /root/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \; 2>/dev/null || true; find /root/.ssh -type f -name "*.pub" -exec chmod 644 {} \; 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true; rm -rf ~/.auto_sync_stage; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
 
 $testSshPort = $env:AS_PORT
-if ([string]::IsNullOrWhiteSpace($testSshPort)) { $testSshPort = '22' }
+if ([string]::IsNullOrWhiteSpace($testSshPort)) { $testSshPort = '10022' }
+$finalSshd = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_sshd_" + [guid]::NewGuid().ToString('N'))
+try {
+    [IO.File]::WriteAllText($finalSshd, (New-FinalSshdConfig $testSshPort), [Text.ASCIIEncoding]::new())
+    & $scp @scpArgs $finalSshd "$($dest):/root/auto_sync_sshd_config"
+    if ($LASTEXITCODE -ne 0) { Write-Host "! sshd_config upload failed"; $errCount++ }
+} finally {
+    Remove-Item -LiteralPath $finalSshd -Force -ErrorAction SilentlyContinue
+}
 Invoke-Remote @"
 set -e
-sed -i -E 's/^([[:space:]]*)(Port|PermitRootLogin|PubkeyAuthentication|PasswordAuthentication)([[:space:]].*)/# auto_sync test disabled: \1\2\3/' /etc/ssh/sshd_config
-grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config || printf '\nInclude /etc/ssh/sshd_config.d/*.conf\n' >> /etc/ssh/sshd_config
 mkdir -p /etc/ssh/sshd_config.d /root/.ssh
-cat > /etc/ssh/sshd_config.d/99-auto-sync-test.conf <<'SSHD'
-Port $testSshPort
-PubkeyAuthentication yes
-PasswordAuthentication yes
-PermitRootLogin yes
-SSHD
+cp /root/auto_sync_sshd_config /etc/ssh/sshd_config
+rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/98-auto-sync-gitlab.conf /etc/ssh/sshd_config.d/99-auto-sync-test.conf
 if [ -f /tmp/auto_sync_root_key.pub ]; then
     cat /tmp/auto_sync_root_key.pub > /root/.ssh/authorized_keys
 fi
 chmod 700 /root /root/.ssh
+chown -R root:root /root/.ssh 2>/dev/null || true
+find /root/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \; 2>/dev/null || true
+find /root/.ssh -type f -name "*.pub" -exec chmod 644 {} \; 2>/dev/null || true
 chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+sshd -t
 systemctl disable --now ssh.socket 2>/dev/null || true
 systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service
 "@
@@ -1032,6 +1074,17 @@ gitlab_rails['repository_storages'] = {
 }
 EOF_GITLAB_ZFS
     fi
+    if ! grep -q 'auto_sync GitLab frontend ports' /etc/gitlab/gitlab.rb 2>/dev/null; then
+        cat >> /etc/gitlab/gitlab.rb <<'EOF_GITLAB_FRONTEND'
+
+# Managed by auto_sync GitLab frontend ports.
+# Workhorse serves nginx on 10080. Puma must not bind TCP 8080 because waiwei-web uses it.
+gitlab_workhorse['listen_network'] = "tcp"
+gitlab_workhorse['listen_addr'] = "127.0.0.1:10080"
+puma['listen'] = ""
+puma['port'] = nil
+EOF_GITLAB_FRONTEND
+    fi
 }
 
 ensure_gitlab_repo_compatible() {
@@ -1052,7 +1105,11 @@ fi
 ensure_zfs_for_gitlab
 mkdir -p /zfs/gitlab_data /zfs/gitlab_data/lfs-objects 2>/dev/null || true
 passwd -S git 2>/dev/null || true
-passwd -u git 2>/dev/null || true
+if id git >/dev/null 2>&1; then
+    git_pw_hash="$(openssl passwd -6 "auto-sync-git-$(date +%s)-$RANDOM" 2>/dev/null || true)"
+    [ -z "$git_pw_hash" ] || usermod -p "$git_pw_hash" git 2>/dev/null || true
+    rm -f /etc/ssh/sshd_config.d/98-auto-sync-gitlab.conf 2>/dev/null || true
+fi
 [ -d /zfs/gitlab_data ] && chown -R git:git /zfs/gitlab_data 2>/dev/null || true
 [ -d /zfs/gitlab_data ] && chmod 2770 /zfs/gitlab_data 2>/dev/null || true
 [ -d /etc/gitlab ] && chown -R git:git /etc/gitlab 2>/dev/null || true
@@ -1370,9 +1427,34 @@ PY_TIGER_LINK_OWNERS
 for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /opt/immich /opt/user/tiger; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
 done
+for f in \
+    /usr/local/auto_sync/bin/auto_sync \
+    /usr/local/auto_sync/bin/auto_syncd \
+    /usr/local/auto_sync/bin/auto_syncctl \
+    /usr/local/auto_sync/bin/auto_sync_gui \
+    /usr/local/auto_sync/bin/auto_sync_web \
+    /opt/auto_sync/bin/auto_sync \
+    /opt/auto_sync/bin/auto_syncd \
+    /opt/auto_sync/bin/auto_syncctl \
+    /opt/auto_sync/bin/auto_sync_gui \
+    /opt/auto_sync/bin/auto_sync_web \
+    /usr/local/tbox/bin/tbox_client \
+    /usr/local/xray/bin/xray \
+    /usr/local/xray/bin/update-geo.sh \
+    /usr/local/waiwei/bin/waiwei_web \
+    /usr/local/waiwei/bin/waiwei_puller \
+    /usr/local/blog/bin/rblog \
+    /usr/local/blog/bin/rblog-backup \
+    /usr/local/blog/bin/admin/* \
+    /usr/local/halo/bin/* \
+    /usr/local/bin/vlmcsd
+do
+    [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
+done
 find /opt/immich/server/bin /opt/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
 chmod a+rx /opt/software/src/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/null || true
 systemctl daemon-reload
+systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
 for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray rblog rblog-backup.timer gitlab-runsvdir gitlab; do
     restart_if_exists "$s"
@@ -1393,10 +1475,22 @@ for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx
     fi
 done
 
+wait_for_unit_active() {
+    name="$1"
+    resolved="$(unit_name "$name" 2>/dev/null || true)"
+    [ -n "$resolved" ] || return 1
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45; do
+        systemctl is-active --quiet "$resolved" && return 0
+        state="$(systemctl is-active "$resolved" 2>/dev/null || true)"
+        [ "$state" = "activating" ] || [ "$state" = "reloading" ] || break
+        sleep 2
+    done
+    systemctl is-active --quiet "$resolved"
+}
+
 required_failed=0
 for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray rblog rblog-backup.timer; do
-    resolved="$(unit_name "$s" 2>/dev/null || true)"
-    if [ -z "$resolved" ] || ! systemctl is-active --quiet "$resolved"; then
+    if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
         required_failed=1
     fi
