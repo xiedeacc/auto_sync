@@ -13,7 +13,7 @@ param(
     [int]$CoresPerSocket = 8,
     [string]$DiskSize = '60GB',
     [string]$DevUser = 'dev',
-    [string]$DevPasswordHash = '$6$bFEO4LRTZJ7wLDOF$ip8BQT2Bn5uqLSUAcsT.3mtUtqtkT3Hd92WU1LRS3RynHeZekYbsVn1Ki2qJ12PILagUw9x2e43WEA4.4pAGE1',
+    [string]$DevPasswordHash = '$6$autoSyncTestVm01$UEaEZIM5/CM.kzRch28cCmWmwLdUQjfgSprEfSuIlRqUpsnDNeCRugUjLFOsL/irIbH2XCPuHXf3DQoV7ZcDs/',
     [switch]$NoStart,
     [switch]$KeepExisting
 )
@@ -143,6 +143,59 @@ local-hostname: test
     [IO.File]::WriteAllText((Join-Path $Dir 'meta-data'), $metaData, [Text.UTF8Encoding]::new($false))
 }
 
+function Get-PythonExe {
+    $python = Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($python) { return $python.Source }
+    $py = Get-Command py -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($py) { return $py.Source }
+    throw 'Python is required to build the cloud-init seed ISO'
+}
+
+function Ensure-PythonModule([string]$Python, [string]$Module, [string]$Target) {
+    $check = "import sys; sys.path.insert(0, r'$Target'); import $Module"
+    & $Python -c $check 2>$null
+    if ($LASTEXITCODE -eq 0) { return }
+
+    New-Item -ItemType Directory -Force -Path $Target | Out-Null
+    & $Python -m pip install --quiet --index-url https://pypi.tuna.tsinghua.edu.cn/simple --target $Target $Module
+    if ($LASTEXITCODE -ne 0) { throw "Failed to install Python module $Module" }
+}
+
+function New-CloudInitSeedIso([string]$Dir, [string]$OutputIso) {
+    $python = Get-PythonExe
+    $moduleDir = Join-Path ([IO.Path]::GetTempPath()) 'auto_sync_pycdlib'
+    Ensure-PythonModule $python 'pycdlib' $moduleDir
+
+    $builder = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_seed_" + [guid]::NewGuid().ToString('N') + '.py')
+    try {
+        $script = @"
+import pathlib
+import sys
+
+sys.path.insert(0, r'$moduleDir')
+import pycdlib
+
+root = pathlib.Path(r'$Dir')
+out = pathlib.Path(r'$OutputIso')
+tmp = out.with_suffix(out.suffix + '.tmp')
+if tmp.exists():
+    tmp.unlink()
+iso = pycdlib.PyCdlib()
+iso.new(interchange_level=3, vol_ident='cidata', joliet=3, rock_ridge='1.09')
+iso.add_file(str(root / 'user-data'), '/USERDATA.;1', joliet_path='/user-data', rr_name='user-data')
+iso.add_file(str(root / 'meta-data'), '/METADATA.;1', joliet_path='/meta-data', rr_name='meta-data')
+iso.write(str(tmp))
+iso.close()
+tmp.replace(out)
+"@
+        [IO.File]::WriteAllText($builder, $script, [Text.UTF8Encoding]::new($false))
+        & $python $builder
+        if ($LASTEXITCODE -ne 0) { throw "Failed to build seed ISO $OutputIso" }
+    } finally {
+        Remove-Item -LiteralPath $builder -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-InstallerIso([string]$MediaRoot, [string]$RequestedIso) {
     if (-not [string]::IsNullOrWhiteSpace($RequestedIso)) {
         if (-not (Test-Path -LiteralPath $RequestedIso)) { throw "Installer ISO not found: $RequestedIso" }
@@ -161,8 +214,8 @@ function Get-SeedIso([string]$MediaRoot, [string]$RequestedSeed) {
         return (Resolve-Path -LiteralPath $RequestedSeed).Path
     }
     $seed = Join-Path $MediaRoot 'seed.iso'
-    if (Test-Path -LiteralPath $seed) { return (Resolve-Path -LiteralPath $seed).Path }
-    throw "Seed ISO not found: $seed. Create cidata seed.iso from $MediaRoot\user-data and $MediaRoot\meta-data first."
+    New-CloudInitSeedIso $MediaRoot $seed
+    return (Resolve-Path -LiteralPath $seed).Path
 }
 
 function Write-Vmx(
@@ -232,14 +285,14 @@ $vmrun = Resolve-Tool 'vmrun.exe' @('C:\Program Files (x86)\VMware\VMware Workst
 $vdisk = Resolve-Tool 'vmware-vdiskmanager.exe' @('C:\Program Files (x86)\VMware\VMware Workstation\vmware-vdiskmanager.exe')
 $vmx = Join-Path $VmDir "$VmName.vmx"
 
-Write-CloudInitSeedFiles $MediaDir $GuestIp $Netmask $Gateway $MacAddress $DevUser $DevPasswordHash
-$installer = Get-InstallerIso $MediaDir $InstallerIso
-$seed = Get-SeedIso $MediaDir $SeedIso
-
 if (-not $KeepExisting) {
     Stop-ExistingVm $vmx $vmrun
     Remove-TestVmDir $VmDir
 }
+
+Write-CloudInitSeedFiles $MediaDir $GuestIp $Netmask $Gateway $MacAddress $DevUser $DevPasswordHash
+$installer = Get-InstallerIso $MediaDir $InstallerIso
+$seed = Get-SeedIso $MediaDir $SeedIso
 
 New-Item -ItemType Directory -Force -Path $VmDir | Out-Null
 & $vdisk -c -s $DiskSize -a lsilogic -t 0 (Join-Path $VmDir 'test.vmdk')
