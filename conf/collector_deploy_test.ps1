@@ -935,11 +935,11 @@ if [ -d /root/.vim/bundle/YouCompleteMe ]; then
             jdt_package="jdt-language-server-$jdt_milestone-$jdt_stamp.tar.gz"
             jdt_cache=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/third_party/eclipse.jdt.ls/target/cache
             mkdir -p "$jdt_cache"
-            aria2c --allow-overwrite=true --auto-file-renaming=false --continue=true -x 16 -s 16 -k 1M \
+            timeout --kill-after=10s 300s aria2c --allow-overwrite=true --auto-file-renaming=false --continue=true -x 16 -s 16 -k 1M \
                 -d "$jdt_cache" -o "$jdt_package" \
                 "https://download.eclipse.org/jdtls/milestones/$jdt_milestone/$jdt_package" || log "WARN: JDT.LS cache prefetch failed"
         fi
-        if (cd /root/.vim/bundle/YouCompleteMe && git submodule update --init --recursive && PATH="$ycm_path" python3 install.py --all --force-sudo); then
+        if (cd /root/.vim/bundle/YouCompleteMe && git submodule update --init --recursive && PATH="$ycm_path" timeout --kill-after=10s 900s python3 install.py --all --force-sudo); then
             printf '%s\n' "$ycm_commit" > /root/.vim/bundle/YouCompleteMe/.auto_sync_installed
         else
             log "WARN: YouCompleteMe install failed"
@@ -1414,6 +1414,13 @@ pg_dump="$(newest_dump postgres $dump_roots 2>/dev/null || true)"
 [ -n "$pg_dump" ] && log "selected postgres dump: $pg_dump"
 restore_once mysql "$mysql_dump"
 restore_once postgres "$pg_dump"
+id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
+mkdir -p /opt/immich/upload
+for d in backups encoded-video library profile thumbs upload; do
+    mkdir -p "/opt/immich/upload/$d"
+    touch "/opt/immich/upload/$d/.immich"
+done
+chown -R tiger:tiger /opt/immich/upload 2>/dev/null || true
 deploy_immich_from_git || log "WARN: immich deploy from git failed"
 rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
 if [ "$zfs_woken" = "1" ]; then
@@ -1425,7 +1432,6 @@ if [ -d /usr/local/auto_sync ] && [ ! -e /opt/auto_sync ]; then
     ln -s /usr/local/auto_sync /opt/auto_sync
 fi
 
-id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
 mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
