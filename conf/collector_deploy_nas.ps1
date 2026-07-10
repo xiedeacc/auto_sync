@@ -670,7 +670,7 @@ if command -v go >/dev/null 2>&1; then
 fi
 
 if [ ! -x /root/.cargo/bin/rustup ]; then
-    curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y || log "WARN: rustup install failed"
+    curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | timeout --kill-after=10s 600s sh -s -- -y || log "WARN: rustup install failed"
 fi
 
 mkdir -p /opt/software/src/tools
