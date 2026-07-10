@@ -332,7 +332,7 @@ apt-get -o Dpkg::Options::=--force-confold install -y \
     python3-pip ruby luajit netcat-openbsd gperf cscope exuberant-ctags vim-nox git git-lfs lcov graphviz \
     libgeoip-dev libxml2-dev libxslt1.1 libxslt1-dev libatomic-ops-dev libgd-dev libperl-dev libluajit-5.1-dev tcl-dev ruby-dev libncurses-dev \
     mysql-server postgresql postgresql-client libpq-dev postgresql-contrib sysstat nginx-full libnginx-mod-stream \
-    ffmpeg libimage-exiftool-perl libgl1 libvips-dev libvips-tools postgresql-server-dev-all redis quota || apt_result=1
+    ffmpeg libimage-exiftool-perl libgl1 libvips-dev libvips-tools openjdk-21-jdk-headless postgresql-server-dev-all redis quota || apt_result=1
 DEBIAN_FRONTEND=noninteractive dpkg --force-confold --configure -a || apt_result=1
 [ "$policy_created" -eq 0 ] || rm -f /usr/sbin/policy-rc.d
 [ "$apt_result" -eq 0 ] || { log "ERROR: package installation/configuration failed"; exit 1; }
@@ -528,6 +528,8 @@ export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 export UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 export RUSTUP_DIST_SERVER=https://rsproxy.cn
 export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+export PATH="$JAVA_HOME/bin:$PATH"
 EOF_DOMESTIC_MIRRORS
 . /etc/profile.d/auto-sync-domestic-mirrors.sh
 cat > /etc/pip.conf <<'EOF_PIP_MIRROR'
@@ -608,13 +610,13 @@ if [ ! -x /usr/local/bin/buildifier ]; then
     chmod +x /usr/local/bin/buildifier
 fi
 
-if [ ! -d /usr/local/java/jdk/jdk-21.0.3 ]; then
-    mkdir -p /usr/local/java/jdk
-    cd /usr/local/java/jdk
-    rm -f jdk-21.0.3_linux-x64_bin.tar.gz
-    curl -L -O https://download.oracle.com/java/21/archive/jdk-21.0.3_linux-x64_bin.tar.gz
-    tar zxf jdk-21.0.3_linux-x64_bin.tar.gz
-    rm -f jdk-21.0.3_linux-x64_bin.tar.gz
+[ -x "$JAVA_HOME/bin/java" ] || { log "ERROR: OpenJDK 21 is not installed at $JAVA_HOME"; exit 1; }
+[ ! -L /usr/local/java/jdk/jdk-21.0.3 ] || rm -f /usr/local/java/jdk/jdk-21.0.3
+[ ! -L /opt/software/src/tools/mise/installs/java/21.0.2 ] || rm -f /opt/software/src/tools/mise/installs/java/21.0.2
+if grep -Rqs '/usr/local/java/.*/bin/java' /etc/systemd/system; then
+    grep -Rl '/usr/local/java/.*/bin/java' /etc/systemd/system |
+        xargs -r sed -i -E "s#/usr/local/java/[^[:space:]]*/bin/java#$JAVA_HOME/bin/java#g"
+    systemctl daemon-reload || true
 fi
 
 if [ -f /root/src/share/ubuntu/conf/.vimrc ]; then
@@ -654,7 +656,7 @@ fi
 if [ -d /root/.vim/bundle/YouCompleteMe ]; then
     ycm_commit="$(git -C /root/.vim/bundle/YouCompleteMe rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$ycm_commit" ] && [ "$(cat /root/.vim/bundle/YouCompleteMe/.auto_sync_installed 2>/dev/null || true)" != "$ycm_commit" ]; then
-        ycm_path="/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/usr/local/java/jdk/jdk-21.0.3/bin:/opt/software/src/tools/nvm/versions/node/v24.18.0/bin:$PATH"
+        ycm_path="$JAVA_HOME/bin:/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/opt/software/src/tools/nvm/versions/node/v24.18.0/bin:$PATH"
         ycmd_build=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/build.py
         jdt_milestone="$(sed -n "s/^JDTLS_MILESTONE = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
         jdt_stamp="$(sed -n "s/^JDTLS_BUILD_STAMP = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
@@ -729,6 +731,25 @@ EOF_IMMICH_ML_ENV
         git checkout deploy &&
         git pull --ff-only origin deploy
     ) || return 1
+    immich_commit="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+    immich_marker=/opt/immich/.auto_sync_deploy_commit
+    immich_installed=0
+    if [ -f /opt/immich/server/dist/main.js ] &&
+       [ -f /opt/immich/web/build/index.html ] &&
+       [ -x /opt/immich/machine-learning/.venv/bin/python ]; then
+        immich_installed=1
+    fi
+    if [ -n "$immich_commit" ] && [ "$immich_installed" -eq 1 ]; then
+        if [ "$(cat "$immich_marker" 2>/dev/null || true)" = "$immich_commit" ]; then
+            log "immich deploy branch unchanged; skip rebuild"
+            return 0
+        fi
+        if [ ! -f "$immich_marker" ]; then
+            printf '%s\n' "$immich_commit" > "$immich_marker"
+            log "immich already installed; record current deploy commit and skip rebuild"
+            return 0
+        fi
+    fi
     patch_immich_deploy_script() {
         script_path="$1"
         command -v python3 >/dev/null 2>&1 || return 0
@@ -767,6 +788,7 @@ PY_PATCH_IMMICH
             chmod +x "$repo/$script" 2>/dev/null || true
             immich_node_home="${IMMICH_NODE_HOME:-/opt/software/src/tools/nvm/versions/node/v24.18.0}"
             (cd "$repo" && VERSION="${IMMICH_VERSION:-deploy}" UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" bash "$script") || return 1
+            [ -z "$immich_commit" ] || printf '%s\n' "$immich_commit" > "$immich_marker"
             return 0
         fi
     done
