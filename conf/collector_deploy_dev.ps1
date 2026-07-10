@@ -440,6 +440,7 @@ ensure_host_entry 192.168.2.247 unlock-music.xiedeacc.com
 ensure_host_entry 192.168.2.247 immich.xiedeacc.com
 ensure_host_entry 192.168.2.247 halo.xiedeacc.com
 ensure_host_entry 192.168.2.247 blog.xiedeacc.com
+ensure_host_entry 192.168.2.247 rblog.xiedeacc.com
 ensure_host_entry 192.168.2.126 dev.xiedeacc.com
 ensure_host_entry 192.168.2.126 coverage.xiedeacc.com
 
