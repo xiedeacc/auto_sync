@@ -451,8 +451,6 @@ $requiredCollectPaths = @($collectPaths | Where-Object { (Normalize-RemotePath $
 Transfer-CollectedPathsToStage $requiredCollectPaths $generatedOptionalPaths '~/.auto_sync_stage'
 Prepare-StagedSymlinks $env:AS_PERMS_FILE
 
-Invoke-Remote 'rsync -rltD --no-perms ~/.auto_sync_stage/ /; rc=$?; if [ -f /tmp/auto_sync_root_key.pub ]; then mkdir -p /root/.ssh; touch /root/.ssh/authorized_keys; grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys; fi; chmod 755 / /etc /usr /usr/bin 2>/dev/null || true; chown -R root:root /root/.ssh 2>/dev/null || true; chmod 700 /root/.ssh 2>/dev/null || true; find /root/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \; 2>/dev/null || true; find /root/.ssh -type f -name "*.pub" -exec chmod 644 {} \; 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true; rm -rf ~/.auto_sync_stage; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
-
 $testSshPort = $env:AS_PORT
 if ([string]::IsNullOrWhiteSpace($testSshPort)) { $testSshPort = '10022' }
 $finalSshd = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_sshd_" + [guid]::NewGuid().ToString('N'))
@@ -550,6 +548,28 @@ disable_if_exists() {
     fi
 }
 
+install_staged_collected_paths() {
+    stage="$HOME/.auto_sync_stage"
+    [ -d "$stage" ] || return 0
+    log "install collected paths after package installation"
+    rsync -rltD --no-perms "$stage/" /
+    rc=$?
+    if [ -f /tmp/auto_sync_root_key.pub ]; then
+        mkdir -p /root/.ssh
+        touch /root/.ssh/authorized_keys
+        grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys
+    fi
+    chmod 755 / /etc /usr /usr/bin 2>/dev/null || true
+    chown -R root:root /root/.ssh 2>/dev/null || true
+    chmod 700 /root/.ssh 2>/dev/null || true
+    find /root/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \; 2>/dev/null || true
+    find /root/.ssh -type f -name "*.pub" -exec chmod 644 {} \; 2>/dev/null || true
+    chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+    rm -rf "$stage"
+    [ "$rc" -eq 0 ] && log "installed collected paths"
+    return "$rc"
+}
+
 if [ -f /etc/apt/sources.list.d/gitlab_gitlab-ce.list ] && grep -q '/ubuntu/resolute\| resolute ' /etc/apt/sources.list.d/gitlab_gitlab-ce.list; then
     log "GitLab CE has no resolute repo yet; use noble package repo"
     sed -i 's#/ubuntu/resolute#/ubuntu/noble#g; s/ resolute / noble /g' /etc/apt/sources.list.d/gitlab_gitlab-ce.list
@@ -587,6 +607,7 @@ DEBIAN_FRONTEND=noninteractive dpkg --force-confold --configure -a || apt_result
 apt-get remove -y apport || true
 apt-get autoremove -y || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+install_staged_collected_paths || { log "ERROR: collected path installation failed"; exit 1; }
 
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
 ensure_opt_link() {
@@ -759,6 +780,7 @@ ensure_host_entry 127.0.0.1 code.xiedeacc.com
 ensure_host_entry 127.0.0.1 unlock-music.xiedeacc.com
 ensure_host_entry 127.0.0.1 immich.xiedeacc.com
 ensure_host_entry 127.0.0.1 halo.xiedeacc.com
+ensure_host_entry 127.0.0.1 blog.xiedeacc.com
 ensure_host_entry 192.168.2.126 dev.xiedeacc.com
 ensure_host_entry 192.168.2.126 coverage.xiedeacc.com
 

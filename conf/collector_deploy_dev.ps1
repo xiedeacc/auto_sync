@@ -229,8 +229,6 @@ Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
 Transfer-CollectedPathsToStage $collectPaths @('/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') '~/.auto_sync_stage'
 Prepare-StagedSymlinks $env:AS_PERMS_FILE
 
-Invoke-Remote 'rsync -rltD --no-perms ~/.auto_sync_stage/ /; rc=$?; if [ -f /tmp/auto_sync_root_key.pub ]; then mkdir -p /root/.ssh; touch /root/.ssh/authorized_keys; grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys; fi; chmod 755 / /etc /usr /usr/bin 2>/dev/null || true; chmod 700 /root/.ssh 2>/dev/null || true; chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true; rm -rf ~/.auto_sync_stage; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
-
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
     $links = New-Object System.Collections.Generic.List[string]
     $chmods = New-Object System.Collections.Generic.List[string]
@@ -299,6 +297,25 @@ disable_if_exists() {
     fi
 }
 
+install_staged_collected_paths() {
+    stage="$HOME/.auto_sync_stage"
+    [ -d "$stage" ] || return 0
+    log "install collected paths after package installation"
+    rsync -rltD --no-perms "$stage/" /
+    rc=$?
+    if [ -f /tmp/auto_sync_root_key.pub ]; then
+        mkdir -p /root/.ssh
+        touch /root/.ssh/authorized_keys
+        grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys
+    fi
+    chmod 755 / /etc /usr /usr/bin 2>/dev/null || true
+    chmod 700 /root/.ssh 2>/dev/null || true
+    chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+    rm -rf "$stage"
+    [ "$rc" -eq 0 ] && log "installed collected paths"
+    return "$rc"
+}
+
 if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
     sed -i 's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' /etc/apt/sources.list.d/ubuntu.sources
 fi
@@ -325,6 +342,7 @@ DEBIAN_FRONTEND=noninteractive dpkg --force-confold --configure -a || apt_result
 apt-get remove -y apport || true
 apt-get autoremove -y || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+install_staged_collected_paths || { log "ERROR: collected path installation failed"; exit 1; }
 
 if [ -f /usr/share/nginx/modules-available/mod-stream.conf ]; then
     mkdir -p /etc/nginx/modules-enabled
@@ -421,6 +439,7 @@ ensure_host_entry 192.168.2.247 code.xiedeacc.com
 ensure_host_entry 192.168.2.247 unlock-music.xiedeacc.com
 ensure_host_entry 192.168.2.247 immich.xiedeacc.com
 ensure_host_entry 192.168.2.247 halo.xiedeacc.com
+ensure_host_entry 192.168.2.247 blog.xiedeacc.com
 ensure_host_entry 192.168.2.126 dev.xiedeacc.com
 ensure_host_entry 192.168.2.126 coverage.xiedeacc.com
 
