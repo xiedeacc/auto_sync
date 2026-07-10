@@ -361,11 +361,30 @@ unit_name() {
     return 1
 }
 unit_exists() { unit_name "$1" >/dev/null; }
+remove_bad_enable_links() {
+    unit="$1"
+    for wants_dir in /etc/systemd/system/*.target.wants; do
+        [ -d "$wants_dir" ] || continue
+        link="$wants_dir/$unit"
+        if [ -e "$link" ] && [ ! -L "$link" ]; then
+            rm -f "$link"
+        fi
+    done
+}
+enable_unit() {
+    unit="$1"
+    remove_bad_enable_links "$unit"
+    if ! systemctl enable "$unit" >/dev/null 2>&1; then
+        log "ERROR: enable $unit failed"
+        systemctl enable "$unit"
+        return 1
+    fi
+}
 restart_if_exists() {
     unit="$(unit_name "$1" 2>/dev/null || true)"
     [ -n "$unit" ] || return 0
     if unit_exists "$unit"; then
-        systemctl enable "$unit" >/dev/null 2>&1 || true
+        enable_unit "$unit"
         systemctl restart "$unit" && log "restarted $unit" || log "WARN: restart $unit failed"
     fi
 }

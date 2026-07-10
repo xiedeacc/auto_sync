@@ -538,11 +538,30 @@ unit_name() {
     return 1
 }
 unit_exists() { unit_name "$1" >/dev/null; }
+remove_bad_enable_links() {
+    unit="$1"
+    for wants_dir in /etc/systemd/system/*.target.wants; do
+        [ -d "$wants_dir" ] || continue
+        link="$wants_dir/$unit"
+        if [ -e "$link" ] && [ ! -L "$link" ]; then
+            rm -f "$link"
+        fi
+    done
+}
+enable_unit() {
+    unit="$1"
+    remove_bad_enable_links "$unit"
+    if ! systemctl enable "$unit" >/dev/null 2>&1; then
+        log "ERROR: enable $unit failed"
+        systemctl enable "$unit"
+        return 1
+    fi
+}
 restart_if_exists() {
     unit="$(unit_name "$1" 2>/dev/null || true)"
     [ -n "$unit" ] || return 0
     if unit_exists "$unit"; then
-        systemctl enable "$unit" >/dev/null 2>&1 || true
+        enable_unit "$unit"
         systemctl restart "$unit" && log "restarted $unit" || log "WARN: restart $unit failed"
     fi
 }
@@ -1546,11 +1565,21 @@ wait_for_unit_active() {
     done
     systemctl is-active --quiet "$resolved"
 }
+wait_for_unit_enabled() {
+    name="$1"
+    resolved="$(unit_name "$name" 2>/dev/null || true)"
+    [ -n "$resolved" ] || return 1
+    systemctl is-enabled --quiet "$resolved"
+}
 
 required_failed=0
 for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray rblog rblog-backup.timer; do
     if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
+        required_failed=1
+    fi
+    if ! wait_for_unit_enabled "$s"; then
+        log "ERROR: required service $s is not enabled"
         required_failed=1
     fi
 done
