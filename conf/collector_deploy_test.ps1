@@ -163,9 +163,11 @@ import paramiko
 import pathlib
 import sys
 import time
+import logging
 
 sys.path.insert(0, r'$paramikoRoot')
 import paramiko
+logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 
 host = r'$($env:AS_HOSTNAME)'
 wait_seconds = int(r'$bootstrapWaitSeconds')
@@ -1581,6 +1583,16 @@ wait_for_unit_enabled() {
     [ -n "$resolved" ] || return 1
     systemctl is-enabled --quiet "$resolved"
 }
+wait_for_https_200() {
+    url="$1"
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+        code="$(curl -k -L --max-time 45 -o /dev/null -s -w '%{http_code}' "$url" || true)"
+        [ "$code" = "200" ] && return 0
+        sleep 10
+    done
+    log "ERROR: $url did not return HTTP 200; last status: $code"
+    return 1
+}
 
 required_failed=0
 for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray rblog rblog-backup.timer; do
@@ -1601,6 +1613,11 @@ if ! command -v gitlab-ctl >/dev/null 2>&1 || ! gitlab-ctl status >/dev/null 2>&
     log "ERROR: required service gitlab is not active"
     required_failed=1
 fi
+for url in https://code.xiedeacc.com https://unlock-music.xiedeacc.com https://halo.xiedeacc.com https://immich.xiedeacc.com https://blog.xiedeacc.com https://rblog.xiedeacc.com; do
+    if ! wait_for_https_200 "$url"; then
+        required_failed=1
+    fi
+done
 exit "$required_failed"
 '@
 Invoke-Remote $remote
