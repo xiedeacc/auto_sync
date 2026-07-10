@@ -332,7 +332,7 @@ apt-get -o Dpkg::Options::=--force-confold install -y \
     python3-pip ruby luajit netcat-openbsd gperf cscope exuberant-ctags vim-nox git git-lfs lcov graphviz \
     libgeoip-dev libxml2-dev libxslt1.1 libxslt1-dev libatomic-ops-dev libgd-dev libperl-dev libluajit-5.1-dev tcl-dev ruby-dev libncurses-dev \
     mysql-server postgresql postgresql-client libpq-dev postgresql-contrib sysstat nginx-full libnginx-mod-stream \
-    ffmpeg libimage-exiftool-perl libvips-dev libvips-tools postgresql-server-dev-all redis quota || apt_result=1
+    ffmpeg libimage-exiftool-perl libgl1 libvips-dev libvips-tools postgresql-server-dev-all redis quota || apt_result=1
 DEBIAN_FRONTEND=noninteractive dpkg --force-confold --configure -a || apt_result=1
 [ "$policy_created" -eq 0 ] || rm -f /usr/sbin/policy-rc.d
 [ "$apt_result" -eq 0 ] || { log "ERROR: package installation/configuration failed"; exit 1; }
@@ -448,6 +448,10 @@ ensure_postgresql_cluster() {
         if [ -n "$source_major" ] && [ "$source_major" != "$pg_major" ]; then
             sed -i "s#/postgresql/$source_major/#/postgresql/$pg_major/#g; s#postgresql-$source_major#postgresql-$pg_major#g" /etc/postgresql/$pg_major/main/*.conf 2>/dev/null || true
         fi
+        sed -i -E \
+            -e "s#^[[:space:]]*external_pid_file[[:space:]]*=.*#external_pid_file = '/var/run/postgresql/$pg_major-main.pid'#" \
+            -e "s#^[[:space:]]*cluster_name[[:space:]]*=.*#cluster_name = '$pg_major/main'#" \
+            "/etc/postgresql/$pg_major/main/postgresql.conf"
     fi
     rm -rf "$source_copy"
     chown -R postgres:postgres "/etc/postgresql/$pg_major" "/var/lib/postgresql/$pg_major"
@@ -514,6 +518,35 @@ swapoff -a || true
 sed -i '/^\/swap\.img[[:space:]]/s/^/#/' /etc/fstab 2>/dev/null || true
 rm -f /swap.img
 
+cat > /etc/profile.d/auto-sync-domestic-mirrors.sh <<'EOF_DOMESTIC_MIRRORS'
+export GOPROXY=https://goproxy.cn,direct
+export NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node
+export npm_config_registry=https://registry.npmmirror.com
+export COREPACK_NPM_REGISTRY=https://registry.npmmirror.com
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+export UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export RUSTUP_DIST_SERVER=https://rsproxy.cn
+export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+EOF_DOMESTIC_MIRRORS
+. /etc/profile.d/auto-sync-domestic-mirrors.sh
+cat > /etc/pip.conf <<'EOF_PIP_MIRROR'
+[global]
+index-url = https://pypi.tuna.tsinghua.edu.cn/simple
+timeout = 120
+EOF_PIP_MIRROR
+mkdir -p /root/.cargo
+cat > /root/.cargo/config.toml <<'EOF_CARGO_MIRROR'
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+EOF_CARGO_MIRROR
+
 if [ ! -d /root/.oh-my-zsh ]; then
     RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" || log "WARN: oh-my-zsh install failed"
 fi
@@ -522,7 +555,7 @@ if [ ! -x /usr/local/go/go1.25.1/bin/go ]; then
     mkdir -p /usr/local/go
     cd /usr/local/go
     rm -rf go go1.25.1 go1.25.1.linux-amd64.tar.gz
-    if curl --retry 5 --retry-all-errors -L -O https://go.dev/dl/go1.25.1.linux-amd64.tar.gz || curl --retry 5 --retry-all-errors -L -O https://dl.google.com/go/go1.25.1.linux-amd64.tar.gz; then
+    if curl --retry 5 --retry-all-errors -L -O https://mirrors.aliyun.com/golang/go1.25.1.linux-amd64.tar.gz || curl --retry 5 --retry-all-errors -L -O https://go.dev/dl/go1.25.1.linux-amd64.tar.gz; then
         tar zxf go1.25.1.linux-amd64.tar.gz
         mv go go1.25.1
         rm -f go1.25.1.linux-amd64.tar.gz
@@ -536,7 +569,7 @@ if command -v go >/dev/null 2>&1; then
 fi
 
 if [ ! -x /root/.cargo/bin/rustup ]; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y || log "WARN: rustup install failed"
+    curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y || log "WARN: rustup install failed"
 fi
 
 mkdir -p /opt/software/src/tools
@@ -546,7 +579,7 @@ fi
 export NVM_DIR=/opt/software/src/tools/nvm
 mkdir -p "$NVM_DIR"
 if [ ! -s "$NVM_DIR/nvm.sh" ]; then
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash || log "WARN: nvm install failed"
+    curl -fsSL https://gitee.com/mirrors/nvm/raw/v0.40.3/install.sh | NVM_SOURCE=https://gitee.com/mirrors/nvm.git bash || log "WARN: nvm install failed"
 fi
 if [ -s "$NVM_DIR/nvm.sh" ]; then
     . "$NVM_DIR/nvm.sh"
@@ -555,6 +588,7 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
     node_bin_dir="$(dirname "$(command -v node 2>/dev/null || true)")"
     if [ -n "$node_bin_dir" ] && [ -x "$node_bin_dir/node" ]; then
         export PATH="$node_bin_dir:$PATH"
+        npm config set registry "$npm_config_registry" || log "WARN: npm mirror setup failed"
         if command -v corepack >/dev/null 2>&1; then
             corepack enable || log "WARN: corepack enable failed"
             corepack prepare pnpm@latest --activate || log "WARN: corepack prepare pnpm failed"
@@ -562,6 +596,7 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
         if ! command -v pnpm >/dev/null 2>&1; then
             npm install -g pnpm || log "WARN: npm install pnpm failed"
         fi
+        command -v pnpm >/dev/null 2>&1 && pnpm config set registry "$npm_config_registry" || true
     fi
 fi
 if [ -d "$NVM_DIR" ]; then
@@ -738,8 +773,6 @@ PY_PATCH_IMMICH
     log "WARN: immich deploy script not found in $repo"
     return 1
 }
-deploy_immich_from_git || log "WARN: immich deploy from git failed"
-
 setquota -u root 20000000 20000000 0 0 /dev/mmcblk0p2 2>/dev/null || true
 for u in tiger git gitlab immich; do
     id "$u" >/dev/null 2>&1 && setquota -u "$u" 1000000 1000000 0 0 / 2>/dev/null || true
@@ -1085,6 +1118,7 @@ pg_dump="$(newest_dump postgres $dump_roots 2>/dev/null || true)"
 [ -n "$pg_dump" ] && log "selected postgres dump: $pg_dump"
 restore_once mysql "$mysql_dump"
 restore_once postgres "$pg_dump"
+deploy_immich_from_git || log "WARN: immich deploy from git failed"
 rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
 if [ "$zfs_woken" = "1" ]; then
     standby_zfs
