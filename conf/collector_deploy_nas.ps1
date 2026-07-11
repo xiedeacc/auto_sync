@@ -466,6 +466,35 @@ rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/nul
 install_staged_collected_paths || { log "ERROR: collected path installation failed"; exit 1; }
 
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
+ensure_software_src_layout() {
+    new=/opt/src/software
+    old=/opt/software/src
+    mkdir -p /opt/src /opt/software
+    if [ -e "$old" ] && [ ! -L "$old" ]; then
+        if [ ! -e "$new" ]; then
+            mv "$old" "$new"
+        else
+            rsync -aHAX "$old/" "$new/" || rsync -a "$old/" "$new/"
+            mv "$old" "${old}.migrated-$(date +%Y%m%d%H%M%S)"
+        fi
+    fi
+    mkdir -p "$new"
+    if [ -L "$old" ] && [ "$(readlink "$old")" != "$new" ]; then
+        rm -f "$old"
+    fi
+    [ -e "$old" ] || ln -s "$new" "$old"
+}
+ensure_software_src_layout
+rewrite_software_src_paths() {
+    replacement="$1"
+    for root in /etc/systemd/system /etc/profile.d /usr/local/bin /usr/local/sbin; do
+        [ -e "$root" ] || continue
+        find "$root" -type f -exec grep -Il '/opt/software/src' {} + 2>/dev/null |
+            xargs -r sed -i "s#/opt/software/src#$replacement#g"
+    done
+    [ ! -f /etc/profile ] || sed -i "s#/opt/software/src#$replacement#g" /etc/profile
+}
+rewrite_software_src_paths /opt/src/software
 ensure_opt_link() {
     path="$1"
     target="$2"
@@ -509,7 +538,7 @@ done <<'EOF_OPT_LINKS'
 /root/.local|/opt/user/root/.local|dir|root:root
 /root/.npm|/opt/user/root/.npm|dir|root:root
 /root/.npmrc|/opt/user/root/.npmrc|file|root:root
-/root/.nvm|/opt/software/src/tools/nvm|dir|root:root
+/root/.nvm|/opt/src/software/tools/nvm|dir|root:root
 /root/.oh-my-zsh|/opt/user/root/.oh-my-zsh|dir|root:root
 /root/.profile|/opt/user/root/.profile|file|root:root
 /root/.rustup|/opt/user/root/.rustup|dir|root:root
@@ -527,7 +556,7 @@ done <<'EOF_OPT_LINKS'
 /home/tiger/.halo2|/opt/user/tiger/.halo2|dir|tiger:tiger
 /home/tiger/.npm|/opt/user/tiger/.npm|dir|tiger:tiger
 /home/tiger/.npmrc|/opt/user/tiger/.npmrc|file|tiger:tiger
-/home/tiger/.nvm|/opt/software/src/tools/nvm|dir|tiger:tiger
+/home/tiger/.nvm|/opt/src/software/tools/nvm|dir|tiger:tiger
 /home/tiger/.oh-my-zsh|/opt/user/tiger/.oh-my-zsh|dir|tiger:tiger
 /home/tiger/.profile|/opt/user/tiger/.profile|file|tiger:tiger
 /home/tiger/.zprofile|/opt/user/tiger/.zprofile|file|tiger:tiger
@@ -543,6 +572,19 @@ if [ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ] || [ ! -e /etc/nginx/mod
     log "ERROR: nginx stream module is not installed or enabled"
     exit 1
 fi
+
+fix_postgresql_config_permissions() {
+    pg_fix_major="${1:-}"
+    if [ -z "$pg_fix_major" ]; then
+        pg_fix_major="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -1)"
+    fi
+    [ -n "$pg_fix_major" ] || return 0
+    [ -d "/etc/postgresql/$pg_fix_major" ] && chown -R postgres:postgres "/etc/postgresql/$pg_fix_major" 2>/dev/null || true
+    [ -d "/var/lib/postgresql/$pg_fix_major" ] && chown -R postgres:postgres "/var/lib/postgresql/$pg_fix_major" 2>/dev/null || true
+    find "/etc/postgresql/$pg_fix_major" -type d -exec chmod 755 {} + 2>/dev/null || true
+    find "/etc/postgresql/$pg_fix_major" -type f \( -name 'pg_hba.conf' -o -name 'pg_ident.conf' \) -exec chmod 640 {} + 2>/dev/null || true
+    find "/etc/postgresql/$pg_fix_major" -type f ! \( -name 'pg_hba.conf' -o -name 'pg_ident.conf' \) -exec chmod 644 {} + 2>/dev/null || true
+}
 
 ensure_postgresql_cluster() {
     pg_major="$(pg_config --version | sed -n 's/^PostgreSQL \([0-9][0-9]*\).*/\1/p')"
@@ -561,7 +603,7 @@ ensure_postgresql_cluster() {
         [ -d "$old_dir" ] || continue
         old_major="${old_dir##*/}"
         [ "$old_major" = "$pg_major" ] && continue
-        mv "$old_dir" "/etc/postgresql/.auto_sync_saved_$old_major" 2>/dev/null || true
+        mv "$old_dir" "/etc/postgresql/.auto_sync_saved_${old_major}_$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
     done
     pg_dropcluster --stop "$pg_major" main 2>/dev/null || true
     rm -rf "/etc/postgresql/$pg_major/main" "/var/lib/postgresql/$pg_major/main"
@@ -579,7 +621,7 @@ ensure_postgresql_cluster() {
             "/etc/postgresql/$pg_major/main/postgresql.conf"
     fi
     rm -rf "$source_copy"
-    chown -R postgres:postgres "/etc/postgresql/$pg_major" "/var/lib/postgresql/$pg_major"
+    fix_postgresql_config_permissions "$pg_major"
     systemctl restart "postgresql@$pg_major-main.service"
     pg_isready -q || { log "ERROR: PostgreSQL cluster $pg_major/main is not ready"; return 1; }
 }
@@ -701,11 +743,11 @@ if [ ! -x /root/.cargo/bin/rustup ]; then
     curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | timeout --kill-after=10s 600s sh -s -- -y || log "WARN: rustup install failed"
 fi
 
-mkdir -p /opt/software/src/tools
-if [ -L /opt/software/src/tools/nvm ]; then
-    rm -f /opt/software/src/tools/nvm
+mkdir -p /opt/src/software/tools
+if [ -L /opt/src/software/tools/nvm ]; then
+    rm -f /opt/src/software/tools/nvm
 fi
-export NVM_DIR=/opt/software/src/tools/nvm
+export NVM_DIR=/opt/src/software/tools/nvm
 mkdir -p "$NVM_DIR"
 if [ ! -s "$NVM_DIR/nvm.sh" ]; then
     curl -fsSL https://gitee.com/mirrors/nvm/raw/v0.40.3/install.sh | NVM_SOURCE=https://gitee.com/mirrors/nvm.git bash || log "WARN: nvm install failed"
@@ -714,6 +756,14 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
     . "$NVM_DIR/nvm.sh"
     nvm install 24.18.0 || nvm install 24 || log "WARN: nvm install 24 failed"
     nvm use 24.18.0 || nvm use 24 || true
+    hash -r 2>/dev/null || true
+    if ! command -v npm >/dev/null 2>&1; then
+        log "npm missing after nvm use; reinstall Node v24.18.0"
+        rm -rf "$NVM_DIR/versions/node/v24.18.0"
+        nvm install 24.18.0 || nvm install 24 || log "WARN: nvm reinstall 24 failed"
+        nvm use 24.18.0 || nvm use 24 || true
+        hash -r 2>/dev/null || true
+    fi
     node_bin_dir="$(dirname "$(command -v node 2>/dev/null || true)")"
     if [ -n "$node_bin_dir" ] && [ -x "$node_bin_dir/node" ]; then
         export PATH="$node_bin_dir:$PATH"
@@ -739,13 +789,14 @@ fi
 
 [ -x "$JAVA_HOME/bin/java" ] || { log "ERROR: OpenJDK 21 is not installed at $JAVA_HOME"; exit 1; }
 [ ! -L /usr/local/java/jdk/jdk-21.0.3 ] || rm -f /usr/local/java/jdk/jdk-21.0.3
-[ ! -L /opt/software/src/tools/mise/installs/java/21.0.2 ] || rm -f /opt/software/src/tools/mise/installs/java/21.0.2
+[ ! -L /opt/src/software/tools/mise/installs/java/21.0.2 ] || rm -f /opt/src/software/tools/mise/installs/java/21.0.2
 if find /etc/systemd/system -type f -exec grep -q '/usr/local/java/.*/bin/java' {} \; -print -quit | grep -q .; then
     find /etc/systemd/system -type f -exec grep -l '/usr/local/java/.*/bin/java' {} + |
         xargs -r sed -i -E "s#/usr/local/java/[^[:space:]]*/bin/java#$JAVA_HOME/bin/java#g"
     systemctl daemon-reload || true
 fi
 
+mkdir -p /usr/local/sbin
 cat > /usr/local/sbin/auto_sync_install_vim_tools.sh <<'EOF_VIM_TOOLS'
 #!/bin/bash
 set -u
@@ -789,7 +840,7 @@ fi
 if [ -d /root/.vim/bundle/YouCompleteMe ]; then
     ycm_commit="$(git -C /root/.vim/bundle/YouCompleteMe rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$ycm_commit" ] && [ "$(cat /root/.vim/bundle/YouCompleteMe/.auto_sync_installed 2>/dev/null || true)" != "$ycm_commit" ]; then
-        ycm_path="$JAVA_HOME/bin:/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/opt/software/src/tools/nvm/versions/node/v24.18.0/bin:$PATH"
+        ycm_path="$JAVA_HOME/bin:/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/opt/src/software/tools/nvm/versions/node/v24.18.0/bin:$PATH"
         ycmd_build=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/build.py
         jdt_milestone="$(sed -n "s/^JDTLS_MILESTONE = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
         jdt_stamp="$(sed -n "s/^JDTLS_BUILD_STAMP = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
@@ -838,7 +889,7 @@ if [ -d /root/src/software/pgvector ]; then
 fi
 
 deploy_immich_from_git() {
-    mkdir -p /opt/software/src
+    mkdir -p /opt/src/software
     mkdir -p /opt/immich/server /opt/immich/web /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf
     if [ ! -s /opt/immich/conf/immich-ml.env ]; then
         cat > /opt/immich/conf/immich-ml.env <<'EOF_IMMICH_ML_ENV'
@@ -853,7 +904,7 @@ EOF_IMMICH_ML_ENV
     mkdir -p /root/.ssh
     ssh-keyscan -T 10 github.com >> /root/.ssh/known_hosts 2>/dev/null || true
     export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'
-    repo=/opt/software/src/immich
+    repo=/opt/src/software/immich
     if [ -e "$repo" ] && [ ! -d "$repo/.git" ]; then
         mv "$repo" "${repo}.before-git-$(date +%Y%m%d%H%M%S)" || return 1
     fi
@@ -925,7 +976,7 @@ PY_PATCH_IMMICH
         if [ -f "$repo/$script" ]; then
             patch_immich_deploy_script "$repo/$script"
             chmod +x "$repo/$script" 2>/dev/null || true
-            immich_node_home="${IMMICH_NODE_HOME:-/opt/software/src/tools/nvm/versions/node/v24.18.0}"
+            immich_node_home="${IMMICH_NODE_HOME:-/opt/src/software/tools/nvm/versions/node/v24.18.0}"
             (cd "$repo" && VERSION="${IMMICH_VERSION:-deploy}" UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" bash "$script") || return 1
             [ -z "$immich_commit" ] || printf '%s\n' "$immich_commit" > "$immich_marker"
             return 0
@@ -1025,15 +1076,17 @@ if [ "$installed_gitlab_version" != "$GITLAB_CE_VERSION" ]; then
     apt-get install -y --allow-downgrades "gitlab-ce=$GITLAB_CE_VERSION" || exit 1
 fi
 ensure_zfs_for_gitlab
-mkdir -p /zfs/gitlab_data /zfs/gitlab_data/lfs-objects 2>/dev/null || true
+mkdir -p /zfs/gitlab_data /zfs/gitlab_data/lfs-objects /zfs/gitlab_data/repositories 2>/dev/null || true
 passwd -S git 2>/dev/null || true
 if id git >/dev/null 2>&1; then
     git_pw_hash="$(openssl passwd -6 "auto-sync-git-$(date +%s)-$RANDOM" 2>/dev/null || true)"
     [ -z "$git_pw_hash" ] || usermod -p "$git_pw_hash" git 2>/dev/null || true
     rm -f /etc/ssh/sshd_config.d/98-auto-sync-gitlab.conf 2>/dev/null || true
 fi
-[ -d /zfs/gitlab_data ] && chown -R git:git /zfs/gitlab_data 2>/dev/null || true
-[ -d /zfs/gitlab_data ] && chmod 2770 /zfs/gitlab_data 2>/dev/null || true
+[ -d /zfs/gitlab_data ] && chown git:git /zfs/gitlab_data 2>/dev/null || true
+[ -d /zfs/gitlab_data/lfs-objects ] && chown git:git /zfs/gitlab_data/lfs-objects 2>/dev/null || true
+[ -d /zfs/gitlab_data/repositories ] && chown git:git /zfs/gitlab_data/repositories 2>/dev/null || true
+[ -d /zfs/gitlab_data ] && chmod 2770 /zfs/gitlab_data /zfs/gitlab_data/lfs-objects /zfs/gitlab_data/repositories 2>/dev/null || true
 [ -d /etc/gitlab ] && chown -R git:git /etc/gitlab 2>/dev/null || true
 [ -d /etc/gitlab ] && chmod 700 /etc/gitlab 2>/dev/null || true
 ensure_gitlab_zfs_config
@@ -1180,33 +1233,44 @@ newest_dump() {
     kind="$1"
     shift
     [ "$#" -gt 0 ] || return 0
-    case "$kind" in
-        mysql)
-            find "$@" -type f \( \
-                -name 'mysql_full_backup_*.sql' -o \
-                -name 'mysql_full_backup_*.sql.gz' -o \
-                -name 'mysql-all.sql' -o \
-                -name 'mysql-all.sql.gz' -o \
-                -name '*mysql*.sql' -o \
-                -name '*mysql*.sql.gz' \
-            \) -print0 2>/dev/null | score_dumps | sort -nr | head -1 | cut -f2-
-            ;;
-        postgres)
-            find "$@" -type f \( \
-                -name 'pg_full_backup_*.sql' -o \
-                -name 'pg_full_backup_*.sql.gz' -o \
-                -name 'postgres-all.sql' -o \
-                -name 'postgres-all.sql.gz' -o \
-                -name '*postgres*.sql' -o \
-                -name '*postgres*.sql.gz' -o \
-                -name '*pg*.sql' -o \
-                -name '*pg*.sql.gz' \
-            \) -print0 2>/dev/null | score_dumps | sort -nr | head -1 | cut -f2-
-            ;;
-        *)
-            return 1
-            ;;
-    esac
+    tmp="$(mktemp)"
+    for root in "$@"; do
+        [ -d "$root" ] || continue
+        maxdepth_args=()
+        case "$root" in
+            /zfs/backup|/zfs/backup/*) maxdepth_args=(-maxdepth 4) ;;
+        esac
+        case "$kind" in
+            mysql)
+                find "$root" "${maxdepth_args[@]}" -type f \( \
+                    -name 'mysql_full_backup_*.sql' -o \
+                    -name 'mysql_full_backup_*.sql.gz' -o \
+                    -name 'mysql-all.sql' -o \
+                    -name 'mysql-all.sql.gz' -o \
+                    -name '*mysql*.sql' -o \
+                    -name '*mysql*.sql.gz' \
+                \) -print0 2>/dev/null >> "$tmp"
+                ;;
+            postgres)
+                find "$root" "${maxdepth_args[@]}" -type f \( \
+                    -name 'pg_full_backup_*.sql' -o \
+                    -name 'pg_full_backup_*.sql.gz' -o \
+                    -name 'postgres-all.sql' -o \
+                    -name 'postgres-all.sql.gz' -o \
+                    -name '*postgres*.sql' -o \
+                    -name '*postgres*.sql.gz' -o \
+                    -name '*pg*.sql' -o \
+                    -name '*pg*.sql.gz' \
+                \) -print0 2>/dev/null >> "$tmp"
+                ;;
+            *)
+                rm -f "$tmp"
+                return 1
+                ;;
+        esac
+    done
+    score_dumps < "$tmp" | sort -nr | head -1 | cut -f2-
+    rm -f "$tmp"
 }
 
 score_dumps() {
@@ -1239,27 +1303,30 @@ ensure_postgresql_ready() {
     if command -v pg_lsclusters >/dev/null 2>&1; then
         pg_lsclusters -h 2>/dev/null | awk '$4 ~ /binaries_missing/ { print $1 }' | while read -r old_version; do
             [ -n "$old_version" ] || continue
-            [ -d "/etc/postgresql/$old_version" ] && mv "/etc/postgresql/$old_version" "/etc/postgresql/${old_version}.disabled-by-auto-sync" 2>/dev/null || true
+            [ -d "/etc/postgresql/$old_version" ] && mv "/etc/postgresql/$old_version" "/etc/postgresql/${old_version}.disabled-by-auto-sync-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
         done
     fi
+    version="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -1)"
+    [ -z "$version" ] || fix_postgresql_config_permissions "$version"
     systemctl restart postgresql 2>/dev/null || true
     if command -v pg_lsclusters >/dev/null 2>&1; then
         if ! pg_lsclusters 2>/dev/null | awk '$4 == "online" { found = 1 } END { exit found ? 0 : 1 }'; then
-            version="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -1)"
             if [ -n "$version" ]; then
                 [ -d "/etc/postgresql/$version/main" ] || pg_createcluster "$version" main --start || true
+                fix_postgresql_config_permissions "$version"
                 pg_ctlcluster "$version" main start 2>/dev/null || true
             fi
         fi
         if ! pg_lsclusters 2>/dev/null | awk '$3 == "5432" && $4 == "online" { found = 1 } END { exit found ? 0 : 1 }'; then
-            version="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -1)"
             if [ -n "$version" ] && [ -f "/etc/postgresql/$version/main/postgresql.conf" ]; then
                 pg_ctlcluster "$version" main stop 2>/dev/null || true
                 sed -i -E "s/^#?[[:space:]]*port[[:space:]]*=.*/port = 5432/" "/etc/postgresql/$version/main/postgresql.conf"
+                fix_postgresql_config_permissions "$version"
                 pg_ctlcluster "$version" main start 2>/dev/null || true
             fi
         fi
     fi
+    [ -z "$version" ] || fix_postgresql_config_permissions "$version"
     systemctl restart postgresql 2>/dev/null || true
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
         pg_isready -q 2>/dev/null && return 0
@@ -1281,6 +1348,29 @@ configure_postgresql_peer_maps() {
     systemctl reload postgresql 2>/dev/null || true
 }
 
+prepare_immich_database_extensions() {
+    ensure_postgresql_ready >/dev/null 2>&1 || { log "WARN: PostgreSQL is not ready for immich extension check"; return 0; }
+    if ! sudo -u postgres psql -Atqc "SELECT 1 FROM pg_database WHERE datname = 'immich'" 2>/dev/null | grep -qx 1; then
+        return 0
+    fi
+    sudo -u postgres psql -d immich -v ON_ERROR_STOP=0 \
+        -c "CREATE EXTENSION IF NOT EXISTS vector;" \
+        -c "ALTER EXTENSION vector UPDATE;" >/dev/null 2>&1 ||
+        log "WARN: immich pgvector extension preparation failed"
+}
+
+mysql_has_user_data() {
+    command -v mysql >/dev/null 2>&1 || return 1
+    count="$(mysql -NBe "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null || echo 0)"
+    [ "${count:-0}" -gt 0 ] 2>/dev/null
+}
+
+postgres_has_user_data() {
+    ensure_postgresql_ready >/dev/null 2>&1 || return 1
+    count="$(sudo -u postgres psql -Atqc "SELECT COUNT(*) FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres')" 2>/dev/null || echo 0)"
+    [ "${count:-0}" -gt 0 ] 2>/dev/null
+}
+
 restore_once() {
     kind="$1"
     latest="$2"
@@ -1291,6 +1381,20 @@ restore_once() {
         log "skip $kind restore: already restored $latest"
         return 0
     fi
+    case "$kind" in
+        mysql)
+            if mysql_has_user_data; then
+                log "skip mysql restore: existing user data found"
+                return 0
+            fi
+            ;;
+        postgres)
+            if postgres_has_user_data; then
+                log "skip postgres restore: existing user databases found"
+                return 0
+            fi
+            ;;
+    esac
     log "restore $kind from $latest"
     case "$kind" in
         mysql)
@@ -1313,6 +1417,7 @@ pg_dump="$(newest_dump postgres $dump_roots 2>/dev/null || true)"
 [ -n "$pg_dump" ] && log "selected postgres dump: $pg_dump"
 restore_once mysql "$mysql_dump"
 restore_once postgres "$pg_dump"
+prepare_immich_database_extensions
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
 mkdir -p /opt/immich/upload
 for d in backups encoded-video library profile thumbs upload; do
@@ -1381,7 +1486,7 @@ do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
 done
 find /opt/immich/server/bin /opt/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
-chmod a+rx /opt/software/src/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/null || true
+chmod a+rx /opt/src/software/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/null || true
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true

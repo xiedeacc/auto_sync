@@ -7,6 +7,7 @@
 - Use the Windows deploy script for full local deployment: `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`. On Windows, deploy binaries into the repository `bin\` directory and use a current-user Startup launcher for both `auto_syncd` and `auto_sync_gui`; always start both from `bin\` after deployment, and do not install or start `auto_syncd` as a Windows service.
 - Unless the user explicitly says not to commit or push, every completed code/config change must be committed and pushed.
 - Do not deploy unless the user explicitly asks for deployment. A code/config change request by itself is not a deployment request.
+- When validating or running collector deployment scripts, execute the target `conf/collector_deploy_*.ps1` script directly with the required `AS_*` environment variables. Do not compile, restart, or deploy the `auto_sync` application itself just to run a collector deployment script unless the user explicitly asks for that.
 - Every commit must include all current repository changes. Do not leave tracked working-tree changes unstaged unless the user explicitly asks to keep them out of the commit.
 - Deploy scripts must preserve existing `conf/auto_sync.toml`; only initialize it from a template when the target config file does not exist.
 - Any user-visible Windows path must be rendered through the standard display-path helper (`displayPath` in web UI, `_displayPath` in Flutter UI, or an equivalent backend helper) so extended-length prefixes such as `\\?\` and `\\?\UNC\` are never shown. Keep the underlying stored path unchanged.
