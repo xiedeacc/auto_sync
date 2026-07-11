@@ -480,7 +480,7 @@ ensure_software_src_layout() {
         fi
     done
     mkdir -p "$new"
-    for old in /opt/src/software /opt/software/src; do
+    for old in /opt/src/software; do
         if [ -L "$old" ] && [ "$(readlink "$old")" != "$new" ]; then
             rm -f "$old"
         fi

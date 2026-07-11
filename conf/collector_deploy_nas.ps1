@@ -482,7 +482,6 @@ ensure_software_src_layout() {
     if [ -L "$old" ] && [ "$(readlink "$old")" != "$new" ]; then
         rm -f "$old"
     fi
-    [ -e "$old" ] || ln -s "$new" "$old"
 }
 ensure_software_src_layout
 rewrite_software_src_paths() {
