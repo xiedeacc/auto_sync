@@ -14,7 +14,7 @@ if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KE
 
 $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
-$platformDefaultCollectPaths = @('/opt/www/gitlab_cleaner', '/opt/www/unlock-music')
+$platformDefaultCollectPaths = @('/opt/www/gitlab_cleaner', '/opt/www/unlock-music', '/opt/www/coverage')
 foreach ($defaultPath in $platformDefaultCollectPaths) {
     if ($collectPaths -notcontains $defaultPath) { $collectPaths += $defaultPath }
 }
@@ -497,7 +497,7 @@ rewrite_software_src_paths() {
     done
     [ ! -f /etc/profile ] || sed -i "s#/opt/software/src#$replacement#g; s#/opt/src/software#$replacement#g" /etc/profile
 }
-rewrite_software_src_paths /root/src/software
+rewrite_software_src_paths /opt/user/root/src/software
 ensure_opt_link() {
     path="$1"
     target="$2"
@@ -541,7 +541,7 @@ done <<'EOF_OPT_LINKS'
 /root/.local|/opt/user/root/.local|dir|root:root
 /root/.npm|/opt/user/root/.npm|dir|root:root
 /root/.npmrc|/opt/user/root/.npmrc|file|root:root
-/root/.nvm|/root/src/software/tools/nvm|dir|root:root
+/root/.nvm|/opt/user/root/src/software/tools/nvm|dir|root:root
 /root/.oh-my-zsh|/opt/user/root/.oh-my-zsh|dir|root:root
 /root/.profile|/opt/user/root/.profile|file|root:root
 /root/.rustup|/opt/user/root/.rustup|dir|root:root
@@ -559,7 +559,7 @@ done <<'EOF_OPT_LINKS'
 /home/tiger/.halo2|/opt/user/tiger/.halo2|dir|tiger:tiger
 /home/tiger/.npm|/opt/user/tiger/.npm|dir|tiger:tiger
 /home/tiger/.npmrc|/opt/user/tiger/.npmrc|file|tiger:tiger
-/home/tiger/.nvm|/root/src/software/tools/nvm|dir|tiger:tiger
+/home/tiger/.nvm|/opt/user/root/src/software/tools/nvm|dir|tiger:tiger
 /home/tiger/.oh-my-zsh|/opt/user/tiger/.oh-my-zsh|dir|tiger:tiger
 /home/tiger/.profile|/opt/user/tiger/.profile|file|tiger:tiger
 /home/tiger/.zprofile|/opt/user/tiger/.zprofile|file|tiger:tiger
@@ -972,6 +972,8 @@ text = text.replace(
     'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --locked --extra cpu --no-dev --compile-bytecode',
     'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --extra cpu --no-dev --compile-bytecode',
 )
+text = text.replace('/opt/software/src', '/opt/user/root/src/software')
+text = text.replace('/opt/src/software', '/opt/user/root/src/software')
 path.write_text(text)
 PY_PATCH_IMMICH
     }
@@ -979,8 +981,9 @@ PY_PATCH_IMMICH
         if [ -f "$repo/$script" ]; then
             patch_immich_deploy_script "$repo/$script"
             chmod +x "$repo/$script" 2>/dev/null || true
-            immich_node_home="${IMMICH_NODE_HOME:-/root/src/software/tools/nvm/versions/node/v24.18.0}"
-            (cd "$repo" && VERSION="${IMMICH_VERSION:-deploy}" UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" bash "$script") || return 1
+            immich_node_home="${IMMICH_NODE_HOME:-/opt/user/root/src/software/tools/nvm/versions/node/v24.18.0}"
+            chmod -R a+rX "$immich_node_home" /opt/user/root/src/software/tools/uv-python 2>/dev/null || true
+            (cd "$repo" && VERSION="${IMMICH_VERSION:-deploy}" UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/opt/user/root/src/software/tools/uv-python}" UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" bash "$script") || return 1
             [ -z "$immich_commit" ] || printf '%s\n' "$immich_commit" > "$immich_marker"
             return 0
         fi
@@ -1330,6 +1333,22 @@ configure_postgresql_peer_maps() {
         [ -f "$hba" ] || continue
         dir="$(dirname "$hba")"
         ident="$dir/pg_ident.conf"
+        if ! grep -Eq '^[[:space:]]*local[[:space:]]+immich[[:space:]]+immich[[:space:]]+trust([[:space:]]|$)' "$hba"; then
+            tmp="$(mktemp)"
+            awk '
+                !inserted && $1 == "local" && $2 == "all" && $3 == "all" {
+                    print "local   immich          immich                                  trust"
+                    inserted = 1
+                }
+                { print }
+                END {
+                    if (!inserted) {
+                        print "local   immich          immich                                  trust"
+                    }
+                }
+            ' "$hba" > "$tmp" && cat "$tmp" > "$hba"
+            rm -f "$tmp"
+        fi
         sed -i -E 's/^(local[[:space:]]+all[[:space:]]+all[[:space:]]+peer)([[:space:]].*)?$/\1 map=gitlab/' "$hba"
         touch "$ident"
         grep -Eq '^[[:space:]]*gitlab[[:space:]]+git[[:space:]]+gitlab([[:space:]]|$)' "$ident" || printf '\ngitlab  git  gitlab\n' >> "$ident"
@@ -1407,6 +1426,7 @@ pg_dump="$(newest_dump postgres $dump_roots 2>/dev/null || true)"
 [ -n "$pg_dump" ] && log "selected postgres dump: $pg_dump"
 restore_once mysql "$mysql_dump"
 restore_once postgres "$pg_dump"
+configure_postgresql_peer_maps
 prepare_immich_database_extensions
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
 mkdir -p /opt/immich/upload
@@ -1426,7 +1446,13 @@ if [ -d /usr/local/auto_sync ] && [ ! -e /opt/auto_sync ]; then
     ln -s /usr/local/auto_sync /opt/auto_sync
 fi
 
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
+mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger /opt/www/coverage
+if [ ! -s /opt/www/coverage/index.html ]; then
+    cat > /opt/www/coverage/index.html <<'EOF_COVERAGE_INDEX'
+<!doctype html>
+<html><head><meta charset="utf-8"><title>coverage</title></head><body>coverage</body></html>
+EOF_COVERAGE_INDEX
+fi
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
@@ -1451,6 +1477,12 @@ PY_TIGER_LINK_OWNERS
 for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /opt/immich /opt/user/tiger; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
 done
+if [ -d /usr/local/auto_sync ]; then
+    chown root:root /usr/local/auto_sync /usr/local/auto_sync/logs /usr/local/auto_sync/conf/state 2>/dev/null || true
+    chown -R root:root /usr/local/auto_sync/logs /usr/local/auto_sync/conf/state 2>/dev/null || true
+    chmod 755 /usr/local/auto_sync /usr/local/auto_sync/logs /usr/local/auto_sync/conf/state 2>/dev/null || true
+    find /usr/local/auto_sync/logs /usr/local/auto_sync/conf/state -type f -exec chmod 644 {} + 2>/dev/null || true
+fi
 for f in \
     /usr/local/auto_sync/bin/auto_sync \
     /usr/local/auto_sync/bin/auto_syncd \
@@ -1475,8 +1507,31 @@ for f in \
 do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
 done
+for link in /opt/immich/machine-learning/.venv/bin/python /opt/immich/machine-learning/.venv/bin/python3 /opt/immich/machine-learning/.venv/bin/python3.*; do
+    [ -L "$link" ] || continue
+    target="$(readlink "$link" || true)"
+    case "$target" in
+        /root/src/*)
+            ln -sfn "/opt/user/root/src/${target#/root/src/}" "$link"
+            ;;
+    esac
+done
+[ ! -f /opt/immich/machine-learning/.venv/pyvenv.cfg ] || sed -i 's#/root/src/software#/opt/user/root/src/software#g' /opt/immich/machine-learning/.venv/pyvenv.cfg
+if [ -f /opt/immich/machine-learning/.venv/pyvenv.cfg ]; then
+    python_home="$(find /opt/user/root/src/software/tools/uv-python -mindepth 1 -maxdepth 1 -type d -name 'cpython-*' 2>/dev/null | sort -V | tail -1)"
+    if [ -n "$python_home" ]; then
+        sed -i -E "s#^home = .*#home = $python_home/bin#" /opt/immich/machine-learning/.venv/pyvenv.cfg
+        if [ -f /etc/systemd/system/immich-ml.service ]; then
+            if grep -q '^Environment="PYTHONHOME=' /etc/systemd/system/immich-ml.service; then
+                sed -i -E "s#^Environment=\"PYTHONHOME=.*#Environment=\"PYTHONHOME=$python_home\"#" /etc/systemd/system/immich-ml.service
+            else
+                sed -i "/^Environment=\"PATH=/a Environment=\"PYTHONHOME=$python_home\"" /etc/systemd/system/immich-ml.service
+            fi
+        fi
+    fi
+fi
 find /opt/immich/server/bin /opt/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
-chmod a+rx /root/src/software/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/null || true
+chmod -R a+rX /opt/user/root/src/software/tools/nvm/versions/node/v24.18.0 /opt/user/root/src/software/tools/uv-python 2>/dev/null || true
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
@@ -1504,12 +1559,12 @@ wait_for_unit_active() {
     resolved="$(unit_name "$name" 2>/dev/null || true)"
     [ -n "$resolved" ] || return 1
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45; do
-        systemctl is-active --quiet "$resolved" && return 0
         state="$(systemctl is-active "$resolved" 2>/dev/null || true)"
+        [ "$state" = "active" ] && return 0
         [ "$state" = "activating" ] || [ "$state" = "reloading" ] || break
         sleep 2
     done
-    systemctl is-active --quiet "$resolved"
+    [ "$(systemctl is-active "$resolved" 2>/dev/null || true)" = "active" ]
 }
 wait_for_unit_enabled() {
     name="$1"
