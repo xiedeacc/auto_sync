@@ -6,7 +6,7 @@ $scp  = $env:AS_SCP
 $dest = $env:AS_DEST
 $root = $env:AS_ROOT
 
-$opts    = @('-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=20')
+$opts    = @('-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new','-o','LogLevel=ERROR','-o','ConnectTimeout=20','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=20')
 $sshArgs = @() + $opts
 $scpArgs = @('-r','-p') + $opts
 if (-not [string]::IsNullOrEmpty($env:AS_PORT)) { $sshArgs += @('-p', $env:AS_PORT); $scpArgs += @('-P', $env:AS_PORT) }
@@ -172,7 +172,12 @@ function Invoke-Remote([string]$Script) {
             return
         }
         & $ssh @sshArgs $dest "bash '$remoteTmp' </dev/null; rc=`$?; rm -f '$remoteTmp'; exit `$rc"
-        if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
+        if ($LASTEXITCODE -ne 0) {
+            $exitCode = $LASTEXITCODE
+            Write-Host "! remote step exit $exitCode"
+            $script:errCount++
+            throw "remote step failed with exit code $exitCode"
+        }
     } finally {
         Remove-Item -LiteralPath $localTmp -Force -ErrorAction SilentlyContinue
     }
@@ -741,9 +746,15 @@ if find /etc/systemd/system -type f -exec grep -q '/usr/local/java/.*/bin/java' 
     systemctl daemon-reload || true
 fi
 
+cat > /usr/local/sbin/auto_sync_install_vim_tools.sh <<'EOF_VIM_TOOLS'
+#!/bin/bash
+set -u
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+log() { printf '[vim-tools] %s\n' "$*"; }
 if [ -f /root/src/share/ubuntu/conf/.vimrc ]; then
     cp /root/src/share/ubuntu/conf/.vimrc /root/.vimrc
 fi
+mkdir -p /root/.vim/bundle
 if [ ! -d /root/.vim/bundle/Vundle.vim ]; then
     git clone https://github.com/VundleVim/Vundle.vim.git /root/.vim/bundle/Vundle.vim || true
 fi
@@ -754,7 +765,7 @@ if command -v vim >/dev/null 2>&1 && [ -f /root/.vimrc ]; then
         sed -n '1,2p' /root/.vimrc > "$vundle_rc"
         sed -n '/^filetype off$/,/^call vundle#end()/p' /root/.vimrc >> "$vundle_rc"
         vundle_exit=0
-        timeout --kill-after=10s 300s vim -Nu "$vundle_rc" -n -es -i NONE '+set nomore' '+PluginInstall' '+qall' </dev/null || vundle_exit=$?
+        timeout --kill-after=10s 600s vim -Nu "$vundle_rc" -n -es -i NONE '+set nomore' '+PluginInstall' '+qall' </dev/null || vundle_exit=$?
         declared_plugins="$(grep -Ec "^[[:space:]]*Plugin[[:space:]]+'" /root/.vimrc || true)"
         installed_plugins="$(find /root/.vim/bundle -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
         if [ "$installed_plugins" -ge "$declared_plugins" ] &&
@@ -762,7 +773,7 @@ if command -v vim >/dev/null 2>&1 && [ -f /root/.vimrc ]; then
            [ -d /root/.vim/bundle/YouCompleteMe ] &&
            [ -d /root/.vim/bundle/vim-glaive ]; then
             printf '%s\n' "$vimrc_hash" > /root/.vim/.auto_sync_vundle_hash
-            [ "$vundle_exit" -eq 0 ] || log "vim PluginInstall returned $vundle_exit; all $declared_plugins declared plugins are present"
+            [ "$vundle_exit" -eq 0 ] || log "PluginInstall returned $vundle_exit; all $declared_plugins declared plugins are present"
         else
             log "WARN: vim plugins incomplete (declared=$declared_plugins installed=$installed_plugins exit=$vundle_exit)"
         fi
@@ -796,6 +807,12 @@ if [ -d /root/.vim/bundle/YouCompleteMe ]; then
             log "WARN: YouCompleteMe install failed"
         fi
     fi
+fi
+EOF_VIM_TOOLS
+chmod 0755 /usr/local/sbin/auto_sync_install_vim_tools.sh
+if ! pgrep -f '/usr/local/sbin/auto_sync_install_vim_tools.sh' >/dev/null 2>&1; then
+    log "start Vim plugin/YouCompleteMe installation in background"
+    nohup /usr/local/sbin/auto_sync_install_vim_tools.sh >> /var/log/auto_sync_vim_tools.log 2>&1 &
 fi
 
 grep -q '^\*[[:space:]]\+soft[[:space:]]\+core[[:space:]]\+unlimited' /etc/security/limits.conf || cat >> /etc/security/limits.conf <<'EOF_LIMITS'
@@ -1309,6 +1326,11 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
+if [ -d /usr/local/auto_sync ] && [ ! -e /opt/auto_sync ]; then
+    mkdir -p /opt
+    ln -s /usr/local/auto_sync /opt/auto_sync
+fi
+
 mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
@@ -1363,18 +1385,15 @@ chmod a+rx /opt/software/src/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/nu
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for s in mysql postgresql redis-server immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer nginx cron; do
+for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray rblog rblog-backup.timer nginx cron; do
     restart_if_exists "$s"
-done
-for s in waiwei waiwei-web waiwei-puller xray; do
-    disable_if_exists "$s"
 done
 
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_pg.sh'; echo '0 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_pg.sh > /dev/null 2>&1') | crontab -
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_mysql.sh'; echo '5 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_mysql.sh > /dev/null 2>&1') | crontab -
 
 echo '--- final states ---'
-for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei xray; do
+for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray rblog rblog-backup.timer gitlab-runsvdir gitlab; do
     resolved="$(unit_name "$s" 2>/dev/null || true)"
     if [ -n "$resolved" ]; then
         printf '  %s: ' "$s"; systemctl is-enabled "$resolved" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$resolved" 2>/dev/null | tr -d '\n'; echo
@@ -1384,7 +1403,61 @@ for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx
         printf '  %s: not-found / inactive\n' "$s"
     fi
 done
-pg_isready -q || { log "ERROR: PostgreSQL is not accepting connections"; exit 1; }
+
+wait_for_unit_active() {
+    name="$1"
+    resolved="$(unit_name "$name" 2>/dev/null || true)"
+    [ -n "$resolved" ] || return 1
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45; do
+        systemctl is-active --quiet "$resolved" && return 0
+        state="$(systemctl is-active "$resolved" 2>/dev/null || true)"
+        [ "$state" = "activating" ] || [ "$state" = "reloading" ] || break
+        sleep 2
+    done
+    systemctl is-active --quiet "$resolved"
+}
+wait_for_unit_enabled() {
+    name="$1"
+    resolved="$(unit_name "$name" 2>/dev/null || true)"
+    [ -n "$resolved" ] || return 1
+    systemctl is-enabled --quiet "$resolved"
+}
+wait_for_https_200() {
+    url="$1"
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+        code="$(curl -k -L --max-time 45 -o /dev/null -s -w '%{http_code}' "$url" || true)"
+        [ "$code" = "200" ] && return 0
+        sleep 10
+    done
+    log "ERROR: $url did not return HTTP 200; last status: $code"
+    return 1
+}
+
+required_failed=0
+for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray rblog rblog-backup.timer; do
+    if ! wait_for_unit_active "$s"; then
+        log "ERROR: required service $s is not active"
+        required_failed=1
+    fi
+    if ! wait_for_unit_enabled "$s"; then
+        log "ERROR: required service $s is not enabled"
+        required_failed=1
+    fi
+done
+if ! pg_isready -q; then
+    log "ERROR: PostgreSQL is not accepting connections"
+    required_failed=1
+fi
+if ! command -v gitlab-ctl >/dev/null 2>&1 || ! gitlab-ctl status >/dev/null 2>&1; then
+    log "ERROR: required service gitlab is not active"
+    required_failed=1
+fi
+for url in https://code.xiedeacc.com https://unlock-music.xiedeacc.com https://halo.xiedeacc.com https://immich.xiedeacc.com https://blog.xiedeacc.com https://rblog.xiedeacc.com; do
+    if ! wait_for_https_200 "$url"; then
+        required_failed=1
+    fi
+done
+exit "$required_failed"
 '@
 Invoke-Remote $remote
 
