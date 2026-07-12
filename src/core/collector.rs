@@ -2016,7 +2016,10 @@ mod tests {
             perm_record_path("symlink Li4vc2hhcmVkL3RhcmdldA== /usr/local/bin/tool link"),
             Some("/usr/local/bin/tool link".to_string())
         );
-        assert_eq!(perm_record_path("symlink Li4vc2hhcmVkL3RhcmdldA== relative"), None);
+        assert_eq!(
+            perm_record_path("symlink Li4vc2hhcmVkL3RhcmdldA== relative"),
+            None
+        );
         assert_eq!(perm_record_path("symlink missing-path"), None);
     }
 

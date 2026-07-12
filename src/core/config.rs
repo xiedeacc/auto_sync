@@ -411,7 +411,7 @@ impl Default for AppConfig {
 impl Default for AppSection {
     fn default() -> Self {
         Self {
-            data_db: PathBuf::from("conf/state/auto_sync.sqlite"),
+            data_db: PathBuf::from("data/auto_sync.sqlite"),
             log_dir: PathBuf::from("logs"),
             status_log_interval_secs: 300,
             port: default_app_port(),
@@ -1396,10 +1396,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         resolve_app_runtime_paths(&config_path, &mut cfg);
 
-        assert_eq!(
-            cfg.app.data_db,
-            root.join("conf").join("state").join("auto_sync.sqlite")
-        );
+        assert_eq!(cfg.app.data_db, root.join("data").join("auto_sync.sqlite"));
         assert_eq!(cfg.app.log_dir, root.join("logs"));
         fs::remove_dir_all(root).ok();
     }

@@ -252,7 +252,7 @@ function Initialize-Config {
     )
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TargetConfig) | Out-Null
-    New-Item -ItemType Directory -Force -Path (Join-Path (Split-Path -Parent $TargetConfig) "state") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path (Split-Path -Parent (Split-Path -Parent $TargetConfig)) "data") | Out-Null
     if (Test-Path -LiteralPath $TargetConfig) {
         return "preserved-existing"
     }
@@ -693,8 +693,7 @@ function Disable-AutoSyncDaemonServiceIfPossible {
 
 function Ensure-AutoSyncStartup {
     param(
-        [string]$BinDir,
-        [string]$ConfigPath
+        [string]$BinDir
     )
 
     $autoSyncExe = Join-Path $BinDir "auto_sync.exe"
@@ -711,21 +710,17 @@ function Ensure-AutoSyncStartup {
         Remove-Item -LiteralPath (Join-Path $startupDir "auto_sync-start.vbs") -Force -ErrorAction SilentlyContinue
         Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-backend-start.vbs") `
             -WorkingDirectory $BinDir `
-            -Executable $autoSyncExe `
-            -Arguments @("--config", $ConfigPath)
+            -Executable $autoSyncExe
         Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-gui-start.vbs") `
             -WorkingDirectory $BinDir `
-            -Executable $autoSyncGuiExe `
-            -Arguments @("--config", $ConfigPath)
+            -Executable $autoSyncGuiExe
     }
 
     Start-Process -FilePath $autoSyncExe `
-        -ArgumentList @("--config", $ConfigPath) `
         -WorkingDirectory $BinDir `
         -WindowStyle Hidden
     Start-Sleep -Seconds 1
     Start-Process -FilePath $autoSyncGuiExe `
-        -ArgumentList @("--config", $ConfigPath) `
         -WorkingDirectory $BinDir
 
     [PSCustomObject]@{
@@ -785,11 +780,12 @@ if ($needsAdmin -and -not (Test-IsAdministrator)) {
 
 $binDir = Join-Path $InstallDir "bin"
 $confDir = Join-Path $InstallDir "conf"
+$dataDir = Join-Path $InstallDir "data"
 $logDir = Join-Path $InstallDir "logs"
 $targetConfig = Join-Path $confDir "auto_sync.toml"
 $targetRuntime = Join-Path $InstallDir "runtime"
 
-New-Item -ItemType Directory -Force -Path $InstallDir, $binDir, $confDir, $logDir | Out-Null
+New-Item -ItemType Directory -Force -Path $InstallDir, $binDir, $confDir, $dataDir, $logDir | Out-Null
 Stop-AutoSyncProcesses
 Copy-ReleaseBinaries -RootDir $rootDir -BinDir $binDir
 Copy-FlutterGuiBinaries -RootDir $rootDir -BinDir $binDir
@@ -814,7 +810,7 @@ $authorizedKeyResult = Ensure-AuthorizedKey -PublicKeyFile $AuthorizedKeyFile
 $disabledService = Disable-AutoSyncDaemonServiceIfPossible
 $startupResult = $null
 if ($ensureStartup) {
-    $startupResult = Ensure-AutoSyncStartup -BinDir $binDir -ConfigPath $targetConfig
+    $startupResult = Ensure-AutoSyncStartup -BinDir $binDir
 }
 
 Write-Host "auto_sync installed under $InstallDir"

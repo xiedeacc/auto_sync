@@ -1883,7 +1883,7 @@ fn apply_desktop_config(cfg: &AppConfig, config_path: &Path) {
 fn apply_desktop_config(_cfg: &AppConfig, _config_path: &Path) {}
 
 #[cfg(windows)]
-fn apply_desktop_config_inner(cfg: &AppConfig, config_path: &Path) -> Result<()> {
+fn apply_desktop_config_inner(cfg: &AppConfig, _config_path: &Path) -> Result<()> {
     let Some(appdata) = std::env::var_os("APPDATA") else {
         return Ok(());
     };
@@ -1909,25 +1909,16 @@ fn apply_desktop_config_inner(cfg: &AppConfig, config_path: &Path) -> Result<()>
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let gui_exe = bin_dir.join("auto_sync_gui.exe");
-    write_startup_launcher(&backend_launcher, &bin_dir, &backend_exe, config_path)?;
+    write_startup_launcher(&backend_launcher, &bin_dir, &backend_exe)?;
     if gui_exe.exists() {
-        write_startup_launcher(&gui_launcher, &bin_dir, &gui_exe, config_path)?;
+        write_startup_launcher(&gui_launcher, &bin_dir, &gui_exe)?;
     }
     Ok(())
 }
 
 #[cfg(windows)]
-fn write_startup_launcher(
-    path: &Path,
-    working_dir: &Path,
-    executable: &Path,
-    config_path: &Path,
-) -> Result<()> {
-    let command = format!(
-        "{} --config {}",
-        quote_windows_arg(&executable.display().to_string()),
-        quote_windows_arg(&config_path.display().to_string())
-    );
+fn write_startup_launcher(path: &Path, working_dir: &Path, executable: &Path) -> Result<()> {
+    let command = quote_windows_arg(&executable.display().to_string());
     let body = format!(
         "Set shell = CreateObject(\"WScript.Shell\")\r\n\
          shell.CurrentDirectory = \"{}\"\r\n\

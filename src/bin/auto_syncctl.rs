@@ -192,7 +192,7 @@ fn deploy_nas(
         &ssh_port,
         &target,
         &format!(
-            "mkdir -p {0}/bin {0}/conf {0}/logs {0}/conf/state",
+            "mkdir -p {0}/bin {0}/conf {0}/data {0}/logs",
             install_dir.display()
         ),
     ]))?;
@@ -290,7 +290,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory={dir}
-ExecStart={dir}/bin/auto_sync --config {dir}/conf/auto_sync.toml
+ExecStart={dir}/bin/auto_sync
 Restart=always
 RestartSec=5
 User=root

@@ -1,5 +1,5 @@
 [app]
-data_db = "conf/state/auto_sync.sqlite"
+data_db = "data/auto_sync.sqlite"
 log_dir = "logs"
 status_log_interval_secs = 300
 port = 18765

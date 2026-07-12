@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/auto_sync
-ExecStart=/opt/auto_sync/bin/auto_sync --config /opt/auto_sync/conf/auto_sync.toml
+ExecStart=/opt/auto_sync/bin/auto_sync
 Restart=always
 RestartSec=5
 User=root

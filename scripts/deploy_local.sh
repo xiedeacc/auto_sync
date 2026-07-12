@@ -161,7 +161,7 @@ install -m 0755 target/release/auto_syncctl bin/auto_syncctl
 "${SUDO[@]}" install -d -m 0755 \
   "$INSTALL_DIR/bin" \
   "$INSTALL_DIR/conf" \
-  "$INSTALL_DIR/conf/state" \
+  "$INSTALL_DIR/data" \
   "$INSTALL_DIR/logs" \
   "$INSTALL_DIR/web"
 

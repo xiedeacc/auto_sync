@@ -4,6 +4,7 @@
 # Local deployment output. Keep these ignored so NAS can use `git pull`
 # inside /opt/auto_sync without generated files making the worktree dirty.
 /conf/auto_sync.toml
+/data/auto_sync.sqlite*
 /conf/collector.ssh.config
 /conf/state/
 /conf/.auto_sync.lock
