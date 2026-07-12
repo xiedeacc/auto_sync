@@ -228,6 +228,10 @@ const el = {
   cycleTime: document.getElementById("cycle-time"),
   cycleWeekday: document.getElementById("cycle-weekday"),
   cycleWeekdayField: document.getElementById("cycle-weekday-field"),
+  cycleEveryWeeks: document.getElementById("cycle-every-weeks"),
+  cycleEveryWeeksField: document.getElementById("cycle-every-weeks-field"),
+  cycleAnchorDate: document.getElementById("cycle-anchor-date"),
+  cycleAnchorDateField: document.getElementById("cycle-anchor-date-field"),
   configModal: document.getElementById("config-modal"),
   configClose: document.getElementById("config-close"),
   configView: document.getElementById("config-view"),
@@ -1751,6 +1755,8 @@ function defaultDestinationSchedule() {
     time: "19:00",
     timezone: "local",
     weekday: "monday",
+    every_weeks: 1,
+    anchor_date: "2026-01-05",
     sync_current_cycle_manually: false,
   };
 }
@@ -1767,6 +1773,8 @@ function normalizeSchedule(schedule) {
   const next = Object.assign({}, defaults, schedule || {});
   next.time = normalizeScheduleTime((schedule && schedule.time) || defaults.time);
   next.weekday = normalizeWeekday(schedule && schedule.weekday);
+  next.every_weeks = normalizeScheduleEveryWeeks(schedule && schedule.every_weeks);
+  next.anchor_date = normalizeScheduleAnchorDate((schedule && schedule.anchor_date) || defaults.anchor_date);
   return next;
 }
 
@@ -1780,9 +1788,24 @@ function scheduleLabel(schedule) {
     return formatScheduleTime(next.time);
   }
   if (next.mode === "weekly") {
-    return `${weekdayAbbrev(next.weekday)} ${formatScheduleTime(next.time)}`;
+    const every = normalizeScheduleEveryWeeks(next.every_weeks);
+    const prefix = every > 1 ? `Every ${every}w ` : "";
+    return `${prefix}${weekdayAbbrev(next.weekday)} ${formatScheduleTime(next.time)}`;
   }
   return "Realtime";
+}
+
+function normalizeScheduleEveryWeeks(value) {
+  const parsed = Number.parseInt(String(value || "1"), 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return 1;
+  }
+  return Math.min(52, parsed);
+}
+
+function normalizeScheduleAnchorDate(value) {
+  const text = String(value || "2026-01-05").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : "2026-01-05";
 }
 
 function destinationSyncTitle(dst) {
@@ -1885,6 +1908,8 @@ function openScheduleModal(schedule, onApply) {
     : draft.time;
   el.cycleTime.value = formatScheduleTime(timeForField);
   el.cycleWeekday.value = normalizeWeekday(draft.weekday);
+  el.cycleEveryWeeks.value = String(normalizeScheduleEveryWeeks(draft.every_weeks));
+  el.cycleAnchorDate.value = normalizeScheduleAnchorDate(draft.anchor_date);
   updateScheduleModalFields();
   el.scheduleModal.hidden = false;
 }
@@ -1894,6 +1919,8 @@ function updateScheduleModalFields() {
   const scheduled = mode !== "realtime";
   el.cycleTime.parentElement.hidden = !scheduled;
   el.cycleWeekdayField.hidden = mode !== "weekly";
+  el.cycleEveryWeeksField.hidden = mode !== "weekly";
+  el.cycleAnchorDateField.hidden = mode !== "weekly";
 }
 
 function closeScheduleModal(apply) {
@@ -1903,6 +1930,12 @@ function closeScheduleModal(apply) {
       time: normalizeScheduleTime(el.cycleTime.value || "19:00"),
       timezone: "local",
       weekday: normalizeWeekday(el.cycleWeekday.value),
+      every_weeks: el.cycleMode.value === "weekly"
+        ? normalizeScheduleEveryWeeks(el.cycleEveryWeeks.value)
+        : 1,
+      anchor_date: el.cycleMode.value === "weekly"
+        ? normalizeScheduleAnchorDate(el.cycleAnchorDate.value)
+        : "2026-01-05",
       sync_current_cycle_manually: false,
     });
     scheduleEditor.onApply(schedule);

@@ -2289,6 +2289,7 @@ mod tests {
                     timezone: String::new(),
                     weekday: Some(far_weekday),
                     sync_current_cycle_manually: false,
+                    ..ScheduleConfig::default()
                 },
                 paused: false,
                 sync: None,

@@ -117,6 +117,8 @@ pub struct ScheduleConfig {
     pub time: String,
     pub timezone: String,
     pub weekday: Option<String>,
+    pub every_weeks: u32,
+    pub anchor_date: String,
     pub sync_current_cycle_manually: bool,
 }
 
@@ -449,6 +451,8 @@ impl Default for ScheduleConfig {
             time: "19:00".to_string(),
             timezone: "local".to_string(),
             weekday: Some("monday".to_string()),
+            every_weeks: 1,
+            anchor_date: "2026-01-05".to_string(),
             sync_current_cycle_manually: false,
         }
     }
@@ -1335,6 +1339,14 @@ pub fn validate_schedule(schedule: &ScheduleConfig) -> Result<()> {
         ScheduleMode::Realtime => Ok(()),
         ScheduleMode::Daily | ScheduleMode::Weekly => {
             parse_schedule_time(&schedule.time)?;
+            if schedule.every_weeks == 0 {
+                bail!("schedule every_weeks must be at least 1");
+            }
+            if matches!(schedule.mode, ScheduleMode::Weekly) {
+                chrono::NaiveDate::parse_from_str(&schedule.anchor_date, "%Y-%m-%d").with_context(
+                    || format!("invalid schedule anchor_date {}", schedule.anchor_date),
+                )?;
+            }
             Ok(())
         }
     }

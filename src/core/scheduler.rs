@@ -37,9 +37,11 @@ pub fn next_boundary_after(
         ScheduleMode::Weekly => {
             let time = schedule_time(cfg)?;
             let wanted = parse_weekday(cfg.weekday.as_deref().unwrap_or("monday"))?;
+            let anchor = schedule_anchor(cfg)?;
+            let every = cfg.every_weeks.max(1) as i64;
             let mut date = start_local.date_naive();
-            for _ in 0..14 {
-                if date.weekday() == wanted {
+            for _ in 0..(every * 7 + 8) {
+                if date.weekday() == wanted && week_on_cadence(anchor, date, every) {
                     let candidate = local_datetime(date, time)?;
                     if candidate > start_local {
                         return Ok(candidate.with_timezone(&Utc));
@@ -58,6 +60,20 @@ fn schedule_time(cfg: &ScheduleConfig) -> Result<NaiveTime> {
     let (hour, minute, second) = parse_schedule_time(&cfg.time)?;
     NaiveTime::from_hms_opt(hour, minute, second)
         .with_context(|| format!("invalid schedule time {}", cfg.time))
+}
+
+fn schedule_anchor(cfg: &ScheduleConfig) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(&cfg.anchor_date, "%Y-%m-%d")
+        .with_context(|| format!("invalid schedule anchor_date {}", cfg.anchor_date))
+}
+
+fn week_on_cadence(anchor: NaiveDate, date: NaiveDate, every: i64) -> bool {
+    if every <= 1 {
+        return true;
+    }
+    let days = (date - anchor).num_days();
+    let week = days.div_euclid(7);
+    week.rem_euclid(every) == 0
 }
 
 fn local_datetime(date: NaiveDate, time: NaiveTime) -> Result<DateTime<Local>> {
@@ -145,6 +161,31 @@ mod tests {
             next_boundary_after(local_utc(2026, 6, 15, 10, 0), &cfg).unwrap(),
             local_utc(2026, 6, 21, 7, 30)
         );
+    }
+
+    #[test]
+    fn weekly_boundary_honors_multi_week_cadence() {
+        let mut cfg = schedule(ScheduleMode::Weekly, "19:00", Some("sat"));
+        cfg.every_weeks = 4;
+        cfg.anchor_date = "2026-07-04".to_string();
+
+        // 2026-07-04 is the anchor Saturday; 2026-07-11 is the same weekday but
+        // not a cadence week. The next allowed boundary is 2026-08-01.
+        assert_eq!(
+            next_boundary_after(local_utc(2026, 7, 11, 9, 0), &cfg).unwrap(),
+            local_utc(2026, 8, 1, 19, 0)
+        );
+
+        assert!(!cycle_is_due(
+            local_utc(2026, 7, 11, 9, 0),
+            local_utc(2026, 7, 11, 19, 0),
+            &cfg
+        ));
+        assert!(cycle_is_due(
+            local_utc(2026, 7, 11, 9, 0),
+            local_utc(2026, 8, 1, 19, 0),
+            &cfg
+        ));
     }
 
     #[test]

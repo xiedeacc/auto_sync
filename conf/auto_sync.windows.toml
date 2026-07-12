@@ -75,4 +75,6 @@ mode = "realtime"
 time = "02:00"
 timezone = "local"
 weekday = "monday"
+every_weeks = 1
+anchor_date = "2026-01-05"
 sync_current_cycle_manually = false

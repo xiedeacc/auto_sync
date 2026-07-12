@@ -1100,57 +1100,59 @@ class _Header extends StatelessWidget {
         color: Palette.panel,
         border: Border(bottom: BorderSide(color: Palette.line)),
       ),
-      child: Stack(
+      child: Row(
         children: [
-          const Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              'auto_sync',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.w800,
-                color: Palette.text,
-              ),
-            ),
-          ),
-          Center(
-            child: OutlinedButton(
-              onPressed: onMachines,
-              style: OutlinedButton.styleFrom(
-                minimumSize: const Size(118, 34),
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                foregroundColor: Palette.accent,
-                side: const BorderSide(color: Palette.line),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                textStyle: const TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
+          const Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
               child: Text(
-                total == 0 ? 'Machines -/-' : 'Machines $online/$total',
+                'auto_sync',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                  color: Palette.text,
+                ),
               ),
             ),
           ),
-          Align(
-            alignment: Alignment.centerRight,
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                MasterButton(label: 'Readme', width: 80, onTap: onReadme),
-                const SizedBox(width: 8),
-                MasterButton(
-                  label: 'Collector',
-                  width: 104,
-                  onTap: onCollector,
-                ),
-                const SizedBox(width: 8),
-                MasterButton(label: 'Config', width: 76, onTap: onConfig),
-                const SizedBox(width: 8),
-                MasterButton(label: 'Tasks', width: 70, onTap: onTasks),
-              ],
+          OutlinedButton(
+            onPressed: onMachines,
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size(118, 34),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              foregroundColor: Palette.accent,
+              side: const BorderSide(color: Palette.line),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(6),
+              ),
+              textStyle: const TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            child: Text(
+              total == 0 ? 'Machines -/-' : 'Machines $online/$total',
+            ),
+          ),
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  MasterButton(label: 'Readme', width: 80, onTap: onReadme),
+                  const SizedBox(width: 8),
+                  MasterButton(
+                    label: 'Collector',
+                    width: 104,
+                    onTap: onCollector,
+                  ),
+                  const SizedBox(width: 8),
+                  MasterButton(label: 'Config', width: 76, onTap: onConfig),
+                  const SizedBox(width: 8),
+                  MasterButton(label: 'Tasks', width: 70, onTap: onTasks),
+                ],
+              ),
             ),
           ),
         ],
@@ -2845,6 +2847,8 @@ Map<String, dynamic> _defaultDestinationSchedule() => {
   'time': '19:00',
   'timezone': 'local',
   'weekday': 'monday',
+  'every_weeks': 1,
+  'anchor_date': '2026-01-05',
   'sync_current_cycle_manually': false,
 };
 
@@ -2863,6 +2867,10 @@ Map<String, dynamic> _cloneSchedule(Map<String, dynamic> schedule) {
     'timezone': 'local',
     'weekday': _normalizeWeekday(
       _str(schedule['weekday'], _str(defaults['weekday'])),
+    ),
+    'every_weeks': _normalizeScheduleEveryWeeks(schedule['every_weeks']),
+    'anchor_date': _normalizeScheduleAnchorDate(
+      _str(schedule['anchor_date'], _str(defaults['anchor_date'])),
     ),
     'sync_current_cycle_manually': false,
   };
@@ -2890,6 +2898,20 @@ String _normalizeWeekday(String value) {
   return weekdays.contains(lower) ? lower : 'monday';
 }
 
+int _normalizeScheduleEveryWeeks(dynamic value) {
+  final parsed = int.tryParse('$value') ?? 1;
+  return parsed.clamp(1, 52);
+}
+
+String _normalizeScheduleAnchorDate(String value) {
+  final text = value.trim();
+  final parsed = DateTime.tryParse(text);
+  if (parsed == null) return '2026-01-05';
+  return '${parsed.year.toString().padLeft(4, '0')}-'
+      '${parsed.month.toString().padLeft(2, '0')}-'
+      '${parsed.day.toString().padLeft(2, '0')}';
+}
+
 String _scheduleModeLabel(String value) => switch (value) {
   'realtime' => 'Realtime',
   'daily' => 'Daily',
@@ -2915,6 +2937,7 @@ String _scheduleLabel(Map<String, dynamic> schedule) {
   final time = _str(next['time'], '19:00');
   final weekday = _str(next['weekday'], 'monday');
   if (mode == 'weekly') {
+    final every = _normalizeScheduleEveryWeeks(next['every_weeks']);
     const labels = {
       'monday': 'Mon',
       'tuesday': 'Tue',
@@ -2924,7 +2947,8 @@ String _scheduleLabel(Map<String, dynamic> schedule) {
       'saturday': 'Sat',
       'sunday': 'Sun',
     };
-    return '${labels[weekday] ?? weekday} $time';
+    final prefix = every > 1 ? 'Every ${every}w ' : '';
+    return '$prefix${labels[weekday] ?? weekday} $time';
   }
   if (mode == 'realtime') {
     return 'Realtime';
@@ -3856,10 +3880,20 @@ class _ScheduleDialogState extends State<_ScheduleDialog> {
   late final TextEditingController time = TextEditingController(
     text: _normalizeScheduleTime(_str(widget.schedule['time'], '19:00')),
   );
+  late final TextEditingController everyWeeks = TextEditingController(
+    text: '${_normalizeScheduleEveryWeeks(widget.schedule['every_weeks'])}',
+  );
+  late final TextEditingController anchorDate = TextEditingController(
+    text: _normalizeScheduleAnchorDate(
+      _str(widget.schedule['anchor_date'], '2026-01-05'),
+    ),
+  );
 
   @override
   void dispose() {
     time.dispose();
+    everyWeeks.dispose();
+    anchorDate.dispose();
     super.dispose();
   }
 
@@ -3869,7 +3903,7 @@ class _ScheduleDialogState extends State<_ScheduleDialog> {
     return _MasterDialogFrame(
       title: 'Schedule',
       width: 420,
-      maxHeight: mode == 'weekly' ? 330 : 270,
+      maxHeight: mode == 'weekly' ? 430 : 270,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -3908,6 +3942,12 @@ class _ScheduleDialogState extends State<_ScheduleDialog> {
                 onSelected: (value) => setState(() => weekday = value),
               ),
             ),
+            const SizedBox(height: 10),
+            const _MasterLabel('Every weeks'),
+            _CompactInput(controller: everyWeeks, placeholder: '1'),
+            const SizedBox(height: 10),
+            const _MasterLabel('Anchor date'),
+            _CompactInput(controller: anchorDate, placeholder: '2026-01-05'),
           ],
           const Spacer(),
           Row(
@@ -3923,6 +3963,10 @@ class _ScheduleDialogState extends State<_ScheduleDialog> {
                     'mode': mode,
                     'time': scheduled ? time.text : '19:00',
                     'weekday': weekday,
+                    'every_weeks': mode == 'weekly' ? everyWeeks.text : 1,
+                    'anchor_date': mode == 'weekly'
+                        ? anchorDate.text
+                        : '2026-01-05',
                   }),
                 ),
               ),
