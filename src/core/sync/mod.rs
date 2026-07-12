@@ -7812,8 +7812,8 @@ fn should_visit_path(root: &Path, path: &Path, mode: SnapshotMode, excludes: &[P
 /// after any delete; letting those paths into a diff union recurses the whole
 /// recycle bin into per-path snapshots and reports it as differences.
 fn rel_str_is_internal(rel: &str) -> bool {
-    let first = rel.split(['/', '\\']).next().unwrap_or(rel);
-    first == INTERNAL_TMP || first == INTERNAL_TRASH || first == INTERNAL_PROBE
+    rel.split(['/', '\\'])
+        .any(|part| part == INTERNAL_TMP || part == INTERNAL_TRASH || part == INTERNAL_PROBE)
 }
 
 fn entry_is_excluded(root: &Path, path: &Path, excludes: &[PathBuf]) -> bool {
@@ -10466,6 +10466,7 @@ other /zfs_other zfs rw 0 0
                       +\t/zfs_pool/.auto_sync_trash/29\n\
                       M\t/zfs_pool/.auto_sync_trash\n\
                       M\t/zfs_pool/.auto_sync_tmp/12/half.bin\n\
+                      M\t/zfs_pool/xwechat_files/.auto_sync_tmp/2363/half.bin\n\
                       +\t/zfs_pool/.auto_sync_probe\n\
                       M\t/zfs_pool/real_change.txt\n";
         let paths = parse_zfs_diff(output, root);
@@ -10493,6 +10494,14 @@ other /zfs_other zfs rw 0 0
         .unwrap();
         assert!(entries.is_empty());
         fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn internal_path_detection_matches_nested_segments() {
+        assert!(rel_str_is_internal(".auto_sync_tmp/1/file"));
+        assert!(rel_str_is_internal("xwechat_files/.auto_sync_tmp/1/file"));
+        assert!(rel_str_is_internal("xwechat_files\\.auto_sync_trash\\old"));
+        assert!(!rel_str_is_internal("xwechat_files/real/file"));
     }
 
     #[test]

@@ -1136,9 +1136,21 @@ fn source_relative_event_path(source: &SourceRoot, path: &Path) -> Option<String
     let rel = path.strip_prefix(&source.root).ok()?;
     if rel.as_os_str().is_empty() {
         None
+    } else if rel_has_internal_component(rel) {
+        None
     } else {
         Some(rel.to_string_lossy().to_string())
     }
+}
+
+fn rel_has_internal_component(rel: &Path) -> bool {
+    rel.components().any(|component| {
+        let text = component.as_os_str().to_string_lossy();
+        matches!(
+            text.as_ref(),
+            ".auto_sync_tmp" | ".auto_sync_trash" | ".auto_sync_probe"
+        )
+    })
 }
 
 fn mask_to_kind(mask: u64) -> &'static str {

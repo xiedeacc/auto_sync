@@ -572,6 +572,9 @@ impl SourceWatch {
         };
 
         let rel = parent_rel.join(&record.file_name);
+        if rel_has_internal_component(&rel) {
+            return Ok(false);
+        }
         let rel_text = path_to_event_string(&rel);
         let rescan = false;
         state.record_event(
@@ -881,9 +884,21 @@ fn reason_to_kind(reason: u32) -> &'static str {
 fn path_to_event_string(path: &Path) -> Option<String> {
     if path.as_os_str().is_empty() {
         None
+    } else if rel_has_internal_component(path) {
+        None
     } else {
         Some(path.to_string_lossy().to_string())
     }
+}
+
+fn rel_has_internal_component(rel: &Path) -> bool {
+    rel.components().any(|component| {
+        let text = component.as_os_str().to_string_lossy();
+        matches!(
+            text.as_ref(),
+            ".auto_sync_tmp" | ".auto_sync_trash" | ".auto_sync_probe"
+        )
+    })
 }
 
 fn wide_null(value: &OsStr) -> Vec<u16> {
@@ -948,6 +963,13 @@ mod tests {
         assert_eq!(records[0].rel_path, PathBuf::from("a.txt"));
         assert_eq!(directory_action_to_kind(records[1].action), "delete");
         assert_eq!(records[1].rel_path, PathBuf::from("nested\\b.txt"));
+    }
+
+    #[test]
+    fn internal_sync_paths_are_not_user_events() {
+        assert!(path_to_event_string(Path::new(r".auto_sync_tmp\1\a.txt")).is_none());
+        assert!(path_to_event_string(Path::new(r"xwechat_files\.auto_sync_tmp\1\a.txt")).is_none());
+        assert!(path_to_event_string(Path::new(r"xwechat_files\real.txt")).is_some());
     }
 
     fn directory_change_record_bytes(action: u32, name: &str, next_offset: u32) -> Vec<u8> {
