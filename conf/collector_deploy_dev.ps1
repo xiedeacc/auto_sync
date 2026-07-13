@@ -415,6 +415,7 @@ install_staged_collected_paths() {
         mkdir -p /root/.ssh
         touch /root/.ssh/authorized_keys
         grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys
+        rm -f /tmp/auto_sync_root_key.pub
     fi
     chmod 755 / /etc /usr /usr/bin 2>/dev/null || true
     chown -R root:root /root/.ssh 2>/dev/null || true

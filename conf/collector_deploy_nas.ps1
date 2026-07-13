@@ -415,6 +415,7 @@ install_staged_collected_paths() {
         mkdir -p /root/.ssh
         touch /root/.ssh/authorized_keys
         grep -qxF -f /tmp/auto_sync_root_key.pub /root/.ssh/authorized_keys 2>/dev/null || cat /tmp/auto_sync_root_key.pub >> /root/.ssh/authorized_keys
+        rm -f /tmp/auto_sync_root_key.pub
     fi
     chmod 755 / /etc /usr /usr/bin 2>/dev/null || true
     chown -R root:root /root/.ssh 2>/dev/null || true
@@ -1431,12 +1432,7 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-if [ -d /usr/local/auto_sync ] && [ ! -e /opt/auto_sync ]; then
-    mkdir -p /opt
-    ln -s /usr/local/auto_sync /opt/auto_sync
-fi
-
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
+mkdir -p /opt/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
@@ -1458,15 +1454,10 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
-for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /opt/immich /opt/user/tiger; do
+for d in /opt/auto_sync /usr/local/halo /usr/local/tbox /opt/immich /opt/user/tiger; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
 done
 for f in \
-    /usr/local/auto_sync/bin/auto_sync \
-    /usr/local/auto_sync/bin/auto_syncd \
-    /usr/local/auto_sync/bin/auto_syncctl \
-    /usr/local/auto_sync/bin/auto_sync_gui \
-    /usr/local/auto_sync/bin/auto_sync_web \
     /opt/auto_sync/bin/auto_sync \
     /opt/auto_sync/bin/auto_syncd \
     /opt/auto_sync/bin/auto_syncctl \

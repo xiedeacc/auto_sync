@@ -150,7 +150,7 @@ paths = [
     "/opt/user/tiger/.halo2",
     "/opt/www/gitlab_cleaner",
     "/opt/www/unlock-music",
-    "/usr/local/auto_sync",
+    "/opt/auto_sync",
     "/usr/local/blog",
     "/usr/local/halo",
     "/usr/local/tbox",
@@ -158,7 +158,7 @@ paths = [
     "/usr/local/xray",
 ]
 exclude = [
-    "/usr/local/auto_sync/logs",
+    "/opt/auto_sync/logs",
     "/usr/local/blog/.backup-worktree",
     "/usr/local/blog/logs",
     "/opt/user/tiger/.halo2/logs",
@@ -262,7 +262,7 @@ paths = [
     "/opt/user/tiger/.halo2",
     "/opt/www/gitlab_cleaner",
     "/opt/www/unlock-music",
-    "/usr/local/auto_sync",
+    "/opt/auto_sync",
     "/usr/local/blog",
     "/usr/local/halo",
     "/usr/local/tbox",
@@ -270,7 +270,7 @@ paths = [
     "/usr/local/xray",
 ]
 exclude = [
-    "/usr/local/auto_sync/logs",
+    "/opt/auto_sync/logs",
     "/usr/local/blog/.backup-worktree",
     "/usr/local/blog/logs",
     "/opt/user/tiger/.halo2/logs",
