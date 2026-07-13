@@ -11,15 +11,15 @@
 - Every commit must include all current repository changes. Do not leave tracked working-tree changes unstaged unless the user explicitly asks to keep them out of the commit.
 - Deploy scripts must preserve existing `conf/auto_sync.toml`; only initialize it from a template when the target config file does not exist.
 - Dev and NAS intentionally use different real paths because their disks are different:
-  - Dev has a large root SSD. Keep dev `auto_sync` at `/usr/local/auto_sync`, Immich at `/usr/local/immich`, shared tooling, source repos, and toolchains such as `aarch64-linux-musl-cross` under `/root/src/software`, and keep `/root` plus `/home/tiger` as real local paths. Do not create or rely on `/opt/auto_sync`, `/opt/immich`, `/opt/user/root`, or `/opt/user/tiger` on dev.
-  - NAS has a small root disk. Keep normal NAS `auto_sync` deployment at `/opt/auto_sync`, Flutter SDK at `/opt/src/software/flutter`, NAS Immich at `/opt/immich`, and NAS home-directory spillover/symlink targets under `/opt/user/{root,tiger}` when needed. Do not flatten NAS `/opt` layout to match dev.
+  - Dev has a large root SSD. Keep dev `auto_sync` at `/usr/local/auto_sync`, Immich at `/usr/local/immich`, shared tooling, source repos, and toolchains such as `aarch64-linux-musl-cross` under `/root/src/software`, and keep `/root` plus `/home/tiger` as real local paths. Do not create or rely on `/opt/usr/local/auto_sync`, `/opt/immich`, `/opt/user/root`, or `/opt/user/tiger` on dev.
+  - NAS has a small root disk. Keep normal NAS `auto_sync` deployment at `/opt/usr/local/auto_sync`, Flutter SDK at `/opt/src/software/flutter`, NAS Immich at `/opt/immich`, and NAS home-directory spillover/symlink targets under `/opt/user/{root,tiger}` when needed. Do not flatten NAS `/opt` layout to match dev. Do not bind-mount `/opt/usr/local` back onto `/usr/local`; old `/usr/local/{blog,go,halo,shadowsocks,tbox,waiwei,xray,bin}` entries must disappear by removing the bind mount, not by deleting data through the old path.
   - NAS GitLab/repository data that is configured for `/zfs` must stay on `/zfs`; make sure the ZFS pool/disk is available before touching that data.
 - Any user-visible Windows path must be rendered through the standard display-path helper (`displayPath` in web UI, `_displayPath` in Flutter UI, or an equivalent backend helper) so extended-length prefixes such as `\\?\` and `\\?\UNC\` are never shown. Keep the underlying stored path unchanged.
 - When the user explicitly asks to deploy, always use this update path:
   1. On Windows, commit all intended repository changes and push them.
   2. After the push succeeds, deploy this Windows machine and NAS in parallel when possible:
      - Windows: `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`.
-     - NAS directly on NAS: `ssh -p 10022 root@192.168.2.247 "cd /opt/auto_sync && git pull --ff-only && scripts/deploy_nas.sh"`.
+     - NAS directly on NAS: `ssh -p 10022 root@192.168.2.247 "cd /opt/usr/local/auto_sync && git pull --ff-only && scripts/deploy_nas.sh"`.
      If parallel execution is not available, run the same two commands sequentially.
 - Do not deploy to tiger and do not use Windows-to-Linux cross-compilation for the normal NAS deployment path; build Linux x64 binaries on NAS.
-- For normal NAS deployment, do not delete `/opt/auto_sync`, do not run `git reset --hard`, and do not clean `/opt/auto_sync/target`; preserving Cargo build cache is required. If tracked files in `/opt/auto_sync` are dirty, stop and resolve why instead of masking it with reset.
+- For normal NAS deployment, do not delete `/opt/usr/local/auto_sync`, do not run `git reset --hard`, and do not clean `/opt/usr/local/auto_sync/target`; preserving Cargo build cache is required. If tracked files in `/opt/usr/local/auto_sync` are dirty, stop and resolve why instead of masking it with reset.

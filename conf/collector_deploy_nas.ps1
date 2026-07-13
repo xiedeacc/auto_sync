@@ -488,7 +488,7 @@ ensure_software_src_layout() {
 ensure_software_src_layout
 rewrite_software_src_paths() {
     replacement="$1"
-    for root in /etc/systemd/system /etc/profile.d /usr/local/bin; do
+    for root in /etc/systemd/system /etc/profile.d /opt/usr/local/bin; do
         [ -e "$root" ] || continue
         find "$root" -type f -exec grep -Il '/opt/software/src' {} + 2>/dev/null |
             xargs -r sed -i "s#/opt/software/src#$replacement#g"
@@ -737,9 +737,12 @@ if [ ! -d /root/.oh-my-zsh ]; then
     RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" || log "WARN: oh-my-zsh install failed"
 fi
 
-if [ ! -x /usr/local/go/go1.25.1/bin/go ]; then
-    mkdir -p /usr/local/go
-    cd /usr/local/go
+mkdir -p /opt/usr/local/bin
+chmod 0755 /opt/usr /opt/usr/local /opt/usr/local/bin 2>/dev/null || true
+
+if [ ! -x /opt/usr/local/go/go1.25.1/bin/go ]; then
+    mkdir -p /opt/usr/local/go
+    cd /opt/usr/local/go
     rm -rf go go1.25.1 go1.25.1.linux-amd64.tar.gz
     if curl --retry 5 --retry-all-errors -L -O https://mirrors.aliyun.com/golang/go1.25.1.linux-amd64.tar.gz || curl --retry 5 --retry-all-errors -L -O https://go.dev/dl/go1.25.1.linux-amd64.tar.gz; then
         tar zxf go1.25.1.linux-amd64.tar.gz
@@ -752,7 +755,7 @@ fi
 export GOPATH=/root/src/go
 export GOBIN=$GOPATH/bin
 mkdir -p "$GOBIN" "$GOPATH/pkg"
-export PATH="/usr/local/go/go1.25.1/bin:$GOBIN:$PATH"
+export PATH="/opt/usr/local/go/go1.25.1/bin:$GOBIN:$PATH"
 if command -v go >/dev/null 2>&1; then
     go install github.com/google/pprof@latest || log "WARN: go install pprof failed"
 fi
@@ -800,9 +803,9 @@ if [ -d "$NVM_DIR" ]; then
     chmod -R a+rX "$NVM_DIR" || true
 fi
 
-if [ ! -x /usr/local/bin/buildifier ]; then
-    curl -L -o /usr/local/bin/buildifier https://github.com/bazelbuild/buildtools/releases/download/v7.1.2/buildifier-linux-amd64
-    chmod +x /usr/local/bin/buildifier
+if [ ! -x /opt/usr/local/bin/buildifier ]; then
+    curl -L -o /opt/usr/local/bin/buildifier https://github.com/bazelbuild/buildtools/releases/download/v7.1.2/buildifier-linux-amd64
+    chmod +x /opt/usr/local/bin/buildifier
 fi
 
 [ -x "$JAVA_HOME/bin/java" ] || { log "ERROR: OpenJDK 21 is not installed at $JAVA_HOME"; exit 1; }
@@ -850,7 +853,7 @@ fi
 if [ -d /root/.vim/bundle/YouCompleteMe ]; then
     ycm_commit="$(git -C /root/.vim/bundle/YouCompleteMe rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$ycm_commit" ] && [ "$(cat /root/.vim/bundle/YouCompleteMe/.auto_sync_installed 2>/dev/null || true)" != "$ycm_commit" ]; then
-        ycm_path="$JAVA_HOME/bin:/usr/local/go/go1.25.1/bin:/root/src/go/bin:/root/.cargo/bin:/opt/src/software/tools/nvm/versions/node/v24.18.0/bin:$PATH"
+        ycm_path="$JAVA_HOME/bin:/opt/usr/local/go/go1.25.1/bin:/root/src/go/bin:/root/.cargo/bin:/opt/src/software/tools/nvm/versions/node/v24.18.0/bin:$PATH"
         ycmd_build=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/build.py
         jdt_milestone="$(sed -n "s/^JDTLS_MILESTONE = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
         jdt_stamp="$(sed -n "s/^JDTLS_BUILD_STAMP = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
@@ -1451,7 +1454,72 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-mkdir -p /opt/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/shadowsocks/logs /usr/local/shadowsocks/conf /usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/root/.halo /opt/user/root/.halo2 /opt/user/tiger /home/tiger
+migrate_opt_usr_local_layout() {
+    mkdir -p /opt/usr/local
+    chmod 0755 /opt/usr /opt/usr/local 2>/dev/null || true
+    if grep -Eq '^/opt/usr/local[[:space:]]+/usr/local[[:space:]]' /etc/fstab 2>/dev/null; then
+        cp -a /etc/fstab "/etc/fstab.auto_sync_backup.$(date +%Y%m%d%H%M%S)"
+        sed -i '\#^/opt/usr/local[[:space:]]\+/usr/local[[:space:]]#d' /etc/fstab
+        systemctl daemon-reload 2>/dev/null || true
+        umount -l /usr/local 2>/dev/null || true
+        mkdir -p /usr/local
+        chmod 0755 /usr/local 2>/dev/null || true
+        systemctl reset-failed usr-local.mount 2>/dev/null || true
+    fi
+    if [ -d /opt/auto_sync ]; then
+        mkdir -p /opt/usr/local/auto_sync
+        rsync -aHAX /opt/auto_sync/ /opt/usr/local/auto_sync/ || rsync -a /opt/auto_sync/ /opt/usr/local/auto_sync/
+        rm -rf /opt/auto_sync
+    fi
+    for name in blog go halo shadowsocks tbox waiwei xray bin; do
+        src="/usr/local/$name"
+        dst="/opt/usr/local/$name"
+        [ -e "$src" ] || [ -L "$src" ] || continue
+        if [ -e "$dst" ] && [ "$src" -ef "$dst" ]; then
+            continue
+        fi
+        mkdir -p "$dst"
+        if [ -d "$src" ]; then
+            rsync -aHAX "$src/" "$dst/" || rsync -a "$src/" "$dst/"
+        elif [ -f "$src" ]; then
+            cp -a "$src" "$dst"
+        fi
+        [ "$src" -ef "$dst" ] 2>/dev/null || rm -rf "$src"
+    done
+    for root in /etc/systemd/system /etc/profile.d /etc/logrotate.d /opt/usr/local /etc/immich; do
+        [ -e "$root" ] || continue
+        find "$root" -type f -exec grep -IlE '/opt/auto_sync|/usr/local/(blog|go|halo|shadowsocks|tbox|waiwei|xray|bin)' {} + 2>/dev/null |
+            xargs -r sed -i \
+                -e 's#/opt/auto_sync#/opt/usr/local/auto_sync#g' \
+                -e 's#/usr/local/blog#/opt/usr/local/blog#g' \
+                -e 's#/usr/local/go#/opt/usr/local/go#g' \
+                -e 's#/usr/local/halo#/opt/usr/local/halo#g' \
+                -e 's#/usr/local/shadowsocks#/opt/usr/local/shadowsocks#g' \
+                -e 's#/usr/local/tbox#/opt/usr/local/tbox#g' \
+                -e 's#/usr/local/waiwei#/opt/usr/local/waiwei#g' \
+                -e 's#/usr/local/xray#/opt/usr/local/xray#g' \
+                -e 's#/usr/local/bin#/opt/usr/local/bin#g'
+        find "$root" -type f -exec grep -Il '/opt/opt' {} + 2>/dev/null |
+            xargs -r sed -i \
+                -e 's#/opt/opt/opt/usr/local#/opt/usr/local#g' \
+                -e 's#/opt/opt/usr/local#/opt/usr/local#g'
+    done
+    cat > /etc/profile.d/opt-usr-local-path.sh <<'EOF_OPT_USR_LOCAL_PATH'
+# Managed by auto_sync NAS deployment.
+case ":$PATH:" in
+  *:/opt/usr/local/bin:*) ;;
+  *) export PATH="/opt/usr/local/bin:$PATH" ;;
+esac
+case ":$PATH:" in
+  *:/opt/usr/local/go/go1.25.1/bin:*) ;;
+  *) [ ! -d /opt/usr/local/go/go1.25.1/bin ] || export PATH="/opt/usr/local/go/go1.25.1/bin:$PATH" ;;
+esac
+EOF_OPT_USR_LOCAL_PATH
+    chmod 0644 /etc/profile.d/opt-usr-local-path.sh
+}
+migrate_opt_usr_local_layout
+
+mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/root/.halo /opt/user/root/.halo2 /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
@@ -1489,25 +1557,25 @@ PY_TIGER_LINK_OWNERS
 for d in /opt/immich /opt/user/tiger; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
 done
-for d in /opt/auto_sync /usr/local/halo /usr/local/tbox /usr/local/shadowsocks /opt/user/root/.halo /opt/user/root/.halo2; do
+for d in /opt/usr/local/auto_sync /opt/usr/local/halo /opt/usr/local/tbox /opt/usr/local/shadowsocks /opt/user/root/.halo /opt/user/root/.halo2; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
 for f in \
-    /opt/auto_sync/bin/auto_sync \
-    /opt/auto_sync/bin/auto_syncd \
-    /opt/auto_sync/bin/auto_syncctl \
-    /opt/auto_sync/bin/auto_sync_gui \
-    /usr/local/tbox/bin/tbox_client \
-    /usr/local/xray/bin/xray \
-    /usr/local/xray/bin/update-geo.sh \
-    /usr/local/waiwei/bin/waiwei_web \
-    /usr/local/waiwei/bin/waiwei_puller \
-    /usr/local/blog/bin/rblog \
-    /usr/local/blog/bin/rblog-backup \
-    /usr/local/blog/bin/admin/* \
-    /usr/local/halo/bin/* \
-    /usr/local/shadowsocks/bin/* \
-    /usr/local/bin/vlmcsd
+    /opt/usr/local/auto_sync/bin/auto_sync \
+    /opt/usr/local/auto_sync/bin/auto_syncd \
+    /opt/usr/local/auto_sync/bin/auto_syncctl \
+    /opt/usr/local/auto_sync/bin/auto_sync_gui \
+    /opt/usr/local/tbox/bin/tbox_client \
+    /opt/usr/local/xray/bin/xray \
+    /opt/usr/local/xray/bin/update-geo.sh \
+    /opt/usr/local/waiwei/bin/waiwei_web \
+    /opt/usr/local/waiwei/bin/waiwei_puller \
+    /opt/usr/local/blog/bin/rblog \
+    /opt/usr/local/blog/bin/rblog-backup \
+    /opt/usr/local/blog/bin/admin/* \
+    /opt/usr/local/halo/bin/* \
+    /opt/usr/local/shadowsocks/bin/* \
+    /opt/usr/local/bin/vlmcsd
 do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
 done
@@ -1531,7 +1599,7 @@ if [ -f /etc/systemd/system/halo2.service ]; then
     fi
 fi
 systemctl daemon-reload
-for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray shadowsocks rblog rblog-backup.timer nginx cron; do
+for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray rblog rblog-backup.timer nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -1539,7 +1607,7 @@ done
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_mysql.sh'; echo '5 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_mysql.sh > /dev/null 2>&1') | crontab -
 
 echo '--- final states ---'
-for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray shadowsocks rblog rblog-backup.timer gitlab-runsvdir gitlab; do
+for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray rblog rblog-backup.timer gitlab-runsvdir gitlab; do
     resolved="$(unit_name "$s" 2>/dev/null || true)"
     if [ -n "$resolved" ]; then
         printf '  %s: ' "$s"; systemctl is-enabled "$resolved" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$resolved" 2>/dev/null | tr -d '\n'; echo

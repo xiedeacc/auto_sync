@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 CONFIG="${CONFIG:-conf/auto_sync.linux.toml}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/auto_sync}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/usr/local/auto_sync}"
 FLUTTER_ROOT="${FLUTTER_ROOT:-/opt/src/software/flutter}"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -13,8 +13,8 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   exit 1
 fi
 
-if [[ "$INSTALL_DIR" != /opt/auto_sync ]]; then
-  echo "NAS install dir must stay /opt/auto_sync; got: $INSTALL_DIR" >&2
+if [[ "$INSTALL_DIR" != /opt/usr/local/auto_sync ]]; then
+  echo "NAS install dir must stay /opt/usr/local/auto_sync; got: $INSTALL_DIR" >&2
   exit 1
 fi
 

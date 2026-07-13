@@ -36,7 +36,7 @@ port = 18765
 ssh_user = "root"
 ssh_port = 10022
 os = "linux"
-install_dir = "/opt/auto_sync"
+install_dir = "/opt/usr/local/auto_sync"
 enabled = true
 manual = true
 
