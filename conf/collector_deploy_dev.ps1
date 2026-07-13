@@ -14,7 +14,7 @@ if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KE
 
 $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
-$platformDefaultCollectPaths = @('/opt/www/gitlab_cleaner', '/opt/www/unlock-music', '/opt/www/coverage')
+$platformDefaultCollectPaths = @('/opt/www/gitlab_cleaner', '/opt/www/unlock-music')
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
 
 function New-FinalSshdConfig([string]$Port) {
@@ -1013,43 +1013,8 @@ EOF_IMMICH_ML_ENV
             return 0
         fi
     fi
-    patch_immich_deploy_script() {
-        script_path="$1"
-        command -v python3 >/dev/null 2>&1 || return 0
-        python3 - "$script_path" <<'PY_PATCH_IMMICH'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text()
-needle = '  cd "$server_dir/node_modules/sharp"\n'
-insert = '''  node_gyp_pkg="$(find "$server_dir/node_modules/.pnpm" -maxdepth 1 -type d -name 'node-gyp@*' 2>/dev/null | head -1)"
-  if [ -n "$node_gyp_pkg" ]; then
-    node_gyp_base="$(basename "$node_gyp_pkg")"
-    node_gyp_link="$STAGING_DIR/$node_gyp_base"
-    if [ ! -e "$node_gyp_link" ]; then
-      ln -s "server/node_modules/.pnpm/$node_gyp_base" "$node_gyp_link" 2>/dev/null || true
-    fi
-  fi
-'''
-if insert not in text and needle in text:
-    text = text.replace(needle, insert + needle, 1)
-text = text.replace(
-    'MISE_TRUSTED_CONFIG_PATHS="$BUILD_DIR/mise.toml" MISE_DISABLE_TOOLS=flutter "$TOOL_BIN/mise" //:plugins',
-    'MISE_TRUSTED_CONFIG_PATHS="$REPO_DIR/mise.toml:$BUILD_DIR/mise.toml" MISE_DISABLE_TOOLS=flutter "$TOOL_BIN/mise" //:plugins',
-)
-text = text.replace(
-    'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --locked --extra cpu --no-dev --compile-bytecode',
-    'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --extra cpu --no-dev --compile-bytecode',
-)
-text = text.replace('/opt/software/src', '/root/src/software')
-text = text.replace('/opt/src/software', '/root/src/software')
-path.write_text(text)
-PY_PATCH_IMMICH
-    }
     for script in deploy.sh scripts/deploy.sh install.sh; do
         if [ -f "$repo/$script" ]; then
-            patch_immich_deploy_script "$repo/$script"
             chmod +x "$repo/$script" 2>/dev/null || true
             immich_node_home="${IMMICH_NODE_HOME:-/root/src/software/tools/nvm/versions/node/v24.18.0}"
             chmod -R a+rX "$immich_node_home" /root/src/software/tools/uv-python 2>/dev/null || true
@@ -1513,13 +1478,7 @@ fi
 
 [ ! -L /opt/auto_sync ] || rm -f /opt/auto_sync
 
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /root/.halo2 /home/tiger /opt/www/coverage
-if [ ! -s /opt/www/coverage/index.html ]; then
-    cat > /opt/www/coverage/index.html <<'EOF_COVERAGE_INDEX'
-<!doctype html>
-<html><head><meta charset="utf-8"><title>coverage</title></head><body>coverage</body></html>
-EOF_COVERAGE_INDEX
-fi
+mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /root/.halo2 /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/usr/local/immich/upload/$d"
     touch "/usr/local/immich/upload/$d/.immich"
@@ -1651,7 +1610,10 @@ fi
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray rblog rblog-backup.timer nginx cron; do
+for s in waiwei waiwei-web waiwei-puller xray; do
+    disable_if_exists "$s"
+done
+for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer rblog rblog-backup.timer nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -1659,7 +1621,7 @@ done
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_mysql.sh'; echo '5 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_mysql.sh > /dev/null 2>&1') | crontab -
 
 echo '--- final states ---'
-for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray rblog rblog-backup.timer gitlab-runsvdir gitlab; do
+for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer gitlab-runsvdir gitlab waiwei-web waiwei-puller xray; do
     resolved="$(unit_name "$s" 2>/dev/null || true)"
     if [ -n "$resolved" ]; then
         printf '  %s: ' "$s"; systemctl is-enabled "$resolved" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$resolved" 2>/dev/null | tr -d '\n'; echo
@@ -1700,7 +1662,7 @@ wait_for_https_200() {
 }
 
 required_failed=0
-for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray rblog rblog-backup.timer; do
+for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer; do
     if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
         required_failed=1
