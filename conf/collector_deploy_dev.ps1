@@ -1503,7 +1503,6 @@ for f in \
     /usr/local/auto_sync/bin/auto_syncd \
     /usr/local/auto_sync/bin/auto_syncctl \
     /usr/local/auto_sync/bin/auto_sync_gui \
-    /usr/local/auto_sync/bin/auto_sync_web \
     /usr/local/tbox/bin/tbox_client \
     /usr/local/xray/bin/xray \
     /usr/local/xray/bin/update-geo.sh \

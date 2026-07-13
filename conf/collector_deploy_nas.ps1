@@ -891,12 +891,20 @@ ProcessSizeMax=unlimited
 ExternalSizeMax=unlimited
 EOF_COREDUMP
 
-mkdir -p /root/src/software
-if [ ! -d /root/src/software/pgvector ]; then
-    git clone https://github.com/pgvector/pgvector.git /root/src/software/pgvector || true
-fi
+mkdir -p /opt/src/software
 if [ -d /root/src/software/pgvector ]; then
-    (cd /root/src/software/pgvector && make && make install) || log "WARN: pgvector build/install failed"
+    if [ ! -e /opt/src/software/pgvector ]; then
+        mv /root/src/software/pgvector /opt/src/software/pgvector
+    else
+        rsync -aHAX /root/src/software/pgvector/ /opt/src/software/pgvector/ || rsync -a /root/src/software/pgvector/ /opt/src/software/pgvector/
+        rm -rf /root/src/software/pgvector
+    fi
+fi
+if [ ! -d /opt/src/software/pgvector ]; then
+    git clone https://github.com/pgvector/pgvector.git /opt/src/software/pgvector || true
+fi
+if [ -d /opt/src/software/pgvector ]; then
+    (cd /opt/src/software/pgvector && make && make install) || log "WARN: pgvector build/install failed"
 fi
 
 deploy_immich_from_git() {
@@ -1472,7 +1480,6 @@ for f in \
     /opt/auto_sync/bin/auto_syncd \
     /opt/auto_sync/bin/auto_syncctl \
     /opt/auto_sync/bin/auto_sync_gui \
-    /opt/auto_sync/bin/auto_sync_web \
     /usr/local/tbox/bin/tbox_client \
     /usr/local/xray/bin/xray \
     /usr/local/xray/bin/update-geo.sh \
