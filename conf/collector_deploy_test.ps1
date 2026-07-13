@@ -15,9 +15,6 @@ if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KE
 $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $platformDefaultCollectPaths = @('/opt/www/gitlab_cleaner', '/opt/www/unlock-music')
-foreach ($defaultPath in $platformDefaultCollectPaths) {
-    if ($collectPaths -notcontains $defaultPath) { $collectPaths += $defaultPath }
-}
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
 
 function New-FinalSshdConfig([string]$Port) {
@@ -422,10 +419,10 @@ function Quote-ShellArg([string]$Value) {
     return "'" + $Value.Replace("'", "'""'""'") + "'"
 }
 
-function Prepare-StagedSymlinks([string]$PermsFile) {
+function Prepare-StagedSymlinks([string]$PermsFile, [string]$RemoteStage) {
     if ([string]::IsNullOrWhiteSpace($PermsFile) -or -not (Test-Path -LiteralPath $PermsFile)) { return }
     $commands = New-Object System.Collections.Generic.List[string]
-    $commands.Add('stage="$HOME/.auto_sync_stage"')
+    $commands.Add("stage=$(Quote-ShellArg $RemoteStage)")
     foreach ($line in [IO.File]::ReadAllLines($PermsFile)) {
         $t = $line.Trim()
         if (-not $t.StartsWith('symlink ')) { continue }
@@ -467,11 +464,12 @@ fi
 Reset-TestKnownHost
 Ensure-TestRootSsh
 Copy-AwsSslIntoCollectedRoot
-Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
-$generatedOptionalPaths = @('/opt/immich/conf', '/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps')
+$remoteStage = '/tmp/auto_sync_deploy_stage'
+Invoke-Remote "rm -rf $(Quote-ShellArg $remoteStage); mkdir -p $(Quote-ShellArg $remoteStage)"
+$generatedOptionalPaths = @('/opt/immich/conf', '/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') + $platformDefaultCollectPaths
 $requiredCollectPaths = @($collectPaths | Where-Object { (Normalize-RemotePath $_) -ne '/opt/immich/conf' })
-Transfer-CollectedPathsToStage $requiredCollectPaths $generatedOptionalPaths '~/.auto_sync_stage'
-Prepare-StagedSymlinks $env:AS_PERMS_FILE
+Transfer-CollectedPathsToStage $requiredCollectPaths $generatedOptionalPaths $remoteStage
+Prepare-StagedSymlinks $env:AS_PERMS_FILE $remoteStage
 
 $testSshPort = $env:AS_PORT
 if ([string]::IsNullOrWhiteSpace($testSshPort)) { $testSshPort = '10022' }
@@ -591,7 +589,7 @@ disable_if_exists() {
 }
 
 install_staged_collected_paths() {
-    stage="$HOME/.auto_sync_stage"
+    stage="/tmp/auto_sync_deploy_stage"
     [ -d "$stage" ] || return 0
     log "install collected paths after package installation"
     rsync -rltD --no-perms "$stage/" /
@@ -647,6 +645,25 @@ apt-get -o Dpkg::Options::=--force-confold install -y \
 DEBIAN_FRONTEND=noninteractive dpkg --force-confold --configure -a || apt_result=1
 [ "$policy_created" -eq 0 ] || rm -f /usr/sbin/policy-rc.d
 [ "$apt_result" -eq 0 ] || { log "ERROR: package installation/configuration failed"; exit 1; }
+restore_system_curl() {
+    if dpkg-divert --list /usr/bin/curl 2>/dev/null | grep -q '/usr/bin/curl'; then
+        rm -f /usr/bin/curl /bin/curl 2>/dev/null || true
+        dpkg-divert --rename --remove /usr/bin/curl 2>/dev/null || true
+    fi
+    if [ ! -x /usr/bin/curl ] || [ -L /usr/bin/curl ]; then
+        rm -f /usr/bin/curl /bin/curl 2>/dev/null || true
+        apt-get install --reinstall -y curl >/dev/null 2>&1 || true
+    fi
+    if [ ! -x /usr/bin/curl ] && [ -x /usr/bin/curl.distrib ]; then
+        cp -f /usr/bin/curl.distrib /usr/bin/curl
+        chmod 0755 /usr/bin/curl
+    fi
+    hash -r 2>/dev/null || true
+}
+restore_system_curl
+chmod 755 /usr /usr/local 2>/dev/null || true
+[ ! -d /usr/local/bin ] || chmod 755 /usr/local/bin 2>/dev/null || true
+[ ! -d /usr/local/sbin ] || chmod 755 /usr/local/sbin 2>/dev/null || true
 apt-get remove -y apport || true
 apt-get autoremove -y || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
@@ -775,9 +792,40 @@ fix_postgresql_config_permissions() {
 ensure_postgresql_cluster() {
     pg_major="$(pg_config --version | sed -n 's/^PostgreSQL \([0-9][0-9]*\).*/\1/p')"
     [ -n "$pg_major" ] || { log "ERROR: cannot detect PostgreSQL major version"; return 1; }
+
+    normalize_pg_config() {
+        cfg_dir="/etc/postgresql/$pg_major/main"
+        [ -f "$cfg_dir/postgresql.conf" ] || return 0
+        sed -i -E \
+            -e "s#^[[:space:]]*data_directory[[:space:]]*=.*#data_directory = '/var/lib/postgresql/$pg_major/main'#" \
+            -e "s#^[[:space:]]*hba_file[[:space:]]*=.*#hba_file = '/etc/postgresql/$pg_major/main/pg_hba.conf'#" \
+            -e "s#^[[:space:]]*ident_file[[:space:]]*=.*#ident_file = '/etc/postgresql/$pg_major/main/pg_ident.conf'#" \
+            -e "s#^[[:space:]]*external_pid_file[[:space:]]*=.*#external_pid_file = '/var/run/postgresql/$pg_major-main.pid'#" \
+            -e "s#^[[:space:]]*cluster_name[[:space:]]*=.*#cluster_name = '$pg_major/main'#" \
+            "$cfg_dir/postgresql.conf" 2>/dev/null || true
+    }
+
+    restore_pg_config_if_missing() {
+        cfg_dir="/etc/postgresql/$pg_major/main"
+        [ -f "$cfg_dir/postgresql.conf" ] && return 0
+        source_dir="$(find /etc/postgresql -path '*/main/postgresql.conf' -printf '%h\n' 2>/dev/null | grep -v "^$cfg_dir$" | sort -V | tail -1)"
+        [ -n "$source_dir" ] || return 0
+        mkdir -p "$cfg_dir"
+        cp -a "$source_dir/." "$cfg_dir/"
+        source_major="$(basename "$(dirname "$source_dir")")"
+        if [ -n "$source_major" ] && [ "$source_major" != "$pg_major" ]; then
+            sed -i "s#/postgresql/$source_major/#/postgresql/$pg_major/#g; s#postgresql-$source_major#postgresql-$pg_major#g" "$cfg_dir"/*.conf 2>/dev/null || true
+        fi
+        normalize_pg_config
+    }
+
     if [ -s "/var/lib/postgresql/$pg_major/main/PG_VERSION" ]; then
-        pg_ctlcluster "$pg_major" main start 2>/dev/null || true
-        pg_isready -q && return 0
+        restore_pg_config_if_missing
+        normalize_pg_config
+        fix_postgresql_config_permissions "$pg_major"
+        systemctl restart "postgresql@$pg_major-main.service" 2>/dev/null || systemctl restart postgresql 2>/dev/null || true
+        pg_isready -q || { log "ERROR: existing PostgreSQL data directory is present but cluster $pg_major/main is not ready"; return 1; }
+        return 0
     fi
 
     source_major="$(find /etc/postgresql -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+$' | sort -V | tail -1)"
@@ -791,8 +839,10 @@ ensure_postgresql_cluster() {
         [ "$old_major" = "$pg_major" ] && continue
         mv "$old_dir" "/etc/postgresql/.auto_sync_saved_${old_major}_$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
     done
-    pg_dropcluster --stop "$pg_major" main 2>/dev/null || true
-    rm -rf "/etc/postgresql/$pg_major/main" "/var/lib/postgresql/$pg_major/main"
+    mkdir -p "/var/lib/postgresql/$pg_major"
+    chown postgres:postgres /var/lib/postgresql "/var/lib/postgresql/$pg_major" 2>/dev/null || true
+    chmod 755 /var/lib/postgresql "/var/lib/postgresql/$pg_major" 2>/dev/null || true
+    rm -rf "/etc/postgresql/$pg_major/main"
     pg_createcluster --port 5432 "$pg_major" main --start
     if [ -f "$source_copy/postgresql.conf" ]; then
         for config in postgresql.conf pg_hba.conf pg_ident.conf pg_ctl.conf start.conf environment; do
@@ -801,10 +851,7 @@ ensure_postgresql_cluster() {
         if [ -n "$source_major" ] && [ "$source_major" != "$pg_major" ]; then
             sed -i "s#/postgresql/$source_major/#/postgresql/$pg_major/#g; s#postgresql-$source_major#postgresql-$pg_major#g" /etc/postgresql/$pg_major/main/*.conf 2>/dev/null || true
         fi
-        sed -i -E \
-            -e "s#^[[:space:]]*external_pid_file[[:space:]]*=.*#external_pid_file = '/var/run/postgresql/$pg_major-main.pid'#" \
-            -e "s#^[[:space:]]*cluster_name[[:space:]]*=.*#cluster_name = '$pg_major/main'#" \
-            "/etc/postgresql/$pg_major/main/postgresql.conf"
+        normalize_pg_config
     fi
     rm -rf "$source_copy"
     fix_postgresql_config_permissions "$pg_major"
@@ -1176,6 +1223,7 @@ text = text.replace(
     'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --locked --extra cpu --no-dev --compile-bytecode',
     'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --extra cpu --no-dev --compile-bytecode',
 )
+text = text.replace('/opt/software/src', '/opt/src/software')
 path.write_text(text)
 PY_PATCH_IMMICH
     }
@@ -1792,6 +1840,11 @@ if [ -f /etc/systemd/system/halo2.service ]; then
     fi
 fi
 systemctl daemon-reload
+if [ -f /etc/systemd/system/redis.service ] && [ -f /usr/lib/systemd/system/redis-server.service ] &&
+   cmp -s /etc/systemd/system/redis.service /usr/lib/systemd/system/redis-server.service; then
+    rm -f /etc/systemd/system/redis.service
+    systemctl daemon-reload
+fi
 for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray rblog rblog-backup.timer nginx cron; do
     restart_if_exists "$s"
 done
