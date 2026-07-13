@@ -106,8 +106,8 @@ Web API 默认监听配置里的 `port`（通常 `18765`）；局域网机器通
 # Windows（在 Windows 本机运行）：构建到仓库 bin\，用当前用户登录任务启动单个 auto_sync 进程
 pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1
 
-# Linux / NAS（在目标机本机运行）：构建到 /opt/auto_sync，安装 systemd unit 并启动
-scripts/deploy_local.sh --install-dir /opt/auto_sync
+# NAS（在 NAS 本机运行）：构建到 /opt/auto_sync，安装 systemd unit 并启动
+scripts/deploy_nas.sh
 
 # OpenWrt：交叉编译 aarch64，安装 procd init 脚本
 scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
@@ -551,14 +551,15 @@ curl -s -X POST http://127.0.0.1:18765/api/sync-destination-now \
 | 目标 | 命令（在目标机本机运行） | 说明 |
 | --- | --- | --- |
 | Windows | `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1` | 构建到仓库 `bin\`，当前用户登录任务启动单进程；不装 Windows 服务。运行时进程以管理员权限自启（读 USN Journal）。 |
-| Linux / NAS | `scripts/deploy_local.sh --install-dir /opt/auto_sync` | 本机编译、装 systemd unit 并启动 `auto_sync.service`；首次自动补齐 Ubuntu/Debian 构建依赖和 Rust stable。 |
+| NAS | `scripts/deploy_nas.sh` | 本机编译到 `/opt/auto_sync`、装 systemd unit 并启动 `auto_sync.service`；首次自动补齐 Ubuntu/Debian 构建依赖和 Rust stable。 |
+| Linux / dev | `scripts/deploy_local.sh --install-dir /usr/local/auto_sync` | 通用 Linux 本机部署入口，dev 默认使用 `/usr/local/auto_sync`。 |
 | OpenWrt | `scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root` | 交叉编译 aarch64，渲染 `conf/auto_sync.procd` 为 `/etc/init.d/auto_sync`。 |
 
 标准更新路径（NAS 直接在 NAS 上执行，保留构建缓存，不 `git reset --hard`、不清 `target`）：
 
 ```bash
 # NAS
-ssh -p 10022 root@192.168.2.247 "cd /opt/auto_sync && git pull --ff-only && scripts/deploy_local.sh --install-dir /opt/auto_sync"
+ssh -p 10022 root@192.168.2.247 "cd /opt/auto_sync && git pull --ff-only && scripts/deploy_nas.sh"
 ```
 
 systemd unit 由 `auto_syncctl print-systemd` 生成（不在 `conf/` 里）。fanotify 需较高权限：daemon 需 `CAP_DAC_READ_SEARCH`（懒加载 handle 解析）与 `CAP_SYS_ADMIN`（filesystem mark），同步只读目录还需 `CAP_DAC_OVERRIDE`；磁盘 standby 主动停转（`hdparm -y` 的 `HDIO_DRIVE_CMD` ioctl）需 `CAP_SYS_RAWIO`（`CAP_SYS_ADMIN` 不够）。unit 均已授予。
