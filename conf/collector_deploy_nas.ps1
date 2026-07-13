@@ -514,7 +514,7 @@ apt-get -o Dpkg::Options::=--force-confold install -y \
     python3-pip ruby luajit netcat-openbsd gperf cscope exuberant-ctags vim-nox git git-lfs lcov graphviz \
     libgeoip-dev libxml2-dev libxslt1.1 libxslt1-dev libatomic-ops-dev libgd-dev libperl-dev libluajit-5.1-dev tcl-dev ruby-dev libncurses-dev \
     mysql-server postgresql postgresql-client libpq-dev postgresql-contrib sysstat nginx-full libnginx-mod-stream \
-    ffmpeg libimage-exiftool-perl libgl1 libvips-dev libvips-tools openjdk-21-jdk-headless postgresql-server-dev-all redis quota || apt_result=1
+    ffmpeg imagemagick libheif-examples heif-gdk-pixbuf libimage-exiftool-perl libgl1 libvips-dev libvips-tools openjdk-21-jdk-headless postgresql-server-dev-all redis quota || apt_result=1
 DEBIAN_FRONTEND=noninteractive dpkg --force-confold --configure -a || apt_result=1
 [ "$policy_created" -eq 0 ] || rm -f /usr/sbin/policy-rc.d
 [ "$apt_result" -eq 0 ] || { log "ERROR: package installation/configuration failed"; exit 1; }
@@ -1491,16 +1491,21 @@ repair_immich_media_derivatives() {
     IMMICH_DERIVATIVE_REPAIR_LIMIT="${IMMICH_DERIVATIVE_REPAIR_LIMIT:-200}" python3 - <<'PY_IMMICH_DERIVATIVE_REPAIR' || log "WARN: immich media derivative repair failed"
 import json
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 UPLOAD_ROOT = Path("/opt/immich/upload")
 LIMIT = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_LIMIT", "200") or "200")
 
 
-def run(cmd, *, check=True):
-    return subprocess.run(cmd, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def run(cmd, *, check=True, timeout=None):
+    try:
+        return subprocess.run(cmd, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(cmd, 124, exc.stdout or "", exc.stderr or "timeout")
 
 
 def psql(sql):
@@ -1512,10 +1517,10 @@ def q(value):
 
 
 def first_color_stream(path):
-    result = run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(path)], check=False)
-    if result.returncode != 0:
+    result = probe_json(path)
+    if result is None:
         return None
-    streams = json.loads(result.stdout or "{}").get("streams", [])
+    streams = result.get("streams", [])
     first_video = None
     for stream in streams:
         if stream.get("codec_type") != "video":
@@ -1526,6 +1531,55 @@ def first_color_stream(path):
         if not str(stream.get("pix_fmt", "")).startswith("gray"):
             return idx
     return first_video
+
+
+def probe_json(path):
+    result = run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(path)], check=False)
+    if result.returncode != 0:
+        return None
+    return json.loads(result.stdout or "{}")
+
+
+def tile_grid_info(path):
+    result = run(["ffmpeg", "-hide_banner", "-i", str(path)], check=False)
+    lines = ((result.stdout or "") + (result.stderr or "")).splitlines()
+    line = next((entry for entry in lines if "Tile Grid:" in entry and "(default)" in entry), None)
+    if line is None:
+        line = next((entry for entry in lines if "Tile Grid:" in entry), None)
+    if line is None:
+        return None
+    dim_match = re.search(r"(\d+)x(\d+)(?: \(default\))?$", line.strip())
+    pix_match = re.search(r"\),\s*([^,\s(]+)\(", line)
+    if not dim_match or not pix_match:
+        return None
+    width, height = int(dim_match.group(1)), int(dim_match.group(2))
+    pix_fmt = pix_match.group(1)
+    info = probe_json(path)
+    if info is None:
+        return None
+    color_streams = [
+        stream for stream in info.get("streams", [])
+        if stream.get("codec_type") == "video" and stream.get("pix_fmt") == pix_fmt and not str(stream.get("pix_fmt", "")).startswith("gray")
+    ]
+    if not color_streams:
+        return None
+    groups = {}
+    for stream in color_streams:
+        key = (int(stream.get("width") or 0), int(stream.get("height") or 0))
+        groups.setdefault(key, []).append(int(stream["index"]))
+    candidates = []
+    for (tile_w, tile_h), indexes in groups.items():
+        if tile_w <= 0 or tile_h <= 0:
+            continue
+        cols = (width + tile_w - 1) // tile_w
+        rows = (height + tile_h - 1) // tile_h
+        needed = cols * rows
+        if len(indexes) >= needed:
+            candidates.append((tile_w * tile_h, tile_w, tile_h, cols, rows, sorted(indexes)[:needed]))
+    if not candidates:
+        return None
+    _, tile_w, tile_h, cols, rows, tiles = max(candidates)
+    return width, height, tile_w, tile_h, cols, rows, tiles
 
 
 def scale_filter(size):
@@ -1539,12 +1593,71 @@ def video_filter(size):
     )
 
 
-def make_image(src, dst, size, stream):
+def output_quality_args(kind):
+    if kind == "thumbnail":
+        return ["-quality", "95"]
+    return ["-q:v", "1"]
+
+
+def make_image(src, dst, size, stream, kind):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
     if stream is not None:
         cmd += ["-map", f"0:{stream}"]
-    cmd += ["-frames:v", "1", "-vf", scale_filter(size), "-q:v", "2", str(dst)]
+    cmd += ["-frames:v", "1", "-vf", scale_filter(size), *output_quality_args(kind), str(dst)]
     return run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0
+
+
+def make_image_from_source(src, dst, size, kind):
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-frames:v", "1", "-vf", scale_filter(size), *output_quality_args(kind), str(dst)]
+    return run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0
+
+
+def make_normal_image_source(src, work_dir):
+    dst = Path(work_dir) / "normal.jpg"
+    if shutil.which("convert"):
+        cmd = ["convert", str(src), "-auto-orient", str(dst)]
+        if run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            return dst
+    if shutil.which("heif-convert"):
+        cmd = ["heif-convert", str(src), str(dst)]
+        if run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            return dst
+    return None
+
+
+def make_tile_grid_source(src, work_dir, orientation):
+    info = tile_grid_info(src)
+    if info is None:
+        return None
+    width, height, tile_w, tile_h, cols, rows, tiles = info
+    tile_paths = []
+    for position, stream_index in enumerate(tiles):
+        tile_path = Path(work_dir) / f"tile_{position:03d}.jpg"
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-map", f"0:{stream_index}", "-frames:v", "1", "-q:v", "1", str(tile_path)]
+        if run(cmd, check=False, timeout=20).returncode != 0 or not tile_path.exists() or tile_path.stat().st_size == 0:
+            return None
+        tile_paths.append(tile_path)
+    inputs = []
+    for tile_path in tile_paths:
+        inputs.extend(["-i", str(tile_path)])
+    layout = "|".join(f"{(idx % cols) * tile_w}_{(idx // cols) * tile_h}" for idx in range(len(tile_paths)))
+    full_path = Path(work_dir) / "tile_grid_full.jpg"
+    filters = [f"xstack=inputs={len(tile_paths)}:layout={layout}", f"crop={width}:{height}:0:0"]
+    if str(orientation) == "6":
+        filters.append("transpose=1")
+    elif str(orientation) == "8":
+        filters.append("transpose=2")
+    elif str(orientation) == "3":
+        filters.append("transpose=1,transpose=1")
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *inputs,
+        "-filter_complex", ",".join(filters),
+        "-frames:v", "1", "-q:v", "1", str(full_path),
+    ]
+    if run(cmd, check=False, timeout=120).returncode != 0 or not full_path.exists() or full_path.stat().st_size == 0:
+        return None
+    return full_path
 
 
 def make_video(src, dst, size):
@@ -1554,6 +1667,35 @@ def make_video(src, dst, size):
         return True
     cmd = base + ["-vf", scale_filter(size), "-q:v", "2", str(dst)]
     return run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0
+
+
+def image_mean(path):
+    if not shutil.which("identify"):
+        return 1.0
+    result = run(["identify", "-format", "%[mean]", str(path)], check=False)
+    if result.returncode != 0:
+        return 0.0
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def representative_video_frame(src, work_dir):
+    best = None
+    best_mean = -1.0
+    for index, second in enumerate((1.0, 3.0, 5.0, 8.0)):
+        frame = Path(work_dir) / f"frame_{index}.jpg"
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{second:.3f}", "-i", str(src), "-map", "0:v:0", "-frames:v", "1", "-vf", "scale=1920:-2", "-q:v", "2", str(frame)]
+        if run(cmd, check=False, timeout=20).returncode != 0 or not frame.exists() or frame.stat().st_size == 0:
+            continue
+        mean = image_mean(frame)
+        if mean > best_mean:
+            best = frame
+            best_mean = mean
+        if mean > 3000:
+            break
+    return best
 
 
 def upsert(asset_id, kind, path):
@@ -1571,34 +1713,55 @@ def asset_dir(owner_id, asset_id):
 
 
 query = f"""
-WITH missing AS (
-    SELECT a.id, a.type, a."ownerId", a."originalPath"
+WITH files AS (
+    SELECT a.id, a.type, a."ownerId", a."originalPath", a."fileModifiedAt", a."createdAt",
+           max(e.orientation) AS orientation,
+           max(CASE WHEN af.type = 'thumbnail' THEN af.path END) AS thumbnail,
+           max(CASE WHEN af.type = 'preview' THEN af.path END) AS preview,
+           max(CASE WHEN af.type = 'fullsize' THEN af.path END) AS fullsize,
+           max(CASE WHEN af.type = 'thumbnail' THEN (pg_stat_file(af.path, true)).size END) AS thumbnail_bytes,
+           max(CASE WHEN af.type = 'preview' THEN (pg_stat_file(af.path, true)).size END) AS preview_bytes,
+           max(CASE WHEN af.type = 'fullsize' THEN (pg_stat_file(af.path, true)).size END) AS fullsize_bytes
     FROM asset a
+    LEFT JOIN asset_file af ON af."assetId" = a.id AND af."isEdited" = false
+    LEFT JOIN asset_exif e ON e."assetId" = a.id
     WHERE a."deletedAt" IS NULL
       AND a."originalPath" IS NOT NULL
-      AND (
-        (a.type = 'IMAGE' AND lower(a."originalPath") ~ '\\.(heic|heif)$')
-        OR a.type = 'VIDEO'
+    GROUP BY a.id, a.type, a."ownerId", a."originalPath", a."fileModifiedAt", a."createdAt"
+),
+missing AS (
+    SELECT id, type, "ownerId", "originalPath", orientation, "fileModifiedAt", "createdAt"
+    FROM files
+    WHERE (
+        type = 'VIDEO'
+        AND (thumbnail IS NULL OR preview IS NULL OR coalesce(thumbnail_bytes, 0) < 1000)
       )
-      AND (
-        NOT EXISTS (SELECT 1 FROM asset_file af WHERE af."assetId" = a.id AND af.type = 'thumbnail' AND af."isEdited" = false)
-        OR NOT EXISTS (SELECT 1 FROM asset_file af WHERE af."assetId" = a.id AND af.type = 'preview' AND af."isEdited" = false)
-        OR (a.type = 'IMAGE' AND NOT EXISTS (SELECT 1 FROM asset_file af WHERE af."assetId" = a.id AND af.type = 'fullsize' AND af."isEdited" = false))
-        OR a."originalPath" IN (
-          '/opt/immich/upload/library/admin/2026/2026-07-12/6390.heic',
-          '/opt/immich/upload/library/admin/2026/2026-07-11/IMG_1229.mov'
+      OR (
+        type = 'IMAGE'
+        AND lower("originalPath") ~ '\\.(heic|heif)$'
+        AND (
+            thumbnail IS NULL OR preview IS NULL OR fullsize IS NULL
+            OR coalesce(thumbnail_bytes, 0) < 1000
+            OR coalesce(preview_bytes, 0) < 50000
+            OR coalesce(fullsize_bytes, 0) < 50000
         )
       )
-    ORDER BY a."fileModifiedAt" DESC NULLS LAST, a."createdAt" DESC
+      OR "originalPath" IN (
+        '/opt/immich/upload/library/admin/2026/2026-07-12/6390.heic',
+        '/opt/immich/upload/library/admin/2026/2026-07-11/IMG_1229.mov',
+        '/opt/immich/upload/library/admin/2026/2026-07-11/IMG_1228.mov',
+        '/opt/immich/upload/library/admin/2026/2026-06-07/IMG_1101.heic'
+      )
+    ORDER BY "fileModifiedAt" DESC NULLS LAST, "createdAt" DESC
     LIMIT {LIMIT}
 )
-SELECT id, type, "ownerId", "originalPath" FROM missing
+SELECT id, type, "ownerId", "originalPath", coalesce(orientation, '') FROM missing
 """
 
-rows = [line.split("\t", 3) for line in psql(query).splitlines() if line.strip()]
+rows = [line.split("\t", 4) for line in psql(query).splitlines() if line.strip()]
 ok = 0
 failed = 0
-for asset_id, asset_type, owner_id, original_path in rows:
+for asset_id, asset_type, owner_id, original_path, orientation in rows:
     src = Path(original_path)
     if not src.exists():
         failed += 1
@@ -1608,19 +1771,31 @@ for asset_id, asset_type, owner_id, original_path in rows:
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         if asset_type == "IMAGE":
-            stream = first_color_stream(src)
             outputs = [
-                ("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 250),
-                ("preview", out_dir / f"{asset_id}_preview.jpeg", 1440),
-                ("fullsize", out_dir / f"{asset_id}_fullsize.jpeg", 3840),
+                ("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 512),
+                ("preview", out_dir / f"{asset_id}_preview.jpeg", 2048),
+                ("fullsize", out_dir / f"{asset_id}_fullsize.jpeg", 4096),
             ]
-            made = [(kind, path) for kind, path, size in outputs if make_image(src, path, size, stream)]
+            with tempfile.TemporaryDirectory(prefix="immich-derivative-") as temp_dir:
+                source = make_normal_image_source(src, temp_dir)
+                if source is None:
+                    source = make_tile_grid_source(src, temp_dir, orientation)
+                if source is not None:
+                    made = [(kind, path) for kind, path, size in outputs if make_image_from_source(source, path, size, kind)]
+                else:
+                    stream = first_color_stream(src)
+                    made = [(kind, path) for kind, path, size in outputs if make_image(src, path, size, stream, kind)]
         else:
             outputs = [
-                ("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 250),
-                ("preview", out_dir / f"{asset_id}_preview.jpeg", 1440),
+                ("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 512),
+                ("preview", out_dir / f"{asset_id}_preview.jpeg", 2048),
             ]
-            made = [(kind, path) for kind, path, size in outputs if make_video(src, path, size)]
+            with tempfile.TemporaryDirectory(prefix="immich-derivative-") as temp_dir:
+                frame = representative_video_frame(src, temp_dir)
+                if frame is not None:
+                    made = [(kind, path) for kind, path, size in outputs if make_image_from_source(frame, path, size, kind)]
+                else:
+                    made = [(kind, path) for kind, path, size in outputs if make_video(src, path, size)]
         if not made:
             failed += 1
             print(f"ffmpeg failed: {asset_id} {src}")
