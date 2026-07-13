@@ -4,29 +4,33 @@ This file records the intended real paths for dev and NAS. Keep collector
 paths, deployment scripts, systemd units, and shell environment setup aligned
 with this table.
 
-## NAS
+## Host Path Matrix
 
-NAS has a small root disk. Large software trees and most user-home state live
-under `/opt`.
+NAS has a small root disk, so large software trees and most user-home state live
+under `/opt`. Dev has a large root SSD and intentionally does not mirror NAS
+symlinks.
 
-| Component | Real path on NAS | Notes |
-| --- | --- | --- |
-| auto_sync | `/opt/usr/local/auto_sync` | Normal NAS deployment target. `scripts/deploy_nas.sh` must run from and deploy to this path. |
-| rblog | `/opt/usr/local/blog` | Service units must use `/opt/usr/local/blog`, including `.backup-worktree`. |
-| Go SDK | `/opt/usr/local/go/go1.25.1` | `/etc/profile.d/opt-usr-local-path.sh` adds this `bin` directory to `PATH`. |
-| `/usr/local/bin` tools | `/opt/usr/local/bin` | Includes tools such as `buildifier`; do not recreate `/usr/local/bin` as a bind mount. |
-| Halo | `/opt/usr/local/halo` | Runtime home is `/root/.halo` and `/root/.halo2`, both symlinked to `/opt/user/root`. |
-| shadowsocks | `/opt/usr/local/shadowsocks` | Directory is supported for collected config/data/logs, but service startup may be disabled when xray owns the ports. |
-| TBox | `/opt/usr/local/tbox` | `tbox_client.service` and logrotate paths must point here. |
-| Waiwei | `/opt/usr/local/waiwei` | `waiwei-web` and `waiwei-puller` units run from here. |
-| Xray | `/opt/usr/local/xray` | `xray.service` uses binaries and data from here. |
-| Immich runtime | `/opt/immich` | Immich is deployed under `/opt`, not `/usr/local`. |
-| Immich source checkout | `/opt/src/software/immich` | Uses the `deploy` branch and native deployment, not Docker. |
-| Flutter SDK | `/opt/src/software/flutter` | Used by NAS web build. |
-| NVM / Node | `/opt/src/software/tools/nvm` | `/root/.nvm` and `/home/tiger/.nvm` should point here on NAS. |
-| pgvector and source tools | `/opt/src/software` | NAS source/tool checkout root. |
-| root home spillover | `/opt/user/root` | Most `/root` dotfiles and `/root/src` are symlinked here. |
-| tiger home spillover | `/opt/user/tiger` | Selected `/home/tiger` dotfiles are symlinked here. |
+| Component | NAS real path | Dev real path | Notes |
+| --- | --- | --- | --- |
+| auto_sync | `/opt/usr/local/auto_sync` | `/usr/local/auto_sync` | NAS uses `scripts/deploy_nas.sh`; dev uses `scripts/deploy_local.sh --install-dir /usr/local/auto_sync`. |
+| rblog | `/opt/usr/local/blog` | `/usr/local/blog` | Service units must use the host-specific path. NAS `.backup-worktree` is under `/opt/usr/local/blog`. |
+| Go SDK | `/opt/usr/local/go/go1.25.1` | `/usr/local/go/go1.25.1` | NAS adds Go to `PATH` via `/etc/profile.d/opt-usr-local-path.sh`; dev uses normal `/usr/local/go`. |
+| GOPATH | `/root/src/go` via `/opt/user/root/src/go` symlink | `/root/src/go` | Do not recreate `/root/go`. |
+| bin tools | `/opt/usr/local/bin` | `/usr/local/bin` | Includes tools such as `buildifier`. Do not recreate `/usr/local/bin` as a NAS bind mount. |
+| buildifier | `/opt/usr/local/bin/buildifier` | `/usr/local/bin/buildifier` | Installed by collector deployment scripts. |
+| Halo install | `/opt/usr/local/halo` | `/usr/local/halo` | Runs as root on both hosts. |
+| Halo runtime home | `/root/.halo`, `/root/.halo2` symlinked to `/opt/user/root` | `/root/.halo`, `/root/.halo2` real local paths | NAS keeps root home state off the root disk. |
+| shadowsocks | `/opt/usr/local/shadowsocks` | `/usr/local/shadowsocks` | Directory is supported for collected config/data/logs; service startup may be disabled when xray owns the ports. |
+| TBox | `/opt/usr/local/tbox` | `/usr/local/tbox` | `tbox_client.service` and logrotate paths must point to the host-specific path. |
+| Waiwei | `/opt/usr/local/waiwei` | `/usr/local/waiwei` | `waiwei-web` and `waiwei-puller` units run from here. |
+| Xray | `/opt/usr/local/xray` | `/usr/local/xray` | `xray.service` uses binaries and data from here. |
+| Immich runtime | `/opt/immich` | `/usr/local/immich` | Native deployment, not Docker. |
+| Immich source checkout | `/opt/src/software/immich` | `/root/src/software/immich` | Uses the `deploy` branch. |
+| Flutter SDK | `/opt/src/software/flutter` | `/root/src/software/flutter` | NAS wrapper sets `FLUTTER_ROOT`; generic/dev default is `/root/src/software/flutter`. |
+| NVM / Node | `/opt/src/software/tools/nvm` | `/root/src/software/tools/nvm` | NAS `/root/.nvm` and `/home/tiger/.nvm` should point to the `/opt` location. |
+| pgvector and source tools | `/opt/src/software` | `/root/src/software` | Dev source tools include `aarch64-linux-musl-cross`. |
+| root home spillover | `/opt/user/root` | none; `/root` is real | NAS symlinks most `/root` dotfiles and `/root/src` here. |
+| tiger home spillover | `/opt/user/tiger` | none; `/home/tiger` is real | NAS symlinks selected `/home/tiger` dotfiles here. |
 
 NAS must not bind-mount `/opt/usr/local` back to `/usr/local`. Old paths such
 as `/usr/local/blog`, `/usr/local/go`, `/usr/local/halo`, `/usr/local/tbox`,
@@ -35,30 +39,6 @@ removing the bind mount or old symlink, not by deleting through `/usr/local`.
 The collector NAS deployment script keeps migration logic for the historical
 `/opt/auto_sync` and `/usr/local/*` layouts, but the final systemd and runtime
 paths should be `/opt/usr/local/*`.
-
-## Dev
-
-Dev has a large root SSD. It intentionally does not mirror NAS symlinks.
-
-| Component | Real path on dev | Notes |
-| --- | --- | --- |
-| auto_sync | `/usr/local/auto_sync` | Dev deployment target and machine `install_dir`. |
-| rblog | `/usr/local/blog` | Service units use the normal `/usr/local` layout on dev. |
-| Go SDK | `/usr/local/go/go1.25.1` | GOPATH remains `/root/src/go`. |
-| GOPATH | `/root/src/go` | Do not recreate `/root/go`. |
-| buildifier | `/usr/local/bin/buildifier` | Dev uses the normal `/usr/local/bin`. |
-| Halo | `/usr/local/halo` | Runs as root; runtime home is `/root/.halo` and `/root/.halo2` as real local paths. |
-| shadowsocks | `/usr/local/shadowsocks` | Dev collector path stays under `/usr/local`. |
-| TBox | `/usr/local/tbox` | Dev service units use `/usr/local/tbox`. |
-| Waiwei | `/usr/local/waiwei` | Dev service units use `/usr/local/waiwei`. |
-| Xray | `/usr/local/xray` | Dev service units use `/usr/local/xray`. |
-| Immich runtime | `/usr/local/immich` | Dev does not use `/opt/immich`. |
-| Immich source checkout | `/root/src/software/immich` | Native deployment, not Docker. |
-| Flutter SDK | `/root/src/software/flutter` when installed for shared dev use | Do not leave `/root/flutter` symlinks. |
-| NVM / Node | `/root/src/software/tools/nvm` | Dev should not use `/usr/local/src/software` or `/opt/src/software` for tools. |
-| pgvector and source tools | `/root/src/software` | Includes toolchains such as `aarch64-linux-musl-cross`. |
-| root home | `/root` | Real local path, not a symlink to `/opt/user/root`. |
-| tiger home | `/home/tiger` | Real local path, not a symlink to `/opt/user/tiger`. |
 
 The dev collector deployment script should restore any accidental `/opt/user`
 symlinks back to real local files/directories, move old `/opt/src/software` or
