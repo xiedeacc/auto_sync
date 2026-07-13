@@ -27,7 +27,7 @@ symlinks.
 | Immich runtime | `/opt/immich` | `/usr/local/immich` | Native deployment, not Docker. |
 | Immich source checkout | `/opt/src/software/immich` | `/root/src/software/immich` | Uses the `deploy` branch. |
 | Flutter SDK | `/opt/src/software/flutter` | `/root/src/software/flutter` | NAS wrapper sets `FLUTTER_ROOT`; generic/dev default is `/root/src/software/flutter`. |
-| NVM root | `/opt/src/software/tools/nvm` | `/root/src/software/tools/nvm` | NAS `/root/.nvm` points to the `/opt` location. Tiger user nvm/npm state should not be recreated. |
+| NVM root | `/opt/src/software/tools/nvm` | `/root/src/software/tools/nvm` | Deployment uses this as `NVM_DIR`; NAS `/root/.nvm` itself stays under `/opt/user/root` with the rest of root home. Tiger user nvm/npm state should not be recreated. |
 | Node.js | `/opt/src/software/tools/nvm/versions/node/v24.18.0` | `/root/src/software/tools/nvm/versions/node/v24.18.0` | Installed by nvm; deployment scripts may fall back to latest Node 24. |
 | npm | Node.js `bin/npm` under the nvm root | Node.js `bin/npm` under the nvm root | npm registry is configured by deployment scripts. |
 | pnpm | Node.js/Corepack-managed binary under the nvm root | Node.js/Corepack-managed binary under the nvm root | Installed or activated after Node setup. |
@@ -37,7 +37,7 @@ symlinks.
 | Rust toolchain | `/root/.cargo`, `/root/.rustup` symlinked to `/opt/user/root` | `/root/.cargo`, `/root/.rustup` real local paths | Installed by rustup; cargo registry mirror lives in `/root/.cargo/config.toml`. |
 | Java / JDK | apt OpenJDK at `/usr/lib/jvm/java-21-openjdk-amd64` | apt OpenJDK at `/usr/lib/jvm/java-21-openjdk-amd64` | Do not recreate `/usr/local/java`; `JAVA_HOME` points to the apt JDK. |
 | pgvector and source tools | `/opt/src/software` | `/root/src/software` | Dev source tools include `aarch64-linux-musl-cross`. |
-| root home spillover | `/opt/user/root` | none; `/root` is real | NAS symlinks most `/root` dotfiles and `/root/src` here. |
+| root home spillover | `/opt/user/root` | none; `/root` is real | NAS symlinks every `/root` child here except `/root/.ssh`, which remains real for SSH login safety. |
 | tiger home spillover | `/opt/user/tiger` | none; `/home/tiger` is real | NAS symlinks selected `/home/tiger` dotfiles here. |
 
 NAS must not bind-mount `/opt/usr/local` back to `/usr/local`. Old paths such

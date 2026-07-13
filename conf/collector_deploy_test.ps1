@@ -724,7 +724,7 @@ done <<'EOF_OPT_LINKS'
 /root/.local|/opt/user/root/.local|dir|root:root
 /root/.npm|/opt/user/root/.npm|dir|root:root
 /root/.npmrc|/opt/user/root/.npmrc|file|root:root
-/root/.nvm|/opt/src/software/tools/nvm|dir|root:root
+/root/.nvm|/opt/user/root/.nvm|dir|root:root
 /root/.oh-my-zsh|/opt/user/root/.oh-my-zsh|dir|root:root
 /root/.profile|/opt/user/root/.profile|file|root:root
 /root/.rustup|/opt/user/root/.rustup|dir|root:root
@@ -1695,24 +1695,47 @@ for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
 done
-migrate_halo_root_home() {
-    for name in .halo2; do
-        dest="/opt/user/root/$name"
-        mkdir -p "$dest"
-        for src in "/home/tiger/$name" "/opt/user/tiger/$name"; do
-            [ -e "$src" ] || [ -L "$src" ] || continue
-            if [ -d "$src" ]; then
-                rsync -aL "$src/" "$dest/" || true
-            fi
-            rm -rf "$src"
-        done
-        rm -rf "/root/$name"
-        ln -s "$dest" "/root/$name"
-        chown -R root:root "$dest" 2>/dev/null || true
-        chown -h root:root "/root/$name" 2>/dev/null || true
+migrate_root_home_to_opt() {
+    mkdir -p /opt/user/root
+
+    # Historical Halo state lived under tiger; merge it into root before the
+    # generic /root spillover pass creates /root/.halo2.
+    for src in /home/tiger/.halo2 /opt/user/tiger/.halo2; do
+        [ -e "$src" ] || [ -L "$src" ] || continue
+        mkdir -p /opt/user/root/.halo2
+        if [ -d "$src" ]; then
+            rsync -aL "$src/" /opt/user/root/.halo2/ || true
+        fi
+        rm -rf "$src"
     done
+
+    shopt -s dotglob nullglob
+    for src in /root/*; do
+        name="${src##*/}"
+        [ "$name" = ".ssh" ] && continue
+        dest="/opt/user/root/$name"
+        if [ -L "$src" ] && [ "$(readlink "$src")" = "$dest" ]; then
+            continue
+        fi
+        if [ -d "$src" ]; then
+            mkdir -p "$dest"
+            rsync -aL "$src/" "$dest/" || true
+        elif [ -f "$src" ] || [ -L "$src" ]; then
+            mkdir -p "$(dirname "$dest")"
+            cp -aL "$src" "$dest" 2>/dev/null || true
+        else
+            continue
+        fi
+        rm -rf "$src"
+        ln -s "$dest" "$src"
+    done
+    shopt -u dotglob nullglob
+
+    chown -R root:root /opt/user/root 2>/dev/null || true
+    find /root -mindepth 1 -maxdepth 1 ! -name .ssh -exec chown -h root:root {} + 2>/dev/null || true
+    chmod 700 /root /root/.ssh 2>/dev/null || true
 }
-migrate_halo_root_home
+migrate_root_home_to_opt
 python3 - <<'PY_TIGER_LINK_OWNERS'
 import os
 import pwd
