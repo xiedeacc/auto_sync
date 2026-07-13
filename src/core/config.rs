@@ -252,6 +252,10 @@ pub struct CollectorHost {
     /// `IdentityFile`: private key path; a leading `~` is expanded. Blank = ssh
     /// default key lookup.
     pub identity_file: String,
+    /// Optional deploy password. Used only by host deploy scripts through
+    /// `AS_PASSWORD`; normal collection still uses non-interactive key auth.
+    #[serde(default)]
+    pub password: String,
     /// Local root that every remote path is reconstructed under. e.g. root
     /// `D:\share\linux\aws` + remote `/usr/local/x` => `…\aws\usr\local\x`.
     pub root: PathBuf,
@@ -281,6 +285,7 @@ impl Default for CollectorHost {
             user: String::new(),
             port: 22,
             identity_file: String::new(),
+            password: String::new(),
             root: PathBuf::new(),
             paths: Vec::new(),
             exclude: Vec::new(),

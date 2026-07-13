@@ -7,15 +7,78 @@ $scp  = $env:AS_SCP
 $dest = $env:AS_DEST
 $root = $env:AS_ROOT
 
-$opts    = @('-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=15')
+$usingPassword = -not [string]::IsNullOrEmpty($env:AS_PASSWORD)
+$opts    = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=15','-o','NumberOfPasswordPrompts=1')
+if ($usingPassword) {
+    $opts += @('-o','BatchMode=no','-o','PreferredAuthentications=publickey,password,keyboard-interactive')
+} else {
+    $opts += @('-o','BatchMode=yes')
+}
 $sshArgs = @() + $opts
 $scpArgs = @('-r','-p') + $opts
 if (-not [string]::IsNullOrEmpty($env:AS_PORT)) { $sshArgs += @('-p', $env:AS_PORT); $scpArgs += @('-P', $env:AS_PORT) }
 if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KEY);  $scpArgs += @('-i', $env:AS_KEY) }
 
+$askpassDir = $null
+if ($usingPassword) {
+    $askpassDir = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_ssh_askpass_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $askpassDir | Out-Null
+    $askpassPs1 = Join-Path $askpassDir 'askpass.ps1'
+    $askpassCmd = Join-Path $askpassDir 'askpass.cmd'
+    $escapedPassword = $env:AS_PASSWORD.Replace("'", "''")
+    [IO.File]::WriteAllText($askpassPs1, "Write-Output '$escapedPassword'`r`n", [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($askpassCmd, "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$askpassPs1`"`r`n", [Text.ASCIIEncoding]::new())
+    $env:SSH_ASKPASS = $askpassCmd
+    $env:SSH_ASKPASS_REQUIRE = 'force'
+    if ([string]::IsNullOrEmpty($env:DISPLAY)) { $env:DISPLAY = 'auto_sync:0' }
+}
+
+function Clear-Askpass {
+    if ($script:askpassDir) {
+        Remove-Item -LiteralPath $script:askpassDir -Recurse -Force -ErrorAction SilentlyContinue
+        $script:askpassDir = $null
+    }
+}
+
 $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
+$deployExcludePaths = @(
+    '/usr/local/shadowsocks/bin/sslocal-master',
+    '/usr/local/shadowsocks/bin/sslocal-master-redir-nft.sh',
+    '/usr/local/shadowsocks/data/source',
+    '/usr/local/shadowsocks/data/temp/dns_cache.jsonl',
+    '/usr/local/shadowsocks/data/temp/domain_conflicts.jsonl',
+    '/usr/local/shadowsocks/data/temp/ip_conflicts.jsonl',
+    '/usr/local/shadowsocks/logs',
+    '/usr/local/shadowsocks/data/record.txt'
+)
+
+function Require-LocalValue([string]$Name, [string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        throw "$Name is required"
+    }
+}
+
+Require-LocalValue 'AS_SSH' $ssh
+Require-LocalValue 'AS_SCP' $scp
+Require-LocalValue 'AS_DEST' $dest
+Require-LocalValue 'AS_ROOT' $root
+if (-not (Get-Command $ssh -ErrorAction SilentlyContinue)) { throw "AS_SSH not found: $ssh" }
+if (-not (Get-Command $scp -ErrorAction SilentlyContinue)) { throw "AS_SCP not found: $scp" }
+if (-not (Test-Path -LiteralPath $root)) { throw "AS_ROOT not found: $root" }
+if ($collectPaths.Count -eq 0) { throw 'AS_COLLECT_PATHS is empty' }
+
+function Stop-IfErrors([string]$Phase) {
+    if ($script:errCount -gt 0) {
+        throw "$Phase failed with $script:errCount error(s); stopping before service/network changes"
+    }
+}
+
+function Test-RemoteConnection([string]$Target) {
+    & $ssh @sshArgs $Target "true" *> $null
+    return $LASTEXITCODE -eq 0
+}
 
 function Normalize-RemotePath([string]$Path) {
     $p = ($Path -replace '\\','/').Trim()
@@ -28,6 +91,10 @@ function Normalize-RemotePath([string]$Path) {
 function Test-RemoteExcluded([string]$Path) {
     $p = Normalize-RemotePath $Path
     foreach ($ex in $excludePaths) {
+        $e = Normalize-RemotePath $ex
+        if ($p -eq $e -or $p.StartsWith($e + '/')) { return $true }
+    }
+    foreach ($ex in $deployExcludePaths) {
         $e = Normalize-RemotePath $ex
         if ($p -eq $e -or $p.StartsWith($e + '/')) { return $true }
     }
@@ -110,14 +177,34 @@ function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
     Write-Host "stage $remote"
 }
 
-# Send the remote script base64-encoded as a plain ASCII argv and decode it on
-# the router. This avoids Windows PowerShell prepending a UTF-8 BOM to native
-# stdin (which made the remote `sh` choke on the first token) and sidesteps all
-# argv-quoting issues for multi-line scripts.
+# Send the remote script as a single shell-quoted argv and feed it to `sh` via
+# the POSIX `printf` builtin. Do not depend on `base64` here: a freshly reset
+# OpenWrt may not have it installed yet, and this function runs provisioning.
+function Quote-RemoteShellArg([string]$Value) {
+    return "'" + $Value.Replace("'", "'""'""'") + "'"
+}
+
 function Invoke-Remote([string]$Script) {
-    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Script))
-    & $ssh @sshArgs $dest "echo $b64 | base64 -d | sh"
-    if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
+    $quoted = Quote-RemoteShellArg $Script
+    & $ssh @sshArgs $dest "printf '%s' $quoted | sh"
+    if ($LASTEXITCODE -ne 0) {
+        $script:errCount++
+        throw "remote step exit $LASTEXITCODE"
+    }
+}
+
+if (-not (Test-RemoteConnection $dest)) {
+    if ($dest -match '192\.168\.2\.1') {
+        $bootstrapDest = $dest -replace '192\.168\.2\.1', '192.168.1.1'
+        if (Test-RemoteConnection $bootstrapDest) {
+            Write-Host "using bootstrap OpenWrt address $bootstrapDest (final LAN config still comes from collected files)"
+            $dest = $bootstrapDest
+        } else {
+            throw "cannot connect to $dest or bootstrap fallback $bootstrapDest"
+        }
+    } else {
+        throw "cannot connect to $dest"
+    }
 }
 
 # 0. Provision the router before any local files are transferred: repoint apk
@@ -128,6 +215,18 @@ set -u
 TUNA=http://mirrors.tuna.tsinghua.edu.cn/openwrt
 FEEDS=/etc/apk/repositories.d/distfeeds.list
 
+require() {
+    "$@" || {
+        code=$?
+        echo "!! required command failed ($code): $*" >&2
+        exit "$code"
+    }
+}
+
+# Free optional editor packages before `apk update`; a previous failed deploy
+# may have filled the tiny rootfs.
+apk del vim-full vim-runtime 2>/dev/null || true
+
 # apk feeds -> TUNA mirror (only rewrites the official downloads.openwrt.org host)
 if [ -f "$FEEDS" ] && grep -Eq "https?://downloads\.openwrt\.org" "$FEEDS"; then
     sed -i -E "s#https?://downloads\.openwrt\.org#$TUNA#g" "$FEEDS"
@@ -136,7 +235,7 @@ else
     echo "feeds already on tuna mirror"
 fi
 
-apk update || echo "!! apk update failed"
+require apk update
 
 # busybox dnsmasq -> dnsmasq-full. Removing dnsmasq kills the router's own
 # DNS (resolv.conf -> 127.0.0.1), so point the resolver at a public server
@@ -146,6 +245,14 @@ if apk list -I 2>/dev/null | grep -q "^dnsmasq-full-[0-9]"; then
 else
     echo "swapping busybox dnsmasq -> dnsmasq-full (keeping DNS up)"
     RESOLV=$(readlink -f /etc/resolv.conf 2>/dev/null); [ -n "$RESOLV" ] || RESOLV=/tmp/resolv.conf
+    RESOLV_BACKUP=/tmp/auto_sync_resolv.$$
+    cp "$RESOLV" "$RESOLV_BACKUP" 2>/dev/null || true
+    restore_resolv() {
+        [ -n "${RESOLV:-}" ] || return 0
+        [ -f "${RESOLV_BACKUP:-}" ] && cp "$RESOLV_BACKUP" "$RESOLV" 2>/dev/null || true
+        rm -f "${RESOLV_BACKUP:-}" 2>/dev/null || true
+    }
+    trap 'restore_resolv' EXIT
     printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" > "$RESOLV"
     PKGDIR=/tmp/auto_sync_apk
     rm -rf "$PKGDIR"
@@ -154,24 +261,29 @@ else
         PKG=$(ls "$PKGDIR"/dnsmasq-full-*.apk 2>/dev/null | head -1)
         if [ -n "$PKG" ]; then
             apk del dnsmasq 2>/dev/null || true
-            apk add "$PKG" 2>/dev/null || apk add --allow-untrusted "$PKG" 2>/dev/null || apk add dnsmasq-full || echo "!! dnsmasq-full install FAILED"
+            apk add "$PKG" 2>/dev/null || apk add --allow-untrusted "$PKG" 2>/dev/null || require apk add dnsmasq-full
             /etc/init.d/dnsmasq restart 2>/dev/null || true
             /etc/init.d/network reload 2>/dev/null || true
         else
-            echo "!! dnsmasq-full fetch produced no local package; keeping busybox dnsmasq"
+            echo "!! dnsmasq-full fetch produced no local package" >&2
+            exit 1
         fi
     else
-        echo "!! dnsmasq-full fetch FAILED; keeping busybox dnsmasq"
+        echo "!! dnsmasq-full fetch FAILED" >&2
+        exit 1
     fi
     rm -rf "$PKGDIR"
+    restore_resolv
+    trap - EXIT
 fi
 
-# busybox `vi` is a builtin applet (cannot be apk-removed); install vim instead.
-apk add vim-full 2>/dev/null || echo "!! vim-full failed"
+# Keep the image lean: the default rootfs is small, and vim-full plus route
+# source data can push it over 100%. Busybox `vi` remains available.
+apk del vim-full vim-runtime 2>/dev/null || true
 
-apk add losetup resize2fs usbutils block-mount fdisk e2fsprogs blkid hdparm ipset libnettle8 libnetfilter-conntrack3 || echo "!! pkg set 1 partial"
-apk add kmod-fs-ext4 kmod-fs-vfat kmod-usb-storage kmod-usb-storage-uas grep diffutils dnsmasq-full coreutils-stat kmod-tcp-bbr || echo "!! pkg set 2 partial"
-apk add coreutils-base64 ca-certificates ca-bundle ip-full curl wget grep nftables kmod-nft-core kmod-nft-nat kmod-nft-tproxy kmod-nft-socket vim-full || echo "!! pkg set 3 partial"
+require apk add losetup resize2fs usbutils block-mount fdisk e2fsprogs blkid hdparm ipset libnettle8 libnetfilter-conntrack3
+require apk add kmod-fs-ext4 kmod-fs-vfat kmod-usb-storage kmod-usb-storage-uas grep diffutils dnsmasq-full coreutils-stat kmod-tcp-bbr
+require apk add coreutils-base64 ca-certificates ca-bundle ip-full curl wget grep nftables kmod-nft-core kmod-nft-nat kmod-nft-tproxy kmod-nft-socket openssh-sftp-server
 
 echo "provisioning complete"
 '@
@@ -182,6 +294,17 @@ Invoke-Remote $provision
 #    keep the router running while collected files are copied back.
 Invoke-Remote @'
 mkdir -p /etc/init.d /etc/sysctl.d /etc/config /usr/local
+/etc/init.d/shadowsocks stop 2>/dev/null || true
+killall sslocal xray-plugin 2>/dev/null || true
+rm -rf \
+  /usr/local/shadowsocks/bin/sslocal-master \
+  /usr/local/shadowsocks/bin/sslocal-master-redir-nft.sh \
+  /usr/local/shadowsocks/data/source \
+  /usr/local/shadowsocks/data/temp/dns_cache.jsonl \
+  /usr/local/shadowsocks/data/temp/domain_conflicts.jsonl \
+  /usr/local/shadowsocks/data/temp/ip_conflicts.jsonl \
+  /usr/local/shadowsocks/logs \
+  /usr/local/shadowsocks/data/record.txt
 '@
 
 # 2. Push every path in the Collector list, excluding anything in Ignore.
@@ -200,6 +323,7 @@ try {
 } finally {
     Remove-Item -LiteralPath $localStage -Recurse -Force -ErrorAction SilentlyContinue
 }
+Stop-IfErrors 'file transfer'
 
 # 3. Overwrite the remote client config with the server-substituted copy that
 #    the engine prepared in Rust (family-matched to aws's hostname).
@@ -209,8 +333,10 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_SS_CLIENT_CONF) -and (Test-Path -L
     & $scp @scpArgs -- $env:AS_SS_CLIENT_CONF ('{0}:{1}' -f $dest, $confRemote)
     if ($LASTEXITCODE -ne 0) { Write-Host '! scp substituted conf failed'; $errCount++ }
 } else {
-    Write-Host '! AS_SS_CLIENT_CONF not provided; remote keeps the pushed conf (server not substituted)'
+    Write-Host '! AS_SS_CLIENT_CONF not provided; refusing to restart with a possibly stale server config'
+    $errCount++
 }
+Stop-IfErrors 'shadowsocks-client.json transfer'
 
 # 4. Restore the Unix permissions recorded at collect time (Windows dropped
 #    them). The engine hands us the per-host cache via AS_PERMS_FILE.
@@ -237,7 +363,8 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
         $sp = $t.IndexOf(' '); if ($sp -lt 1) { continue }
         $mode = $t.Substring(0, $sp); $path = $t.Substring($sp + 1)
         if (-not ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/'))) { continue }
-        $chmods.Add("chmod $mode $(Quote-ShellArg $path)")
+        $qPath = Quote-ShellArg $path
+        $chmods.Add("[ -e $qPath ] && chmod $mode $qPath || true")
     }
     if ($links.Count -gt 0) {
         Write-Host "restoring $($links.Count) recorded symlink(s)"
@@ -250,32 +377,163 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
 } else {
     Write-Host '! AS_PERMS_FILE not provided; skipping permission restore'
 }
+Stop-IfErrors 'permission restore'
 
 # 5. Apply the config and (re)start shadowsocks. Network reload is last because
 #    it can briefly drop this ssh session.
 $remote = @'
+set -u
+
+wait_ubus() {
+    i=0
+    while [ $i -lt 20 ]; do
+        ubus list service >/dev/null 2>&1 && return 0
+        sleep 1
+        i=$((i+1))
+    done
+    echo "!! ubus is not ready" >&2
+    return 1
+}
+
+restart_ubusd() {
+    echo "restarting ubusd"
+    killall ubusd 2>/dev/null || true
+    sleep 1
+    pgrep ubusd >/dev/null 2>&1 ||
+        start-stop-daemon -S -b -x /sbin/ubusd -- -s /var/run/ubus/ubus.sock
+}
+
+ensure_ubus() {
+    wait_ubus && return 0
+    restart_ubusd
+    wait_ubus
+}
+
+sslocal_running() {
+    pgrep -f '/usr/local/shadowsocks/bin/sslocal([[:space:]]|$)' >/dev/null 2>&1 ||
+        ps w 2>/dev/null | grep -q '[s]slocal -c /usr/local/shadowsocks/conf/shadowsocks-client.json'
+}
+
+dns_listener_ready() {
+    netstat -ln 2>/dev/null | grep -Eq '(^|[.:])1053[[:space:]]'
+}
+
+validate_lan_dhcp_config() {
+    iface=$(uci -q get dhcp.lan.interface 2>/dev/null || true)
+    ignore=$(uci -q get dhcp.lan.ignore 2>/dev/null || true)
+    start=$(uci -q get dhcp.lan.start 2>/dev/null || true)
+    limit=$(uci -q get dhcp.lan.limit 2>/dev/null || true)
+    if [ "$iface" != lan ]; then
+        echo "!! dhcp.lan.interface is '$iface', expected 'lan'" >&2
+        return 1
+    fi
+    if [ "$ignore" = 1 ]; then
+        echo "!! dhcp.lan.ignore=1, LAN DHCP is disabled" >&2
+        return 1
+    fi
+    if [ -z "$start" ] || [ -z "$limit" ]; then
+        echo "!! dhcp.lan start/limit is missing" >&2
+        return 1
+    fi
+}
+
+schedule_network_reload() {
+    # Network reload can reset this SSH connection. Detach it so the deploy
+    # script can report success after all preflight checks have passed.
+    rm -f /var/run/auto_sync_network_reload.pid /tmp/auto_sync_network_reload.log
+    start-stop-daemon -S -b -m -p /var/run/auto_sync_network_reload.pid -x /bin/sh -- -c '
+        exec >/tmp/auto_sync_network_reload.log 2>&1 </dev/null
+        sleep 1
+        /etc/init.d/network reload || true
+        sleep 6
+        /etc/init.d/dnsmasq restart || true
+        /etc/init.d/dropbear restart || true
+    ' || {
+        echo "!! failed to schedule network reload" >&2
+        return 1
+    }
+}
+
+target_lan_cidr() {
+    awk '
+        $1 == "config" && $2 == "interface" && $3 == "'\''lan'\''" { in_lan = 1; next }
+        $1 == "config" { in_lan = 0 }
+        in_lan && $1 == "list" && $2 == "ipaddr" { gsub(/'\''/, "", $3); print $3; exit }
+        in_lan && $1 == "option" && $2 == "ipaddr" { gsub(/'\''/, "", $3); print $3; exit }
+    ' /etc/config/network
+}
+
+ensure_target_lan_ip_present() {
+    cidr=$(target_lan_cidr)
+    [ -n "$cidr" ] || return 0
+    ip_only=${cidr%%/*}
+    prefix=${cidr#*/}
+    [ "$prefix" != "$cidr" ] || prefix=24
+    ip addr show dev br-lan 2>/dev/null | grep -q "$ip_only/" && return 0
+    echo "adding temporary LAN address $ip_only/$prefix to br-lan for pre-reload binds"
+    ip addr add "$ip_only/$prefix" dev br-lan 2>/dev/null || true
+}
+
+ensure_ubus || exit 1
+
 # apply sysctl
 sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
 for f in /etc/sysctl.d/*.conf; do [ -f $f ] && sysctl -p $f >/dev/null 2>&1 || true; done
 
-# apply dhcp config
-/etc/init.d/dnsmasq restart 2>/dev/null || true
-/etc/init.d/odhcpd restart 2>/dev/null || true
+# If the collected network config changes LAN from the currently reachable
+# address to 192.168.2.1, make that address usable before starting sslocal.
+# Otherwise web_admin.listen=192.168.2.1:9090 can make the process fail before
+# the final network reload.
+ensure_target_lan_ip_present
 
-# shadowsocks (sslocal) on; shadowsocks-rust (sslocal-master) off to avoid a
-# procd name clash (both init scripts use NAME=shadowsocks-rust).
+# shadowsocks (sslocal) on; shadowsocks-rust (sslocal-master) off. The
+# /etc/init.d/shadowsocks script must use NAME=shadowsocks, while the legacy
+# shadowsocks-rust script keeps NAME=shadowsocks-rust.
 /etc/init.d/shadowsocks-rust disable 2>/dev/null || true
 /etc/init.d/shadowsocks-rust stop 2>/dev/null || true
-/etc/init.d/shadowsocks enable
-/etc/init.d/shadowsocks restart
-# procd spawns sslocal asynchronously; give it a few seconds before checking.
-i=0; while [ $i -lt 10 ]; do pgrep -f /usr/local/shadowsocks/bin/sslocal >/dev/null && break; sleep 1; i=$((i+1)); done
-echo "shadowsocks pgrep:"; pgrep -f /usr/local/shadowsocks/bin/sslocal || echo "  (not running)"
+ensure_ubus || exit 1
+
+[ -x /etc/init.d/shadowsocks ] || { echo "!! missing /etc/init.d/shadowsocks" >&2; exit 1; }
+[ -x /usr/local/shadowsocks/bin/sslocal ] || { echo "!! missing /usr/local/shadowsocks/bin/sslocal" >&2; exit 1; }
+[ -s /usr/local/shadowsocks/conf/shadowsocks-client.json ] || { echo "!! missing shadowsocks-client.json" >&2; exit 1; }
+
+/etc/init.d/shadowsocks enable || exit 1
+/etc/init.d/shadowsocks start || exit 1
+
+# procd spawns sslocal asynchronously; verify both the process and DNS listener
+# before switching dnsmasq to 127.0.0.1#1053.
+i=0
+while [ $i -lt 15 ]; do
+    if sslocal_running && dns_listener_ready; then
+        break
+    fi
+    sleep 1
+    i=$((i+1))
+done
+
+echo "shadowsocks pgrep:"
+pgrep -f /usr/local/shadowsocks/bin/sslocal || echo "  (not running)"
+if ! sslocal_running || ! dns_listener_ready; then
+    echo "!! shadowsocks did not start cleanly; leaving dnsmasq/network untouched" >&2
+    logread 2>/dev/null | grep -iE 'shadowsocks|sslocal|procd|ubus' | tail -n 80 >&2 || true
+    exit 1
+fi
+
+# Only now apply dhcp DNS forwarding to sslocal's DNS listener.
+validate_lan_dhcp_config || exit 1
+/etc/init.d/dnsmasq restart || exit 1
+/etc/init.d/odhcpd restart 2>/dev/null || true
 
 # apply network config last (may briefly drop this session)
-/etc/init.d/network reload 2>/dev/null || true
+schedule_network_reload || exit 1
+echo "network reload scheduled in background"
 '@
 Invoke-Remote $remote
 
-if ($errCount -gt 0) { Write-Host "deploy completed with $errCount error(s)"; exit 1 }
+if ($errCount -gt 0) {
+    Write-Host "deploy completed with $errCount error(s)"
+    Clear-Askpass
+    exit 1
+}
+Clear-Askpass
 Write-Host 'deploy completed cleanly'

@@ -1391,6 +1391,9 @@ fn run_local_deploy_script(
             expand_tilde(conn.identity_file)
         },
     );
+    if !host.password.trim().is_empty() {
+        cmd.env("AS_PASSWORD", host.password.trim());
+    }
     cmd.env("AS_ROOT", host.root.as_os_str());
     cmd.env("AS_COLLECT_PATHS", host.paths.join("\n"));
     cmd.env("AS_EXCLUDE_PATHS", host.exclude.join("\n"));
