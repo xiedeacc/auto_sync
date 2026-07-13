@@ -492,6 +492,16 @@ ensure_software_src_layout() {
         fi
     fi
     [ ! -L /opt/aarch64-linux-musl-cross ] || rm -f /opt/aarch64-linux-musl-cross
+    if [ -e /usr/local/curl-cares ] && [ ! -L /usr/local/curl-cares ]; then
+        target="$new/curl-cares"
+        if [ ! -e "$target" ]; then
+            mv /usr/local/curl-cares "$target"
+        else
+            rsync -aHAX /usr/local/curl-cares/ "$target/" || rsync -a /usr/local/curl-cares/ "$target/"
+            mv /usr/local/curl-cares "/usr/local/curl-cares.migrated-$(date +%Y%m%d%H%M%S)"
+        fi
+    fi
+    [ ! -L /usr/local/curl-cares ] || rm -f /usr/local/curl-cares
     [ ! -L /opt/src/software ] || rm -f /opt/src/software
     [ ! -L /opt/software/src ] || rm -f /opt/software/src
 }
@@ -875,6 +885,8 @@ if [ -d /root/.vim/bundle/YouCompleteMe ]; then
 fi
 EOF_VIM_TOOLS
 chmod 0755 /root/src/software/tools/auto_sync_install_vim_tools.sh
+rm -f /usr/local/sbin/auto_sync_install_vim_tools.sh 2>/dev/null || true
+rmdir /usr/local/sbin 2>/dev/null || true
 if ! pgrep -f '/root/src/software/tools/auto_sync_install_vim_tools.sh' >/dev/null 2>&1; then
     log "start Vim plugin/YouCompleteMe installation in background"
     nohup /root/src/software/tools/auto_sync_install_vim_tools.sh >> /var/log/auto_sync_vim_tools.log 2>&1 &

@@ -1055,6 +1055,8 @@ if [ -d /root/.vim/bundle/YouCompleteMe ]; then
 fi
 EOF_VIM_TOOLS
 chmod 0755 /opt/src/software/tools/auto_sync_install_vim_tools.sh
+rm -f /usr/local/sbin/auto_sync_install_vim_tools.sh 2>/dev/null || true
+rmdir /usr/local/sbin 2>/dev/null || true
 if ! pgrep -f '/opt/src/software/tools/auto_sync_install_vim_tools.sh' >/dev/null 2>&1; then
     log "start Vim plugin/YouCompleteMe installation in background"
     nohup /opt/src/software/tools/auto_sync_install_vim_tools.sh >> /var/log/auto_sync_vim_tools.log 2>&1 &
