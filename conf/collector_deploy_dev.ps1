@@ -564,7 +564,6 @@ done <<'EOF_DEV_LOCAL_LINKS'
 /root/.vimundo|root:root
 /root/.vimviews|root:root
 /root/.vscode-server|root:root
-/root/.halo|root:root
 /root/.halo2|root:root
 /root/.zprofile|root:root
 /root/.zshenv|root:root
@@ -1467,7 +1466,7 @@ fi
 
 [ ! -L /opt/auto_sync ] || rm -f /opt/auto_sync
 
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /root/.halo /root/.halo2 /home/tiger /opt/www/coverage
+mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /root/.halo2 /home/tiger /opt/www/coverage
 if [ ! -s /opt/www/coverage/index.html ]; then
     cat > /opt/www/coverage/index.html <<'EOF_COVERAGE_INDEX'
 <!doctype html>
@@ -1491,7 +1490,7 @@ for entry in Path('/home/tiger').iterdir():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
 migrate_halo_root_home() {
-    for name in .halo .halo2; do
+    for name in .halo2; do
         dest="/root/$name"
         if [ -L "$dest" ]; then
             tmp="${dest}.auto_sync_restore_tmp"
@@ -1521,7 +1520,7 @@ migrate_halo_root_home
 for d in /usr/local/immich; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
 done
-for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /root/.halo /root/.halo2; do
+for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /root/.halo2; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
 if [ -d /usr/local/auto_sync ]; then

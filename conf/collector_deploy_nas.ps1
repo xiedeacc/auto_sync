@@ -549,7 +549,6 @@ done <<'EOF_OPT_LINKS'
 /root/.vimundo|/opt/user/root/.vimundo|dir|root:root
 /root/.vimviews|/opt/user/root/.vimviews|dir|root:root
 /root/.vscode-server|/opt/user/root/.vscode-server|dir|root:root
-/root/.halo|/opt/user/root/.halo|dir|root:root
 /root/.halo2|/opt/user/root/.halo2|dir|root:root
 /root/.zprofile|/opt/user/root/.zprofile|file|root:root
 /root/.zshenv|/opt/user/root/.zshenv|file|root:root
@@ -1519,13 +1518,13 @@ EOF_OPT_USR_LOCAL_PATH
 }
 migrate_opt_usr_local_layout
 
-mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/root/.halo /opt/user/root/.halo2 /opt/user/tiger /home/tiger
+mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/root/.halo2 /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
 done
 migrate_halo_root_home() {
-    for name in .halo .halo2; do
+    for name in .halo2; do
         dest="/opt/user/root/$name"
         mkdir -p "$dest"
         for src in "/home/tiger/$name" "/opt/user/tiger/$name"; do
@@ -1557,7 +1556,7 @@ PY_TIGER_LINK_OWNERS
 for d in /opt/immich /opt/user/tiger; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
 done
-for d in /opt/usr/local/auto_sync /opt/usr/local/halo /opt/usr/local/tbox /opt/usr/local/shadowsocks /opt/user/root/.halo /opt/user/root/.halo2; do
+for d in /opt/usr/local/auto_sync /opt/usr/local/halo /opt/usr/local/tbox /opt/usr/local/shadowsocks /opt/user/root/.halo2; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
 for f in \

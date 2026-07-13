@@ -19,7 +19,7 @@ symlinks.
 | bin tools | `/opt/usr/local/bin` | `/usr/local/bin` | Includes tools such as `buildifier`. Do not recreate `/usr/local/bin` as a NAS bind mount. |
 | buildifier | `/opt/usr/local/bin/buildifier` | `/usr/local/bin/buildifier` | Installed by collector deployment scripts. |
 | Halo install | `/opt/usr/local/halo` | `/usr/local/halo` | Runs as root on both hosts. |
-| Halo runtime home | `/root/.halo`, `/root/.halo2` symlinked to `/opt/user/root` | `/root/.halo`, `/root/.halo2` real local paths | NAS keeps root home state off the root disk. |
+| Halo runtime home | `/root/.halo2` symlinked to `/opt/user/root/.halo2` | `/root/.halo2` real local path | Halo 2 uses `.halo2`; old `.halo` is a Halo 1.x legacy path and should not be recreated. NAS keeps root home state off the root disk. |
 | shadowsocks | `/opt/usr/local/shadowsocks` | `/usr/local/shadowsocks` | Directory is supported for collected config/data/logs; service startup may be disabled when xray owns the ports. |
 | TBox | `/opt/usr/local/tbox` | `/usr/local/tbox` | `tbox_client.service` and logrotate paths must point to the host-specific path. |
 | Waiwei | `/opt/usr/local/waiwei` | `/usr/local/waiwei` | `waiwei-web` and `waiwei-puller` units run from here. |
