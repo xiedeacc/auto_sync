@@ -740,15 +740,15 @@ done <<'EOF_OPT_LINKS'
 /root/.zshrc|/opt/user/root/.zshrc|file|root:root
 /root/src|/opt/user/root/src|dir|root:root
 /home/tiger/.bashrc|/opt/user/tiger/.bashrc|file|tiger:tiger
-/home/tiger/.npm|/opt/user/tiger/.npm|dir|tiger:tiger
-/home/tiger/.npmrc|/opt/user/tiger/.npmrc|file|tiger:tiger
-/home/tiger/.nvm|/opt/src/software/tools/nvm|dir|tiger:tiger
 /home/tiger/.oh-my-zsh|/opt/user/tiger/.oh-my-zsh|dir|tiger:tiger
 /home/tiger/.profile|/opt/user/tiger/.profile|file|tiger:tiger
 /home/tiger/.zprofile|/opt/user/tiger/.zprofile|file|tiger:tiger
 /home/tiger/.zshenv|/opt/user/tiger/.zshenv|file|tiger:tiger
 /home/tiger/.zshrc|/opt/user/tiger/.zshrc|file|tiger:tiger
 EOF_OPT_LINKS
+
+rm -rf /home/tiger/.nvm /home/tiger/.npm /home/tiger/.npmrc \
+       /opt/user/tiger/.nvm /opt/user/tiger/.npm /opt/user/tiger/.npmrc 2>/dev/null || true
 
 if [ -f /usr/share/nginx/modules-available/mod-stream.conf ]; then
     mkdir -p /etc/nginx/modules-enabled

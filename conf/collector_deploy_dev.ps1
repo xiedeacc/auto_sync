@@ -570,15 +570,15 @@ done <<'EOF_DEV_LOCAL_LINKS'
 /root/.zshrc|root:root
 /root/src|root:root
 /home/tiger/.bashrc|tiger:tiger
-/home/tiger/.npm|tiger:tiger
-/home/tiger/.npmrc|tiger:tiger
-/home/tiger/.nvm|tiger:tiger
 /home/tiger/.oh-my-zsh|tiger:tiger
 /home/tiger/.profile|tiger:tiger
 /home/tiger/.zprofile|tiger:tiger
 /home/tiger/.zshenv|tiger:tiger
 /home/tiger/.zshrc|tiger:tiger
 EOF_DEV_LOCAL_LINKS
+
+rm -rf /home/tiger/.nvm /home/tiger/.npm /home/tiger/.npmrc \
+       /opt/user/tiger/.nvm /opt/user/tiger/.npm /opt/user/tiger/.npmrc 2>/dev/null || true
 
 if [ -f /usr/share/nginx/modules-available/mod-stream.conf ]; then
     mkdir -p /etc/nginx/modules-enabled

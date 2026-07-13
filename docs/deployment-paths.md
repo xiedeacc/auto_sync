@@ -27,7 +27,7 @@ symlinks.
 | Immich runtime | `/opt/immich` | `/usr/local/immich` | Native deployment, not Docker. |
 | Immich source checkout | `/opt/src/software/immich` | `/root/src/software/immich` | Uses the `deploy` branch. |
 | Flutter SDK | `/opt/src/software/flutter` | `/root/src/software/flutter` | NAS wrapper sets `FLUTTER_ROOT`; generic/dev default is `/root/src/software/flutter`. |
-| NVM root | `/opt/src/software/tools/nvm` | `/root/src/software/tools/nvm` | NAS `/root/.nvm` and `/home/tiger/.nvm` should point to the `/opt` location. |
+| NVM root | `/opt/src/software/tools/nvm` | `/root/src/software/tools/nvm` | NAS `/root/.nvm` points to the `/opt` location. Tiger user nvm/npm state should not be recreated. |
 | Node.js | `/opt/src/software/tools/nvm/versions/node/v24.18.0` | `/root/src/software/tools/nvm/versions/node/v24.18.0` | Installed by nvm; deployment scripts may fall back to latest Node 24. |
 | npm | Node.js `bin/npm` under the nvm root | Node.js `bin/npm` under the nvm root | npm registry is configured by deployment scripts. |
 | pnpm | Node.js/Corepack-managed binary under the nvm root | Node.js/Corepack-managed binary under the nvm root | Installed or activated after Node setup. |
