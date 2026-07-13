@@ -283,8 +283,8 @@ fi
 
 Copy-AwsSslIntoCollectedRoot
 Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
-$generatedOptionalPaths = @('/opt/immich/conf', '/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps')
-$requiredCollectPaths = @($collectPaths | Where-Object { (Normalize-RemotePath $_) -ne '/opt/immich/conf' })
+$generatedOptionalPaths = @('/usr/local/immich/conf', '/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps')
+$requiredCollectPaths = @($collectPaths | Where-Object { (Normalize-RemotePath $_) -ne '/usr/local/immich/conf' })
 Transfer-CollectedPathsToStage $requiredCollectPaths $generatedOptionalPaths '~/.auto_sync_stage'
 Prepare-StagedSymlinks $env:AS_PERMS_FILE
 
@@ -468,7 +468,7 @@ install_staged_collected_paths || { log "ERROR: collected path installation fail
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
 ensure_software_src_layout() {
     new=/root/src/software
-    mkdir -p /root/src /opt/src /opt/software
+    mkdir -p /root/src
     for old in /opt/src/software /opt/software/src; do
         if [ -e "$old" ] && [ ! -L "$old" ]; then
             if [ ! -e "$new" ]; then
@@ -480,12 +480,8 @@ ensure_software_src_layout() {
         fi
     done
     mkdir -p "$new"
-    for old in /opt/src/software; do
-        if [ -L "$old" ] && [ "$(readlink "$old")" != "$new" ]; then
-            rm -f "$old"
-        fi
-        [ -e "$old" ] || ln -s "$new" "$old"
-    done
+    [ ! -L /opt/src/software ] || rm -f /opt/src/software
+    [ ! -L /opt/software/src ] || rm -f /opt/software/src
 }
 ensure_software_src_layout
 rewrite_software_src_paths() {
@@ -497,75 +493,70 @@ rewrite_software_src_paths() {
     done
     [ ! -f /etc/profile ] || sed -i "s#/opt/software/src#$replacement#g; s#/opt/src/software#$replacement#g" /etc/profile
 }
-rewrite_software_src_paths /opt/user/root/src/software
-ensure_opt_link() {
+rewrite_software_src_paths /root/src/software
+restore_opt_user_link() {
     path="$1"
-    target="$2"
-    kind="$3"
     owner="$4"
-    if [ -L "$path" ] && [ "$(readlink "$path")" = "$target" ]; then
-        if [ "$kind" = dir ]; then mkdir -p "$target"; else touch "$target"; fi
-        return 0
-    fi
-    mkdir -p "$(dirname "$path")" "$(dirname "$target")"
-    if [ "$kind" = dir ]; then
-        mkdir -p "$target"
-        if [ -d "$path" ] && [ ! -L "$path" ]; then
-            rsync -a "$path/" "$target/"
-        elif [ -L "$path" ] && [ -d "$path" ]; then
-            rsync -aL "$path/" "$target/"
-        fi
-    else
-        if [ -f "$path" ] || { [ -L "$path" ] && [ -f "$path" ]; }; then
-            cp -aL "$path" "$target"
-        elif [ ! -e "$target" ]; then
-            touch "$target"
-        fi
-    fi
-    rm -rf "$path"
-    ln -s "$target" "$path"
-    chown -h "$owner" "$path" 2>/dev/null || true
-    case "$target" in /opt/user/*) chown -h "$owner" "$target" 2>/dev/null || true ;; esac
+    [ -L "$path" ] || return 0
+    target="$(readlink "$path" || true)"
+    case "$target" in
+        /opt/user/*)
+            tmp="${path}.auto_sync_restore_tmp"
+            rm -rf "$tmp"
+            mkdir -p "$(dirname "$path")"
+            if [ -d "$target" ]; then
+                cp -a "$target" "$tmp"
+            elif [ -e "$target" ]; then
+                cp -a "$target" "$tmp"
+            else
+                rm -f "$path"
+                return 0
+            fi
+            rm -f "$path"
+            mv "$tmp" "$path"
+            chown -R "$owner" "$path" 2>/dev/null || true
+            ;;
+    esac
 }
-while IFS='|' read -r path target kind owner; do
-    [ -n "$path" ] && ensure_opt_link "$path" "$target" "$kind" "$owner"
-done <<'EOF_OPT_LINKS'
-/root/.bashrc|/opt/user/root/.bashrc|file|root:root
-/root/.cache|/opt/user/root/.cache|dir|root:root
-/root/.cargo|/opt/user/root/.cargo|dir|root:root
-/root/.codex|/opt/user/root/.codex|dir|root:root
-/root/.config|/opt/user/root/.config|dir|root:root
-/root/.cscope.vim|/opt/user/root/.cscope.vim|file|root:root
-/root/.dotnet|/opt/user/root/.dotnet|dir|root:root
-/root/.launchpadlib|/opt/user/root/.launchpadlib|dir|root:root
-/root/.local|/opt/user/root/.local|dir|root:root
-/root/.npm|/opt/user/root/.npm|dir|root:root
-/root/.npmrc|/opt/user/root/.npmrc|file|root:root
-/root/.nvm|/opt/user/root/src/software/tools/nvm|dir|root:root
-/root/.oh-my-zsh|/opt/user/root/.oh-my-zsh|dir|root:root
-/root/.profile|/opt/user/root/.profile|file|root:root
-/root/.rustup|/opt/user/root/.rustup|dir|root:root
-/root/.vim|/opt/user/root/.vim|dir|root:root
-/root/.vimbackup|/opt/user/root/.vimbackup|dir|root:root
-/root/.vimswap|/opt/user/root/.vimswap|dir|root:root
-/root/.vimundo|/opt/user/root/.vimundo|dir|root:root
-/root/.vimviews|/opt/user/root/.vimviews|dir|root:root
-/root/.vscode-server|/opt/user/root/.vscode-server|dir|root:root
-/root/.zprofile|/opt/user/root/.zprofile|file|root:root
-/root/.zshenv|/opt/user/root/.zshenv|file|root:root
-/root/.zshrc|/opt/user/root/.zshrc|file|root:root
-/root/src|/opt/user/root/src|dir|root:root
-/home/tiger/.bashrc|/opt/user/tiger/.bashrc|file|tiger:tiger
-/home/tiger/.halo2|/opt/user/tiger/.halo2|dir|tiger:tiger
-/home/tiger/.npm|/opt/user/tiger/.npm|dir|tiger:tiger
-/home/tiger/.npmrc|/opt/user/tiger/.npmrc|file|tiger:tiger
-/home/tiger/.nvm|/opt/user/root/src/software/tools/nvm|dir|tiger:tiger
-/home/tiger/.oh-my-zsh|/opt/user/tiger/.oh-my-zsh|dir|tiger:tiger
-/home/tiger/.profile|/opt/user/tiger/.profile|file|tiger:tiger
-/home/tiger/.zprofile|/opt/user/tiger/.zprofile|file|tiger:tiger
-/home/tiger/.zshenv|/opt/user/tiger/.zshenv|file|tiger:tiger
-/home/tiger/.zshrc|/opt/user/tiger/.zshrc|file|tiger:tiger
-EOF_OPT_LINKS
+while IFS='|' read -r path owner; do
+    [ -n "$path" ] && restore_opt_user_link "$path" "$owner"
+done <<'EOF_DEV_LOCAL_LINKS'
+/root/.bashrc|root:root
+/root/.cache|root:root
+/root/.cargo|root:root
+/root/.codex|root:root
+/root/.config|root:root
+/root/.cscope.vim|root:root
+/root/.dotnet|root:root
+/root/.launchpadlib|root:root
+/root/.local|root:root
+/root/.npm|root:root
+/root/.npmrc|root:root
+/root/.nvm|root:root
+/root/.oh-my-zsh|root:root
+/root/.profile|root:root
+/root/.rustup|root:root
+/root/.vim|root:root
+/root/.vimbackup|root:root
+/root/.vimswap|root:root
+/root/.vimundo|root:root
+/root/.vimviews|root:root
+/root/.vscode-server|root:root
+/root/.zprofile|root:root
+/root/.zshenv|root:root
+/root/.zshrc|root:root
+/root/src|root:root
+/home/tiger/.bashrc|tiger:tiger
+/home/tiger/.halo2|tiger:tiger
+/home/tiger/.npm|tiger:tiger
+/home/tiger/.npmrc|tiger:tiger
+/home/tiger/.nvm|tiger:tiger
+/home/tiger/.oh-my-zsh|tiger:tiger
+/home/tiger/.profile|tiger:tiger
+/home/tiger/.zprofile|tiger:tiger
+/home/tiger/.zshenv|tiger:tiger
+/home/tiger/.zshrc|tiger:tiger
+EOF_DEV_LOCAL_LINKS
 
 if [ -f /usr/share/nginx/modules-available/mod-stream.conf ]; then
     mkdir -p /etc/nginx/modules-enabled
@@ -746,11 +737,11 @@ if [ ! -x /root/.cargo/bin/rustup ]; then
     curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | timeout --kill-after=10s 600s sh -s -- -y || log "WARN: rustup install failed"
 fi
 
-mkdir -p /root/src/software/tools
-if [ -L /root/src/software/tools/nvm ]; then
-    rm -f /root/src/software/tools/nvm
+mkdir -p /usr/local/src/software/tools
+if [ -L /usr/local/src/software/tools/nvm ]; then
+    rm -f /usr/local/src/software/tools/nvm
 fi
-export NVM_DIR=/root/src/software/tools/nvm
+export NVM_DIR=/usr/local/src/software/tools/nvm
 mkdir -p "$NVM_DIR"
 if [ ! -s "$NVM_DIR/nvm.sh" ]; then
     curl -fsSL https://gitee.com/mirrors/nvm/raw/v0.40.3/install.sh | NVM_SOURCE=https://gitee.com/mirrors/nvm.git bash || log "WARN: nvm install failed"
@@ -792,7 +783,7 @@ fi
 
 [ -x "$JAVA_HOME/bin/java" ] || { log "ERROR: OpenJDK 21 is not installed at $JAVA_HOME"; exit 1; }
 [ ! -L /usr/local/java/jdk/jdk-21.0.3 ] || rm -f /usr/local/java/jdk/jdk-21.0.3
-[ ! -L /root/src/software/tools/mise/installs/java/21.0.2 ] || rm -f /root/src/software/tools/mise/installs/java/21.0.2
+[ ! -L /usr/local/src/software/tools/mise/installs/java/21.0.2 ] || rm -f /usr/local/src/software/tools/mise/installs/java/21.0.2
 if find /etc/systemd/system -type f -exec grep -q '/usr/local/java/.*/bin/java' {} \; -print -quit | grep -q .; then
     find /etc/systemd/system -type f -exec grep -l '/usr/local/java/.*/bin/java' {} + |
         xargs -r sed -i -E "s#/usr/local/java/[^[:space:]]*/bin/java#$JAVA_HOME/bin/java#g"
@@ -843,7 +834,7 @@ fi
 if [ -d /root/.vim/bundle/YouCompleteMe ]; then
     ycm_commit="$(git -C /root/.vim/bundle/YouCompleteMe rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$ycm_commit" ] && [ "$(cat /root/.vim/bundle/YouCompleteMe/.auto_sync_installed 2>/dev/null || true)" != "$ycm_commit" ]; then
-        ycm_path="$JAVA_HOME/bin:/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/root/src/software/tools/nvm/versions/node/v24.18.0/bin:$PATH"
+        ycm_path="$JAVA_HOME/bin:/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/usr/local/src/software/tools/nvm/versions/node/v24.18.0/bin:$PATH"
         ycmd_build=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/build.py
         jdt_milestone="$(sed -n "s/^JDTLS_MILESTONE = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
         jdt_stamp="$(sed -n "s/^JDTLS_BUILD_STAMP = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
@@ -893,16 +884,16 @@ fi
 
 deploy_immich_from_git() {
     mkdir -p /root/src/software
-    mkdir -p /opt/immich/server /opt/immich/web /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf
-    if [ ! -s /opt/immich/conf/immich-ml.env ]; then
-        cat > /opt/immich/conf/immich-ml.env <<'EOF_IMMICH_ML_ENV'
+    mkdir -p /usr/local/immich/server /usr/local/immich/web /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf
+    if [ ! -s /usr/local/immich/conf/immich-ml.env ]; then
+        cat > /usr/local/immich/conf/immich-ml.env <<'EOF_IMMICH_ML_ENV'
 IMMICH_HOST=0.0.0.0
 IMMICH_PORT=3003
 IMMICH_LOG_LEVEL=log
-MACHINE_LEARNING_CACHE_FOLDER=/opt/immich/machine-learning/.cache
-TRANSFORMERS_CACHE=/opt/immich/machine-learning/.cache
+MACHINE_LEARNING_CACHE_FOLDER=/usr/local/immich/machine-learning/.cache
+TRANSFORMERS_CACHE=/usr/local/immich/machine-learning/.cache
 EOF_IMMICH_ML_ENV
-        chmod 0640 /opt/immich/conf/immich-ml.env
+        chmod 0640 /usr/local/immich/conf/immich-ml.env
     fi
     mkdir -p /root/.ssh
     ssh-keyscan -T 10 github.com >> /root/.ssh/known_hosts 2>/dev/null || true
@@ -925,11 +916,11 @@ EOF_IMMICH_ML_ENV
         git pull --ff-only origin deploy
     ) || return 1
     immich_commit="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
-    immich_marker=/opt/immich/.auto_sync_deploy_commit
+    immich_marker=/usr/local/immich/.auto_sync_deploy_commit
     immich_installed=0
-    if [ -f /opt/immich/server/dist/main.js ] &&
-       [ -f /opt/immich/web/build/index.html ] &&
-       [ -x /opt/immich/machine-learning/.venv/bin/python ]; then
+    if [ -f /usr/local/immich/server/dist/main.js ] &&
+       [ -f /usr/local/immich/web/build/index.html ] &&
+       [ -x /usr/local/immich/machine-learning/.venv/bin/python ]; then
         immich_installed=1
     fi
     if [ -n "$immich_commit" ] && [ "$immich_installed" -eq 1 ]; then
@@ -972,8 +963,8 @@ text = text.replace(
     'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --locked --extra cpu --no-dev --compile-bytecode',
     'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --extra cpu --no-dev --compile-bytecode',
 )
-text = text.replace('/opt/software/src', '/opt/user/root/src/software')
-text = text.replace('/opt/src/software', '/opt/user/root/src/software')
+text = text.replace('/opt/software/src', '/usr/local/src/software')
+text = text.replace('/opt/src/software', '/usr/local/src/software')
 path.write_text(text)
 PY_PATCH_IMMICH
     }
@@ -981,9 +972,9 @@ PY_PATCH_IMMICH
         if [ -f "$repo/$script" ]; then
             patch_immich_deploy_script "$repo/$script"
             chmod +x "$repo/$script" 2>/dev/null || true
-            immich_node_home="${IMMICH_NODE_HOME:-/opt/user/root/src/software/tools/nvm/versions/node/v24.18.0}"
-            chmod -R a+rX "$immich_node_home" /opt/user/root/src/software/tools/uv-python 2>/dev/null || true
-            (cd "$repo" && VERSION="${IMMICH_VERSION:-deploy}" UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/opt/user/root/src/software/tools/uv-python}" UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" bash "$script") || return 1
+            immich_node_home="${IMMICH_NODE_HOME:-/usr/local/src/software/tools/nvm/versions/node/v24.18.0}"
+            chmod -R a+rX "$immich_node_home" /usr/local/src/software/tools/uv-python 2>/dev/null || true
+            (cd "$repo" && VERSION="${IMMICH_VERSION:-deploy}" UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/usr/local/src/software/tools/uv-python}" UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" bash "$script") || return 1
             [ -z "$immich_commit" ] || printf '%s\n' "$immich_commit" > "$immich_marker"
             return 0
         fi
@@ -1429,24 +1420,21 @@ restore_once postgres "$pg_dump"
 configure_postgresql_peer_maps
 prepare_immich_database_extensions
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
-mkdir -p /opt/immich/upload
+mkdir -p /usr/local/immich/upload
 for d in backups encoded-video library profile thumbs upload; do
-    mkdir -p "/opt/immich/upload/$d"
-    touch "/opt/immich/upload/$d/.immich"
+    mkdir -p "/usr/local/immich/upload/$d"
+    touch "/usr/local/immich/upload/$d/.immich"
 done
-chown -R tiger:tiger /opt/immich/upload 2>/dev/null || true
+chown -R tiger:tiger /usr/local/immich/upload 2>/dev/null || true
 deploy_immich_from_git || log "WARN: immich deploy from git failed"
 rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
 if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-if [ -d /usr/local/auto_sync ] && [ ! -e /opt/auto_sync ]; then
-    mkdir -p /opt
-    ln -s /usr/local/auto_sync /opt/auto_sync
-fi
+[ ! -L /opt/auto_sync ] || rm -f /opt/auto_sync
 
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger /opt/www/coverage
+mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /home/tiger /opt/www/coverage
 if [ ! -s /opt/www/coverage/index.html ]; then
     cat > /opt/www/coverage/index.html <<'EOF_COVERAGE_INDEX'
 <!doctype html>
@@ -1454,14 +1442,9 @@ if [ ! -s /opt/www/coverage/index.html ]; then
 EOF_COVERAGE_INDEX
 fi
 for d in backups encoded-video library profile thumbs upload; do
-    mkdir -p "/opt/immich/upload/$d"
-    touch "/opt/immich/upload/$d/.immich"
+    mkdir -p "/usr/local/immich/upload/$d"
+    touch "/usr/local/immich/upload/$d/.immich"
 done
-if [ -d /opt/user/tiger/.halo2 ]; then
-    rm -rf /home/tiger/.halo2
-    ln -s /opt/user/tiger/.halo2 /home/tiger/.halo2
-    chown -h tiger:tiger /home/tiger/.halo2 2>/dev/null || true
-fi
 python3 - <<'PY_TIGER_LINK_OWNERS'
 import os
 import pwd
@@ -1474,7 +1457,7 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
-for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /opt/immich /opt/user/tiger; do
+for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /usr/local/immich /home/tiger/.halo2; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
 done
 if [ -d /usr/local/auto_sync ]; then
@@ -1489,11 +1472,6 @@ for f in \
     /usr/local/auto_sync/bin/auto_syncctl \
     /usr/local/auto_sync/bin/auto_sync_gui \
     /usr/local/auto_sync/bin/auto_sync_web \
-    /opt/auto_sync/bin/auto_sync \
-    /opt/auto_sync/bin/auto_syncd \
-    /opt/auto_sync/bin/auto_syncctl \
-    /opt/auto_sync/bin/auto_sync_gui \
-    /opt/auto_sync/bin/auto_sync_web \
     /usr/local/tbox/bin/tbox_client \
     /usr/local/xray/bin/xray \
     /usr/local/xray/bin/update-geo.sh \
@@ -1507,20 +1485,20 @@ for f in \
 do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
 done
-for link in /opt/immich/machine-learning/.venv/bin/python /opt/immich/machine-learning/.venv/bin/python3 /opt/immich/machine-learning/.venv/bin/python3.*; do
+for link in /usr/local/immich/machine-learning/.venv/bin/python /usr/local/immich/machine-learning/.venv/bin/python3 /usr/local/immich/machine-learning/.venv/bin/python3.*; do
     [ -L "$link" ] || continue
     target="$(readlink "$link" || true)"
     case "$target" in
         /root/src/*)
-            ln -sfn "/opt/user/root/src/${target#/root/src/}" "$link"
+            ln -sfn "/root/src/${target#/root/src/}" "$link"
             ;;
     esac
 done
-[ ! -f /opt/immich/machine-learning/.venv/pyvenv.cfg ] || sed -i 's#/root/src/software#/opt/user/root/src/software#g' /opt/immich/machine-learning/.venv/pyvenv.cfg
-if [ -f /opt/immich/machine-learning/.venv/pyvenv.cfg ]; then
-    python_home="$(find /opt/user/root/src/software/tools/uv-python -mindepth 1 -maxdepth 1 -type d -name 'cpython-*' 2>/dev/null | sort -V | tail -1)"
+[ ! -f /usr/local/immich/machine-learning/.venv/pyvenv.cfg ] || sed -i 's#/opt/user/root/src/software#/usr/local/src/software#g; s#/opt/software/src#/usr/local/src/software#g; s#/opt/src/software#/usr/local/src/software#g' /usr/local/immich/machine-learning/.venv/pyvenv.cfg
+if [ -f /usr/local/immich/machine-learning/.venv/pyvenv.cfg ]; then
+    python_home="$(find /usr/local/src/software/tools/uv-python -mindepth 1 -maxdepth 1 -type d -name 'cpython-*' 2>/dev/null | sort -V | tail -1)"
     if [ -n "$python_home" ]; then
-        sed -i -E "s#^home = .*#home = $python_home/bin#" /opt/immich/machine-learning/.venv/pyvenv.cfg
+        sed -i -E "s#^home = .*#home = $python_home/bin#" /usr/local/immich/machine-learning/.venv/pyvenv.cfg
         if [ -f /etc/systemd/system/immich-ml.service ]; then
             if grep -q '^Environment="PYTHONHOME=' /etc/systemd/system/immich-ml.service; then
                 sed -i -E "s#^Environment=\"PYTHONHOME=.*#Environment=\"PYTHONHOME=$python_home\"#" /etc/systemd/system/immich-ml.service
@@ -1530,8 +1508,15 @@ if [ -f /opt/immich/machine-learning/.venv/pyvenv.cfg ]; then
         fi
     fi
 fi
-find /opt/immich/server/bin /opt/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
-chmod -R a+rX /opt/user/root/src/software/tools/nvm/versions/node/v24.18.0 /opt/user/root/src/software/tools/uv-python 2>/dev/null || true
+find /usr/local/immich/server/bin /usr/local/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
+chmod -R a+rX /usr/local/src/software/tools/nvm/versions/node/v24.18.0 /usr/local/src/software/tools/uv-python 2>/dev/null || true
+if [ -f /etc/systemd/system/auto_sync.service ]; then
+    sed -i 's#/opt/auto_sync#/usr/local/auto_sync#g' /etc/systemd/system/auto_sync.service
+fi
+for f in /etc/immich/*.env /etc/systemd/system/immich.service /etc/systemd/system/immich-ml.service; do
+    [ -f "$f" ] || continue
+    sed -i 's#/opt/immich#/usr/local/immich#g; s#/opt/user/root/src/software#/usr/local/src/software#g; s#/root/src/software/tools#/usr/local/src/software/tools#g; s#/opt/software/src#/usr/local/src/software#g; s#/opt/src/software#/usr/local/src/software#g' "$f"
+done
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
