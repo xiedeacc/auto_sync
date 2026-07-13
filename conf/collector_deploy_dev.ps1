@@ -1533,7 +1533,6 @@ fi
 for f in \
     /usr/local/auto_sync/bin/auto_sync \
     /usr/local/auto_sync/bin/auto_syncd \
-    /usr/local/auto_sync/bin/auto_syncctl \
     /usr/local/auto_sync/bin/auto_sync_gui \
     /usr/local/tbox/bin/tbox_client \
     /usr/local/xray/bin/xray \

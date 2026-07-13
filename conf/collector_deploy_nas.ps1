@@ -1563,7 +1563,6 @@ done
 for f in \
     /opt/usr/local/auto_sync/bin/auto_sync \
     /opt/usr/local/auto_sync/bin/auto_syncd \
-    /opt/usr/local/auto_sync/bin/auto_syncctl \
     /opt/usr/local/auto_sync/bin/auto_sync_gui \
     /opt/usr/local/tbox/bin/tbox_client \
     /opt/usr/local/xray/bin/xray \

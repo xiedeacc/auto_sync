@@ -135,7 +135,7 @@ function Copy-ReleaseBinaries {
     if (-not $NoBuild) {
         Push-Location $RootDir
         try {
-            cargo build --release --bin auto_sync --bin auto_syncctl
+            cargo build --release --bin auto_sync
         }
         finally {
             Pop-Location
@@ -144,7 +144,7 @@ function Copy-ReleaseBinaries {
 
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
     $artifactDir = Join-Path $RootDir "target\release"
-    foreach ($binary in @("auto_sync.exe", "auto_syncctl.exe")) {
+    foreach ($binary in @("auto_sync.exe")) {
         $source = Join-Path $artifactDir $binary
         if (-not (Test-Path -LiteralPath $source)) {
             throw "Missing build artifact: $source"
@@ -166,7 +166,7 @@ function Copy-ReleaseBinaries {
         }
     }
     # Remove stale binaries from the previous multi-binary layout.
-    foreach ($stale in @("auto_syncd.exe", "auto_sync_web.exe")) {
+    foreach ($stale in @("auto_syncd.exe", "auto_syncctl.exe", "auto_sync_web.exe")) {
         Remove-Item -LiteralPath (Join-Path $BinDir $stale) -Force -ErrorAction SilentlyContinue
     }
 }
@@ -239,7 +239,7 @@ function Copy-FlutterGuiBinaries {
 }
 
 function Stop-AutoSyncProcesses {
-    foreach ($name in @("auto_sync", "auto_syncd", "auto_syncctl", "auto_sync_web", "auto_sync_gui")) {
+    foreach ($name in @("auto_sync", "auto_syncd", "auto_sync_web", "auto_sync_gui")) {
         Get-Process -Name $name -ErrorAction SilentlyContinue |
             Stop-Process -Force -ErrorAction SilentlyContinue
     }

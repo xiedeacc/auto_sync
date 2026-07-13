@@ -8,10 +8,6 @@ license = "MIT"
 name = "auto_sync"
 path = "src/bin/auto_sync.rs"
 
-[[bin]]
-name = "auto_syncctl"
-path = "src/bin/auto_syncctl.rs"
-
 [dependencies]
 anyhow = "1"
 axum = "0.7"

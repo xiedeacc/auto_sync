@@ -164,16 +164,41 @@ install_if_different() {
   "${SUDO[@]}" install -m "$mode" "$src" "$dst"
 }
 
+write_systemd_unit() {
+  local install_dir="$1"
+  local output="$2"
+  cat > "$output" <<EOF_SYSTEMD
+[Unit]
+Description=auto_sync daemon
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$install_dir
+ExecStart=$install_dir/bin/auto_sync
+Restart=always
+RestartSec=5
+User=root
+Group=root
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
+EOF_SYSTEMD
+}
+
 ensure_linux_build_environment
 build_flutter_web
 
 # One unified backend binary. The desktop GUI is the separate Flutter
 # auto_sync_gui app on Windows; Linux/NAS deploys only the backend and web UI.
-cargo build --release --bin auto_sync --bin auto_syncctl
-echo "Built auto_sync backend and control utility"
+cargo build --release --bin auto_sync
+echo "Built auto_sync backend"
 mkdir -p bin
 install -m 0755 target/release/auto_sync bin/auto_sync
-install -m 0755 target/release/auto_syncctl bin/auto_syncctl
 
 "${SUDO[@]}" install -d -m 0755 \
   "$INSTALL_DIR/bin" \
@@ -188,10 +213,10 @@ install -m 0755 target/release/auto_syncctl bin/auto_syncctl
 "${SUDO[@]}" rm -f \
   "$INSTALL_DIR/bin/auto_syncd" \
   "$INSTALL_DIR/bin/auto_sync_web" \
-  "$INSTALL_DIR/bin/auto_sync_gui"
+  "$INSTALL_DIR/bin/auto_sync_gui" \
+  "$INSTALL_DIR/bin/auto_syncctl"
 
 install_if_different 0755 bin/auto_sync "$INSTALL_DIR/bin/auto_sync"
-install_if_different 0755 bin/auto_syncctl "$INSTALL_DIR/bin/auto_syncctl"
 "${SUDO[@]}" rm -rf "$INSTALL_DIR/web"
 "${SUDO[@]}" install -d -m 0755 "$INSTALL_DIR/web"
 "${SUDO[@]}" cp -a "$ROOT_DIR/flutter/auto_sync_gui/build/web/." "$INSTALL_DIR/web/"
@@ -210,7 +235,7 @@ fi
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-bin/auto_syncctl print-systemd --install-dir "$INSTALL_DIR" > "$tmp_dir/auto_sync.service"
+write_systemd_unit "$INSTALL_DIR" "$tmp_dir/auto_sync.service"
 
 "${SUDO[@]}" install -m 0644 "$tmp_dir/auto_sync.service" /etc/systemd/system/auto_sync.service
 "${SUDO[@]}" systemctl daemon-reload

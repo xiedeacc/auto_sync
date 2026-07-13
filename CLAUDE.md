@@ -1,6 +1,6 @@
 # Project Rules
 
-- The project ships a single runtime binary `auto_sync` (scheduler + watcher + web, plus the desktop window when a display is available) and the `auto_syncctl` CLI. The old `auto_syncd` / `auto_sync_gui` / `auto_sync_web` binaries were merged into `auto_sync`.
+- The project ships a single runtime binary `auto_sync` (scheduler + watcher + web, plus the desktop window when a display is available). The old split binaries were merged into `auto_sync`; scriptable control goes through the HTTP API and UI.
 - For every local code-change loop, stop old `auto_sync` processes first: `auto_sync` (and any legacy `auto_syncd`, `auto_sync_web`, `auto_sync_gui`).
 - After stopping old processes, run an incremental debug build: `cargo build --bins`.
 - On Windows, before starting any `auto_sync` process, copy the freshly compiled binaries into `D:\code\auto_sync\bin` and start them only from that `bin\` directory, never directly from `target\debug\` or `target\release\`.

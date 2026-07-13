@@ -59,8 +59,6 @@ or profile references back to dev paths.
 | --- | --- | --- |
 | `scripts/deploy_local.sh` | `/usr/local/auto_sync` | `scripts/deploy_nas.sh` sets `/opt/usr/local/auto_sync`. |
 | `scripts/deploy_nas.sh` | `/opt/usr/local/auto_sync` | The script rejects any other NAS install dir. |
-| `auto_syncctl print-systemd` | `/usr/local/auto_sync` | Pass `--install-dir /opt/usr/local/auto_sync` for NAS. |
-| `auto_syncctl deploy-nas` | `/opt/usr/local/auto_sync` | NAS-specific command default. |
 | UI default for new Linux machines | `/usr/local/auto_sync` | Set NAS explicitly to `/opt/usr/local/auto_sync`. |
 
 ## Environment Files
@@ -94,4 +92,5 @@ or profile references back to dev paths.
 | Java | `JAVA_HOME` | `/usr/lib/jvm/java-21-openjdk-amd64` | `/etc/profile.d/auto-sync-domestic-mirrors.sh`; JDK is installed from apt. |
 
 Systemd unit files should use absolute real paths from the tables above.
-Generated `auto_sync.service` comes from `auto_syncctl print-systemd`.
+`scripts/deploy_local.sh` renders `auto_sync.service` directly from the selected
+install directory; `scripts/deploy_nas.sh` supplies the NAS path.

@@ -1,7 +1,7 @@
 # Project Rules
 
 - For every local code-change loop, stop old `auto_sync` processes first:
-  `auto_syncd`, `auto_syncctl`, `auto_sync_web`, and `auto_sync_gui`.
+  `auto_sync`, `auto_syncd`, `auto_sync_web`, and `auto_sync_gui`.
 - After stopping old processes, run an incremental debug build: `cargo build --bins`.
 - On Windows, before starting any `auto_sync` process, copy the freshly compiled binaries into `D:\code\auto_sync\bin` and start them only from that `bin\` directory, never directly from `target\debug\` or `target\release\`.
 - Use the Windows deploy script for full local deployment: `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`. On Windows, deploy binaries into the repository `bin\` directory and use a current-user Startup launcher for both `auto_syncd` and `auto_sync_gui`; always start both from `bin\` after deployment, and do not install or start `auto_syncd` as a Windows service.

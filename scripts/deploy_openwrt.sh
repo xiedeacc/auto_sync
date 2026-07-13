@@ -82,14 +82,12 @@ build_openwrt_binaries() {
 
   cargo build --release --target "$TARGET" \
     --no-default-features \
-    --bin auto_sync \
-    --bin auto_syncctl
+    --bin auto_sync
 
   mkdir -p "$OUT_DIR"
   install -m 0755 "target/$TARGET/release/auto_sync" "$OUT_DIR/auto_sync"
-  install -m 0755 "target/$TARGET/release/auto_syncctl" "$OUT_DIR/auto_syncctl"
 
-  echo "OpenWrt aarch64 binaries staged in $OUT_DIR"
+  echo "OpenWrt aarch64 binary staged in $OUT_DIR"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -164,26 +162,22 @@ if [[ -z "$BINARY_DIR" ]]; then
     BINARY_DIR="bin/openwrt"
   else
     echo "No OpenWrt binaries found for arch '$arch'." >&2
-    echo "Put auto_sync and auto_syncctl under bin/openwrt/$arch or pass --binary-dir." >&2
+    echo "Put auto_sync under bin/openwrt/$arch or pass --binary-dir." >&2
     exit 1
   fi
 fi
 
-for binary in auto_sync auto_syncctl; do
-  if [[ ! -x "$BINARY_DIR/$binary" ]]; then
-    echo "$BINARY_DIR/$binary is missing or not executable" >&2
-    exit 1
-  fi
-done
+if [[ ! -x "$BINARY_DIR/auto_sync" ]]; then
+  echo "$BINARY_DIR/auto_sync is missing or not executable" >&2
+  exit 1
+fi
 
 ssh -p "$PORT" "$target" "mkdir -p '$INSTALL_DIR/bin' '$INSTALL_DIR/conf' '$INSTALL_DIR/conf/state' '$INSTALL_DIR/logs'"
 
 # Stop and retire the old split services/binaries.
-ssh -p "$PORT" "$target" "/etc/init.d/auto_sync stop >/dev/null 2>&1 || true; /etc/init.d/auto_sync_web stop >/dev/null 2>&1 || true; /etc/init.d/auto_sync_web disable >/dev/null 2>&1 || true; rm -f /etc/init.d/auto_sync_web ${INSTALL_DIR}/bin/auto_syncd ${INSTALL_DIR}/bin/auto_sync_web ${INSTALL_DIR}/bin/auto_sync_gui"
+ssh -p "$PORT" "$target" "/etc/init.d/auto_sync stop >/dev/null 2>&1 || true; /etc/init.d/auto_sync_web stop >/dev/null 2>&1 || true; /etc/init.d/auto_sync_web disable >/dev/null 2>&1 || true; rm -f /etc/init.d/auto_sync_web ${INSTALL_DIR}/bin/auto_syncd ${INSTALL_DIR}/bin/auto_sync_web ${INSTALL_DIR}/bin/auto_sync_gui ${INSTALL_DIR}/bin/auto_syncctl"
 
-for binary in auto_sync auto_syncctl; do
-  scp -O -P "$PORT" "$BINARY_DIR/$binary" "${target}:${INSTALL_DIR}/bin/${binary}"
-done
+scp -O -P "$PORT" "$BINARY_DIR/auto_sync" "${target}:${INSTALL_DIR}/bin/auto_sync"
 
 if ssh -p "$PORT" "$target" "test -f '${INSTALL_DIR}/conf/auto_sync.toml'"; then
   echo "Preserved existing OpenWrt config $INSTALL_DIR/conf/auto_sync.toml"
