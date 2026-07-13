@@ -1691,7 +1691,7 @@ if [ -f /etc/systemd/system/redis.service ] && [ -f /usr/lib/systemd/system/redi
     rm -f /etc/systemd/system/redis.service
     systemctl daemon-reload
 fi
-for s in shadowsocks shadowsocks-rust waiwei waiwei-web waiwei-puller xray; do
+for s in shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
 for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer rblog rblog-backup.timer nginx cron; do

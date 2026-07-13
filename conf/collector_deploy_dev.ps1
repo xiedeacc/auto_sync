@@ -1610,7 +1610,7 @@ fi
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for s in tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei waiwei-web waiwei-puller xray; do
+for s in tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
 for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron; do

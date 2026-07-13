@@ -267,11 +267,11 @@ mkdir -p /etc/init.d /etc/sysctl.d /etc/config /usr/local
 /etc/init.d/shadowsocks stop 2>/dev/null || true
 /etc/init.d/shadowsocks-rust disable 2>/dev/null || true
 /etc/init.d/shadowsocks-rust stop 2>/dev/null || true
-for svc in waiwei waiwei-web waiwei-puller xray; do
+for svc in waiwei-web waiwei-puller xray; do
   /etc/init.d/$svc disable 2>/dev/null || true
   /etc/init.d/$svc stop 2>/dev/null || true
 done
-killall sslocal sslocal-master xray waiwei waiwei-web waiwei-puller 2>/dev/null || true
+killall sslocal sslocal-master xray waiwei-web waiwei-puller 2>/dev/null || true
 rm -rf \
   /usr/local/shadowsocks/bin/sslocal-master \
   /usr/local/shadowsocks/bin/sslocal-master-redir-nft.sh \
@@ -486,11 +486,11 @@ for f in /etc/sysctl.d/*.conf; do [ -f $f ] && sysctl -p $f >/dev/null 2>&1 || t
 # for collection/round-trip but disabled and stopped.
 /etc/init.d/shadowsocks-rust disable 2>/dev/null || true
 /etc/init.d/shadowsocks-rust stop 2>/dev/null || true
-for svc in waiwei waiwei-web waiwei-puller xray; do
+for svc in waiwei-web waiwei-puller xray; do
   /etc/init.d/$svc disable 2>/dev/null || true
   /etc/init.d/$svc stop 2>/dev/null || true
 done
-killall sslocal-master xray waiwei waiwei-web waiwei-puller 2>/dev/null || true
+killall sslocal-master xray waiwei-web waiwei-puller 2>/dev/null || true
 ensure_ubus || exit 1
 
 [ -x /etc/init.d/shadowsocks ] || { echo "!! missing /etc/init.d/shadowsocks" >&2; exit 1; }
