@@ -26,6 +26,9 @@ symlinks.
 | Xray | `/opt/usr/local/xray` | `/usr/local/xray` | `xray.service` uses binaries and data from here. |
 | Immich runtime | `/opt/immich` | `/usr/local/immich` | Native deployment, not Docker. |
 | Immich source checkout | `/opt/src/software/immich` | `/root/src/software/immich` | Uses the `deploy` branch. |
+| GitLab repository data | `/zfs/gitlab_data` on the imported NAS ZFS pool | `/zfs/gitlab_data` plain directory | Collector deployment scripts configure GitLab repository and LFS storage here. Test uses the same path as a plain directory. |
+| Database backups | `/zfs/backup/pg_backup` and `/zfs/backup/mysql_backup` | `/zfs/backup/pg_backup` and `/zfs/backup/mysql_backup` | Backup cron scripts keep weekly dumps here and prune files older than seven days. NAS wakes `/zfs` before restore and can return disks to standby. |
+| Static web roots | `/opt/www/gitlab_cleaner`, `/opt/www/unlock-music` | `/opt/www/gitlab_cleaner`, `/opt/www/unlock-music`, `/opt/www/coverage` | Collector deployment scripts add these platform defaults even if the collector list is older. |
 | Flutter SDK | `/opt/src/software/flutter` | `/root/src/software/flutter` | NAS wrapper sets `FLUTTER_ROOT`; generic/dev default is `/root/src/software/flutter`. |
 | NVM root | `/opt/src/software/tools/nvm` | `/root/src/software/tools/nvm` | Deployment uses this as `NVM_DIR`; NAS `/root/.nvm` itself stays under `/opt/user/root` with the rest of root home. Tiger user nvm/npm state should not be recreated. |
 | Node.js | `/opt/src/software/tools/nvm/versions/node/v24.18.0` | `/root/src/software/tools/nvm/versions/node/v24.18.0` | Installed by nvm; deployment scripts may fall back to latest Node 24. |
