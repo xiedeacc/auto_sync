@@ -690,12 +690,12 @@ ensure_host_entry() {
     cat "$tmp" > /etc/hosts
     rm -f "$tmp"
 }
-ensure_host_entry 192.168.2.247 code.xiedeacc.com
-ensure_host_entry 192.168.2.247 unlock-music.xiedeacc.com
-ensure_host_entry 192.168.2.247 immich.xiedeacc.com
-ensure_host_entry 192.168.2.247 halo.xiedeacc.com
-ensure_host_entry 192.168.2.247 blog.xiedeacc.com
-ensure_host_entry 192.168.2.247 rblog.xiedeacc.com
+ensure_host_entry 127.0.0.1 code.xiedeacc.com
+ensure_host_entry 127.0.0.1 unlock-music.xiedeacc.com
+ensure_host_entry 127.0.0.1 immich.xiedeacc.com
+ensure_host_entry 127.0.0.1 halo.xiedeacc.com
+ensure_host_entry 127.0.0.1 blog.xiedeacc.com
+ensure_host_entry 127.0.0.1 rblog.xiedeacc.com
 ensure_host_entry 127.0.0.1 dev.xiedeacc.com
 ensure_host_entry 127.0.0.1 coverage.xiedeacc.com
 

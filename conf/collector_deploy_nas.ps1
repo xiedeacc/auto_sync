@@ -681,8 +681,8 @@ ensure_host_entry 127.0.0.1 immich.xiedeacc.com
 ensure_host_entry 127.0.0.1 halo.xiedeacc.com
 ensure_host_entry 127.0.0.1 blog.xiedeacc.com
 ensure_host_entry 127.0.0.1 rblog.xiedeacc.com
-ensure_host_entry 192.168.2.126 dev.xiedeacc.com
-ensure_host_entry 192.168.2.126 coverage.xiedeacc.com
+ensure_host_entry 127.0.0.1 dev.xiedeacc.com
+ensure_host_entry 127.0.0.1 coverage.xiedeacc.com
 
 swapoff -a || true
 sed -i '/^\/swap\.img[[:space:]]/s/^/#/' /etc/fstab 2>/dev/null || true
