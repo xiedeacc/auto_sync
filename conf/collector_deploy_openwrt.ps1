@@ -44,6 +44,7 @@ $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
 $deployExcludePaths = @(
+    '/etc/init.d/shadowsocks-rust',
     '/usr/local/shadowsocks/bin/sslocal-master',
     '/usr/local/shadowsocks/bin/sslocal-master-redir-nft.sh',
     '/usr/local/shadowsocks/data/source',
@@ -265,8 +266,12 @@ echo "OpenWrt deploy prerequisites OK"
 Invoke-Remote @'
 mkdir -p /etc/init.d /etc/sysctl.d /etc/config /usr/local
 /etc/init.d/shadowsocks stop 2>/dev/null || true
+/etc/init.d/shadowsocks-rust disable 2>/dev/null || true
+/etc/init.d/shadowsocks-rust stop 2>/dev/null || true
 killall sslocal xray-plugin 2>/dev/null || true
 rm -rf \
+  /etc/init.d/shadowsocks-rust \
+  /etc/rc.d/*shadowsocks-rust \
   /usr/local/shadowsocks/bin/sslocal-master \
   /usr/local/shadowsocks/bin/sslocal-master-redir-nft.sh \
   /usr/local/shadowsocks/data/source \
@@ -434,11 +439,11 @@ ensure_ubus || exit 1
 sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
 for f in /etc/sysctl.d/*.conf; do [ -f $f ] && sysctl -p $f >/dev/null 2>&1 || true; done
 
-# shadowsocks (sslocal) on; shadowsocks-rust (sslocal-master) off. The
-# /etc/init.d/shadowsocks script must use NAME=shadowsocks, while the legacy
-# shadowsocks-rust script keeps NAME=shadowsocks-rust.
+# shadowsocks (sslocal) on; legacy shadowsocks-rust (sslocal-master) off.
+# Remove the old init entry so it cannot come back with a missing NFT helper.
 /etc/init.d/shadowsocks-rust disable 2>/dev/null || true
 /etc/init.d/shadowsocks-rust stop 2>/dev/null || true
+rm -f /etc/init.d/shadowsocks-rust /etc/rc.d/*shadowsocks-rust 2>/dev/null || true
 ensure_ubus || exit 1
 
 [ -x /etc/init.d/shadowsocks ] || { echo "!! missing /etc/init.d/shadowsocks" >&2; exit 1; }

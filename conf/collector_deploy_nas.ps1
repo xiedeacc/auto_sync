@@ -8,7 +8,7 @@ $root = $env:AS_ROOT
 
 $opts    = @('-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new','-o','LogLevel=ERROR','-o','ConnectTimeout=20','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=20')
 $sshArgs = @() + $opts
-$scpArgs = @('-r','-p') + $opts
+$scpArgs = @('-r') + $opts
 if (-not [string]::IsNullOrEmpty($env:AS_PORT)) { $sshArgs += @('-p', $env:AS_PORT); $scpArgs += @('-P', $env:AS_PORT) }
 if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KEY);  $scpArgs += @('-i', $env:AS_KEY) }
 
