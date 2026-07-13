@@ -72,8 +72,8 @@ or profile references back to dev paths.
 
 | Tool | Setting | Value | Where it is managed |
 | --- | --- | --- | --- |
-| apt | Ubuntu archive mirror | `https://mirrors.cloud.tencent.com` | `conf/collector_deploy_dev.ps1`, `conf/collector_deploy_nas.ps1`, and `conf/collector_deploy_test.ps1` rewrite Ubuntu sources before package install. |
-| Go modules | `GOPROXY` | `https://goproxy.cn,direct` | `/etc/profile.d/auto-sync-domestic-mirrors.sh` |
+| apt | Ubuntu archive mirror | `https://mirrors.cloud.tencent.com` | `conf/collector_deploy_dev.ps1`, `conf/collector_deploy_nas.ps1`, and `conf/collector_deploy_test.ps1` rewrite Ubuntu sources before package install; `scripts/deploy_local.sh` also rewrites official Ubuntu sources before installing auto_sync build deps. |
+| Go modules | `GOPROXY` | `https://goproxy.cn,direct` | `/etc/profile.d/auto-sync-domestic-mirrors.sh`; also exported by `scripts/deploy_local.sh` during normal auto_sync deploys. |
 | Go SDK tarball | download URL | first `https://mirrors.aliyun.com/golang/go1.25.1.linux-amd64.tar.gz`, fallback `https://go.dev/dl/go1.25.1.linux-amd64.tar.gz` | Collector deployment scripts. |
 | nvm installer | source URL | `https://gitee.com/mirrors/nvm/raw/v0.40.3/install.sh` with `NVM_SOURCE=https://gitee.com/mirrors/nvm.git` | Collector deployment scripts. |
 | Node.js downloads | `NVM_NODEJS_ORG_MIRROR` | `https://npmmirror.com/mirrors/node` | `/etc/profile.d/auto-sync-domestic-mirrors.sh` |
@@ -83,10 +83,10 @@ or profile references back to dev paths.
 | pip | `index-url` | `https://pypi.tuna.tsinghua.edu.cn/simple` | `/etc/pip.conf` |
 | pip | `PIP_INDEX_URL` | `https://pypi.tuna.tsinghua.edu.cn/simple` | `/etc/profile.d/auto-sync-domestic-mirrors.sh` |
 | uv | `UV_DEFAULT_INDEX`, `UV_INDEX_URL` | `https://pypi.tuna.tsinghua.edu.cn/simple` | `/etc/profile.d/auto-sync-domestic-mirrors.sh` |
-| rustup | `RUSTUP_DIST_SERVER` | `https://rsproxy.cn` | `/etc/profile.d/auto-sync-domestic-mirrors.sh` |
-| rustup | `RUSTUP_UPDATE_ROOT` | `https://rsproxy.cn/rustup` | `/etc/profile.d/auto-sync-domestic-mirrors.sh` |
-| rustup installer | source URL | `https://rsproxy.cn/rustup-init.sh` | Collector deployment scripts. |
-| Cargo | crates.io replacement | `sparse+https://rsproxy.cn/index/` | `/root/.cargo/config.toml` |
+| rustup | `RUSTUP_DIST_SERVER` | `https://rsproxy.cn` | `/etc/profile.d/auto-sync-domestic-mirrors.sh`; also exported by `scripts/deploy_local.sh` during normal auto_sync deploys. |
+| rustup | `RUSTUP_UPDATE_ROOT` | `https://rsproxy.cn/rustup` | `/etc/profile.d/auto-sync-domestic-mirrors.sh`; also exported by `scripts/deploy_local.sh` during normal auto_sync deploys. |
+| rustup installer | source URL | `https://rsproxy.cn/rustup-init.sh` | Collector deployment scripts and `scripts/deploy_local.sh` when Rust is missing. |
+| Cargo | crates.io replacement | `sparse+https://rsproxy.cn/index/` | `/root/.cargo/config.toml`; `scripts/deploy_local.sh` creates this when no cargo config exists. |
 | Flutter pub | `PUB_HOSTED_URL` | `https://pub.flutter-io.cn` | `scripts/deploy_local.sh` and `scripts/deploy_windows.ps1` during Flutter build. |
 | Flutter storage | `FLUTTER_STORAGE_BASE_URL` | `https://storage.flutter-io.cn` | `scripts/deploy_local.sh` and `scripts/deploy_windows.ps1` during Flutter build. |
 | Java | `JAVA_HOME` | `/usr/lib/jvm/java-21-openjdk-amd64` | `/etc/profile.d/auto-sync-domestic-mirrors.sh`; JDK is installed from apt. |

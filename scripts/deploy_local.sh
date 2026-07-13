@@ -42,11 +42,59 @@ if [[ "${EUID}" -ne 0 ]]; then
   SUDO=(sudo)
 fi
 
+configure_domestic_build_mirrors() {
+  export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
+  export RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER:-https://rsproxy.cn}"
+  export RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}"
+  export CARGO_REGISTRIES_CRATES_IO_PROTOCOL="${CARGO_REGISTRIES_CRATES_IO_PROTOCOL:-sparse}"
+  export PUB_HOSTED_URL="${PUB_HOSTED_URL:-https://pub.flutter-io.cn}"
+  export FLUTTER_STORAGE_BASE_URL="${FLUTTER_STORAGE_BASE_URL:-https://storage.flutter-io.cn}"
+
+  if command -v apt-get >/dev/null 2>&1; then
+    local apt_changed=0
+    if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]] && \
+      grep -Eq 'archive\.ubuntu\.com|security\.ubuntu\.com' /etc/apt/sources.list.d/ubuntu.sources; then
+      "${SUDO[@]}" sed -i \
+        's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' \
+        /etc/apt/sources.list.d/ubuntu.sources
+      apt_changed=1
+    fi
+    if [[ -f /etc/apt/sources.list ]] && \
+      grep -Eq 'archive\.ubuntu\.com|security\.ubuntu\.com' /etc/apt/sources.list; then
+      "${SUDO[@]}" sed -i \
+        's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' \
+        /etc/apt/sources.list
+      apt_changed=1
+    fi
+    if [[ "$apt_changed" -eq 1 ]]; then
+      echo "Configured Ubuntu apt mirror: https://mirrors.cloud.tencent.com"
+    fi
+  fi
+
+  mkdir -p "$HOME/.cargo"
+  if [[ ! -f "$HOME/.cargo/config.toml" ]]; then
+    cat > "$HOME/.cargo/config.toml" <<'EOF_CARGO_MIRROR'
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+EOF_CARGO_MIRROR
+  elif ! grep -q 'rsproxy\.cn' "$HOME/.cargo/config.toml"; then
+    echo "Existing $HOME/.cargo/config.toml does not use rsproxy; leaving it unchanged"
+  fi
+}
+
 ensure_linux_build_environment() {
   if [[ "$(uname -s)" != "Linux" ]]; then
     echo "deploy_local.sh must run on Linux." >&2
     exit 1
   fi
+
+  configure_domestic_build_mirrors
 
   local need_apt=0
   local packages=(
@@ -87,7 +135,7 @@ ensure_linux_build_environment() {
 
   if ! command -v cargo >/dev/null 2>&1; then
     echo "Installing Rust stable toolchain ..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+    curl --proto '=https' --tlsv1.2 -sSf "${RUSTUP_INIT_URL:-https://rsproxy.cn/rustup-init.sh}" |
       sh -s -- -y --profile minimal --default-toolchain stable
   fi
 
@@ -144,8 +192,7 @@ build_flutter_web() {
     echo "Missing Flutter project: $flutter_project" >&2
     exit 1
   fi
-  export PUB_HOSTED_URL="${PUB_HOSTED_URL:-https://pub.flutter-io.cn}"
-  export FLUTTER_STORAGE_BASE_URL="${FLUTTER_STORAGE_BASE_URL:-https://storage.flutter-io.cn}"
+  configure_domestic_build_mirrors
   (
     cd "$flutter_project"
     flutter pub get
