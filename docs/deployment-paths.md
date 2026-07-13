@@ -68,6 +68,62 @@ or profile references back to dev paths.
 | NAS/dev/test | `/etc/profile.d/auto-sync-domestic-mirrors.sh` | Domestic mirrors for Go, Node, npm, Python, Rust, and `JAVA_HOME` from apt OpenJDK. |
 | NAS/test | `/etc/profile.d/opt-usr-local-path.sh` | Adds `/opt/usr/local/bin` and `/opt/usr/local/go/go1.25.1/bin` to `PATH`. |
 
+## Managed Configuration Files
+
+These files are created or modified by the deployment scripts. Keep this list in
+sync with `conf/collector_deploy_*.ps1`, `scripts/deploy_local.sh`, and
+`scripts/deploy_nas.sh` when adding new host-level configuration.
+
+| File | Host | Managed by | Purpose |
+| --- | --- | --- | --- |
+| `/etc/apt/sources.list.d/ubuntu.sources` | NAS/dev/test | Collector deployment scripts and `scripts/deploy_local.sh` | Rewrites official Ubuntu archive/security URLs to `https://mirrors.cloud.tencent.com` when present. |
+| `/etc/apt/sources.list` | NAS/dev/test | `scripts/deploy_local.sh` | Rewrites legacy official Ubuntu archive/security URLs to `https://mirrors.cloud.tencent.com` when present. |
+| `/etc/profile.d/auto-sync-domestic-mirrors.sh` | NAS/dev/test | Collector deployment scripts | Persistent shell environment for domestic mirrors plus apt OpenJDK `JAVA_HOME`. |
+| `/etc/profile.d/opt-usr-local-path.sh` | NAS/test | Collector deployment scripts | Adds NAS `/opt/usr/local/bin` and `/opt/usr/local/go/go1.25.1/bin` to `PATH` without bind-mounting `/usr/local`. |
+| `/etc/pip.conf` | NAS/dev/test | Collector deployment scripts | Sets the global pip index to Tsinghua PyPI mirror. |
+| `/root/.cargo/config.toml` | NAS/dev/test | Collector deployment scripts and `scripts/deploy_local.sh` | Sets crates.io replacement to rsproxy sparse registry and enables git CLI fetch. |
+| `/etc/systemd/system/auto_sync.service` | NAS/dev | `scripts/deploy_local.sh` via `scripts/deploy_nas.sh` on NAS | Starts the unified `auto_sync` process from the host-specific install dir. |
+| `/etc/systemd/coredump.conf` | NAS/dev/test | Collector deployment scripts | Enables external unlimited coredump storage. |
+| `/etc/security/limits.conf` | NAS/dev/test | Collector deployment scripts | Appends unlimited core size limits. |
+| `/etc/sysctl.conf` | NAS/dev/test | Collector deployment scripts | Appends coredump pattern and reloads sysctl. |
+| `/etc/hosts` | NAS/dev/test | Collector deployment scripts | Ensures local service hostnames point to the intended NAS/dev addresses without duplicate stale entries. |
+| `/etc/fstab` | NAS/dev/test | Collector deployment scripts | Comments `/swap.img` swap entry when disabling swap. |
+| `/etc/ssh/sshd_config` | NAS/dev/test | Collector deployment scripts | Enforces the project SSH policy when bootstrapping hosts. |
+
+Service-specific files such as nginx vhosts, GitLab, MySQL, PostgreSQL, Immich,
+Halo, TBox, Waiwei, Xray, rblog, and logrotate configs are copied from the
+collector share into their normal system locations. They should stay aligned
+with the corresponding collected paths rather than being regenerated ad hoc.
+
+## Managed Environment Variables
+
+Java uses only `JAVA_HOME`; do not set a global `CLASSPATH`/`CLASS_PATH`.
+The collector deployment scripts explicitly remove stale `CLASSPATH` and
+old `/usr/local/java` shell startup entries from root and tiger profiles, so
+each Java project remains responsible for its own classpath.
+
+| Variable | Value | Scope | Managed by | Notes |
+| --- | --- | --- | --- | --- |
+| `GOPROXY` | `https://goproxy.cn,direct` | Persistent on NAS/dev/test; process-local during normal Linux auto_sync deploys | `/etc/profile.d/auto-sync-domestic-mirrors.sh`, `scripts/deploy_local.sh` | Go module mirror. |
+| `NVM_NODEJS_ORG_MIRROR` | `https://npmmirror.com/mirrors/node` | Persistent on NAS/dev/test | `/etc/profile.d/auto-sync-domestic-mirrors.sh` | Node binary mirror for nvm. |
+| `npm_config_registry` | `https://registry.npmmirror.com` | Persistent on NAS/dev/test | `/etc/profile.d/auto-sync-domestic-mirrors.sh`; also written by `npm config set registry` | npm registry mirror. |
+| `COREPACK_NPM_REGISTRY` | `https://registry.npmmirror.com` | Persistent on NAS/dev/test | `/etc/profile.d/auto-sync-domestic-mirrors.sh` | Corepack package registry. |
+| `PIP_INDEX_URL` | `https://pypi.tuna.tsinghua.edu.cn/simple` | Persistent on NAS/dev/test | `/etc/profile.d/auto-sync-domestic-mirrors.sh` | Python package mirror; `/etc/pip.conf` carries the same index for pip. |
+| `UV_DEFAULT_INDEX` | `https://pypi.tuna.tsinghua.edu.cn/simple` | Persistent on NAS/dev/test | `/etc/profile.d/auto-sync-domestic-mirrors.sh` | uv default package index. |
+| `UV_INDEX_URL` | `https://pypi.tuna.tsinghua.edu.cn/simple` | Persistent on NAS/dev/test | `/etc/profile.d/auto-sync-domestic-mirrors.sh` | uv package index URL. |
+| `RUSTUP_DIST_SERVER` | `https://rsproxy.cn` | Persistent on NAS/dev/test; process-local during normal Linux auto_sync deploys | `/etc/profile.d/auto-sync-domestic-mirrors.sh`, `scripts/deploy_local.sh` | Rust distribution mirror. |
+| `RUSTUP_UPDATE_ROOT` | `https://rsproxy.cn/rustup` | Persistent on NAS/dev/test; process-local during normal Linux auto_sync deploys | `/etc/profile.d/auto-sync-domestic-mirrors.sh`, `scripts/deploy_local.sh` | rustup metadata mirror. |
+| `JAVA_HOME` | `/usr/lib/jvm/java-21-openjdk-amd64` | Persistent on NAS/dev/test | `/etc/profile.d/auto-sync-domestic-mirrors.sh` | apt OpenJDK 21. No `/usr/local/java` symlink and no global `CLASSPATH`. |
+| `PATH` | Prepends `$JAVA_HOME/bin` | Persistent on NAS/dev/test | `/etc/profile.d/auto-sync-domestic-mirrors.sh` | Makes apt OpenJDK tools visible. |
+| `PATH` | Prepends `/opt/usr/local/bin` and `/opt/usr/local/go/go1.25.1/bin` when present | Persistent on NAS/test | `/etc/profile.d/opt-usr-local-path.sh` | NAS/test only because `/usr/local` software lives under `/opt/usr/local`. |
+| `GOPATH` | `/root/src/go` | Process-local during collector deployment | Collector deployment scripts | Used while installing Go tools; do not recreate `/root/go`. |
+| `GOBIN` | `$GOPATH/bin` | Process-local during collector deployment | Collector deployment scripts | Go tool install output path. |
+| `NVM_DIR` | NAS/test: `/opt/src/software/tools/nvm`; dev: `/root/src/software/tools/nvm` | Process-local during collector deployment | Collector deployment scripts | nvm install root. |
+| `PUB_HOSTED_URL` | `https://pub.flutter-io.cn` | Process-local during Flutter builds | `scripts/deploy_local.sh`, `scripts/deploy_windows.ps1` | Flutter/Dart package mirror. |
+| `FLUTTER_STORAGE_BASE_URL` | `https://storage.flutter-io.cn` | Process-local during Flutter builds | `scripts/deploy_local.sh`, `scripts/deploy_windows.ps1` | Flutter artifact mirror. |
+| `CARGO_REGISTRIES_CRATES_IO_PROTOCOL` | `sparse` | Process-local during normal Linux auto_sync deploys | `scripts/deploy_local.sh` | Forces sparse Cargo protocol; actual registry replacement is in `/root/.cargo/config.toml`. |
+| `RUSTUP_INIT_URL` | Defaults to `https://rsproxy.cn/rustup-init.sh` when unset | Process-local override for normal Linux auto_sync deploys | `scripts/deploy_local.sh` | Optional override for the rustup installer URL. |
+
 ## Source Matrix
 
 | Tool | Setting | Value | Where it is managed |
