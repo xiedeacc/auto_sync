@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -31,6 +32,11 @@ use crate::core::sync::{
 
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MANUAL_DISCOVERY_MIN_INTERVAL: Duration = Duration::from_secs(5);
+static PROCESS_STARTED_AT: OnceLock<DateTime<Utc>> = OnceLock::new();
+
+pub fn set_process_started_at(started_at: DateTime<Utc>) {
+    let _ = PROCESS_STARTED_AT.set(started_at);
+}
 
 #[derive(Clone)]
 pub struct Backend {
@@ -520,6 +526,13 @@ impl Backend {
     }
 
     pub fn runtime_status(&self) -> RuntimeStatus {
+        let process_started_at = PROCESS_STARTED_AT.get().cloned();
+        let process_uptime_secs = process_started_at.map(|started_at| {
+            Utc::now()
+                .signed_duration_since(started_at)
+                .num_seconds()
+                .max(0) as u64
+        });
         RuntimeStatus {
             syncing: sync_is_running(),
             sync_kind: current_sync_kind(),
@@ -532,6 +545,8 @@ impl Backend {
             build: BuildInfo::current(),
             config_errors: current_config_warnings(),
             status_epoch: crate::core::peer_notify::status_epoch(),
+            process_started_at: process_started_at.map(|started_at| started_at.to_rfc3339()),
+            process_uptime_secs,
         }
     }
 
@@ -1637,6 +1652,10 @@ pub struct RuntimeStatus {
     /// status notification; the UI re-fetches statuses when it moves.
     #[serde(default)]
     pub status_epoch: u64,
+    #[serde(default)]
+    pub process_started_at: Option<String>,
+    #[serde(default)]
+    pub process_uptime_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

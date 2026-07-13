@@ -91,6 +91,12 @@ fn main() -> Result<()> {
         }
     };
 
+    let process_started_at = chrono::Utc::now();
+    auto_sync::core::backend::set_process_started_at(process_started_at);
+    State::open(&cfg.app.data_db)
+        .and_then(|state| state.record_process_started_at(process_started_at))
+        .context("failed to record process start time")?;
+
     // Apply receiver-side policy up front so the web server (the destination of
     // pushes) honours it even though it never runs the scheduler loop.
     auto_sync::core::sync::configure_fsync(cfg.app.sync.fsync);

@@ -103,11 +103,21 @@ ensure_linux_build_environment() {
 }
 
 ensure_flutter_web_environment() {
+  local flutter_root="${FLUTTER_ROOT:-$HOME/src/software/flutter}"
+  local legacy_flutter_root="$HOME/flutter"
+  if [[ ! -e "$flutter_root" && -x "$legacy_flutter_root/bin/flutter" ]]; then
+    echo "Moving Flutter SDK from $legacy_flutter_root to $flutter_root ..."
+    mkdir -p "$(dirname "$flutter_root")"
+    mv "$legacy_flutter_root" "$flutter_root"
+  fi
+  if [[ -x "$flutter_root/bin/flutter" ]]; then
+    export PATH="$flutter_root/bin:$PATH"
+    return
+  fi
   if command -v flutter >/dev/null 2>&1; then
     return
   fi
 
-  local flutter_root="${FLUTTER_ROOT:-$HOME/flutter}"
   if [[ ! -x "$flutter_root/bin/flutter" ]]; then
     echo "Installing Flutter stable to $flutter_root ..."
     mkdir -p "$(dirname "$flutter_root")"

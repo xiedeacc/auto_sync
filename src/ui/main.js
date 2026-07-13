@@ -195,6 +195,7 @@ let latestDestinationSchedule = defaultDestinationSchedule();
 let machineHostLocked = false;
 
 const el = {
+  appTitle: document.getElementById("app-title"),
   configPath: document.getElementById("config-path"),
   sourcePanel: document.getElementById("source-panel"),
   readme: document.getElementById("readme"),
@@ -696,6 +697,38 @@ function updateStatusBar() {
   const buildText = `${commit} · ${time}`;
   el.statusBuild.textContent = buildText;
   el.statusBuild.title = buildText;
+  updateHeaderUptime();
+}
+
+function updateHeaderUptime() {
+  if (!el.appTitle) {
+    return;
+  }
+  const uptime = runtimeUptimeLabel(runtimeStatus);
+  el.appTitle.textContent = uptime ? `auto_sync · up ${uptime}` : "auto_sync";
+  const startedAt = runtimeStatus && runtimeStatus.process_started_at;
+  el.appTitle.title = startedAt ? `Started at ${startedAt}` : el.appTitle.textContent;
+}
+
+function runtimeUptimeLabel(status) {
+  const seconds = Number(status && status.process_uptime_secs);
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return "";
+  }
+  if (seconds < 60) {
+    return `${Math.floor(seconds)}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h ${minutes % 60}m`;
+  }
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return remHours === 0 ? `${days}d` : `${days}d ${remHours}h`;
 }
 
 function updateConfigErrorIndicator() {

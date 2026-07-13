@@ -947,6 +947,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
         children: [
           _Header(
             machineStatus: machineStatus,
+            runtimeStatus: runtimeStatus,
             onMachines: _openMachinesDialog,
             onReadme: _openReadmeDialog,
             onCollector: _openCollectorDialog,
@@ -1075,6 +1076,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
 class _Header extends StatelessWidget {
   const _Header({
     required this.machineStatus,
+    required this.runtimeStatus,
     required this.onMachines,
     required this.onReadme,
     required this.onCollector,
@@ -1083,6 +1085,7 @@ class _Header extends StatelessWidget {
   });
 
   final Map<String, dynamic> machineStatus;
+  final Map<String, dynamic> runtimeStatus;
   final VoidCallback onMachines;
   final VoidCallback onReadme;
   final VoidCallback onCollector;
@@ -1093,6 +1096,8 @@ class _Header extends StatelessWidget {
   Widget build(BuildContext context) {
     final online = _int(machineStatus['online'], 0);
     final total = _int(machineStatus['total'], 0);
+    final uptime = _runtimeUptimeLabel(runtimeStatus);
+    final startedAt = _str(runtimeStatus['process_started_at']);
     return Container(
       height: 58,
       padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -1102,17 +1107,10 @@ class _Header extends StatelessWidget {
       ),
       child: Row(
         children: [
-          const Expanded(
+          Expanded(
             child: Align(
               alignment: Alignment.centerLeft,
-              child: Text(
-                'auto_sync',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w800,
-                  color: Palette.text,
-                ),
-              ),
+              child: _HeaderTitle(uptime: uptime, startedAt: startedAt),
             ),
           ),
           OutlinedButton(
@@ -1156,6 +1154,45 @@ class _Header extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _HeaderTitle extends StatelessWidget {
+  const _HeaderTitle({required this.uptime, required this.startedAt});
+
+  final String uptime;
+  final String startedAt;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: startedAt.isEmpty
+          ? (uptime.isEmpty ? 'auto_sync' : 'auto_sync · up $uptime')
+          : 'Started at $startedAt',
+      child: Text.rich(
+        TextSpan(
+          children: [
+            const TextSpan(text: 'auto_sync'),
+            if (uptime.isNotEmpty)
+              TextSpan(
+                text: ' · up $uptime',
+                style: const TextStyle(
+                  color: Palette.muted,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+          ],
+        ),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(
+          fontSize: 18,
+          fontWeight: FontWeight.w800,
+          color: Palette.text,
+        ),
       ),
     );
   }
@@ -7333,6 +7370,19 @@ String _taskDurationLabel(Map<String, dynamic> task) {
   final minutes = seconds ~/ 60;
   if (minutes < 60) return '${minutes}m ${seconds.round() % 60}s';
   return '${minutes ~/ 60}h ${minutes % 60}m';
+}
+
+String _runtimeUptimeLabel(Map<String, dynamic> runtimeStatus) {
+  final seconds = _int(runtimeStatus['process_uptime_secs'], -1);
+  if (seconds < 0) return '';
+  if (seconds < 60) return '${seconds}s';
+  final minutes = seconds ~/ 60;
+  if (minutes < 60) return '${minutes}m';
+  final hours = minutes ~/ 60;
+  if (hours < 24) return '${hours}h ${minutes % 60}m';
+  final days = hours ~/ 24;
+  final remHours = hours % 24;
+  return remHours == 0 ? '${days}d' : '${days}d ${remHours}h';
 }
 
 String _taskResultLabel(Map<String, dynamic> task) {

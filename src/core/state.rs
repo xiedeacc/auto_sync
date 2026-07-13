@@ -317,6 +317,12 @@ impl State {
                 differences INTEGER NOT NULL DEFAULT 0,
                 entries_scanned INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             "#,
         )?;
         self.ensure_column("destination_offset", "target_cycle_id", "INTEGER")?;
@@ -437,6 +443,32 @@ impl State {
         }
         self.applied_config_fingerprint.set(Some(fingerprint));
         Ok(())
+    }
+
+    pub fn record_process_started_at(&self, started_at: DateTime<Utc>) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO app_meta (key, value, updated_at)
+            VALUES ('process_started_at', ?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            "#,
+            params![started_at.to_rfc3339(), now_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn process_started_at(&self) -> Result<Option<DateTime<Utc>>> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM app_meta WHERE key='process_started_at'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value.as_deref().map(parse_db_time).transpose()
     }
 
     fn ensure_destination_offset(&self, source_id: &str, destination_id: &str) -> Result<()> {
@@ -2031,6 +2063,22 @@ mod tests {
         assert!(state.raise_restart_notice("src_n").unwrap());
         state.dismiss_restart_notice("src_n").unwrap();
         assert!(state.restart_notice("src_n").unwrap().is_none());
+
+        std::fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
+    fn process_started_at_is_overwritten_on_each_start() {
+        let temp = temp_dir("state_process_started_at");
+        let state = State::open(&temp.join("state.sqlite")).unwrap();
+        let first = parse_db_time("2026-07-13T01:00:00Z").unwrap();
+        let second = parse_db_time("2026-07-13T02:00:00Z").unwrap();
+
+        state.record_process_started_at(first).unwrap();
+        assert_eq!(state.process_started_at().unwrap(), Some(first));
+
+        state.record_process_started_at(second).unwrap();
+        assert_eq!(state.process_started_at().unwrap(), Some(second));
 
         std::fs::remove_dir_all(temp).ok();
     }
