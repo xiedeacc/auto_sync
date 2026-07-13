@@ -197,6 +197,61 @@ if (-not (Test-RemoteConnection $dest)) {
     throw "cannot connect to $dest; prepare OpenWrt on 192.168.2.1 before running this deploy script"
 }
 
+# Fail before touching services or files if the prepared OpenWrt image is still
+# missing tooling that this Windows deploy path relies on.
+Write-Host 'checking OpenWrt deploy prerequisites'
+Invoke-Remote @'
+set -u
+missing=0
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "!! missing command: $1" >&2
+        missing=1
+    }
+}
+
+need_exec() {
+    [ -x "$1" ] || {
+        echo "!! missing executable: $1 ($2)" >&2
+        missing=1
+    }
+}
+
+need_init() {
+    [ -x "/etc/init.d/$1" ] || {
+        echo "!! missing init script: /etc/init.d/$1" >&2
+        missing=1
+    }
+}
+
+need_exec /usr/libexec/sftp-server "install openssh-sftp-server for Windows scp"
+need_cmd ubus
+need_cmd uci
+need_cmd ip
+need_cmd nft
+need_cmd netstat
+need_cmd pgrep
+need_cmd grep
+need_cmd start-stop-daemon
+need_init dnsmasq
+need_init dropbear
+need_init network
+
+if ! ip rule show >/dev/null 2>&1; then
+    echo "!! ip command cannot show policy rules; install ip-full" >&2
+    missing=1
+fi
+
+if ! nft list tables >/dev/null 2>&1; then
+    echo "!! nft command cannot list tables; install nftables and nft kernel modules" >&2
+    missing=1
+fi
+
+[ "$missing" -eq 0 ] || exit 1
+echo "OpenWrt deploy prerequisites OK"
+'@
+
 # 1. Prepare parent directories before file transfer. The router must already
 #    have the required OpenWrt packages and filesystem layout.
 Invoke-Remote @'
