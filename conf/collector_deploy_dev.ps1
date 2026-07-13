@@ -1515,6 +1515,11 @@ migrate_halo_root_home() {
         done
         chown -R root:root "$dest" 2>/dev/null || true
     done
+    if [ -d /root/src/blog/halo2_theme/plugins ]; then
+        mkdir -p /root/.halo2/plugins
+        cp -an /root/src/blog/halo2_theme/plugins/*.jar /root/.halo2/plugins/ 2>/dev/null || true
+        chown -R root:root /root/.halo2/plugins 2>/dev/null || true
+    fi
 }
 migrate_halo_root_home
 for d in /usr/local/immich; do
