@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
-# Runs on Windows. Pushes the collected OpenWrt tree back to the router with the
-# bundled ssh/scp, fixes permissions, points shadowsocks at the aws server, makes
-# the config take effect and (re)starts shadowsocks (not shadowsocks-rust).
+# Runs on Windows. Pushes the collected OpenWrt tree back to an already prepared
+# router at 192.168.2.1, fixes permissions, points shadowsocks at the aws server,
+# makes the config take effect and starts shadowsocks (not shadowsocks-rust).
 $ssh  = $env:AS_SSH
 $scp  = $env:AS_SCP
 $dest = $env:AS_DEST
@@ -64,6 +64,7 @@ Require-LocalValue 'AS_SSH' $ssh
 Require-LocalValue 'AS_SCP' $scp
 Require-LocalValue 'AS_DEST' $dest
 Require-LocalValue 'AS_ROOT' $root
+if ($dest -notmatch '(^|@)192\.168\.2\.1$') { throw "AS_DEST must target 192.168.2.1; got: $dest" }
 if (-not (Get-Command $ssh -ErrorAction SilentlyContinue)) { throw "AS_SSH not found: $ssh" }
 if (-not (Get-Command $scp -ErrorAction SilentlyContinue)) { throw "AS_SCP not found: $scp" }
 if (-not (Test-Path -LiteralPath $root)) { throw "AS_ROOT not found: $root" }
@@ -178,8 +179,7 @@ function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
 }
 
 # Send the remote script as a single shell-quoted argv and feed it to `sh` via
-# the POSIX `printf` builtin. Do not depend on `base64` here: a freshly reset
-# OpenWrt may not have it installed yet, and this function runs provisioning.
+# the POSIX `printf` builtin, avoiding stdin encoding and argv-quoting issues.
 function Quote-RemoteShellArg([string]$Value) {
     return "'" + $Value.Replace("'", "'""'""'") + "'"
 }
@@ -194,104 +194,11 @@ function Invoke-Remote([string]$Script) {
 }
 
 if (-not (Test-RemoteConnection $dest)) {
-    if ($dest -match '192\.168\.2\.1') {
-        $bootstrapDest = $dest -replace '192\.168\.2\.1', '192.168.1.1'
-        if (Test-RemoteConnection $bootstrapDest) {
-            Write-Host "using bootstrap OpenWrt address $bootstrapDest (final LAN config still comes from collected files)"
-            $dest = $bootstrapDest
-        } else {
-            throw "cannot connect to $dest or bootstrap fallback $bootstrapDest"
-        }
-    } else {
-        throw "cannot connect to $dest"
-    }
+    throw "cannot connect to $dest; prepare OpenWrt on 192.168.2.1 before running this deploy script"
 }
 
-# 0. Provision the router before any local files are transferred: repoint apk
-#    at the TUNA mirror, refresh indexes, swap busybox dnsmasq for dnsmasq-full
-#    without dropping DNS, and ensure every required package is installed.
-$provision = @'
-set -u
-TUNA=http://mirrors.tuna.tsinghua.edu.cn/openwrt
-FEEDS=/etc/apk/repositories.d/distfeeds.list
-
-require() {
-    "$@" || {
-        code=$?
-        echo "!! required command failed ($code): $*" >&2
-        exit "$code"
-    }
-}
-
-# Free optional editor packages before `apk update`; a previous failed deploy
-# may have filled the tiny rootfs.
-apk del vim-full vim-runtime 2>/dev/null || true
-
-# apk feeds -> TUNA mirror (only rewrites the official downloads.openwrt.org host)
-if [ -f "$FEEDS" ] && grep -Eq "https?://downloads\.openwrt\.org" "$FEEDS"; then
-    sed -i -E "s#https?://downloads\.openwrt\.org#$TUNA#g" "$FEEDS"
-    echo "feeds repointed -> $TUNA"
-else
-    echo "feeds already on tuna mirror"
-fi
-
-require apk update
-
-# busybox dnsmasq -> dnsmasq-full. Removing dnsmasq kills the router's own
-# DNS (resolv.conf -> 127.0.0.1), so point the resolver at a public server
-# for the swap, then let netifd restore it.
-if apk list -I 2>/dev/null | grep -q "^dnsmasq-full-[0-9]"; then
-    echo "dnsmasq-full already installed"
-else
-    echo "swapping busybox dnsmasq -> dnsmasq-full (keeping DNS up)"
-    RESOLV=$(readlink -f /etc/resolv.conf 2>/dev/null); [ -n "$RESOLV" ] || RESOLV=/tmp/resolv.conf
-    RESOLV_BACKUP=/tmp/auto_sync_resolv.$$
-    cp "$RESOLV" "$RESOLV_BACKUP" 2>/dev/null || true
-    restore_resolv() {
-        [ -n "${RESOLV:-}" ] || return 0
-        [ -f "${RESOLV_BACKUP:-}" ] && cp "$RESOLV_BACKUP" "$RESOLV" 2>/dev/null || true
-        rm -f "${RESOLV_BACKUP:-}" 2>/dev/null || true
-    }
-    trap 'restore_resolv' EXIT
-    printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" > "$RESOLV"
-    PKGDIR=/tmp/auto_sync_apk
-    rm -rf "$PKGDIR"
-    mkdir -p "$PKGDIR"
-    if apk fetch -o "$PKGDIR" dnsmasq-full 2>/dev/null || apk fetch --output "$PKGDIR" dnsmasq-full 2>/dev/null; then
-        PKG=$(ls "$PKGDIR"/dnsmasq-full-*.apk 2>/dev/null | head -1)
-        if [ -n "$PKG" ]; then
-            apk del dnsmasq 2>/dev/null || true
-            apk add "$PKG" 2>/dev/null || apk add --allow-untrusted "$PKG" 2>/dev/null || require apk add dnsmasq-full
-            /etc/init.d/dnsmasq restart 2>/dev/null || true
-            /etc/init.d/network reload 2>/dev/null || true
-        else
-            echo "!! dnsmasq-full fetch produced no local package" >&2
-            exit 1
-        fi
-    else
-        echo "!! dnsmasq-full fetch FAILED" >&2
-        exit 1
-    fi
-    rm -rf "$PKGDIR"
-    restore_resolv
-    trap - EXIT
-fi
-
-# Keep the image lean: the default rootfs is small, and vim-full plus route
-# source data can push it over 100%. Busybox `vi` remains available.
-apk del vim-full vim-runtime 2>/dev/null || true
-
-require apk add losetup resize2fs usbutils block-mount fdisk e2fsprogs blkid hdparm ipset libnettle8 libnetfilter-conntrack3
-require apk add kmod-fs-ext4 kmod-fs-vfat kmod-usb-storage kmod-usb-storage-uas grep diffutils dnsmasq-full coreutils-stat kmod-tcp-bbr
-require apk add coreutils-base64 ca-certificates ca-bundle ip-full curl wget grep nftables kmod-nft-core kmod-nft-nat kmod-nft-tproxy kmod-nft-socket openssh-sftp-server
-
-echo "provisioning complete"
-'@
-Write-Host 'provisioning router (apk mirror + packages)'
-Invoke-Remote $provision
-
-# 1. Prepare parent directories before file transfer. Do not stop services here:
-#    keep the router running while collected files are copied back.
+# 1. Prepare parent directories before file transfer. The router must already
+#    have the required OpenWrt packages and filesystem layout.
 Invoke-Remote @'
 mkdir -p /etc/init.d /etc/sysctl.d /etc/config /usr/local
 /etc/init.d/shadowsocks stop 2>/dev/null || true
@@ -454,37 +361,11 @@ schedule_network_reload() {
     }
 }
 
-target_lan_cidr() {
-    awk '
-        $1 == "config" && $2 == "interface" && $3 == "'\''lan'\''" { in_lan = 1; next }
-        $1 == "config" { in_lan = 0 }
-        in_lan && $1 == "list" && $2 == "ipaddr" { gsub(/'\''/, "", $3); print $3; exit }
-        in_lan && $1 == "option" && $2 == "ipaddr" { gsub(/'\''/, "", $3); print $3; exit }
-    ' /etc/config/network
-}
-
-ensure_target_lan_ip_present() {
-    cidr=$(target_lan_cidr)
-    [ -n "$cidr" ] || return 0
-    ip_only=${cidr%%/*}
-    prefix=${cidr#*/}
-    [ "$prefix" != "$cidr" ] || prefix=24
-    ip addr show dev br-lan 2>/dev/null | grep -q "$ip_only/" && return 0
-    echo "adding temporary LAN address $ip_only/$prefix to br-lan for pre-reload binds"
-    ip addr add "$ip_only/$prefix" dev br-lan 2>/dev/null || true
-}
-
 ensure_ubus || exit 1
 
 # apply sysctl
 sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
 for f in /etc/sysctl.d/*.conf; do [ -f $f ] && sysctl -p $f >/dev/null 2>&1 || true; done
-
-# If the collected network config changes LAN from the currently reachable
-# address to 192.168.2.1, make that address usable before starting sslocal.
-# Otherwise web_admin.listen=192.168.2.1:9090 can make the process fail before
-# the final network reload.
-ensure_target_lan_ip_present
 
 # shadowsocks (sslocal) on; shadowsocks-rust (sslocal-master) off. The
 # /etc/init.d/shadowsocks script must use NAME=shadowsocks, while the legacy
