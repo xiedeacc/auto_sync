@@ -225,7 +225,7 @@ with sftp.file('/tmp/auto_sync_bootstrap_root_ssh.sh', 'w') as f:
 sftp.chmod('/tmp/auto_sync_bootstrap_root_ssh.sh', 0o700)
 sftp.close()
 
-stdin, stdout, stderr = client.exec_command("sudo -S bash /tmp/auto_sync_bootstrap_root_ssh.sh", get_pty=True)
+stdin, stdout, stderr = client.exec_command("sudo -S bash /tmp/auto_sync_bootstrap_root_ssh.sh; rc=$?; rm -f /tmp/auto_sync_bootstrap_root_ssh.sh; exit $rc", get_pty=True)
 stdin.write(password + "\n")
 stdin.flush()
 rc = stdout.channel.recv_exit_status()
