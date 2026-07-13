@@ -748,7 +748,10 @@ if [ ! -x /usr/local/go/go1.25.1/bin/go ]; then
         log "WARN: go download failed"
     fi
 fi
-export PATH="/usr/local/go/go1.25.1/bin:/root/go/bin:$PATH"
+export GOPATH=/root/src/go
+export GOBIN=$GOPATH/bin
+mkdir -p "$GOBIN" "$GOPATH/pkg"
+export PATH="/usr/local/go/go1.25.1/bin:$GOBIN:$PATH"
 if command -v go >/dev/null 2>&1; then
     go install github.com/google/pprof@latest || log "WARN: go install pprof failed"
 fi
@@ -846,7 +849,7 @@ fi
 if [ -d /root/.vim/bundle/YouCompleteMe ]; then
     ycm_commit="$(git -C /root/.vim/bundle/YouCompleteMe rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$ycm_commit" ] && [ "$(cat /root/.vim/bundle/YouCompleteMe/.auto_sync_installed 2>/dev/null || true)" != "$ycm_commit" ]; then
-        ycm_path="$JAVA_HOME/bin:/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/opt/src/software/tools/nvm/versions/node/v24.18.0/bin:$PATH"
+        ycm_path="$JAVA_HOME/bin:/usr/local/go/go1.25.1/bin:/root/src/go/bin:/root/.cargo/bin:/opt/src/software/tools/nvm/versions/node/v24.18.0/bin:$PATH"
         ycmd_build=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/build.py
         jdt_milestone="$(sed -n "s/^JDTLS_MILESTONE = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
         jdt_stamp="$(sed -n "s/^JDTLS_BUILD_STAMP = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
