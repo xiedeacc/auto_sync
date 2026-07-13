@@ -15,7 +15,7 @@ if ($usingPassword) {
     $opts += @('-o','BatchMode=yes')
 }
 $sshArgs = @() + $opts
-$scpArgs = @('-r','-p') + $opts
+$scpArgs = @('-r') + $opts
 if (-not [string]::IsNullOrEmpty($env:AS_PORT)) { $sshArgs += @('-p', $env:AS_PORT); $scpArgs += @('-P', $env:AS_PORT) }
 if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KEY);  $scpArgs += @('-i', $env:AS_KEY) }
 
@@ -248,6 +248,14 @@ if ! nft list tables >/dev/null 2>&1; then
     missing=1
 fi
 
+if ! ubus list >/dev/null 2>&1; then
+    echo "!! ubus is unavailable" >&2
+    missing=1
+elif ! ubus list service >/dev/null 2>&1; then
+    echo "!! procd service registry is unavailable on ubus" >&2
+    missing=1
+fi
+
 [ "$missing" -eq 0 ] || exit 1
 echo "OpenWrt deploy prerequisites OK"
 '@
@@ -286,6 +294,14 @@ try {
     Remove-Item -LiteralPath $localStage -Recurse -Force -ErrorAction SilentlyContinue
 }
 Stop-IfErrors 'file transfer'
+
+# Windows staging directories do not carry meaningful Unix modes. If scp/SFTP
+# applies those modes to existing top-level OpenWrt directories, daemons running
+# as non-root users can lose access to /etc and /usr. Restore these before any
+# ubus/procd work.
+Invoke-Remote @'
+chmod 755 /etc /etc/config /etc/init.d /etc/sysctl.d /usr /usr/local 2>/dev/null || true
+'@
 
 # 3. Overwrite the remote client config with the server-substituted copy that
 #    the engine prepared in Rust (family-matched to aws's hostname).
@@ -349,11 +365,13 @@ set -u
 wait_ubus() {
     i=0
     while [ $i -lt 20 ]; do
-        ubus list service >/dev/null 2>&1 && return 0
+        if ubus list >/dev/null 2>&1 && ubus list service >/dev/null 2>&1; then
+            return 0
+        fi
         sleep 1
         i=$((i+1))
     done
-    echo "!! ubus is not ready" >&2
+    echo "!! ubus/procd service registry is not ready" >&2
     return 1
 }
 
