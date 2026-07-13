@@ -892,10 +892,22 @@ async fn api_collector_run_host(
     blocking(move || Ok(Json(backend.collector_run_host(req.index)?))).await
 }
 
+#[derive(Deserialize)]
+struct CollectorStatusQuery {
+    index: Option<usize>,
+}
+
 async fn api_collector_status(
     AxumState(backend): AxumState<Backend>,
+    Query(req): Query<CollectorStatusQuery>,
 ) -> Result<Json<CollectorRunState>, ApiError> {
-    blocking(move || Ok(Json(backend.collector_status()))).await
+    blocking(move || {
+        Ok(Json(match req.index {
+            Some(index) => backend.collector_status_for_host(index),
+            None => backend.collector_status(),
+        }))
+    })
+    .await
 }
 
 async fn api_collector_browse(
@@ -919,8 +931,15 @@ async fn api_collector_deploy(
 
 async fn api_collector_deploy_status(
     AxumState(backend): AxumState<Backend>,
+    Query(req): Query<CollectorStatusQuery>,
 ) -> Result<Json<CollectorRunState>, ApiError> {
-    blocking(move || Ok(Json(backend.collector_deploy_status()))).await
+    blocking(move || {
+        Ok(Json(match req.index {
+            Some(index) => backend.collector_deploy_status_for_host(index),
+            None => backend.collector_deploy_status(),
+        }))
+    })
+    .await
 }
 
 #[derive(Deserialize)]

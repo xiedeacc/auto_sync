@@ -14,7 +14,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,8 @@ const SSH_OPTS: &[&str] = &[
     "-o",
     "ConnectTimeout=15",
 ];
+
+static GIT_FINALIZE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Live state of a collector run, polled by the UI.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -343,12 +345,23 @@ fn run_hosts_inner(
     }
     set_current_file(state, None);
 
-    if cfg.split_threshold_mb > 0 {
-        track_large_files_with_lfs(&git_dir, cfg.split_threshold_mb, state)?;
-    }
+    if cfg.split_threshold_mb > 0 || cfg.auto_commit_push {
+        let _git_guard = GIT_FINALIZE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("collector git finalize lock poisoned"))?;
+        if cfg.split_threshold_mb > 0 {
+            track_large_files_with_lfs(&git_dir, cfg.split_threshold_mb, state)?;
+        }
 
-    if cfg.auto_commit_push {
-        commit_and_push(&git_dir, state)?;
+        if cfg.auto_commit_push {
+            commit_and_push(&git_dir, state)?;
+        } else {
+            log(
+                state,
+                "auto commit/push disabled; leaving working tree as-is",
+            );
+        }
     } else {
         log(
             state,

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -45,12 +46,109 @@ pub struct Backend {
     machine_cache: Arc<Mutex<MachineCache>>,
     collector_run: Arc<Mutex<CollectorRunState>>,
     collector_deploy: Arc<Mutex<CollectorRunState>>,
+    collector_host_runs: Arc<Mutex<HashMap<usize, Arc<Mutex<CollectorRunState>>>>>,
+    collector_host_deploys: Arc<Mutex<HashMap<usize, Arc<Mutex<CollectorRunState>>>>>,
 }
 
 #[derive(Default)]
 struct MachineCache {
     status: Option<MachineStatus>,
     refreshed_at: Option<Instant>,
+}
+
+type CollectorStateMap = Arc<Mutex<HashMap<usize, Arc<Mutex<CollectorRunState>>>>>;
+
+fn collector_started_state() -> CollectorRunState {
+    let now = chrono::Local::now();
+    CollectorRunState {
+        running: true,
+        started_at: Some(now.format("%Y-%m-%d %H:%M:%S").to_string()),
+        started_epoch_ms: Some(now.timestamp_millis()),
+        ..Default::default()
+    }
+}
+
+fn collector_state_snapshot(state: &Arc<Mutex<CollectorRunState>>) -> CollectorRunState {
+    state.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
+
+fn any_collector_state_running(states: &CollectorStateMap) -> bool {
+    states
+        .lock()
+        .map(|guard| {
+            guard
+                .values()
+                .any(|state| collector_state_snapshot(state).running)
+        })
+        .unwrap_or(false)
+}
+
+fn collector_state_for_index(
+    states: &CollectorStateMap,
+    index: usize,
+) -> Arc<Mutex<CollectorRunState>> {
+    let mut guard = states.lock().expect("collector state map poisoned");
+    guard
+        .entry(index)
+        .or_insert_with(|| Arc::new(Mutex::new(CollectorRunState::default())))
+        .clone()
+}
+
+fn aggregate_collector_state(
+    global: &Arc<Mutex<CollectorRunState>>,
+    states: &CollectorStateMap,
+) -> CollectorRunState {
+    let global_state = collector_state_snapshot(global);
+    if global_state.running {
+        return global_state;
+    }
+    let snapshots = states
+        .lock()
+        .map(|guard| {
+            guard
+                .values()
+                .map(collector_state_snapshot)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut running = snapshots
+        .iter()
+        .filter(|state| state.running)
+        .cloned()
+        .collect::<Vec<_>>();
+    if running.is_empty() {
+        return snapshots
+            .into_iter()
+            .max_by_key(|state| state.started_epoch_ms.unwrap_or_default())
+            .unwrap_or(global_state);
+    }
+    if running.len() == 1 {
+        return running.remove(0);
+    }
+    let started_epoch_ms = running
+        .iter()
+        .filter_map(|state| state.started_epoch_ms)
+        .min();
+    CollectorRunState {
+        running: true,
+        started_at: started_epoch_ms.map(|ms| {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .unwrap_or_else(chrono::Utc::now)
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        }),
+        started_epoch_ms,
+        total_files: running.iter().map(|state| state.total_files).sum(),
+        succeeded_files: running.iter().map(|state| state.succeeded_files).sum(),
+        failed_files: running.iter().map(|state| state.failed_files).sum(),
+        errors: running
+            .iter()
+            .flat_map(|state| state.errors.clone())
+            .collect(),
+        log: running.iter().flat_map(|state| state.log.clone()).collect(),
+        ..Default::default()
+    }
 }
 
 /// Retry an incomplete delegation push in the background until every source
@@ -90,6 +188,8 @@ impl Backend {
             machine_cache: Arc::new(Mutex::new(MachineCache::default())),
             collector_run: Arc::new(Mutex::new(CollectorRunState::default())),
             collector_deploy: Arc::new(Mutex::new(CollectorRunState::default())),
+            collector_host_runs: Arc::new(Mutex::new(HashMap::new())),
+            collector_host_deploys: Arc::new(Mutex::new(HashMap::new())),
         };
         backend.spawn_machine_discovery_worker();
         backend
@@ -155,9 +255,15 @@ impl Backend {
     /// Current collector run state (running flag + accumulated log), polled by
     /// the UI while a collection is in progress.
     pub fn collector_status(&self) -> CollectorRunState {
-        self.collector_run
+        aggregate_collector_state(&self.collector_run, &self.collector_host_runs)
+    }
+
+    pub fn collector_status_for_host(&self, index: usize) -> CollectorRunState {
+        self.collector_host_runs
             .lock()
-            .map(|guard| guard.clone())
+            .ok()
+            .and_then(|guard| guard.get(&index).cloned())
+            .map(|state| collector_state_snapshot(&state))
             .unwrap_or_default()
     }
 
@@ -223,13 +329,10 @@ impl Backend {
             if guard.running {
                 anyhow::bail!("a collector run is already in progress");
             }
-            let now = chrono::Local::now();
-            *guard = CollectorRunState {
-                running: true,
-                started_at: Some(now.format("%Y-%m-%d %H:%M:%S").to_string()),
-                started_epoch_ms: Some(now.timestamp_millis()),
-                ..Default::default()
-            };
+            if any_collector_state_running(&self.collector_host_runs) {
+                anyhow::bail!("one or more host collector runs are already in progress");
+            }
+            *guard = collector_started_state();
         }
         let state = self.collector_run.clone();
         thread::spawn(move || collector::run(cfg, state));
@@ -241,32 +344,35 @@ impl Backend {
         cfg.hosts
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("no host at index {index}"))?;
+        let state = collector_state_for_index(&self.collector_host_runs, index);
         {
-            let mut guard = self
-                .collector_run
+            if collector_state_snapshot(&self.collector_run).running {
+                anyhow::bail!("a collector run is already in progress");
+            }
+            let mut guard = state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("collector state poisoned"))?;
             if guard.running {
-                anyhow::bail!("a collector run is already in progress");
+                anyhow::bail!("collector run for this host is already in progress");
             }
-            let now = chrono::Local::now();
-            *guard = CollectorRunState {
-                running: true,
-                started_at: Some(now.format("%Y-%m-%d %H:%M:%S").to_string()),
-                started_epoch_ms: Some(now.timestamp_millis()),
-                ..Default::default()
-            };
+            *guard = collector_started_state();
         }
-        let state = self.collector_run.clone();
-        thread::spawn(move || collector::run_host(cfg, index, state));
-        Ok(self.collector_status())
+        let run_state = state.clone();
+        thread::spawn(move || collector::run_host(cfg, index, run_state));
+        Ok(collector_state_snapshot(&state))
     }
 
     /// Current deploy run state (running flag + log), polled by the UI.
     pub fn collector_deploy_status(&self) -> CollectorRunState {
-        self.collector_deploy
+        aggregate_collector_state(&self.collector_deploy, &self.collector_host_deploys)
+    }
+
+    pub fn collector_deploy_status_for_host(&self, index: usize) -> CollectorRunState {
+        self.collector_host_deploys
             .lock()
-            .map(|guard| guard.clone())
+            .ok()
+            .and_then(|guard| guard.get(&index).cloned())
+            .map(|state| collector_state_snapshot(&state))
             .unwrap_or_default()
     }
 
@@ -309,26 +415,20 @@ impl Backend {
                 self.resolve_collector_deploy_script_path(host.deploy_script_path.trim());
             host.deploy_script_path = resolved.to_string_lossy().to_string();
         }
+        let state = collector_state_for_index(&self.collector_host_deploys, index);
         {
-            let mut guard = self
-                .collector_deploy
+            let mut guard = state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("deploy state poisoned"))?;
             if guard.running {
-                anyhow::bail!("a deploy is already in progress");
+                anyhow::bail!("deploy for this host is already in progress");
             }
-            let now = chrono::Local::now();
-            *guard = CollectorRunState {
-                running: true,
-                started_at: Some(now.format("%Y-%m-%d %H:%M:%S").to_string()),
-                started_epoch_ms: Some(now.timestamp_millis()),
-                ..Default::default()
-            };
+            *guard = collector_started_state();
         }
-        let state = self.collector_deploy.clone();
         let all_hosts = cfg.hosts.clone();
-        thread::spawn(move || collector::deploy(host, all_hosts, state));
-        Ok(self.collector_deploy_status())
+        let deploy_state = state.clone();
+        thread::spawn(move || collector::deploy(host, all_hosts, deploy_state));
+        Ok(collector_state_snapshot(&state))
     }
 
     fn resolve_collector_deploy_script_path(&self, configured: &str) -> PathBuf {

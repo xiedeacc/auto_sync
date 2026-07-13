@@ -177,8 +177,13 @@ class AutoSyncApi {
   Future<Map<String, dynamic>> saveCollectorConfig(
     Map<String, dynamic> cfg,
   ) async => _map(await _request('POST', '/api/collector/config', body: cfg));
-  Future<Map<String, dynamic>> collectorStatus() async =>
-      _map(await _request('GET', '/api/collector/status'));
+  Future<Map<String, dynamic>> collectorStatus({int? index}) async => _map(
+    await _request(
+      'GET',
+      '/api/collector/status',
+      query: index == null ? null : {'index': '$index'},
+    ),
+  );
   Future<Map<String, dynamic>> collectorRun() async =>
       _map(await _request('POST', '/api/collector/run'));
   Future<Map<String, dynamic>> collectorRunHost(int index) async => _map(
@@ -197,8 +202,14 @@ class AutoSyncApi {
       query: {'index': '$index'},
     ),
   );
-  Future<Map<String, dynamic>> collectorDeployStatus() async =>
-      _map(await _request('GET', '/api/collector/deploy-status'));
+  Future<Map<String, dynamic>> collectorDeployStatus({int? index}) async =>
+      _map(
+        await _request(
+          'GET',
+          '/api/collector/deploy-status',
+          query: index == null ? null : {'index': '$index'},
+        ),
+      );
   Future<Map<String, dynamic>> localFilePreview(String path) async => _map(
     await _request('GET', '/api/local-file/preview', query: {'path': path}),
   );
@@ -5494,8 +5505,8 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   bool loading = true;
   bool busy = false;
   bool autoPush = false;
-  int? activeRunIndex;
-  int? activeDeployIndex;
+  final activeRunIndexes = <int>{};
+  final activeDeployIndexes = <int>{};
   Timer? saveTimer;
   Timer? runTimer;
   Timer? deployTimer;
@@ -5532,24 +5543,54 @@ class _CollectorDialogState extends State<_CollectorDialog> {
       final nextCfg = await widget.api.collectorConfig();
       final nextStatus = await widget.api.collectorStatus();
       final nextDeployStatus = await widget.api.collectorDeployStatus();
+      final nextHosts = _mapRefs(
+        nextCfg['hosts'],
+      ).map((host) => Map<String, dynamic>.from(host)).toList();
+      final nextHostRunStatuses = <int, Map<String, dynamic>>{};
+      final nextHostDeployStatuses = <int, Map<String, dynamic>>{};
+      final nextActiveRunIndexes = <int>{};
+      final nextActiveDeployIndexes = <int>{};
+      for (var index = 0; index < nextHosts.length; index++) {
+        final run = await widget.api.collectorStatus(index: index);
+        final deploy = await widget.api.collectorDeployStatus(index: index);
+        if (run.isNotEmpty) {
+          nextHostRunStatuses[index] = run;
+          if (_bool(run['running'])) nextActiveRunIndexes.add(index);
+        }
+        if (deploy.isNotEmpty) {
+          nextHostDeployStatuses[index] = deploy;
+          if (_bool(deploy['running'])) nextActiveDeployIndexes.add(index);
+        }
+      }
       if (mounted) {
         setState(() {
           cfg = Map<String, dynamic>.from(nextCfg);
-          cfg['hosts'] = _mapRefs(
-            nextCfg['hosts'],
-          ).map((host) => Map<String, dynamic>.from(host)).toList();
+          cfg['hosts'] = nextHosts;
           status = nextStatus;
           deployStatus = nextDeployStatus;
+          hostRunStatuses
+            ..clear()
+            ..addAll(nextHostRunStatuses);
+          hostDeployStatuses
+            ..clear()
+            ..addAll(nextHostDeployStatuses);
+          activeRunIndexes
+            ..clear()
+            ..addAll(nextActiveRunIndexes);
+          activeDeployIndexes
+            ..clear()
+            ..addAll(nextActiveDeployIndexes);
           gitDir.text = _str(cfg['git_dir']);
           splitMb.text = _str(cfg['split_threshold_mb'], '95');
           autoPush = _bool(cfg['auto_commit_push']);
           loading = false;
           message = '';
         });
-        if (_bool(nextDeployStatus['running'])) {
+        if (nextActiveDeployIndexes.isNotEmpty ||
+            _bool(nextDeployStatus['running'])) {
           _startDeployPolling();
         }
-        if (_bool(nextStatus['running'])) {
+        if (nextActiveRunIndexes.isNotEmpty || _bool(nextStatus['running'])) {
           _startRunPolling();
         }
       }
@@ -5616,14 +5657,16 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   }
 
   Future<void> _runHost(int index) async {
-    if (_bool(status['running']) && activeRunIndex != index) {
-      setState(() => message = _runState());
+    if (_bool(hostRunStatuses[index]?['running'])) {
+      setState(
+        () => message = 'Collector run for this host is already running',
+      );
       return;
     }
     setState(() {
       busy = true;
       message = '';
-      activeRunIndex = index;
+      activeRunIndexes.add(index);
       status = {'running': true, 'log': <String>[]};
       hostRunStatuses[index] = Map<String, dynamic>.from(status);
     });
@@ -5657,16 +5700,27 @@ class _CollectorDialogState extends State<_CollectorDialog> {
 
   Future<void> _refreshRunStatus() async {
     try {
-      final next = await widget.api.collectorStatus();
+      final indexes = activeRunIndexes.toList();
+      if (indexes.isEmpty) {
+        runTimer?.cancel();
+        runTimer = null;
+        return;
+      }
+      final states = <int, Map<String, dynamic>>{};
+      for (final index in indexes) {
+        states[index] = await widget.api.collectorStatus(index: index);
+      }
       if (!mounted) return;
       setState(() {
-        status = next;
-        final index = activeRunIndex;
-        if (index != null) {
-          hostRunStatuses[index] = Map<String, dynamic>.from(next);
+        for (final entry in states.entries) {
+          hostRunStatuses[entry.key] = Map<String, dynamic>.from(entry.value);
+          status = entry.value;
+          if (!_bool(entry.value['running'])) {
+            activeRunIndexes.remove(entry.key);
+          }
         }
       });
-      if (!_bool(next['running'])) {
+      if (activeRunIndexes.isEmpty) {
         runTimer?.cancel();
         runTimer = null;
       }
@@ -5730,13 +5784,13 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   }
 
   Future<void> _runDeploy(int index) async {
-    if (_bool(deployStatus['running']) && activeDeployIndex != index) {
-      setState(() => message = _runState());
+    if (_bool(hostDeployStatuses[index]?['running'])) {
+      setState(() => message = 'Deploy for this host is already running');
       return;
     }
     setState(() {
       message = 'Deploying...';
-      activeDeployIndex = index;
+      activeDeployIndexes.add(index);
       deployStatus = {'running': true, 'log': <String>[]};
       hostDeployStatuses[index] = Map<String, dynamic>.from(deployStatus);
     });
@@ -5778,16 +5832,29 @@ class _CollectorDialogState extends State<_CollectorDialog> {
 
   Future<void> _refreshDeployStatus() async {
     try {
-      final next = await widget.api.collectorDeployStatus();
+      final indexes = activeDeployIndexes.toList();
+      if (indexes.isEmpty) {
+        deployTimer?.cancel();
+        deployTimer = null;
+        return;
+      }
+      final states = <int, Map<String, dynamic>>{};
+      for (final index in indexes) {
+        states[index] = await widget.api.collectorDeployStatus(index: index);
+      }
       if (!mounted) return;
       setState(() {
-        deployStatus = next;
-        final index = activeDeployIndex;
-        if (index != null) {
-          hostDeployStatuses[index] = Map<String, dynamic>.from(next);
+        for (final entry in states.entries) {
+          deployStatus = entry.value;
+          hostDeployStatuses[entry.key] = Map<String, dynamic>.from(
+            entry.value,
+          );
+          if (!_bool(entry.value['running'])) {
+            activeDeployIndexes.remove(entry.key);
+          }
         }
       });
-      if (!_bool(next['running'])) {
+      if (activeDeployIndexes.isEmpty) {
         deployTimer?.cancel();
         deployTimer = null;
       }
@@ -5795,14 +5862,13 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   }
 
   Future<void> _showHostLog(int index) async {
-    final activeRun = activeRunIndex == index && _bool(status['running']);
-    final activeDeploy =
-        activeDeployIndex == index && _bool(deployStatus['running']);
+    final activeRun = _bool(hostRunStatuses[index]?['running']);
+    final activeDeploy = _bool(hostDeployStatuses[index]?['running']);
     final initialRun = activeRun
-        ? status
+        ? (hostRunStatuses[index] ?? <String, dynamic>{})
         : (hostRunStatuses[index] ?? <String, dynamic>{});
     final initialDeploy = activeDeploy
-        ? deployStatus
+        ? (hostDeployStatuses[index] ?? <String, dynamic>{})
         : (hostDeployStatuses[index] ?? <String, dynamic>{});
     await showDialog<void>(
       context: context,
@@ -5812,6 +5878,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
         initialDeployStatus: initialDeploy,
         pollRun: activeRun,
         pollDeploy: activeDeploy,
+        hostIndex: index,
       ),
     );
   }
@@ -5836,15 +5903,20 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   String _runState() {
     if (loading) return 'Loading...';
     if (message.isNotEmpty) return message;
-    if (_bool(status['running'])) return _collectorRunningText();
-    if (_bool(deployStatus['running'])) {
-      final index = activeDeployIndex;
-      if (index != null && index >= 0 && index < hosts.length) {
-        final host = hosts[index];
-        final label = _str(host['name'], _str(host['hostname'], 'host'));
-        return 'Deploying $label...';
+    if (activeRunIndexes.isNotEmpty) {
+      if (activeRunIndexes.length == 1) return _collectorRunningText();
+      return 'Collecting ${activeRunIndexes.length} hosts...';
+    }
+    if (activeDeployIndexes.isNotEmpty) {
+      if (activeDeployIndexes.length == 1) {
+        final index = activeDeployIndexes.first;
+        if (index >= 0 && index < hosts.length) {
+          final host = hosts[index];
+          final label = _str(host['name'], _str(host['hostname'], 'host'));
+          return 'Deploying $label...';
+        }
       }
-      return 'Deploying...';
+      return 'Deploying ${activeDeployIndexes.length} hosts...';
     }
     if (status['ok'] != null) return _collectorSummaryText();
     return '';
@@ -6021,12 +6093,12 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                               );
                             },
                             onDeployLog: () => _showHostLog(entry.key),
-                            onCollect: _bool(status['running'])
+                            onCollect:
+                                _bool(hostRunStatuses[entry.key]?['running'])
                                 ? null
                                 : () => _runHost(entry.key),
                             onDeployRun:
-                                _bool(deployStatus['running']) &&
-                                    activeDeployIndex == entry.key
+                                _bool(hostDeployStatuses[entry.key]?['running'])
                                 ? null
                                 : () => _runDeploy(entry.key),
                           ),
@@ -6058,6 +6130,7 @@ class _CollectorLogDialog extends StatefulWidget {
     required this.initialDeployStatus,
     required this.pollRun,
     required this.pollDeploy,
+    required this.hostIndex,
   });
 
   final AutoSyncApi api;
@@ -6065,6 +6138,7 @@ class _CollectorLogDialog extends StatefulWidget {
   final Map<String, dynamic> initialDeployStatus;
   final bool pollRun;
   final bool pollDeploy;
+  final int hostIndex;
 
   @override
   State<_CollectorLogDialog> createState() => _CollectorLogDialogState();
@@ -6098,10 +6172,10 @@ class _CollectorLogDialogState extends State<_CollectorLogDialog> {
   Future<void> _refresh() async {
     try {
       final nextRun = widget.pollRun
-          ? await widget.api.collectorStatus()
+          ? await widget.api.collectorStatus(index: widget.hostIndex)
           : runStatus;
       final nextDeploy = widget.pollDeploy
-          ? await widget.api.collectorDeployStatus()
+          ? await widget.api.collectorDeployStatus(index: widget.hostIndex)
           : deployStatus;
       if (!mounted) return;
       setState(() {
