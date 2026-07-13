@@ -486,6 +486,7 @@ Invoke-Remote @"
 set -e
 mkdir -p /etc/ssh/sshd_config.d /root/.ssh
 cp /root/auto_sync_sshd_config /etc/ssh/sshd_config
+rm -f /root/auto_sync_sshd_config
 rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/98-auto-sync-gitlab.conf /etc/ssh/sshd_config.d/99-auto-sync-test.conf
 if [ -f /tmp/auto_sync_root_key.pub ]; then
     cat /tmp/auto_sync_root_key.pub > /root/.ssh/authorized_keys
