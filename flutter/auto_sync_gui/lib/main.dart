@@ -1096,8 +1096,7 @@ class _Header extends StatelessWidget {
   Widget build(BuildContext context) {
     final online = _int(machineStatus['online'], 0);
     final total = _int(machineStatus['total'], 0);
-    final startedAt = _str(runtimeStatus['process_started_at']);
-    final startedAtLabel = _headerStartedAtLabel(startedAt);
+    final uptimeLabel = _runtimeUptimeClockLabel(runtimeStatus);
     return Container(
       height: 58,
       padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -1110,7 +1109,7 @@ class _Header extends StatelessWidget {
           Expanded(
             child: Align(
               alignment: Alignment.centerLeft,
-              child: _HeaderTitle(label: startedAtLabel, startedAt: startedAt),
+              child: _HeaderTitle(label: uptimeLabel),
             ),
           ),
           OutlinedButton(
@@ -1160,15 +1159,14 @@ class _Header extends StatelessWidget {
 }
 
 class _HeaderTitle extends StatelessWidget {
-  const _HeaderTitle({required this.label, required this.startedAt});
+  const _HeaderTitle({required this.label});
 
   final String label;
-  final String startedAt;
 
   @override
   Widget build(BuildContext context) {
     return Tooltip(
-      message: startedAt.isEmpty ? '' : 'Started at $startedAt',
+      message: label.isEmpty ? '' : 'uptime $label',
       child: Text(
         label,
         maxLines: 1,
@@ -1183,13 +1181,17 @@ class _HeaderTitle extends StatelessWidget {
   }
 }
 
-String _headerStartedAtLabel(String value) {
-  if (value.isEmpty) return '';
-  final startedAt = DateTime.tryParse(value)?.toLocal();
-  if (startedAt == null) return '';
+String _runtimeUptimeClockLabel(Map<String, dynamic> runtimeStatus) {
+  final seconds = _int(runtimeStatus['process_uptime_secs'], -1);
+  if (seconds < 0) return '';
+  final days = seconds ~/ Duration.secondsPerDay;
+  final rem = seconds % Duration.secondsPerDay;
+  final hours = rem ~/ Duration.secondsPerHour;
+  final minutes = (rem % Duration.secondsPerHour) ~/ Duration.secondsPerMinute;
+  final secs = rem % Duration.secondsPerMinute;
   String pad(int part) => part.toString().padLeft(2, '0');
-  return '${pad(startedAt.month)}-${pad(startedAt.day)} '
-      '${pad(startedAt.hour)}:${pad(startedAt.minute)}:${pad(startedAt.second)}';
+  final clock = '${pad(hours)}:${pad(minutes)}:${pad(secs)}';
+  return days > 0 ? '${days}d $clock' : clock;
 }
 
 const double _masterRightBlockWidth = 446;

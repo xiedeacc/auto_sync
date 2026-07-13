@@ -704,22 +704,24 @@ function updateHeaderUptime() {
   if (!el.appTitle) {
     return;
   }
-  const startedAt = runtimeStatus && runtimeStatus.process_started_at;
-  const label = formatHeaderStartedAt(startedAt);
+  const label = runtimeUptimeClockLabel(runtimeStatus);
   el.appTitle.textContent = label;
-  el.appTitle.title = startedAt ? `Started at ${startedAt}` : "";
+  el.appTitle.title = label ? `uptime ${label}` : "";
 }
 
-function formatHeaderStartedAt(value) {
-  if (!value) {
+function runtimeUptimeClockLabel(status) {
+  const seconds = Number(status && status.process_uptime_secs);
+  if (!Number.isFinite(seconds) || seconds < 0) {
     return "";
   }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "";
-  }
+  const whole = Math.floor(seconds);
+  const days = Math.floor(whole / 86400);
+  const hours = Math.floor((whole % 86400) / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const secs = whole % 60;
   const pad = (part) => String(part).padStart(2, "0");
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  const clock = `${pad(hours)}:${pad(minutes)}:${pad(secs)}`;
+  return days > 0 ? `${days}d ${clock}` : clock;
 }
 
 function runtimeUptimeLabel(status) {
