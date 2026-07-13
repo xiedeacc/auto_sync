@@ -1479,6 +1479,165 @@ prepare_immich_database_extensions() {
         log "WARN: immich pgvector extension preparation failed"
 }
 
+repair_immich_media_derivatives() {
+    ensure_postgresql_ready >/dev/null 2>&1 || { log "WARN: PostgreSQL is not ready for immich media derivative repair"; return 0; }
+    if ! sudo -u postgres psql -Atqc "SELECT 1 FROM pg_database WHERE datname = 'immich'" 2>/dev/null | grep -qx 1; then
+        return 0
+    fi
+    command -v ffmpeg >/dev/null 2>&1 || { log "WARN: ffmpeg is missing; skip immich media derivative repair"; return 0; }
+    command -v ffprobe >/dev/null 2>&1 || { log "WARN: ffprobe is missing; skip immich media derivative repair"; return 0; }
+    command -v python3 >/dev/null 2>&1 || { log "WARN: python3 is missing; skip immich media derivative repair"; return 0; }
+    log "repair immich media derivatives"
+    IMMICH_DERIVATIVE_REPAIR_LIMIT="${IMMICH_DERIVATIVE_REPAIR_LIMIT:-200}" python3 - <<'PY_IMMICH_DERIVATIVE_REPAIR' || log "WARN: immich media derivative repair failed"
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+UPLOAD_ROOT = Path("/opt/immich/upload")
+LIMIT = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_LIMIT", "200") or "200")
+
+
+def run(cmd, *, check=True):
+    return subprocess.run(cmd, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def psql(sql):
+    return run(["sudo", "-u", "postgres", "psql", "-d", "immich", "-At", "-F", "\t", "-c", sql]).stdout
+
+
+def q(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def first_color_stream(path):
+    result = run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(path)], check=False)
+    if result.returncode != 0:
+        return None
+    streams = json.loads(result.stdout or "{}").get("streams", [])
+    first_video = None
+    for stream in streams:
+        if stream.get("codec_type") != "video":
+            continue
+        idx = stream.get("index")
+        if first_video is None:
+            first_video = idx
+        if not str(stream.get("pix_fmt", "")).startswith("gray"):
+            return idx
+    return first_video
+
+
+def scale_filter(size):
+    return f"scale='if(gt(iw,ih),-2,{size})':'if(gt(iw,ih),{size},-2)'"
+
+
+def video_filter(size):
+    return (
+        "zscale=t=linear:npl=100,format=gbrpf32le,"
+        f"zscale=p=bt709,tonemap=hable,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,{scale_filter(size)}"
+    )
+
+
+def make_image(src, dst, size, stream):
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
+    if stream is not None:
+        cmd += ["-map", f"0:{stream}"]
+    cmd += ["-frames:v", "1", "-vf", scale_filter(size), "-q:v", "2", str(dst)]
+    return run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0
+
+
+def make_video(src, dst, size):
+    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "1", "-i", str(src), "-map", "0:v:0", "-frames:v", "1"]
+    cmd = base + ["-vf", video_filter(size), "-q:v", "2", str(dst)]
+    if run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+        return True
+    cmd = base + ["-vf", scale_filter(size), "-q:v", "2", str(dst)]
+    return run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0
+
+
+def upsert(asset_id, kind, path):
+    sql = (
+        'INSERT INTO asset_file ("assetId", type, path, "createdAt", "updatedAt", "isEdited") VALUES '
+        f"({q(asset_id)}, {q(kind)}, {q(str(path))}, now(), now(), false) "
+        'ON CONFLICT ("assetId", type, "isEdited") DO UPDATE SET '
+        'path = EXCLUDED.path, "updatedAt" = now()'
+    )
+    psql(sql)
+
+
+def asset_dir(owner_id, asset_id):
+    return UPLOAD_ROOT / "thumbs" / owner_id / asset_id[:2] / asset_id[2:4]
+
+
+query = f"""
+WITH missing AS (
+    SELECT a.id, a.type, a."ownerId", a."originalPath"
+    FROM asset a
+    WHERE a."deletedAt" IS NULL
+      AND a."originalPath" IS NOT NULL
+      AND (
+        (a.type = 'IMAGE' AND lower(a."originalPath") ~ '\\.(heic|heif)$')
+        OR a.type = 'VIDEO'
+      )
+      AND (
+        NOT EXISTS (SELECT 1 FROM asset_file af WHERE af."assetId" = a.id AND af.type = 'thumbnail' AND af."isEdited" = false)
+        OR NOT EXISTS (SELECT 1 FROM asset_file af WHERE af."assetId" = a.id AND af.type = 'preview' AND af."isEdited" = false)
+        OR (a.type = 'IMAGE' AND NOT EXISTS (SELECT 1 FROM asset_file af WHERE af."assetId" = a.id AND af.type = 'fullsize' AND af."isEdited" = false))
+        OR a."originalPath" IN (
+          '/opt/immich/upload/library/admin/2026/2026-07-12/6390.heic',
+          '/opt/immich/upload/library/admin/2026/2026-07-11/IMG_1229.mov'
+        )
+      )
+    ORDER BY a."fileModifiedAt" DESC NULLS LAST, a."createdAt" DESC
+    LIMIT {LIMIT}
+)
+SELECT id, type, "ownerId", "originalPath" FROM missing
+"""
+
+rows = [line.split("\t", 3) for line in psql(query).splitlines() if line.strip()]
+ok = 0
+failed = 0
+for asset_id, asset_type, owner_id, original_path in rows:
+    src = Path(original_path)
+    if not src.exists():
+        failed += 1
+        print(f"missing original: {asset_id} {src}")
+        continue
+    out_dir = asset_dir(owner_id, asset_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if asset_type == "IMAGE":
+            stream = first_color_stream(src)
+            outputs = [
+                ("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 250),
+                ("preview", out_dir / f"{asset_id}_preview.jpeg", 1440),
+                ("fullsize", out_dir / f"{asset_id}_fullsize.jpeg", 3840),
+            ]
+            made = [(kind, path) for kind, path, size in outputs if make_image(src, path, size, stream)]
+        else:
+            outputs = [
+                ("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 250),
+                ("preview", out_dir / f"{asset_id}_preview.jpeg", 1440),
+            ]
+            made = [(kind, path) for kind, path, size in outputs if make_video(src, path, size)]
+        if not made:
+            failed += 1
+            print(f"ffmpeg failed: {asset_id} {src}")
+            continue
+        for kind, path in made:
+            shutil.chown(path, user="tiger", group="tiger")
+            path.chmod(0o644)
+            upsert(asset_id, kind, path)
+        ok += 1
+    except Exception as exc:
+        failed += 1
+        print(f"repair failed: {asset_id} {src}: {exc}")
+
+print(f"immich derivative repair summary: {ok} ok, {failed} failed, {len(rows)} checked")
+PY_IMMICH_DERIVATIVE_REPAIR
+}
+
 mysql_has_user_data() {
     command -v mysql >/dev/null 2>&1 || return 1
     count="$(mysql -NBe "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null || echo 0)"
@@ -1546,6 +1705,7 @@ for d in backups encoded-video library profile thumbs upload; do
 done
 chown -R tiger:tiger /opt/immich/upload 2>/dev/null || true
 deploy_immich_from_git || log "WARN: immich deploy from git failed"
+repair_immich_media_derivatives
 rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
 if [ "$zfs_woken" = "1" ]; then
     standby_zfs
