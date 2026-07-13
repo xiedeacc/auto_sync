@@ -1096,8 +1096,8 @@ class _Header extends StatelessWidget {
   Widget build(BuildContext context) {
     final online = _int(machineStatus['online'], 0);
     final total = _int(machineStatus['total'], 0);
-    final uptime = _runtimeUptimeLabel(runtimeStatus);
     final startedAt = _str(runtimeStatus['process_started_at']);
+    final startedAtLabel = _headerStartedAtLabel(startedAt);
     return Container(
       height: 58,
       padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -1110,7 +1110,7 @@ class _Header extends StatelessWidget {
           Expanded(
             child: Align(
               alignment: Alignment.centerLeft,
-              child: _HeaderTitle(uptime: uptime, startedAt: startedAt),
+              child: _HeaderTitle(label: startedAtLabel, startedAt: startedAt),
             ),
           ),
           OutlinedButton(
@@ -1160,32 +1160,17 @@ class _Header extends StatelessWidget {
 }
 
 class _HeaderTitle extends StatelessWidget {
-  const _HeaderTitle({required this.uptime, required this.startedAt});
+  const _HeaderTitle({required this.label, required this.startedAt});
 
-  final String uptime;
+  final String label;
   final String startedAt;
 
   @override
   Widget build(BuildContext context) {
     return Tooltip(
-      message: startedAt.isEmpty
-          ? (uptime.isEmpty ? 'auto_sync' : 'auto_sync · up $uptime')
-          : 'Started at $startedAt',
-      child: Text.rich(
-        TextSpan(
-          children: [
-            const TextSpan(text: 'auto_sync'),
-            if (uptime.isNotEmpty)
-              TextSpan(
-                text: ' · up $uptime',
-                style: const TextStyle(
-                  color: Palette.muted,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-          ],
-        ),
+      message: startedAt.isEmpty ? '' : 'Started at $startedAt',
+      child: Text(
+        label,
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(
@@ -1196,6 +1181,15 @@ class _HeaderTitle extends StatelessWidget {
       ),
     );
   }
+}
+
+String _headerStartedAtLabel(String value) {
+  if (value.isEmpty) return '';
+  final startedAt = DateTime.tryParse(value)?.toLocal();
+  if (startedAt == null) return '';
+  String pad(int part) => part.toString().padLeft(2, '0');
+  return '${pad(startedAt.month)}-${pad(startedAt.day)} '
+      '${pad(startedAt.hour)}:${pad(startedAt.minute)}:${pad(startedAt.second)}';
 }
 
 const double _masterRightBlockWidth = 446;

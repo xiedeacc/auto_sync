@@ -704,10 +704,22 @@ function updateHeaderUptime() {
   if (!el.appTitle) {
     return;
   }
-  const uptime = runtimeUptimeLabel(runtimeStatus);
-  el.appTitle.textContent = uptime ? `auto_sync · up ${uptime}` : "auto_sync";
   const startedAt = runtimeStatus && runtimeStatus.process_started_at;
-  el.appTitle.title = startedAt ? `Started at ${startedAt}` : el.appTitle.textContent;
+  const label = formatHeaderStartedAt(startedAt);
+  el.appTitle.textContent = label;
+  el.appTitle.title = startedAt ? `Started at ${startedAt}` : "";
+}
+
+function formatHeaderStartedAt(value) {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const pad = (part) => String(part).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function runtimeUptimeLabel(status) {
