@@ -498,7 +498,7 @@ ensure_software_src_layout() {
 ensure_software_src_layout
 rewrite_software_src_paths() {
     replacement="$1"
-    for root in /etc/systemd/system /etc/profile.d /usr/local/bin /usr/local/sbin; do
+    for root in /etc/systemd/system /etc/profile.d /usr/local/bin; do
         [ -e "$root" ] || continue
         find "$root" -type f -exec grep -IlE '/opt/software/src|/opt/src/software' {} + 2>/dev/null |
             xargs -r sed -i "s#/opt/software/src#$replacement#g; s#/opt/src/software#$replacement#g"
@@ -707,6 +707,19 @@ export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export PATH="$JAVA_HOME/bin:$PATH"
 EOF_DOMESTIC_MIRRORS
 . /etc/profile.d/auto-sync-domestic-mirrors.sh
+clean_shell_startup_files() {
+    for f in /root/.bashrc /root/.zshrc /root/.profile /root/.zprofile /root/.zshenv /home/tiger/.bashrc /home/tiger/.zshrc /home/tiger/.profile /home/tiger/.zprofile /home/tiger/.zshenv; do
+        [ -f "$f" ] || continue
+        sed -i -E \
+            -e '/\/usr\/local\/java|\/usr\/local\/jdk-|\/opt\/software\/src\/tools\/nvm|\/usr\/local\/src\/software/d' \
+            -e '/^[[:space:]]*#?[[:space:]]*export[[:space:]]+JAVA_HOME=/d' \
+            -e '/^[[:space:]]*export[[:space:]]+CLASSPATH=/d' \
+            -e '/JAVA_HOME\/bin|JAVA_HOME\/jre/d' \
+            -e '/^[[:space:]]*export[[:space:]]+NVM_DIR="\$HOME\/\.nvm"/,+2d' \
+            "$f"
+    done
+}
+clean_shell_startup_files
 cat > /etc/pip.conf <<'EOF_PIP_MIRROR'
 [global]
 index-url = https://pypi.tuna.tsinghua.edu.cn/simple
@@ -794,16 +807,8 @@ if [ ! -x /usr/local/bin/buildifier ]; then
 fi
 
 [ -x "$JAVA_HOME/bin/java" ] || { log "ERROR: OpenJDK 21 is not installed at $JAVA_HOME"; exit 1; }
-[ ! -L /usr/local/java/jdk/jdk-21.0.3 ] || rm -f /usr/local/java/jdk/jdk-21.0.3
-[ ! -L /root/src/software/tools/mise/installs/java/21.0.2 ] || rm -f /root/src/software/tools/mise/installs/java/21.0.2
-if find /etc/systemd/system -type f -exec grep -q '/usr/local/java/.*/bin/java' {} \; -print -quit | grep -q .; then
-    find /etc/systemd/system -type f -exec grep -l '/usr/local/java/.*/bin/java' {} + |
-        xargs -r sed -i -E "s#/usr/local/java/[^[:space:]]*/bin/java#$JAVA_HOME/bin/java#g"
-    systemctl daemon-reload || true
-fi
 
-mkdir -p /usr/local/sbin
-cat > /usr/local/sbin/auto_sync_install_vim_tools.sh <<'EOF_VIM_TOOLS'
+cat > /root/src/software/tools/auto_sync_install_vim_tools.sh <<'EOF_VIM_TOOLS'
 #!/bin/bash
 set -u
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
@@ -866,10 +871,10 @@ if [ -d /root/.vim/bundle/YouCompleteMe ]; then
     fi
 fi
 EOF_VIM_TOOLS
-chmod 0755 /usr/local/sbin/auto_sync_install_vim_tools.sh
-if ! pgrep -f '/usr/local/sbin/auto_sync_install_vim_tools.sh' >/dev/null 2>&1; then
+chmod 0755 /root/src/software/tools/auto_sync_install_vim_tools.sh
+if ! pgrep -f '/root/src/software/tools/auto_sync_install_vim_tools.sh' >/dev/null 2>&1; then
     log "start Vim plugin/YouCompleteMe installation in background"
-    nohup /usr/local/sbin/auto_sync_install_vim_tools.sh >> /var/log/auto_sync_vim_tools.log 2>&1 &
+    nohup /root/src/software/tools/auto_sync_install_vim_tools.sh >> /var/log/auto_sync_vim_tools.log 2>&1 &
 fi
 
 grep -q '^\*[[:space:]]\+soft[[:space:]]\+core[[:space:]]\+unlimited' /etc/security/limits.conf || cat >> /etc/security/limits.conf <<'EOF_LIMITS'
