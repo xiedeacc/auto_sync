@@ -564,12 +564,13 @@ done <<'EOF_DEV_LOCAL_LINKS'
 /root/.vimundo|root:root
 /root/.vimviews|root:root
 /root/.vscode-server|root:root
+/root/.halo|root:root
+/root/.halo2|root:root
 /root/.zprofile|root:root
 /root/.zshenv|root:root
 /root/.zshrc|root:root
 /root/src|root:root
 /home/tiger/.bashrc|tiger:tiger
-/home/tiger/.halo2|tiger:tiger
 /home/tiger/.npm|tiger:tiger
 /home/tiger/.npmrc|tiger:tiger
 /home/tiger/.nvm|tiger:tiger
@@ -1466,7 +1467,7 @@ fi
 
 [ ! -L /opt/auto_sync ] || rm -f /opt/auto_sync
 
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /home/tiger /opt/www/coverage
+mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /root/.halo /root/.halo2 /home/tiger /opt/www/coverage
 if [ ! -s /opt/www/coverage/index.html ]; then
     cat > /opt/www/coverage/index.html <<'EOF_COVERAGE_INDEX'
 <!doctype html>
@@ -1489,8 +1490,39 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
-for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /usr/local/immich /home/tiger/.halo2; do
+migrate_halo_root_home() {
+    for name in .halo .halo2; do
+        dest="/root/$name"
+        if [ -L "$dest" ]; then
+            tmp="${dest}.auto_sync_restore_tmp"
+            rm -rf "$tmp"
+            if [ -d "$dest" ]; then
+                mkdir -p "$tmp"
+                rsync -aL "$dest/" "$tmp/" || true
+            fi
+            rm -f "$dest"
+            mkdir -p "$dest"
+            [ ! -d "$tmp" ] || rsync -a "$tmp/" "$dest/"
+            rm -rf "$tmp"
+        else
+            mkdir -p "$dest"
+        fi
+        for src in "/home/tiger/$name" "/opt/user/tiger/$name"; do
+            [ -e "$src" ] || [ -L "$src" ] || continue
+            if [ -d "$src" ]; then
+                rsync -aL "$src/" "$dest/" || true
+            fi
+            rm -rf "$src"
+        done
+        chown -R root:root "$dest" 2>/dev/null || true
+    done
+}
+migrate_halo_root_home
+for d in /usr/local/immich; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
+done
+for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /root/.halo /root/.halo2; do
+    [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
 if [ -d /usr/local/auto_sync ]; then
     chown root:root /usr/local/auto_sync /usr/local/auto_sync/logs /usr/local/auto_sync/conf/state 2>/dev/null || true
@@ -1552,6 +1584,20 @@ for f in /etc/systemd/system/immich.service /etc/systemd/system/immich-ml.servic
     [ -f "$f" ] || continue
     sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
 done
+for f in /etc/systemd/system/auto_sync.service /etc/systemd/system/halo2.service /etc/systemd/system/tbox_client.service; do
+    [ -f "$f" ] || continue
+    sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
+    grep -q '^User=' "$f" || sed -i '/^\[Service\]/a User=root' "$f"
+    grep -q '^Group=' "$f" || sed -i '/^User=root/a Group=root' "$f"
+done
+if [ -f /etc/systemd/system/halo2.service ]; then
+    grep -q '^Environment="HOME=/root"' /etc/systemd/system/halo2.service || sed -i '/^Group=root/a Environment="HOME=/root"' /etc/systemd/system/halo2.service
+    if grep -q '^WorkingDirectory=' /etc/systemd/system/halo2.service; then
+        sed -i 's#^WorkingDirectory=.*#WorkingDirectory=/root#' /etc/systemd/system/halo2.service
+    else
+        sed -i '/^Environment="HOME=\/root"/a WorkingDirectory=/root' /etc/systemd/system/halo2.service
+    fi
+fi
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true

@@ -734,12 +734,13 @@ done <<'EOF_OPT_LINKS'
 /root/.vimundo|/opt/user/root/.vimundo|dir|root:root
 /root/.vimviews|/opt/user/root/.vimviews|dir|root:root
 /root/.vscode-server|/opt/user/root/.vscode-server|dir|root:root
+/root/.halo|/opt/user/root/.halo|dir|root:root
+/root/.halo2|/opt/user/root/.halo2|dir|root:root
 /root/.zprofile|/opt/user/root/.zprofile|file|root:root
 /root/.zshenv|/opt/user/root/.zshenv|file|root:root
 /root/.zshrc|/opt/user/root/.zshrc|file|root:root
 /root/src|/opt/user/root/src|dir|root:root
 /home/tiger/.bashrc|/opt/user/tiger/.bashrc|file|tiger:tiger
-/home/tiger/.halo2|/opt/user/tiger/.halo2|dir|tiger:tiger
 /home/tiger/.npm|/opt/user/tiger/.npm|dir|tiger:tiger
 /home/tiger/.npmrc|/opt/user/tiger/.npmrc|file|tiger:tiger
 /home/tiger/.nvm|/opt/src/software/tools/nvm|dir|tiger:tiger
@@ -1622,16 +1623,29 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-mkdir -p /opt/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
+mkdir -p /opt/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/shadowsocks/logs /usr/local/shadowsocks/conf /usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/root/.halo /opt/user/root/.halo2 /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
 done
-if [ -d /opt/user/tiger/.halo2 ]; then
-    rm -rf /home/tiger/.halo2
-    ln -s /opt/user/tiger/.halo2 /home/tiger/.halo2
-    chown -h tiger:tiger /home/tiger/.halo2 2>/dev/null || true
-fi
+migrate_halo_root_home() {
+    for name in .halo .halo2; do
+        dest="/opt/user/root/$name"
+        mkdir -p "$dest"
+        for src in "/home/tiger/$name" "/opt/user/tiger/$name"; do
+            [ -e "$src" ] || [ -L "$src" ] || continue
+            if [ -d "$src" ]; then
+                rsync -aL "$src/" "$dest/" || true
+            fi
+            rm -rf "$src"
+        done
+        rm -rf "/root/$name"
+        ln -s "$dest" "/root/$name"
+        chown -R root:root "$dest" 2>/dev/null || true
+        chown -h root:root "/root/$name" 2>/dev/null || true
+    done
+}
+migrate_halo_root_home
 python3 - <<'PY_TIGER_LINK_OWNERS'
 import os
 import pwd
@@ -1644,8 +1658,11 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
-for d in /opt/auto_sync /usr/local/halo /usr/local/tbox /opt/immich /opt/user/tiger; do
+for d in /opt/immich /opt/user/tiger; do
     [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
+done
+for d in /opt/auto_sync /usr/local/halo /usr/local/tbox /usr/local/shadowsocks /opt/user/root/.halo /opt/user/root/.halo2; do
+    [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
 for f in \
     /opt/auto_sync/bin/auto_sync \
@@ -1661,6 +1678,7 @@ for f in \
     /usr/local/blog/bin/rblog-backup \
     /usr/local/blog/bin/admin/* \
     /usr/local/halo/bin/* \
+    /usr/local/shadowsocks/bin/* \
     /usr/local/bin/vlmcsd
 do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
@@ -1670,7 +1688,22 @@ chmod a+rx /opt/src/software/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/nu
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray rblog rblog-backup.timer nginx cron; do
+for f in /etc/systemd/system/auto_sync.service /etc/systemd/system/halo2.service /etc/systemd/system/tbox_client.service; do
+    [ -f "$f" ] || continue
+    sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
+    grep -q '^User=' "$f" || sed -i '/^\[Service\]/a User=root' "$f"
+    grep -q '^Group=' "$f" || sed -i '/^User=root/a Group=root' "$f"
+done
+if [ -f /etc/systemd/system/halo2.service ]; then
+    grep -q '^Environment="HOME=/root"' /etc/systemd/system/halo2.service || sed -i '/^Group=root/a Environment="HOME=/root"' /etc/systemd/system/halo2.service
+    if grep -q '^WorkingDirectory=' /etc/systemd/system/halo2.service; then
+        sed -i 's#^WorkingDirectory=.*#WorkingDirectory=/root#' /etc/systemd/system/halo2.service
+    else
+        sed -i '/^Environment="HOME=\/root"/a WorkingDirectory=/root' /etc/systemd/system/halo2.service
+    fi
+fi
+systemctl daemon-reload
+for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray shadowsocks rblog rblog-backup.timer nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -1678,7 +1711,7 @@ done
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_mysql.sh'; echo '5 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_mysql.sh > /dev/null 2>&1') | crontab -
 
 echo '--- final states ---'
-for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray rblog rblog-backup.timer gitlab-runsvdir gitlab; do
+for s in auto_sync halo2 immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server waiwei-web waiwei-puller xray shadowsocks rblog rblog-backup.timer gitlab-runsvdir gitlab; do
     resolved="$(unit_name "$s" 2>/dev/null || true)"
     if [ -n "$resolved" ]; then
         printf '  %s: ' "$s"; systemctl is-enabled "$resolved" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$resolved" 2>/dev/null | tr -d '\n'; echo
