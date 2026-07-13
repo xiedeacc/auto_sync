@@ -749,11 +749,11 @@ if [ ! -x /root/.cargo/bin/rustup ]; then
     curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | timeout --kill-after=10s 600s sh -s -- -y || log "WARN: rustup install failed"
 fi
 
-mkdir -p /usr/local/src/software/tools
-if [ -L /usr/local/src/software/tools/nvm ]; then
-    rm -f /usr/local/src/software/tools/nvm
+mkdir -p /root/src/software/tools
+if [ -L /root/src/software/tools/nvm ]; then
+    rm -f /root/src/software/tools/nvm
 fi
-export NVM_DIR=/usr/local/src/software/tools/nvm
+export NVM_DIR=/root/src/software/tools/nvm
 mkdir -p "$NVM_DIR"
 if [ ! -s "$NVM_DIR/nvm.sh" ]; then
     curl -fsSL https://gitee.com/mirrors/nvm/raw/v0.40.3/install.sh | NVM_SOURCE=https://gitee.com/mirrors/nvm.git bash || log "WARN: nvm install failed"
@@ -795,7 +795,7 @@ fi
 
 [ -x "$JAVA_HOME/bin/java" ] || { log "ERROR: OpenJDK 21 is not installed at $JAVA_HOME"; exit 1; }
 [ ! -L /usr/local/java/jdk/jdk-21.0.3 ] || rm -f /usr/local/java/jdk/jdk-21.0.3
-[ ! -L /usr/local/src/software/tools/mise/installs/java/21.0.2 ] || rm -f /usr/local/src/software/tools/mise/installs/java/21.0.2
+[ ! -L /root/src/software/tools/mise/installs/java/21.0.2 ] || rm -f /root/src/software/tools/mise/installs/java/21.0.2
 if find /etc/systemd/system -type f -exec grep -q '/usr/local/java/.*/bin/java' {} \; -print -quit | grep -q .; then
     find /etc/systemd/system -type f -exec grep -l '/usr/local/java/.*/bin/java' {} + |
         xargs -r sed -i -E "s#/usr/local/java/[^[:space:]]*/bin/java#$JAVA_HOME/bin/java#g"
@@ -846,7 +846,7 @@ fi
 if [ -d /root/.vim/bundle/YouCompleteMe ]; then
     ycm_commit="$(git -C /root/.vim/bundle/YouCompleteMe rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$ycm_commit" ] && [ "$(cat /root/.vim/bundle/YouCompleteMe/.auto_sync_installed 2>/dev/null || true)" != "$ycm_commit" ]; then
-        ycm_path="$JAVA_HOME/bin:/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/usr/local/src/software/tools/nvm/versions/node/v24.18.0/bin:$PATH"
+        ycm_path="$JAVA_HOME/bin:/usr/local/go/go1.25.1/bin:/root/go/bin:/root/.cargo/bin:/root/src/software/tools/nvm/versions/node/v24.18.0/bin:$PATH"
         ycmd_build=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/build.py
         jdt_milestone="$(sed -n "s/^JDTLS_MILESTONE = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
         jdt_stamp="$(sed -n "s/^JDTLS_BUILD_STAMP = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
@@ -975,8 +975,8 @@ text = text.replace(
     'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --locked --extra cpu --no-dev --compile-bytecode',
     'UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_LINK_MODE=copy "$UV_BIN" sync --extra cpu --no-dev --compile-bytecode',
 )
-text = text.replace('/opt/software/src', '/usr/local/src/software')
-text = text.replace('/opt/src/software', '/usr/local/src/software')
+text = text.replace('/opt/software/src', '/root/src/software')
+text = text.replace('/opt/src/software', '/root/src/software')
 path.write_text(text)
 PY_PATCH_IMMICH
     }
@@ -984,9 +984,9 @@ PY_PATCH_IMMICH
         if [ -f "$repo/$script" ]; then
             patch_immich_deploy_script "$repo/$script"
             chmod +x "$repo/$script" 2>/dev/null || true
-            immich_node_home="${IMMICH_NODE_HOME:-/usr/local/src/software/tools/nvm/versions/node/v24.18.0}"
-            chmod -R a+rX "$immich_node_home" /usr/local/src/software/tools/uv-python 2>/dev/null || true
-            (cd "$repo" && VERSION="${IMMICH_VERSION:-deploy}" UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/usr/local/src/software/tools/uv-python}" UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" bash "$script") || return 1
+            immich_node_home="${IMMICH_NODE_HOME:-/root/src/software/tools/nvm/versions/node/v24.18.0}"
+            chmod -R a+rX "$immich_node_home" /root/src/software/tools/uv-python 2>/dev/null || true
+            (cd "$repo" && VERSION="${IMMICH_VERSION:-deploy}" UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/root/src/software/tools/uv-python}" UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" bash "$script") || return 1
             [ -z "$immich_commit" ] || printf '%s\n' "$immich_commit" > "$immich_marker"
             return 0
         fi
@@ -1506,9 +1506,9 @@ for link in /usr/local/immich/machine-learning/.venv/bin/python /usr/local/immic
             ;;
     esac
 done
-[ ! -f /usr/local/immich/machine-learning/.venv/pyvenv.cfg ] || sed -i 's#/opt/user/root/src/software#/usr/local/src/software#g; s#/opt/software/src#/usr/local/src/software#g; s#/opt/src/software#/usr/local/src/software#g' /usr/local/immich/machine-learning/.venv/pyvenv.cfg
+[ ! -f /usr/local/immich/machine-learning/.venv/pyvenv.cfg ] || sed -i 's#/opt/user/root/src/software#/root/src/software#g; s#/opt/software/src#/root/src/software#g; s#/opt/src/software#/root/src/software#g' /usr/local/immich/machine-learning/.venv/pyvenv.cfg
 if [ -f /usr/local/immich/machine-learning/.venv/pyvenv.cfg ]; then
-    python_home="$(find /usr/local/src/software/tools/uv-python -mindepth 1 -maxdepth 1 -type d -name 'cpython-*' 2>/dev/null | sort -V | tail -1)"
+    python_home="$(find /root/src/software/tools/uv-python -mindepth 1 -maxdepth 1 -type d -name 'cpython-*' 2>/dev/null | sort -V | tail -1)"
     if [ -n "$python_home" ]; then
         sed -i -E "s#^home = .*#home = $python_home/bin#" /usr/local/immich/machine-learning/.venv/pyvenv.cfg
         if [ -f /etc/systemd/system/immich-ml.service ]; then
@@ -1521,13 +1521,17 @@ if [ -f /usr/local/immich/machine-learning/.venv/pyvenv.cfg ]; then
     fi
 fi
 find /usr/local/immich/server/bin /usr/local/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
-chmod -R a+rX /usr/local/src/software/tools/nvm/versions/node/v24.18.0 /usr/local/src/software/tools/uv-python 2>/dev/null || true
+chmod -R a+rX /root/src/software/tools/nvm/versions/node/v24.18.0 /root/src/software/tools/uv-python 2>/dev/null || true
 if [ -f /etc/systemd/system/auto_sync.service ]; then
     sed -i 's#/opt/auto_sync#/usr/local/auto_sync#g' /etc/systemd/system/auto_sync.service
 fi
 for f in /etc/immich/*.env /etc/systemd/system/immich.service /etc/systemd/system/immich-ml.service; do
     [ -f "$f" ] || continue
-    sed -i 's#/opt/immich#/usr/local/immich#g; s#/opt/user/root/src/software#/usr/local/src/software#g; s#/root/src/software/tools#/usr/local/src/software/tools#g; s#/opt/software/src#/usr/local/src/software#g; s#/opt/src/software#/usr/local/src/software#g' "$f"
+    sed -i 's#/opt/immich#/usr/local/immich#g; s#/usr/local/src/software#/root/src/software#g; s#/opt/user/root/src/software#/root/src/software#g; s#/opt/software/src#/root/src/software#g; s#/opt/src/software#/root/src/software#g' "$f"
+done
+for f in /etc/systemd/system/immich.service /etc/systemd/system/immich-ml.service; do
+    [ -f "$f" ] || continue
+    sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
 done
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
