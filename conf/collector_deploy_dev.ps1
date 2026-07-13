@@ -480,6 +480,16 @@ ensure_software_src_layout() {
         fi
     done
     mkdir -p "$new"
+    if [ -e /opt/aarch64-linux-musl-cross ] && [ ! -L /opt/aarch64-linux-musl-cross ]; then
+        target="$new/aarch64-linux-musl-cross"
+        if [ ! -e "$target" ]; then
+            mv /opt/aarch64-linux-musl-cross "$target"
+        else
+            rsync -aHAX /opt/aarch64-linux-musl-cross/ "$target/" || rsync -a /opt/aarch64-linux-musl-cross/ "$target/"
+            mv /opt/aarch64-linux-musl-cross "/opt/aarch64-linux-musl-cross.migrated-$(date +%Y%m%d%H%M%S)"
+        fi
+    fi
+    [ ! -L /opt/aarch64-linux-musl-cross ] || rm -f /opt/aarch64-linux-musl-cross
     [ ! -L /opt/src/software ] || rm -f /opt/src/software
     [ ! -L /opt/software/src ] || rm -f /opt/software/src
 }
@@ -496,7 +506,7 @@ rewrite_software_src_paths() {
 rewrite_software_src_paths /root/src/software
 restore_opt_user_link() {
     path="$1"
-    owner="$4"
+    owner="$2"
     [ -L "$path" ] || return 0
     target="$(readlink "$path" || true)"
     case "$target" in
