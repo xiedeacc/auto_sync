@@ -555,6 +555,8 @@ curl -s -X POST http://127.0.0.1:18765/api/sync-destination-now \
 | Linux / dev | `scripts/deploy_local.sh --install-dir /usr/local/auto_sync` | 通用 Linux 本机部署入口，dev 默认使用 `/usr/local/auto_sync`。 |
 | OpenWrt | `scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root` | 交叉编译 aarch64，渲染 `conf/auto_sync.procd` 为 `/etc/init.d/auto_sync`。 |
 
+Dev 和 NAS 的真实部署目录、用户目录 symlink 策略、toolchain 位置与环境变量见 `docs/deployment-paths.md`。
+
 标准更新路径（NAS 直接在 NAS 上执行，保留构建缓存，不 `git reset --hard`、不清 `target`）：
 
 ```bash

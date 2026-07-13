@@ -400,7 +400,7 @@ pub fn merge_discovered(cfg: &AppConfig, discovered: Vec<MachineHealth>) -> Mach
             ssh_user: health.ssh_user.trim().to_string(),
             ssh_port: normalized_ssh_port(health.ssh_port),
             os: health.os,
-            install_dir: PathBuf::from("/opt/auto_sync"),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: false,
             online: true,
@@ -1655,7 +1655,7 @@ mod tests {
             ssh_user: "Administrator".to_string(),
             ssh_port: 2222,
             os: "windows".to_string(),
-            install_dir: PathBuf::from("/opt/auto_sync"),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1764,7 +1764,7 @@ mod tests {
             ssh_user: "root".to_string(),
             ssh_port: 10022,
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/opt/auto_sync"),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1838,7 +1838,7 @@ mod tests {
             ssh_user: "root".to_string(),
             ssh_port: 10022,
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/opt/auto_sync"),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -1868,7 +1868,7 @@ mod tests {
             ssh_user: "manual".to_string(),
             ssh_port: 2222,
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/opt/auto_sync"),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });

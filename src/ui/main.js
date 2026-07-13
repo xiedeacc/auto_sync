@@ -1680,7 +1680,7 @@ function machineIdFromEndpoint(host, machinePort) {
 }
 
 function defaultInstallDirForOs(os) {
-  return String(os || "").toLowerCase() === "windows" ? "C:/auto_sync" : "/opt/auto_sync";
+  return String(os || "").toLowerCase() === "windows" ? "C:/auto_sync" : "/usr/local/auto_sync";
 }
 
 function machineIdOrLocal(value) {

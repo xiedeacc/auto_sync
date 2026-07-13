@@ -2224,7 +2224,7 @@ mod tests {
             ssh_user: "Administrator".to_string(),
             ssh_port: 22,
             os: "windows".to_string(),
-            install_dir: PathBuf::from("/opt/auto_sync"),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -2254,7 +2254,7 @@ mod tests {
             ssh_user: "root".to_string(),
             ssh_port: 10022,
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/opt/auto_sync"),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         });
@@ -2362,7 +2362,7 @@ mod tests {
             ssh_user: "root".to_string(),
             ssh_port: 10022,
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/opt/auto_sync"),
+            install_dir: PathBuf::from("/usr/local/auto_sync"),
             enabled: true,
             manual: true,
         };
@@ -2434,7 +2434,7 @@ mod tests {
             ssh_user: "olduser".to_string(), // stale; health advertises root
             ssh_port: 22,                    // stale default; health advertises 10022
             os: "linux".to_string(),
-            install_dir: PathBuf::from("/old/dir"), // stale; health reports /opt/auto_sync
+            install_dir: PathBuf::from("/old/dir"), // stale; health reports /usr/local/auto_sync
             enabled: true,
             manual: true,
         });
@@ -2447,7 +2447,7 @@ mod tests {
             ssh_user: "root".to_string(),
             ssh_port: 10022,
             os: "linux".to_string(),
-            install_dir: "/opt/auto_sync".to_string(),
+            install_dir: "/usr/local/auto_sync".to_string(),
             version: String::new(),
         }];
 
@@ -2455,7 +2455,7 @@ mod tests {
         assert!(changed);
         let nas = cfg.machines.iter().find(|m| m.id == "nas").unwrap();
         assert_eq!(nas.name, "nas");
-        assert_eq!(nas.install_dir, PathBuf::from("/opt/auto_sync"));
+        assert_eq!(nas.install_dir, PathBuf::from("/usr/local/auto_sync"));
         assert_eq!(nas.ssh_user, "root", "ssh user preferred from discovery");
         assert_eq!(nas.ssh_port, 10022, "ssh port preferred from discovery");
         assert_eq!(nas.alias_name, "nas", "alias must be preserved");

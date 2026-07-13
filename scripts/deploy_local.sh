@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 CONFIG="${CONFIG:-}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/auto_sync}"
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/auto_sync}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -103,7 +103,7 @@ ensure_linux_build_environment() {
 }
 
 ensure_flutter_web_environment() {
-  local flutter_root="${FLUTTER_ROOT:-/opt/src/software/flutter}"
+  local flutter_root="${FLUTTER_ROOT:-/root/src/software/flutter}"
   local legacy_roots=(
     "$HOME/flutter"
     "$HOME/src/software/flutter"
