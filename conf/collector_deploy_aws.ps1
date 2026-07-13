@@ -249,14 +249,14 @@ sudo systemctl daemon-reload
 sudo sysctl --system >/dev/null 2>&1 && echo "sysctl applied" || echo "!! sysctl apply FAILED"
 
 # enable at boot + restart (restart, since a process may already be running)
-for s in rblog rblog-backup.timer shadowsocks-rust tbox_server nginx vlmcsd; do
+for s in rblog rblog-backup.timer shadowsocks-rust nginx vlmcsd; do
     sudo systemctl enable "$s" >/dev/null 2>&1
     sudo systemctl restart "$s" && echo "restarted $s" || echo "!! restart $s FAILED"
 done
 
-# waiwei + xray: off and stay off. `waiwei` is the old monolithic
+# tbox + waiwei + xray: off and stay off. `waiwei` is the old monolithic
 # unit name; current waiwei is split into waiwei-web and waiwei-puller.
-for s in waiwei waiwei-web waiwei-puller xray; do
+for s in tbox_server tbox_client tbox-logrotate.timer waiwei waiwei-web waiwei-puller xray; do
     sudo systemctl disable "$s" >/dev/null 2>&1
     sudo systemctl stop "$s" 2>/dev/null
     sudo systemctl reset-failed "$s" 2>/dev/null
@@ -329,7 +329,7 @@ echo "rblog-backup: $(systemctl show rblog-backup.service -p Result --value 2>/d
 git -C /usr/local/blog/.backup-worktree log --oneline -1 2>/dev/null | sed 's/^/  latest backup: /'
 
 echo "--- final states ---"
-for s in rblog rblog-backup.timer shadowsocks-rust tbox_server nginx vlmcsd waiwei waiwei-web waiwei-puller xray; do
+for s in rblog rblog-backup.timer shadowsocks-rust nginx vlmcsd tbox_server tbox_client tbox-logrotate.timer waiwei waiwei-web waiwei-puller xray; do
     printf "  %s: " "$s"; systemctl is-enabled "$s" 2>/dev/null | tr -d '\n'; printf " / "; systemctl is-active "$s" 2>/dev/null | tr -d '\n'; echo
 done
 # `systemctl is-active` returns non-zero for the intentionally-stopped services,
