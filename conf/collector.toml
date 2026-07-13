@@ -13,6 +13,7 @@ paths = [
     "/etc/config/dhcp",
     "/etc/config/network",
     "/etc/init.d/shadowsocks",
+    "/etc/init.d/shadowsocks-rust",
     "/etc/resolv.conf",
     "/etc/sysctl.conf",
     "/etc/sysctl.d/10-default.conf",
