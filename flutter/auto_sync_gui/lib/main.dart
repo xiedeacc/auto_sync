@@ -174,8 +174,9 @@ class AutoSyncApi {
   );
   Future<Map<String, dynamic>> collectorConfig() async =>
       _map(await _request('GET', '/api/collector/config'));
-  Future<void> saveCollectorConfig(Map<String, dynamic> cfg) async =>
-      _request('POST', '/api/collector/config', body: cfg);
+  Future<Map<String, dynamic>> saveCollectorConfig(
+    Map<String, dynamic> cfg,
+  ) async => _map(await _request('POST', '/api/collector/config', body: cfg));
   Future<Map<String, dynamic>> collectorStatus() async =>
       _map(await _request('GET', '/api/collector/status'));
   Future<Map<String, dynamic>> collectorRun() async =>
@@ -5583,7 +5584,35 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   Future<void> _persistNow() async {
     saveTimer?.cancel();
     saveTimer = null;
-    await _save();
+    final nextCfg = await widget.api.saveCollectorConfig(cfg);
+    if (!mounted) return;
+    setState(() {
+      cfg = Map<String, dynamic>.from(nextCfg);
+      cfg['hosts'] = _mapRefs(
+        nextCfg['hosts'],
+      ).map((host) => Map<String, dynamic>.from(host)).toList();
+      gitDir.text = _str(cfg['git_dir']);
+      splitMb.text = _str(cfg['split_threshold_mb'], '95');
+      autoPush = _bool(cfg['auto_commit_push']);
+    });
+  }
+
+  Future<Map<String, dynamic>?> _refreshHostConfig(int index) async {
+    await _persistNow();
+    final nextCfg = await widget.api.collectorConfig();
+    if (!mounted) return null;
+    final nextHosts = _mapRefs(
+      nextCfg['hosts'],
+    ).map((host) => Map<String, dynamic>.from(host)).toList();
+    setState(() {
+      cfg = Map<String, dynamic>.from(nextCfg);
+      cfg['hosts'] = nextHosts;
+      gitDir.text = _str(cfg['git_dir']);
+      splitMb.text = _str(cfg['split_threshold_mb'], '95');
+      autoPush = _bool(cfg['auto_commit_push']);
+    });
+    if (index < 0 || index >= nextHosts.length) return null;
+    return nextHosts[index];
   }
 
   Future<void> _runHost(int index) async {
@@ -5963,11 +5992,13 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                             },
                             onBrowseRoot: () => _browseRoot(entry.value),
                             onPaths: () async {
+                              final host = await _refreshHostConfig(entry.key);
+                              if (!context.mounted || host == null) return;
                               await showDialog<void>(
                                 context: context,
                                 builder: (context) => _CollectorPathsDialog(
                                   api: widget.api,
-                                  host: entry.value,
+                                  host: host,
                                   onChanged: () {
                                     setState(() {});
                                     _scheduleSave();
@@ -7366,19 +7397,6 @@ String _taskDurationLabel(Map<String, dynamic> task) {
   final minutes = seconds ~/ 60;
   if (minutes < 60) return '${minutes}m ${seconds.round() % 60}s';
   return '${minutes ~/ 60}h ${minutes % 60}m';
-}
-
-String _runtimeUptimeLabel(Map<String, dynamic> runtimeStatus) {
-  final seconds = _int(runtimeStatus['process_uptime_secs'], -1);
-  if (seconds < 0) return '';
-  if (seconds < 60) return '${seconds}s';
-  final minutes = seconds ~/ 60;
-  if (minutes < 60) return '${minutes}m';
-  final hours = minutes ~/ 60;
-  if (hours < 24) return '${hours}h ${minutes % 60}m';
-  final days = hours ~/ 24;
-  final remHours = hours % 24;
-  return remHours == 0 ? '${days}d' : '${days}d ${remHours}h';
 }
 
 String _taskResultLabel(Map<String, dynamic> task) {

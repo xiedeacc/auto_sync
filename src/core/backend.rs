@@ -175,10 +175,10 @@ impl Backend {
     pub fn get_collector_config(&self) -> Result<CollectorConfig> {
         let path = self.collector_config_path();
         match std::fs::read_to_string(&path) {
-            Ok(text) if !text.trim().is_empty() => {
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-            }
-            _ => Ok(CollectorConfig::default()),
+            Ok(text) if !text.trim().is_empty() => toml::from_str::<CollectorConfig>(&text)
+                .map(CollectorConfig::normalized)
+                .with_context(|| format!("parsing {}", path.display())),
+            _ => Ok(CollectorConfig::default().normalized()),
         }
     }
 
@@ -188,9 +188,11 @@ impl Backend {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let text = toml::to_string_pretty(cfg).with_context(|| "serializing collector config")?;
+        let normalized = cfg.clone().normalized();
+        let text =
+            toml::to_string_pretty(&normalized).with_context(|| "serializing collector config")?;
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-        Ok(cfg.clone())
+        Ok(normalized)
     }
 
     /// Path + raw text of the collector config file, for the UI's Config view.

@@ -233,6 +233,51 @@ impl CollectorConfig {
     pub fn is_empty(&self) -> bool {
         self.git_dir.as_os_str().is_empty() && self.hosts.is_empty()
     }
+
+    pub fn normalized(mut self) -> Self {
+        for host in &mut self.hosts {
+            host.paths = normalize_collector_paths(&host.paths);
+            host.exclude = normalize_collector_paths(&host.exclude);
+        }
+        self
+    }
+}
+
+const NAS_ROOT_COLLECT_PATHS: &[&str] = &[
+    "/opt/user/root/.bash_history",
+    "/opt/user/root/.bashrc",
+    "/opt/user/root/.claude.json",
+    "/opt/user/root/.flutter",
+    "/opt/user/root/.gitconfig",
+    "/opt/user/root/.halo2",
+    "/opt/user/root/.profile",
+    "/opt/user/root/.vimrc",
+    "/opt/user/root/.zprofile",
+    "/opt/user/root/.zsh_history",
+    "/opt/user/root/.zshenv",
+    "/opt/user/root/.zshrc",
+];
+
+fn normalize_collector_paths(paths: &[String]) -> Vec<String> {
+    let mut cleaned = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = trimmed.trim_end_matches('/');
+        if normalized == "/opt/user/root" {
+            for item in NAS_ROOT_COLLECT_PATHS {
+                if seen.insert((*item).to_string()) {
+                    cleaned.push((*item).to_string());
+                }
+            }
+        } else if seen.insert(normalized.to_string()) {
+            cleaned.push(normalized.to_string());
+        }
+    }
+    cleaned
 }
 
 /// One SSH host the collector pulls from. The connection is described by
