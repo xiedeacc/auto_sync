@@ -103,13 +103,20 @@ ensure_linux_build_environment() {
 }
 
 ensure_flutter_web_environment() {
-  local flutter_root="${FLUTTER_ROOT:-$HOME/src/software/flutter}"
-  local legacy_flutter_root="$HOME/flutter"
-  if [[ ! -e "$flutter_root" && -x "$legacy_flutter_root/bin/flutter" ]]; then
-    echo "Moving Flutter SDK from $legacy_flutter_root to $flutter_root ..."
-    mkdir -p "$(dirname "$flutter_root")"
-    mv "$legacy_flutter_root" "$flutter_root"
-  fi
+  local flutter_root="${FLUTTER_ROOT:-/opt/src/software/flutter}"
+  local legacy_roots=(
+    "$HOME/flutter"
+    "$HOME/src/software/flutter"
+    "/opt/flutter"
+  )
+  for legacy_flutter_root in "${legacy_roots[@]}"; do
+    if [[ ! -e "$flutter_root" && -d "$legacy_flutter_root" && ! -L "$legacy_flutter_root" && -x "$legacy_flutter_root/bin/flutter" ]]; then
+      echo "Moving Flutter SDK from $legacy_flutter_root to $flutter_root ..."
+      mkdir -p "$(dirname "$flutter_root")"
+      mv "$legacy_flutter_root" "$flutter_root"
+      break
+    fi
+  done
   if [[ -x "$flutter_root/bin/flutter" ]]; then
     export PATH="$flutter_root/bin:$PATH"
     return
