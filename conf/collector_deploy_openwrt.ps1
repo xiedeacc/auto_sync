@@ -281,15 +281,17 @@ rm -rf \
 
 # 2. Push every path in the Collector list, excluding anything in Ignore.
 $localStage = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_openwrt_deploy_stage_" + [guid]::NewGuid().ToString('N'))
+$remoteStage = '/tmp/auto_sync_openwrt_stage'
 New-Item -ItemType Directory -Force -Path $localStage | Out-Null
 try {
     foreach ($p in $collectPaths) {
         Copy-CollectedPathToStage $p $localStage
     }
 
+    Invoke-Remote "rm -rf $remoteStage; mkdir -p $remoteStage"
     foreach ($entry in Get-ChildItem -LiteralPath $localStage -Force) {
         Write-Host "scp staged $($entry.Name)"
-        & $scp @scpArgs -- $entry.FullName ('{0}:/' -f $dest)
+        & $scp @scpArgs -- $entry.FullName ('{0}:{1}/' -f $dest, $remoteStage)
         if ($LASTEXITCODE -ne 0) { Write-Host "! scp failed for staged $($entry.Name)"; $errCount++ }
     }
 } finally {
@@ -299,9 +301,27 @@ Stop-IfErrors 'file transfer'
 
 # Windows staging directories do not carry meaningful Unix modes. If scp/SFTP
 # applies those modes to existing top-level OpenWrt directories, daemons running
-# as non-root users can lose access to /etc and /usr. Restore these before any
-# ubus/procd work.
+# as non-root users can lose access to /etc and /usr. Install from a remote
+# stage so scp never writes attributes onto those live top-level directories.
 Invoke-Remote @'
+set -e
+stage=/tmp/auto_sync_openwrt_stage
+chmod 755 /etc /etc/config /etc/init.d /etc/sysctl.d /usr /usr/local 2>/dev/null || true
+if [ -d "$stage" ]; then
+    for entry in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name=${entry##*/}
+        case "$name" in .|..) continue ;; esac
+        dst="/$name"
+        if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+            mkdir -p "$dst"
+            cp -R "$entry"/. "$dst"/
+        else
+            cp -f "$entry" "$dst"
+        fi
+    done
+    rm -rf "$stage"
+fi
 chmod 755 /etc /etc/config /etc/init.d /etc/sysctl.d /usr /usr/local 2>/dev/null || true
 '@
 
@@ -324,6 +344,23 @@ function Quote-ShellArg([string]$Value) {
     return "'" + $Value.Replace("'", "'""'""'") + "'"
 }
 
+function Test-ProtectedModePath([string]$Path) {
+    $p = Normalize-RemotePath $Path
+    return @(
+        '/etc',
+        '/etc/config',
+        '/etc/init.d',
+        '/etc/sysctl.d',
+        '/usr',
+        '/usr/local',
+        '/usr/local/shadowsocks',
+        '/usr/local/shadowsocks/bin',
+        '/usr/local/shadowsocks/conf',
+        '/usr/local/shadowsocks/data',
+        '/usr/local/shadowsocks/data/temp'
+    ) -contains $p
+}
+
 if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -LiteralPath $env:AS_PERMS_FILE)) {
     $links = New-Object System.Collections.Generic.List[string]
     $chmods = New-Object System.Collections.Generic.List[string]
@@ -343,6 +380,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
         $sp = $t.IndexOf(' '); if ($sp -lt 1) { continue }
         $mode = $t.Substring(0, $sp); $path = $t.Substring($sp + 1)
         if (-not ($path.StartsWith('/etc/') -or $path.StartsWith('/usr/') -or $path.StartsWith('/root/') -or $path.StartsWith('/opt/'))) { continue }
+        if (Test-ProtectedModePath $path) { continue }
         $qPath = Quote-ShellArg $path
         $chmods.Add("[ -e $qPath ] && chmod $mode $qPath || true")
     }
@@ -358,6 +396,10 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
     Write-Host '! AS_PERMS_FILE not provided; skipping permission restore'
 }
 Stop-IfErrors 'permission restore'
+
+Invoke-Remote @'
+chmod 755 /etc /etc/config /etc/init.d /etc/sysctl.d /usr /usr/local /usr/local/shadowsocks /usr/local/shadowsocks/bin /usr/local/shadowsocks/conf /usr/local/shadowsocks/data /usr/local/shadowsocks/data/temp 2>/dev/null || true
+'@
 
 # 5. Apply the config and (re)start shadowsocks. Network reload is last because
 #    it can briefly drop this ssh session.
