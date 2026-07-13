@@ -1601,6 +1601,9 @@ migrate_opt_usr_local_layout() {
                 -e 's#/opt/opt/opt/usr/local#/opt/usr/local#g' \
                 -e 's#/opt/opt/usr/local#/opt/usr/local#g'
     done
+    if [ -f /opt/usr/local/blog/conf/rblog.toml ]; then
+        sed -i 's#/usr/local/blog#/opt/usr/local/blog#g' /opt/usr/local/blog/conf/rblog.toml
+    fi
     cat > /etc/profile.d/opt-usr-local-path.sh <<'EOF_OPT_USR_LOCAL_PATH'
 # Managed by auto_sync NAS deployment.
 case ":$PATH:" in
