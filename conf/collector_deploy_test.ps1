@@ -588,6 +588,38 @@ disable_if_exists() {
     fi
 }
 
+normalize_deploy_permissions() {
+    log "normalize deployed file permissions"
+    if [ -d /etc/nginx/ssl ]; then
+        chown root:root /etc/nginx/ssl /etc/nginx/ssl/* 2>/dev/null || true
+        chmod 755 /etc/nginx/ssl 2>/dev/null || true
+        find /etc/nginx/ssl -maxdepth 1 -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
+        find /etc/nginx/ssl -maxdepth 1 -type f ! -name '*.key' -exec chmod 644 {} + 2>/dev/null || true
+    fi
+    for d in /opt/usr/local/blog /opt/usr/local/tbox /opt/usr/local/waiwei /opt/usr/local/xray /opt/usr/local/shadowsocks /opt/usr/local/halo; do
+        [ -e "$d" ] || continue
+        chown -R root:root "$d" 2>/dev/null || true
+        find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
+        find "$d" -type f -exec chmod 644 {} + 2>/dev/null || true
+    done
+    for d in \
+        /opt/usr/local/blog/bin \
+        /opt/usr/local/blog/bin/admin \
+        /opt/usr/local/tbox/bin \
+        /opt/usr/local/waiwei/bin \
+        /opt/usr/local/waiwei/scripts \
+        /opt/usr/local/xray/bin \
+        /opt/usr/local/shadowsocks/bin \
+        /opt/usr/local/halo/bin \
+        /opt/usr/local/bin
+    do
+        [ -d "$d" ] && find "$d" -type f -exec chmod 755 {} + 2>/dev/null || true
+    done
+    for d in /opt/usr/local /opt/immich /opt/src /opt/user; do
+        [ -d "$d" ] && find "$d" -xdev \( -type d -o -type f \) \( -perm -0002 -o -perm -0020 \) -exec chmod go-w {} + 2>/dev/null || true
+    done
+}
+
 install_staged_collected_paths() {
     stage="/tmp/auto_sync_deploy_stage"
     [ -d "$stage" ] || return 0
@@ -1788,6 +1820,7 @@ do
 done
 find /opt/immich/server/bin /opt/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
 chmod a+rx /opt/src/software/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/null || true
+normalize_deploy_permissions
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true

@@ -403,6 +403,38 @@ disable_if_exists() {
     fi
 }
 
+normalize_deploy_permissions() {
+    log "normalize deployed file permissions"
+    if [ -d /etc/nginx/ssl ]; then
+        chown root:root /etc/nginx/ssl /etc/nginx/ssl/* 2>/dev/null || true
+        chmod 755 /etc/nginx/ssl 2>/dev/null || true
+        find /etc/nginx/ssl -maxdepth 1 -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
+        find /etc/nginx/ssl -maxdepth 1 -type f ! -name '*.key' -exec chmod 644 {} + 2>/dev/null || true
+    fi
+    for d in /usr/local/blog /usr/local/tbox /usr/local/waiwei /usr/local/xray /usr/local/shadowsocks /usr/local/halo; do
+        [ -e "$d" ] || continue
+        chown -R root:root "$d" 2>/dev/null || true
+        find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
+        find "$d" -type f -exec chmod 644 {} + 2>/dev/null || true
+    done
+    for d in \
+        /usr/local/blog/bin \
+        /usr/local/blog/bin/admin \
+        /usr/local/tbox/bin \
+        /usr/local/waiwei/bin \
+        /usr/local/waiwei/scripts \
+        /usr/local/xray/bin \
+        /usr/local/shadowsocks/bin \
+        /usr/local/halo/bin \
+        /usr/local/bin
+    do
+        [ -d "$d" ] && find "$d" -type f -exec chmod 755 {} + 2>/dev/null || true
+    done
+    for d in /usr/local /root/src/software; do
+        [ -d "$d" ] && find "$d" -xdev \( -type d -o -type f \) \( -perm -0002 -o -perm -0020 \) -exec chmod go-w {} + 2>/dev/null || true
+    done
+}
+
 install_staged_collected_paths() {
     stage="/tmp/auto_sync_deploy_stage"
     [ -d "$stage" ] || return 0
@@ -1582,6 +1614,7 @@ if [ -f /usr/local/immich/machine-learning/.venv/pyvenv.cfg ]; then
 fi
 find /usr/local/immich/server/bin /usr/local/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
 chmod -R a+rX /root/src/software/tools/nvm/versions/node/v24.18.0 /root/src/software/tools/uv-python 2>/dev/null || true
+normalize_deploy_permissions
 if [ -f /etc/systemd/system/auto_sync.service ]; then
     sed -i 's#/opt/auto_sync#/usr/local/auto_sync#g' /etc/systemd/system/auto_sync.service
 fi
