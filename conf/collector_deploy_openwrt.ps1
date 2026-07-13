@@ -302,18 +302,12 @@ wait_ubus() {
     return 1
 }
 
-restart_ubusd() {
-    echo "restarting ubusd"
-    killall ubusd 2>/dev/null || true
-    sleep 1
-    pgrep ubusd >/dev/null 2>&1 ||
-        start-stop-daemon -S -b -x /sbin/ubusd -- -s /var/run/ubus/ubus.sock
-}
-
 ensure_ubus() {
-    wait_ubus && return 0
-    restart_ubusd
-    wait_ubus
+    wait_ubus || {
+        echo "!! ubus is unavailable; refusing to restart ubusd from deploy script" >&2
+        echo "!! fix OpenWrt ubus/rpcd/uhttpd first, then rerun deploy" >&2
+        return 1
+    }
 }
 
 sslocal_running() {
