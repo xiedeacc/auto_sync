@@ -8,6 +8,7 @@ hostname = "192.168.2.1"
 user = "root"
 port = 10022
 identity_file = "~/.ssh/id_ed25519"
+password = ""
 root = 'D:\share\openwrt'
 paths = [
     "/etc/config/dhcp",
@@ -31,6 +32,7 @@ hostname = "192.168.2.126"
 user = "root"
 port = 10022
 identity_file = "~/.ssh/id_ed25519"
+password = ""
 root = 'D:\share\dev'
 paths = [
     "/etc/gitlab",
@@ -110,6 +112,7 @@ hostname = "192.168.2.247"
 user = "root"
 port = 10022
 identity_file = "~/.ssh/id_ed25519"
+password = ""
 root = 'D:\share\nas'
 paths = [
     "/etc/gitlab",
@@ -178,6 +181,7 @@ hostname = "54.179.191.126"
 user = "ubuntu"
 port = 22
 identity_file = "~/.ssh/id_ed25519"
+password = ""
 root = 'D:\share\aws'
 paths = [
     "/etc/nginx",
@@ -223,6 +227,7 @@ hostname = "192.168.255.131"
 user = "root"
 port = 10022
 identity_file = "~/.ssh/id_ed25519"
+password = ""
 root = 'D:\share\test'
 paths = [
     "/etc/gitlab",
