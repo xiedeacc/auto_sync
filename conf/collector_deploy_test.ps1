@@ -1619,6 +1619,7 @@ from pathlib import Path
 
 UPLOAD_ROOT = Path("/opt/immich/upload")
 LIMIT = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_LIMIT", "200") or "200")
+REPAIR_ALL = os.environ.get("IMMICH_DERIVATIVE_REPAIR_ALL", "").lower() in ("1", "true", "yes", "all")
 
 
 def run(cmd, *, check=True, timeout=None):
@@ -1828,9 +1829,77 @@ def upsert(asset_id, kind, path):
     psql(sql)
 
 
+def node_bin():
+    candidates = [
+        os.environ.get("NODE_BIN"),
+        "/opt/src/software/tools/nvm/versions/node/v24.18.0/bin/node",
+        shutil.which("node"),
+    ]
+    return next((str(candidate) for candidate in candidates if candidate and Path(str(candidate)).exists()), None)
+
+
+def refresh_asset_cache_key(asset_id, image_path):
+    node = node_bin()
+    if not node or not Path("/opt/immich/server/node_modules/sharp").exists():
+        psql(f'UPDATE asset SET "updatedAt" = now(), "updateId" = immich_uuid_v7() WHERE id = {q(asset_id)}')
+        return
+    script = r"""
+const sharp = require('/opt/immich/server/node_modules/sharp');
+const { rgbaToThumbHash } = require('/opt/immich/server/node_modules/thumbhash');
+const input = process.argv[1];
+sharp(input)
+  .resize(100, 100, { fit: 'inside' })
+  .ensureAlpha()
+  .raw()
+  .toBuffer({ resolveWithObject: true })
+  .then(({ data, info }) => {
+    process.stdout.write(Buffer.from(rgbaToThumbHash(info.width, info.height, data)).toString('base64'));
+  })
+  .catch((error) => {
+    console.error(error && error.stack ? error.stack : error);
+    process.exit(1);
+  });
+"""
+    result = run([node, "-e", script, str(image_path)], check=False, timeout=30)
+    thumbhash = (result.stdout or "").strip()
+    if result.returncode != 0 or not thumbhash:
+        psql(f'UPDATE asset SET "updatedAt" = now(), "updateId" = immich_uuid_v7() WHERE id = {q(asset_id)}')
+        return
+    psql(
+        f'UPDATE asset SET thumbhash = decode({q(thumbhash)}, '
+        f'\'base64\'), "updatedAt" = now(), "updateId" = immich_uuid_v7() WHERE id = {q(asset_id)}'
+    )
+
+
 def asset_dir(owner_id, asset_id):
     return UPLOAD_ROOT / "thumbs" / owner_id / asset_id[:2] / asset_id[2:4]
 
+
+where_clause = """
+    type IN ('IMAGE', 'VIDEO')
+""" if REPAIR_ALL else """
+    (
+        type = 'VIDEO'
+        AND (thumbnail IS NULL OR preview IS NULL OR coalesce(thumbnail_bytes, 0) < 1000)
+      )
+      OR (
+        type = 'IMAGE'
+        AND lower("originalPath") ~ '\\.(heic|heif)$'
+        AND (
+            thumbnail IS NULL OR preview IS NULL OR fullsize IS NULL
+            OR coalesce(thumbnail_bytes, 0) < 1000
+            OR coalesce(preview_bytes, 0) < 50000
+            OR coalesce(fullsize_bytes, 0) < 50000
+        )
+      )
+      OR "originalPath" IN (
+        '/opt/immich/upload/library/admin/2026/2026-07-12/6390.heic',
+        '/opt/immich/upload/library/admin/2026/2026-07-11/IMG_1229.mov',
+        '/opt/immich/upload/library/admin/2026/2026-07-11/IMG_1228.mov',
+        '/opt/immich/upload/library/admin/2026/2026-06-07/IMG_1101.heic'
+      )
+"""
+limit_clause = "" if LIMIT <= 0 else f"LIMIT {LIMIT}"
 
 query = f"""
 WITH files AS (
@@ -1852,28 +1921,9 @@ WITH files AS (
 missing AS (
     SELECT id, type, "ownerId", "originalPath", orientation, "fileModifiedAt", "createdAt"
     FROM files
-    WHERE (
-        type = 'VIDEO'
-        AND (thumbnail IS NULL OR preview IS NULL OR coalesce(thumbnail_bytes, 0) < 1000)
-      )
-      OR (
-        type = 'IMAGE'
-        AND lower("originalPath") ~ '\\.(heic|heif)$'
-        AND (
-            thumbnail IS NULL OR preview IS NULL OR fullsize IS NULL
-            OR coalesce(thumbnail_bytes, 0) < 1000
-            OR coalesce(preview_bytes, 0) < 50000
-            OR coalesce(fullsize_bytes, 0) < 50000
-        )
-      )
-      OR "originalPath" IN (
-        '/opt/immich/upload/library/admin/2026/2026-07-12/6390.heic',
-        '/opt/immich/upload/library/admin/2026/2026-07-11/IMG_1229.mov',
-        '/opt/immich/upload/library/admin/2026/2026-07-11/IMG_1228.mov',
-        '/opt/immich/upload/library/admin/2026/2026-06-07/IMG_1101.heic'
-      )
+    WHERE {where_clause}
     ORDER BY "fileModifiedAt" DESC NULLS LAST, "createdAt" DESC
-    LIMIT {LIMIT}
+    {limit_clause}
 )
 SELECT id, type, "ownerId", "originalPath", coalesce(orientation, '') FROM missing
 """
@@ -1924,6 +1974,8 @@ for asset_id, asset_type, owner_id, original_path, orientation in rows:
             shutil.chown(path, user="tiger", group="tiger")
             path.chmod(0o644)
             upsert(asset_id, kind, path)
+        cache_source = next((path for kind, path in made if kind == "preview"), made[0][1])
+        refresh_asset_cache_key(asset_id, cache_source)
         ok += 1
     except Exception as exc:
         failed += 1
