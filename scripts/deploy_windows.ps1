@@ -710,13 +710,15 @@ function Ensure-AutoSyncStartup {
         Remove-Item -LiteralPath (Join-Path $startupDir "auto_sync-start.vbs") -Force -ErrorAction SilentlyContinue
         Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-backend-start.vbs") `
             -WorkingDirectory $BinDir `
-            -Executable $autoSyncExe
+            -Executable $autoSyncExe `
+            -Arguments @("--elevation-attempted")
         Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-gui-start.vbs") `
             -WorkingDirectory $BinDir `
             -Executable $autoSyncGuiExe
     }
 
     Start-Process -FilePath $autoSyncExe `
+        -ArgumentList @("--elevation-attempted") `
         -WorkingDirectory $BinDir `
         -WindowStyle Hidden
     Start-Sleep -Seconds 1
