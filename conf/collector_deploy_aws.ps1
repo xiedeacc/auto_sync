@@ -305,9 +305,22 @@ if [ -d "$BACKUP_WORKTREE/.git" ]; then
     sudo -u ubuntu git -C "$BACKUP_WORKTREE" remote set-url origin "$BACKUP_REPO" \
         && echo "rblog backup worktree remote ok" \
         || echo "!! rblog backup worktree remote update FAILED"
-    sudo -u ubuntu git -C "$BACKUP_WORKTREE" pull --ff-only \
-        && echo "rblog backup worktree pulled" \
-        || echo "!! rblog backup worktree pull FAILED"
+    if sudo -u ubuntu git -C "$BACKUP_WORKTREE" fetch origin master >/dev/null 2>&1; then
+        local_head="$(sudo -u ubuntu git -C "$BACKUP_WORKTREE" rev-parse HEAD 2>/dev/null || true)"
+        remote_head="$(sudo -u ubuntu git -C "$BACKUP_WORKTREE" rev-parse origin/master 2>/dev/null || true)"
+        base_head="$(sudo -u ubuntu git -C "$BACKUP_WORKTREE" merge-base HEAD origin/master 2>/dev/null || true)"
+        if [ -n "$remote_head" ] && [ "$local_head" = "$remote_head" ]; then
+            echo "rblog backup worktree already current"
+        elif [ -n "$base_head" ] && [ "$base_head" = "$local_head" ]; then
+            sudo -u ubuntu git -C "$BACKUP_WORKTREE" merge --ff-only origin/master >/dev/null 2>&1 \
+                && echo "rblog backup worktree fast-forwarded" \
+                || echo "rblog backup worktree fast-forward skipped"
+        else
+            echo "rblog backup worktree diverged; backup service will reconcile"
+        fi
+    else
+        echo "rblog backup worktree fetch skipped"
+    fi
 elif [ -e "$BACKUP_WORKTREE" ]; then
     echo "!! $BACKUP_WORKTREE exists but is not a git checkout"
 else
