@@ -189,12 +189,13 @@ Transfer-CollectedPathsToStage $collectPaths @() '~/.auto_sync_stage'
 # fixed below.
 Invoke-Remote @'
 echo "stop services before installing collected paths"
-for s in rblog rblog-backup.timer shadowsocks-rust nginx vlmcsd tbox_server tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray; do
+for s in rblog.service rblog-backup.timer shadowsocks-rust.service nginx.service vlmcsd.service tbox_server.service tbox_client.service tbox-logrotate.timer waiwei-web.service waiwei-puller.service xray.service; do
     if systemctl list-unit-files "$s" --no-legend 2>/dev/null | grep -q . || [ -e "/etc/systemd/system/$s" ] || [ -e "/lib/systemd/system/$s" ] || [ -e "/usr/lib/systemd/system/$s" ]; then
         sudo systemctl stop "$s" >/dev/null 2>&1 || true
         echo "stopped $s before installing collected paths"
     fi
 done
+exit 0
 '@
 Invoke-Remote 'sudo cp -a ~/.auto_sync_stage/. / && rm -rf ~/.auto_sync_stage && echo "installed collected paths"'
 
@@ -236,16 +237,20 @@ if [ ! -e /usr/sbin/policy-rc.d ]; then
     policy_created=1
 fi
 sudo apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confold install -y libnginx-mod-stream
+if nginx -V 2>&1 | grep -q -- '--with-stream'; then
+    echo "nginx stream built in"
+else
+    sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confold install -y libnginx-mod-stream
+    if [ -f /usr/share/nginx/modules-available/mod-stream.conf ]; then
+        sudo mkdir -p /etc/nginx/modules-enabled
+        sudo ln -sfn /usr/share/nginx/modules-available/mod-stream.conf /etc/nginx/modules-enabled/50-mod-stream.conf
+    fi
+    if [ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ] || [ ! -e /etc/nginx/modules-enabled/50-mod-stream.conf ]; then
+        echo "!! nginx stream module is not installed or enabled"
+        exit 1
+    fi
+fi
 [ "$policy_created" -eq 0 ] || sudo rm -f /usr/sbin/policy-rc.d
-if [ -f /usr/share/nginx/modules-available/mod-stream.conf ]; then
-    sudo mkdir -p /etc/nginx/modules-enabled
-    sudo ln -sfn /usr/share/nginx/modules-available/mod-stream.conf /etc/nginx/modules-enabled/50-mod-stream.conf
-fi
-if [ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ] || [ ! -e /etc/nginx/modules-enabled/50-mod-stream.conf ]; then
-    echo "!! nginx stream module is not installed or enabled"
-    exit 1
-fi
 
 # Files installed by sudo cp may be root-owned when they were created fresh.
 # rblog and acme.sh run as ubuntu, so restore ownership for those trees.

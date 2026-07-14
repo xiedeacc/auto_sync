@@ -476,6 +476,8 @@ install_staged_collected_paths() {
     chmod 700 /root/.ssh 2>/dev/null || true
     find /root/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \; 2>/dev/null || true
     find /root/.ssh -type f -name "*.pub" -exec chmod 644 {} \; 2>/dev/null || true
+    chmod 600 /root/.ssh/config 2>/dev/null || true
+    chmod 644 /root/.ssh/known_hosts /root/.ssh/known_hosts.old 2>/dev/null || true
     chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
     rm -rf "$stage"
     [ "$rc" -eq 0 ] && log "installed collected paths"
