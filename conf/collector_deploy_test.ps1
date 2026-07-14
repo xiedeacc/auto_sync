@@ -2302,6 +2302,13 @@ for asset_id, asset_type, owner_id, original_path, orientation in rows:
         failed += 1
         print(f"missing original: {asset_id} {src}")
         continue
+    if src.stat().st_size == 0:
+        ok += 1
+        mark_checkpoint(asset_id, "empty-original")
+        print(f"skip empty original: {asset_id} {src}")
+        if (ok + failed + resumed) % 100 == 0:
+            print(f"immich derivative repair progress: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {resumed} resumed, {ok + failed + resumed}/{len(rows)} checked", flush=True)
+        continue
     out_dir = asset_dir(owner_id, asset_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
