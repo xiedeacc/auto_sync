@@ -1987,11 +1987,13 @@ for asset_id, asset_type, owner_id, original_path, orientation in rows:
         cache_source = next((path for kind, path in made if kind == "preview"), made[0][1])
         refresh_asset_cache_key(asset_id, cache_source)
         ok += 1
+        if (ok + failed) % 100 == 0:
+            print(f"immich derivative repair progress: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {ok + failed}/{len(rows)} checked", flush=True)
     except Exception as exc:
         failed += 1
         print(f"repair failed: {asset_id} {src}: {exc}")
 
-print(f"immich derivative repair summary: {ok} ok, {failed} failed, {len(rows)} checked")
+print(f"immich derivative repair summary: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {len(rows)} checked")
 PY_IMMICH_DERIVATIVE_REPAIR
 }
 
