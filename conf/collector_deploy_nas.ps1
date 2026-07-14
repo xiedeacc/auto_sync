@@ -17,6 +17,7 @@ $remoteScratch = '/opt/tmp/auto_sync_deploy_scratch'
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $platformDefaultCollectPaths = @()
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
+$excludePaths += @('/opt/usr/local/blog/data/uploads')
 
 function New-FinalSshdConfig([string]$Port) {
     if ([string]::IsNullOrWhiteSpace($Port)) { $Port = '10022' }

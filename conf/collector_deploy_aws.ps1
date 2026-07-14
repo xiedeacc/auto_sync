@@ -17,6 +17,7 @@ if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KE
 $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
+$excludePaths += @('/usr/local/blog/data/uploads')
 
 function Normalize-RemotePath([string]$Path) {
     $p = ($Path -replace '\\','/').Trim()
@@ -110,13 +111,22 @@ function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
     Write-Host "stage $remote"
 }
 
-# Remote commands run as the ubuntu user; root actions use `sudo` inline
-# (passwordless). base64 stdin avoids the Windows-PowerShell UTF-8 BOM.
+$remoteScriptSeq = 0
+# Remote commands run as the ubuntu user; root actions use `sudo` inline.
 function Invoke-Remote([string]$Script) {
-    $Script = $Script -replace "`r`n", "`n"
-    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Script))
-    $b64 | & $ssh @sshArgs $dest 'tmp=$(mktemp /tmp/auto_sync_remote.XXXXXX); base64 -d > "$tmp" && sh "$tmp" </dev/null; rc=$?; rm -f "$tmp"; exit "$rc"'
-    if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
+    $script:remoteScriptSeq++
+    $localScript = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_aws_remote_{0}_{1}.sh" -f $PID, $script:remoteScriptSeq)
+    $remoteScript = "/tmp/auto_sync_aws_remote_${PID}_$($script:remoteScriptSeq).sh"
+    try {
+        $normalized = $Script -replace "`r`n", "`n"
+        [IO.File]::WriteAllText($localScript, $normalized, [Text.UTF8Encoding]::new($false))
+        & $scp @scpArgs $localScript "$($dest):$remoteScript"
+        if ($LASTEXITCODE -ne 0) { Write-Host "! remote script upload exit $LASTEXITCODE"; $script:errCount++; return }
+        & $ssh @sshArgs $dest "sh $remoteScript; rc=`$?; rm -f $remoteScript; exit `$rc"
+        if ($LASTEXITCODE -ne 0) { Write-Host "! remote step exit $LASTEXITCODE"; $script:errCount++ }
+    } finally {
+        Remove-Item -LiteralPath $localScript -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$OptionalPaths, [string]$RemoteStage) {
@@ -149,11 +159,25 @@ function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$Opt
         if ($rel -ne '') { $excludeArgs += "--exclude=$rel" }
     }
 
-    $tarArgs = @('-C', $root, '-cf', '-') + $excludeArgs + @($tarPaths)
-    & tar @tarArgs | & $ssh @sshArgs $dest "tar -C $RemoteStage -xf -"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "! tar stage transfer failed"
-        $script:errCount++
+    $localTar = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_aws_stage_" + [guid]::NewGuid().ToString('N') + ".tar")
+    $remoteTar = "/tmp/" + [IO.Path]::GetFileName($localTar)
+    try {
+        $tarArgs = @('-C', $root, '-cf', $localTar) + $excludeArgs + @($tarPaths)
+        & tar @tarArgs
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "! local tar stage creation failed"
+            $script:errCount++
+            return
+        }
+        & $scp @scpArgs $localTar "$($dest):$remoteTar"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "! tar stage upload failed"
+            $script:errCount++
+            return
+        }
+        Invoke-Remote "mkdir -p $RemoteStage; tar -C $RemoteStage -xf '$remoteTar'; rc=`$?; rm -f '$remoteTar'; exit `$rc"
+    } finally {
+        Remove-Item -LiteralPath $localTar -Force -ErrorAction SilentlyContinue
     }
 }
 
