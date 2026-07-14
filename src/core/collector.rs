@@ -883,6 +883,7 @@ fn prepare_sqlite_snapshots(
 set -e
 work="${{TMPDIR:-/tmp}}/auto_sync_collector_sqlite_snap.$$"
 mkdir -p "$work"
+cd /
 {{
 {find_commands}
 }} | sort -u | while IFS= read -r db; do
