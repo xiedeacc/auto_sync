@@ -915,7 +915,7 @@ PY_SQLITE_BACKUP
 done
 "#
     );
-    let remote_cmd = format!("bash -lc {}", shell_quote(&script));
+    let remote_cmd = format!("sh -c {}", shell_quote(&script));
     let out = ssh_capture(conn, &remote_cmd)?;
     let mut snapshots = Vec::new();
     for line in out.lines() {
