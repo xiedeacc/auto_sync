@@ -1613,6 +1613,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -1622,6 +1623,7 @@ LIMIT = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_LIMIT", "200") or "200")
 REPAIR_ALL = os.environ.get("IMMICH_DERIVATIVE_REPAIR_ALL", "").lower() in ("1", "true", "yes", "all")
 SHARD_INDEX = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_SHARD_INDEX", "0") or "0")
 SHARD_COUNT = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_SHARD_COUNT", "1") or "1")
+ASSET_IDS = [value.strip() for value in os.environ.get("IMMICH_DERIVATIVE_REPAIR_ASSET_IDS", "").split(",") if value.strip()]
 
 
 def run(cmd, *, check=True, timeout=None):
@@ -1746,6 +1748,287 @@ def make_normal_image_source(src, work_dir):
         if run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0:
             return dst
     return None
+
+
+def make_heif_box_grid_source(src, work_dir):
+    data = Path(src).read_bytes()
+
+    def u8(offset):
+        return data[offset]
+
+    def u16(offset):
+        return struct.unpack_from(">H", data, offset)[0]
+
+    def u32(offset):
+        return struct.unpack_from(">I", data, offset)[0]
+
+    def u64(offset):
+        return struct.unpack_from(">Q", data, offset)[0]
+
+    def read_int(offset, size):
+        return 0 if size == 0 else int.from_bytes(data[offset:offset + size], "big")
+
+    def children(start, end):
+        offset = start
+        while offset + 8 <= end:
+            size = u32(offset)
+            box_type = data[offset + 4:offset + 8].decode("latin1")
+            header = 8
+            if size == 1:
+                size = u64(offset + 8)
+                header = 16
+            elif size == 0:
+                size = end - offset
+            if size < header or offset + size > end:
+                break
+            yield box_type, offset, header, offset + size
+            offset += size
+
+    meta = None
+    for box_type, offset, header, end in children(0, len(data)):
+        if box_type == "meta":
+            meta = {t: (o, h, e) for t, o, h, e in children(offset + header + 4, end)}
+            break
+    if not meta or not all(key in meta for key in ("pitm", "iinf", "iloc", "iref", "iprp", "idat")):
+        return None
+
+    def parse_pitm():
+        offset, header, _ = meta["pitm"]
+        pos = offset + header
+        version = u8(pos)
+        pos += 4
+        return u16(pos) if version == 0 else u32(pos)
+
+    def parse_iinf():
+        items = {}
+        offset, header, end = meta["iinf"]
+        pos = offset + header
+        version = u8(pos)
+        pos += 4
+        count = u16(pos) if version == 0 else u32(pos)
+        pos += 2 if version == 0 else 4
+        for _ in range(count):
+            size = u32(pos)
+            box_type = data[pos + 4:pos + 8].decode("latin1")
+            box_end = pos + size
+            p = pos + 8
+            item_version = u8(p)
+            p += 4
+            if box_type == "infe" and item_version >= 2:
+                item_id = u16(p) if item_version < 3 else u32(p)
+                p += 2 if item_version < 3 else 4
+                p += 2
+                items[item_id] = data[p:p + 4].decode("latin1")
+            pos = box_end
+        return items
+
+    def parse_iloc():
+        locs = {}
+        offset, header, _ = meta["iloc"]
+        pos = offset + header
+        version = u8(pos)
+        pos += 4
+        sizes = u8(pos)
+        pos += 1
+        offset_size, length_size = sizes >> 4, sizes & 15
+        sizes = u8(pos)
+        pos += 1
+        base_size = sizes >> 4
+        index_size = (sizes & 15) if version in (1, 2) else 0
+        count = u16(pos) if version < 2 else u32(pos)
+        pos += 2 if version < 2 else 4
+        for _ in range(count):
+            item_id = u16(pos) if version < 2 else u32(pos)
+            pos += 2 if version < 2 else 4
+            construction = 0
+            if version in (1, 2):
+                construction = u16(pos) & 15
+                pos += 2
+            pos += 2
+            base = read_int(pos, base_size)
+            pos += base_size
+            extent_count = u16(pos)
+            pos += 2
+            extents = []
+            for _ in range(extent_count):
+                if version in (1, 2) and index_size:
+                    pos += index_size
+                extent_offset = read_int(pos, offset_size)
+                pos += offset_size
+                extent_length = read_int(pos, length_size)
+                pos += length_size
+                extents.append((base + extent_offset, extent_length))
+            locs[item_id] = (construction, extents)
+        return locs
+
+    def parse_iref():
+        refs = {}
+        offset, header, end = meta["iref"]
+        pos = offset + header
+        version = u8(pos)
+        pos += 4
+        while pos + 8 <= end:
+            size = u32(pos)
+            ref_type = data[pos + 4:pos + 8].decode("latin1")
+            p = pos + 8
+            box_end = pos + size
+            from_id = u16(p) if version == 0 else u32(p)
+            p += 2 if version == 0 else 4
+            count = u16(p)
+            p += 2
+            targets = []
+            for _ in range(count):
+                targets.append(u16(p) if version == 0 else u32(p))
+                p += 2 if version == 0 else 4
+            refs.setdefault(ref_type, {})[from_id] = targets
+            pos = box_end
+        return refs
+
+    def parse_iprp():
+        offset, header, end = meta["iprp"]
+        ipco = ipma = None
+        for box_type, child_offset, child_header, child_end in children(offset + header, end):
+            if box_type == "ipco":
+                ipco = (child_offset, child_header, child_end)
+            elif box_type == "ipma":
+                ipma = (child_offset, child_header, child_end)
+        if not ipco or not ipma:
+            return [], {}
+        props = [(t, data[o + h:e]) for t, o, h, e in children(ipco[0] + ipco[1], ipco[2])]
+        assoc = {}
+        offset, header, _ = ipma
+        pos = offset + header
+        version = u8(pos)
+        flags = int.from_bytes(data[pos + 1:pos + 4], "big")
+        pos += 4
+        count = u32(pos)
+        pos += 4
+        for _ in range(count):
+            item_id = u16(pos) if version < 1 else u32(pos)
+            pos += 2 if version < 1 else 4
+            assoc_count = u8(pos)
+            pos += 1
+            indexes = []
+            for _ in range(assoc_count):
+                if flags & 1:
+                    value = u16(pos)
+                    pos += 2
+                    indexes.append(value & 0x7fff)
+                else:
+                    value = u8(pos)
+                    pos += 1
+                    indexes.append(value & 0x7f)
+            assoc[item_id] = indexes
+        return props, assoc
+
+    def prop(props, assoc, item_id, prop_type):
+        for index in assoc.get(item_id, []):
+            if 1 <= index <= len(props) and props[index - 1][0] == prop_type:
+                return props[index - 1][1]
+        return None
+
+    def ispe_size(payload):
+        return struct.unpack_from(">II", payload, 4)
+
+    def hvcc_to_annexb(hvcc):
+        output = bytearray()
+        pos = 23
+        for _ in range(hvcc[22]):
+            pos += 1
+            count = struct.unpack_from(">H", hvcc, pos)[0]
+            pos += 2
+            for _ in range(count):
+                length = struct.unpack_from(">H", hvcc, pos)[0]
+                pos += 2
+                output += b"\x00\x00\x00\x01" + hvcc[pos:pos + length]
+                pos += length
+        return bytes(output)
+
+    def sample_to_annexb(sample, nal_length_size):
+        output = bytearray()
+        pos = 0
+        while pos + nal_length_size <= len(sample):
+            length = int.from_bytes(sample[pos:pos + nal_length_size], "big")
+            pos += nal_length_size
+            if length <= 0 or pos + length > len(sample):
+                return b"\x00\x00\x00\x01" + sample
+            output += b"\x00\x00\x00\x01" + sample[pos:pos + length]
+            pos += length
+        return bytes(output)
+
+    try:
+        primary = parse_pitm()
+        items = parse_iinf()
+        if items.get(primary) != "grid":
+            return None
+        locs = parse_iloc()
+        refs = parse_iref()
+        props, assoc = parse_iprp()
+        tile_ids = refs.get("dimg", {}).get(primary)
+        if not tile_ids:
+            return None
+        idat_offset = meta["idat"][0] + meta["idat"][1]
+        construction, extents = locs[primary]
+        if construction != 1:
+            return None
+        grid_payload = b"".join(data[idat_offset + offset:idat_offset + offset + length] for offset, length in extents)
+        rows = grid_payload[2] + 1
+        cols = grid_payload[3] + 1
+        if len(grid_payload) >= 8:
+            width = int.from_bytes(grid_payload[4:6], "big")
+            height = int.from_bytes(grid_payload[6:8], "big")
+        else:
+            width, height = ispe_size(prop(props, assoc, primary, "ispe"))
+        tile_ids = tile_ids[:rows * cols]
+        if len(tile_ids) != rows * cols:
+            return None
+        irot = prop(props, assoc, primary, "irot")
+        rotation = (irot[0] & 3) if irot else 0
+    except Exception:
+        return None
+
+    tile_paths = []
+    for position, item_id in enumerate(tile_ids):
+        try:
+            hvcc = prop(props, assoc, item_id, "hvcC")
+            nal_length_size = (hvcc[21] & 3) + 1
+            _, item_extents = locs[item_id]
+            sample = b"".join(data[offset:offset + length] for offset, length in item_extents)
+        except Exception:
+            return None
+        hevc_path = Path(work_dir) / f"box_tile_{position:03d}.hevc"
+        tile_path = Path(work_dir) / f"box_tile_{position:03d}.jpg"
+        hevc_path.write_bytes(hvcc_to_annexb(hvcc) + sample_to_annexb(sample, nal_length_size))
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "hevc", "-i", str(hevc_path), "-frames:v", "1", "-q:v", "1", str(tile_path)]
+        if run(cmd, check=False, timeout=20).returncode != 0 or not tile_path.exists() or tile_path.stat().st_size == 0:
+            return None
+        tile_paths.append(tile_path)
+
+    first = run(["identify", "-format", "%w %h", str(tile_paths[0])], check=False)
+    if first.returncode != 0:
+        return None
+    tile_w, tile_h = (int(value) for value in first.stdout.split())
+    inputs = []
+    for tile_path in tile_paths:
+        inputs.extend(["-i", str(tile_path)])
+    layout = "|".join(f"{(idx % cols) * tile_w}_{(idx // cols) * tile_h}" for idx in range(len(tile_paths)))
+    filters = [f"xstack=inputs={len(tile_paths)}:layout={layout}", f"crop={width}:{height}:0:0"]
+    if rotation == 1:
+        filters.append("transpose=2")
+    elif rotation == 2:
+        filters.append("transpose=1,transpose=1")
+    elif rotation == 3:
+        filters.append("transpose=1")
+    full_path = Path(work_dir) / "box_grid_full.jpg"
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *inputs,
+        "-filter_complex", ",".join(filters),
+        "-frames:v", "1", "-q:v", "1", str(full_path),
+    ]
+    if run(cmd, check=False, timeout=180).returncode != 0 or not full_path.exists() or full_path.stat().st_size == 0:
+        return None
+    return full_path
 
 
 def make_tile_grid_source(src, work_dir, orientation):
@@ -1912,7 +2195,9 @@ def asset_dir(owner_id, asset_id):
 
 where_clause = """
     type IN ('IMAGE', 'VIDEO')
-""" if REPAIR_ALL else """
+""" if REPAIR_ALL else (
+    "id IN (" + ", ".join(q(asset_id) for asset_id in ASSET_IDS) + ")"
+    if ASSET_IDS else """
     (
         type = 'VIDEO'
         AND (thumbnail IS NULL OR preview IS NULL OR coalesce(thumbnail_bytes, 0) < 1000)
@@ -1934,9 +2219,10 @@ where_clause = """
         '/opt/immich/upload/library/admin/2026/2026-06-07/IMG_1101.heic'
       )
 """
+)
 limit_clause = "" if LIMIT <= 0 else f"LIMIT {LIMIT}"
 shard_clause = ""
-if SHARD_COUNT > 1:
+if SHARD_COUNT > 1 and not ASSET_IDS:
     shard_clause = f"AND mod(abs(hashtext(id::text)), {SHARD_COUNT}) = {SHARD_INDEX}"
 
 query = f"""
@@ -1988,9 +2274,14 @@ for asset_id, asset_type, owner_id, original_path, orientation in rows:
             suffix = src.suffix.lower()
             if suffix in (".heic", ".heif"):
                 with tempfile.TemporaryDirectory(prefix="immich-derivative-") as temp_dir:
-                    source = make_normal_image_source(src, temp_dir)
+                    # Prefer the primary color Tile Grid for iPhone HEIC files.
+                    # Generic HEIF decoders can pick depth/gain-map/tmap auxiliary
+                    # images and produce black, grayscale, or wrong-aspect outputs.
+                    source = make_tile_grid_source(src, temp_dir, orientation)
                     if source is None:
-                        source = make_tile_grid_source(src, temp_dir, orientation)
+                        source = make_heif_box_grid_source(src, temp_dir)
+                    if source is None:
+                        source = make_normal_image_source(src, temp_dir)
                     if source is not None:
                         made = [(kind, path) for kind, path, size in outputs if make_image_from_source(source, path, size, kind)]
                     else:
