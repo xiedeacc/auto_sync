@@ -10,6 +10,7 @@
 //! The whole feature is UI-driven (the "Collector" button): nothing here runs
 //! on a schedule.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -768,7 +769,13 @@ fn pull_paths_tar(
         remove_symlinks_recursive(&local_path);
     }
 
-    let exclude_patterns = tar_exclude_patterns(&rel_paths, excludes);
+    let sqlite_snapshots = prepare_sqlite_snapshots(conn, &rel_paths, state)?;
+    let mut snapshot_excludes: Vec<String> = sqlite_snapshots
+        .iter()
+        .map(|snapshot| snapshot.source_rel.clone())
+        .collect();
+    let mut exclude_patterns = tar_exclude_patterns(&rel_paths, excludes);
+    exclude_patterns.append(&mut snapshot_excludes);
     let mut remote_cmd = String::from("cd / && tar -chf - ");
     if !exclude_patterns.is_empty() {
         remote_cmd.push_str("-X - ");
@@ -818,19 +825,181 @@ fn pull_paths_tar(
     let ssh_output = ssh_child
         .wait_with_output()
         .context("waiting for ssh tar")?;
-    if !ssh_output.status.success() {
-        bail!(
+    let result = if !ssh_output.status.success() {
+        Err(anyhow::anyhow!(
             "remote tar failed: {}",
             String::from_utf8_lossy(&ssh_output.stderr).trim()
-        );
-    }
-    if !tar_output.status.success() {
-        bail!(
+        ))
+    } else if !tar_output.status.success() {
+        Err(anyhow::anyhow!(
             "local tar failed: {}",
             String::from_utf8_lossy(&tar_output.stderr).trim()
+        ))
+    } else {
+        for snapshot in &sqlite_snapshots {
+            pull_sqlite_snapshot(host, conn, snapshot, state)?;
+        }
+        Ok(())
+    };
+    cleanup_sqlite_snapshots(conn, &sqlite_snapshots, state);
+    result
+}
+
+#[derive(Debug)]
+struct SqliteSnapshot {
+    source_rel: String,
+    remote_tmp: String,
+}
+
+fn prepare_sqlite_snapshots(
+    conn: &SshConn,
+    rel_paths: &[String],
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<Vec<SqliteSnapshot>> {
+    let dir_roots: Vec<&String> = rel_paths
+        .iter()
+        .filter(|rel| {
+            let q = shell_quote(rel);
+            ssh_capture(conn, &format!("cd / && [ -d {q} ] && echo yes || true"))
+                .map(|out| out.trim() == "yes")
+                .unwrap_or(false)
+        })
+        .collect();
+    if dir_roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut find_commands = String::new();
+    for root in dir_roots {
+        find_commands.push_str("if [ -d ");
+        find_commands.push_str(&shell_quote(root));
+        find_commands.push_str(" ]; then find ");
+        find_commands.push_str(&shell_quote(root));
+        find_commands.push_str(" -type f -path '*/data/auto_sync.sqlite' -print; fi\n");
+    }
+
+    let script = format!(
+        r#"
+set -e
+work="${{TMPDIR:-/tmp}}/auto_sync_collector_sqlite_snap.$$"
+mkdir -p "$work"
+{{
+{find_commands}
+}} | sort -u | while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    hash="$(printf '%s' "$db" | sha256sum | awk '{{print $1}}')"
+    snap="$work/$hash.sqlite"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$db" "$snap" <<'PY_SQLITE_BACKUP'
+import sqlite3
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+source = sqlite3.connect(f"file:{{src}}?mode=ro", uri=True, timeout=30)
+target = sqlite3.connect(dst)
+try:
+    with target:
+        source.backup(target)
+finally:
+    target.close()
+    source.close()
+PY_SQLITE_BACKUP
+    elif command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 "$db" ".backup '$snap'"
+    else
+        cp -f -- "$db" "$snap"
+    fi
+    chmod 600 "$snap" 2>/dev/null || true
+    printf 'SQLITE_SNAPSHOT %s %s\n' "$db" "$snap"
+done
+"#
+    );
+    let remote_cmd = format!("bash -lc {}", shell_quote(&script));
+    let out = ssh_capture(conn, &remote_cmd)?;
+    let mut snapshots = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("SQLITE_SNAPSHOT ") {
+            if let Some((source_rel, remote_tmp)) = rest.rsplit_once(' ') {
+                let source_rel = source_rel.trim_start_matches('/').to_string();
+                let remote_tmp = remote_tmp.to_string();
+                log(
+                    state,
+                    format!("  sqlite snapshot /{source_rel} -> {remote_tmp}"),
+                );
+                snapshots.push(SqliteSnapshot {
+                    source_rel,
+                    remote_tmp,
+                });
+            }
+        }
+    }
+    Ok(snapshots)
+}
+
+fn pull_sqlite_snapshot(
+    host: &CollectorHost,
+    conn: &SshConn,
+    snapshot: &SqliteSnapshot,
+    state: &Arc<Mutex<CollectorRunState>>,
+) -> Result<()> {
+    let local_path = host.root.join(local_rel_path(&snapshot.source_rel));
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    clear_readonly_recursive(&local_path);
+    remove_symlinks_recursive(&local_path);
+    log(
+        state,
+        format!(
+            "  sqlite snapshot {}:{} -> {}",
+            conn.dest(),
+            snapshot.remote_tmp,
+            local_path.display()
+        ),
+    );
+    let mut cmd = scp_command(conn);
+    cmd.arg(format!("{}:{}", conn.dest(), snapshot.remote_tmp));
+    cmd.arg(&local_path);
+    let output = cmd.output().context("copying sqlite snapshot")?;
+    if !output.status.success() {
+        bail!(
+            "sqlite snapshot scp failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     Ok(())
+}
+
+fn cleanup_sqlite_snapshots(
+    conn: &SshConn,
+    snapshots: &[SqliteSnapshot],
+    state: &Arc<Mutex<CollectorRunState>>,
+) {
+    let mut dirs = BTreeSet::new();
+    for snapshot in snapshots {
+        if let Some((dir, _)) = snapshot.remote_tmp.rsplit_once('/') {
+            dirs.insert(dir.to_string());
+        }
+    }
+    if dirs.is_empty() {
+        return;
+    }
+    let mut cmd = String::from("rm -rf -- ");
+    for dir in &dirs {
+        cmd.push_str(&shell_quote(dir));
+        cmd.push(' ');
+    }
+    match ssh_capture(conn, &cmd) {
+        Ok(_) => log(
+            state,
+            "  sqlite snapshot cleanup: removed remote temp files",
+        ),
+        Err(err) => log(
+            state,
+            format!("  sqlite snapshot cleanup: could not remove remote temp files: {err:#}"),
+        ),
+    }
 }
 
 /// Normalize exclude entries to absolute paths without a trailing slash.
