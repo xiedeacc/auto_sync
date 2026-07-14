@@ -207,11 +207,18 @@ for rel in \
     usr/local/waiwei/bin/waiwei_web \
     usr/local/waiwei/bin/waiwei_puller
 do
-    if [ -e "$stage/$rel" ] && [ -e "/$rel" ]; then
+    if [ -e "$stage/$rel" ] && { [ -e "/$rel" ] || [ -L "/$rel" ]; }; then
         sudo rm -f "/$rel.auto_sync_old" 2>/dev/null || true
         sudo mv "/$rel" "/$rel.auto_sync_old" 2>/dev/null || true
     fi
 done
+if [ -d "$stage/usr/local/lib" ]; then
+    for src in "$stage"/usr/local/lib/*; do
+        [ -e "$src" ] || [ -L "$src" ] || continue
+        rel="usr/local/lib/${src##*/}"
+        sudo rm -f "/$rel" 2>/dev/null || true
+    done
+fi
 exit 0
 '@
 Invoke-Remote 'sudo cp -a ~/.auto_sync_stage/. / && rm -rf ~/.auto_sync_stage && echo "installed collected paths"'
@@ -276,6 +283,10 @@ for p in /home/ubuntu /usr/local/blog; do
         sudo chown -R ubuntu:ubuntu "$p" || echo "!! chown $p FAILED"
     fi
 done
+sudo chown -R ubuntu:ubuntu /home/ubuntu/.ssh 2>/dev/null || true
+sudo chmod 700 /home/ubuntu/.ssh 2>/dev/null || true
+sudo chmod 600 /home/ubuntu/.ssh/id_ed25519 /home/ubuntu/.ssh/authorized_keys 2>/dev/null || true
+sudo chmod 644 /home/ubuntu/.ssh/id_ed25519.pub /home/ubuntu/.ssh/known_hosts /home/ubuntu/.ssh/known_hosts.old 2>/dev/null || true
 for d in /usr/local/blog/bin /usr/local/blog/bin/admin /usr/local/shadowsocks/bin /usr/local/vlmcsd/bin /usr/local/tbox/bin /usr/local/waiwei/bin /usr/local/xray/bin; do
     [ -d "$d" ] && sudo find "$d" -type f -exec chmod 0755 {} + 2>/dev/null || true
 done
