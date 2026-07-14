@@ -178,18 +178,26 @@ function Copy-CollectedPathToStage([string]$RemotePath, [string]$StageRoot) {
     Write-Host "stage $remote"
 }
 
-# Send the remote script as a single shell-quoted argv and feed it to `sh` via
-# the POSIX `printf` builtin, avoiding stdin encoding and argv-quoting issues.
-function Quote-RemoteShellArg([string]$Value) {
-    return "'" + $Value.Replace("'", "'""'""'") + "'"
-}
-
+$remoteScriptSeq = 0
 function Invoke-Remote([string]$Script) {
-    $quoted = Quote-RemoteShellArg $Script
-    & $ssh @sshArgs $dest "printf '%s' $quoted | sh"
-    if ($LASTEXITCODE -ne 0) {
-        $script:errCount++
-        throw "remote step exit $LASTEXITCODE"
+    $script:remoteScriptSeq++
+    $localScript = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_openwrt_remote_{0}_{1}.sh" -f $PID, $script:remoteScriptSeq)
+    $remoteScript = "/tmp/auto_sync_openwrt_remote_${PID}_$($script:remoteScriptSeq).sh"
+    try {
+        $normalized = $Script -replace "`r`n", "`n"
+        [IO.File]::WriteAllText($localScript, $normalized, [Text.UTF8Encoding]::new($false))
+        & $scp @scpArgs -- $localScript ('{0}:{1}' -f $dest, $remoteScript)
+        if ($LASTEXITCODE -ne 0) {
+            $script:errCount++
+            throw "remote script upload exit $LASTEXITCODE"
+        }
+        & $ssh @sshArgs $dest "sh $remoteScript; rc=`$?; rm -f $remoteScript; exit `$rc"
+        if ($LASTEXITCODE -ne 0) {
+            $script:errCount++
+            throw "remote step exit $LASTEXITCODE"
+        }
+    } finally {
+        Remove-Item -LiteralPath $localScript -Force -ErrorAction SilentlyContinue
     }
 }
 
