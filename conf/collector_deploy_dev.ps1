@@ -262,7 +262,7 @@ if [ -e "`$src" ] || [ -L "`$src" ]; then
     mkdir -p -- "`$(dirname -- "`$dst")" "`$(dirname -- "`$src")"
     if [ -d "`$src" ] && [ ! -L "`$src" ]; then
         mkdir -p -- "`$dst"
-        rsync -a "`$src/" "`$dst/"
+        cp -a "`$src"/. "`$dst"/
         rm -rf -- "`$src"
     else
         rm -rf -- "`$dst"
@@ -389,8 +389,31 @@ restart_if_exists() {
     [ -n "$unit" ] || return 0
     if unit_exists "$unit"; then
         enable_unit "$unit"
-        systemctl restart "$unit" && log "restarted $unit" || log "WARN: restart $unit failed"
+        systemctl restart "$unit" && { log "restarted $unit"; log_unit_processes "$unit"; } || log "WARN: restart $unit failed"
     fi
+}
+log_unit_processes() {
+    unit="$(unit_name "$1" 2>/dev/null || true)"
+    [ -n "$unit" ] || return 0
+    active="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    main_pid="$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)"
+    pids="$(systemctl show "$unit" -p ControlPID -p MainPID --value 2>/dev/null | awk '$1 != "" && $1 != "0" {print}' | paste -sd, - 2>/dev/null || true)"
+    [ -n "$pids" ] || pids="$main_pid"
+    log "process $unit active=${active:-unknown} pid=${pids:-none}"
+}
+stop_if_exists() {
+    unit="$(unit_name "$1" 2>/dev/null || true)"
+    [ -n "$unit" ] || return 0
+    if unit_exists "$unit"; then
+        systemctl stop "$unit" >/dev/null 2>&1 || true
+        log "stopped $unit before installing collected paths"
+    fi
+}
+stop_services_before_install() {
+    log "stop services before installing collected paths"
+    for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+        stop_if_exists "$s"
+    done
 }
 disable_if_exists() {
     unit="$(unit_name "$1" 2>/dev/null || true)"
@@ -439,7 +462,7 @@ install_staged_collected_paths() {
     stage="/tmp/auto_sync_deploy_stage"
     [ -d "$stage" ] || return 0
     log "install collected paths after package installation"
-    rsync -rltD --no-perms "$stage/" /
+    cp -a "$stage"/. /
     rc=$?
     if [ -f /tmp/auto_sync_root_key.pub ]; then
         mkdir -p /root/.ssh
@@ -514,6 +537,7 @@ chmod 755 /usr /usr/local 2>/dev/null || true
 apt-get remove -y apport || true
 apt-get autoremove -y || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+stop_services_before_install
 install_staged_collected_paths || { log "ERROR: collected path installation failed"; exit 1; }
 
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
@@ -525,7 +549,7 @@ ensure_software_src_layout() {
             if [ ! -e "$new" ]; then
                 mv "$old" "$new"
             else
-                rsync -aHAX "$old/" "$new/" || rsync -a "$old/" "$new/"
+                cp -a "$old"/. "$new"/
                 mv "$old" "${old}.migrated-$(date +%Y%m%d%H%M%S)"
             fi
         fi
@@ -536,7 +560,7 @@ ensure_software_src_layout() {
         if [ ! -e "$target" ]; then
             mv /opt/aarch64-linux-musl-cross "$target"
         else
-            rsync -aHAX /opt/aarch64-linux-musl-cross/ "$target/" || rsync -a /opt/aarch64-linux-musl-cross/ "$target/"
+            cp -a /opt/aarch64-linux-musl-cross/. "$target"/
             mv /opt/aarch64-linux-musl-cross "/opt/aarch64-linux-musl-cross.migrated-$(date +%Y%m%d%H%M%S)"
         fi
     fi
@@ -546,7 +570,7 @@ ensure_software_src_layout() {
         if [ ! -e "$target" ]; then
             mv /usr/local/curl-cares "$target"
         else
-            rsync -aHAX /usr/local/curl-cares/ "$target/" || rsync -a /usr/local/curl-cares/ "$target/"
+            cp -a /usr/local/curl-cares/. "$target"/
             mv /usr/local/curl-cares "/usr/local/curl-cares.migrated-$(date +%Y%m%d%H%M%S)"
         fi
     fi
@@ -1535,11 +1559,11 @@ migrate_halo_root_home() {
             rm -rf "$tmp"
             if [ -d "$dest" ]; then
                 mkdir -p "$tmp"
-                rsync -aL "$dest/" "$tmp/" || true
+                cp -aL "$dest"/. "$tmp"/ 2>/dev/null || true
             fi
             rm -f "$dest"
             mkdir -p "$dest"
-            [ ! -d "$tmp" ] || rsync -a "$tmp/" "$dest/"
+            [ ! -d "$tmp" ] || cp -a "$tmp"/. "$dest"/
             rm -rf "$tmp"
         else
             mkdir -p "$dest"
@@ -1547,7 +1571,7 @@ migrate_halo_root_home() {
         for src in "/home/tiger/$name" "/opt/user/tiger/$name"; do
             [ -e "$src" ] || [ -L "$src" ] || continue
             if [ -d "$src" ]; then
-                rsync -aL "$src/" "$dest/" || true
+                cp -aL "$src"/. "$dest"/ 2>/dev/null || true
             fi
             rm -rf "$src"
         done

@@ -285,7 +285,7 @@ if [ -e "`$src" ] || [ -L "`$src" ]; then
     mkdir -p -- "`$(dirname -- "`$dst")" "`$(dirname -- "`$src")"
     if [ -d "`$src" ] && [ ! -L "`$src" ]; then
         mkdir -p -- "`$dst"
-        rsync -a "`$src/" "`$dst/"
+        cp -a "`$src"/. "`$dst"/
         rm -rf -- "`$src"
     else
         rm -rf -- "`$dst"
@@ -415,8 +415,31 @@ restart_if_exists() {
     [ -n "$unit" ] || return 0
     if unit_exists "$unit"; then
         enable_unit "$unit"
-        systemctl restart "$unit" && log "restarted $unit" || log "WARN: restart $unit failed"
+        systemctl restart "$unit" && { log "restarted $unit"; log_unit_processes "$unit"; } || log "WARN: restart $unit failed"
     fi
+}
+log_unit_processes() {
+    unit="$(unit_name "$1" 2>/dev/null || true)"
+    [ -n "$unit" ] || return 0
+    active="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    main_pid="$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)"
+    pids="$(systemctl show "$unit" -p ControlPID -p MainPID --value 2>/dev/null | awk '$1 != "" && $1 != "0" {print}' | paste -sd, - 2>/dev/null || true)"
+    [ -n "$pids" ] || pids="$main_pid"
+    log "process $unit active=${active:-unknown} pid=${pids:-none}"
+}
+stop_if_exists() {
+    unit="$(unit_name "$1" 2>/dev/null || true)"
+    [ -n "$unit" ] || return 0
+    if unit_exists "$unit"; then
+        systemctl stop "$unit" >/dev/null 2>&1 || true
+        log "stopped $unit before installing collected paths"
+    fi
+}
+stop_services_before_install() {
+    log "stop services before installing collected paths"
+    for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_client tbox-logrotate.timer rblog rblog-backup.timer nginx cron shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+        stop_if_exists "$s"
+    done
 }
 disable_if_exists() {
     unit="$(unit_name "$1" 2>/dev/null || true)"
@@ -465,7 +488,7 @@ install_staged_collected_paths() {
     stage="/opt/tmp/auto_sync_deploy_stage"
     [ -d "$stage" ] || return 0
     log "install collected paths after package installation"
-    rsync -rltD --no-perms "$stage/" /
+    cp -a "$stage"/. /
     rc=$?
     if [ -f /tmp/auto_sync_root_key.pub ]; then
         mkdir -p /root/.ssh
@@ -540,6 +563,7 @@ chmod 755 /usr /usr/local 2>/dev/null || true
 apt-get remove -y apport || true
 apt-get autoremove -y || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+stop_services_before_install
 install_staged_collected_paths || { log "ERROR: collected path installation failed"; exit 1; }
 
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
@@ -551,7 +575,7 @@ ensure_software_src_layout() {
         if [ ! -e "$new" ]; then
             mv "$old" "$new"
         else
-            rsync -aHAX "$old/" "$new/" || rsync -a "$old/" "$new/"
+            cp -a "$old"/. "$new"/
             mv "$old" "${old}.migrated-$(date +%Y%m%d%H%M%S)"
         fi
     fi
@@ -584,9 +608,9 @@ ensure_opt_link() {
     if [ "$kind" = dir ]; then
         mkdir -p "$target"
         if [ -d "$path" ] && [ ! -L "$path" ]; then
-            rsync -a "$path/" "$target/"
+            cp -a "$path"/. "$target"/
         elif [ -L "$path" ] && [ -d "$path" ]; then
-            rsync -aL "$path/" "$target/"
+            cp -aL "$path"/. "$target"/
         fi
     else
         if [ -f "$path" ] || { [ -L "$path" ] && [ -f "$path" ]; }; then
@@ -1030,7 +1054,7 @@ if [ -d /root/src/software/pgvector ]; then
     if [ ! -e /opt/src/software/pgvector ]; then
         mv /root/src/software/pgvector /opt/src/software/pgvector
     else
-        rsync -aHAX /root/src/software/pgvector/ /opt/src/software/pgvector/ || rsync -a /root/src/software/pgvector/ /opt/src/software/pgvector/
+        cp -a /root/src/software/pgvector/. /opt/src/software/pgvector/
         rm -rf /root/src/software/pgvector
     fi
 fi
@@ -2477,7 +2501,7 @@ migrate_opt_usr_local_layout() {
     fi
     if [ -d /opt/auto_sync ]; then
         mkdir -p /opt/usr/local/auto_sync
-        rsync -aHAX /opt/auto_sync/ /opt/usr/local/auto_sync/ || rsync -a /opt/auto_sync/ /opt/usr/local/auto_sync/
+        cp -a /opt/auto_sync/. /opt/usr/local/auto_sync/
         rm -rf /opt/auto_sync
     fi
     for name in blog go halo shadowsocks tbox waiwei xray bin; do
@@ -2489,7 +2513,7 @@ migrate_opt_usr_local_layout() {
         fi
         mkdir -p "$dst"
         if [ -d "$src" ]; then
-            rsync -aHAX "$src/" "$dst/" || rsync -a "$src/" "$dst/"
+            cp -a "$src"/. "$dst"/
         elif [ -f "$src" ]; then
             cp -a "$src" "$dst"
         fi
@@ -2545,7 +2569,7 @@ migrate_root_home_to_opt() {
         [ -e "$src" ] || [ -L "$src" ] || continue
         mkdir -p /opt/user/root/.halo2
         if [ -d "$src" ]; then
-            rsync -aL "$src/" /opt/user/root/.halo2/ || true
+            cp -aL "$src"/. /opt/user/root/.halo2/ 2>/dev/null || true
         fi
         rm -rf "$src"
     done
@@ -2560,7 +2584,7 @@ migrate_root_home_to_opt() {
         fi
         if [ -d "$src" ]; then
             mkdir -p "$dest"
-            rsync -aL "$src/" "$dest/" || true
+            cp -aL "$src"/. "$dest"/ 2>/dev/null || true
         elif [ -f "$src" ] || [ -L "$src" ]; then
             mkdir -p "$(dirname "$dest")"
             cp -aL "$src" "$dest" 2>/dev/null || true

@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 # Runs on Windows. Brings aws to its desired state. aws logs in as `ubuntu`
 # (non-root) with passwordless sudo, so root files are staged in the home dir
-# and installed with `sudo rsync`; acme.sh runs as the ubuntu user (it owns
+# and installed with `sudo cp -a`; acme.sh runs as the ubuntu user (it owns
 # /etc/nginx/ssl). Modes come from AS_PERMS_FILE, so scp is used without -p.
 $ssh  = $env:AS_SSH
 $scp  = $env:AS_SCP
@@ -158,11 +158,21 @@ function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$Opt
 }
 
 # 1. Stage every path in the Collector list, excluding anything in Ignore, then
-#    install with sudo rsync.
+#    install with sudo cp.
 Invoke-Remote 'rm -rf ~/.auto_sync_stage; mkdir -p ~/.auto_sync_stage'
 Transfer-CollectedPathsToStage $collectPaths @() '~/.auto_sync_stage'
-# rsync without -o/-g; ownership for ubuntu-owned trees is fixed below.
-Invoke-Remote 'sudo rsync -rltD --no-perms ~/.auto_sync_stage/ / && rm -rf ~/.auto_sync_stage && echo "installed collected paths"'
+# Copy without deleting live-only files; ownership for ubuntu-owned trees is
+# fixed below.
+Invoke-Remote @'
+echo "stop services before installing collected paths"
+for s in rblog rblog-backup.timer shadowsocks-rust nginx vlmcsd tbox_server tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray; do
+    if systemctl list-unit-files "$s" --no-legend 2>/dev/null | grep -q . || [ -e "/etc/systemd/system/$s" ] || [ -e "/lib/systemd/system/$s" ] || [ -e "/usr/lib/systemd/system/$s" ]; then
+        sudo systemctl stop "$s" >/dev/null 2>&1 || true
+        echo "stopped $s before installing collected paths"
+    fi
+done
+'@
+Invoke-Remote 'sudo cp -a ~/.auto_sync_stage/. / && rm -rf ~/.auto_sync_stage && echo "installed collected paths"'
 
 # 2. Restore recorded permissions for the pushed /etc files.
 function Quote-ShellArg([string]$Value) {
@@ -213,7 +223,7 @@ if [ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ] || [ ! -e /etc/nginx/mod
     exit 1
 fi
 
-# Files installed by sudo rsync may be root-owned when they were created fresh.
+# Files installed by sudo cp may be root-owned when they were created fresh.
 # rblog and acme.sh run as ubuntu, so restore ownership for those trees.
 for p in /home/ubuntu /usr/local/blog; do
     if [ -e "$p" ]; then
@@ -247,11 +257,17 @@ fi
 
 sudo systemctl daemon-reload
 sudo sysctl --system >/dev/null 2>&1 && echo "sysctl applied" || echo "!! sysctl apply FAILED"
+log_unit_processes() {
+    unit="$1"
+    active="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    pids="$(systemctl show "$unit" -p ControlPID -p MainPID --value 2>/dev/null | awk '$1 != "" && $1 != "0" {print}' | paste -sd, - 2>/dev/null || true)"
+    echo "process $unit active=${active:-unknown} pid=${pids:-none}"
+}
 
 # enable at boot + restart (restart, since a process may already be running)
 for s in rblog rblog-backup.timer shadowsocks-rust nginx vlmcsd; do
     sudo systemctl enable "$s" >/dev/null 2>&1
-    sudo systemctl restart "$s" && echo "restarted $s" || echo "!! restart $s FAILED"
+    sudo systemctl restart "$s" && { echo "restarted $s"; log_unit_processes "$s"; } || echo "!! restart $s FAILED"
 done
 
 # tbox + waiwei + xray: off and stay off. waiwei is split into
@@ -268,7 +284,7 @@ done
 ACME=/home/ubuntu/.acme.sh/acme.sh
 [ -d /etc/nginx/ssl ] || sudo mkdir -p /etc/nginx/ssl
 # acme.sh runs as ubuntu and rewrites these on renewal, so the whole dir must be
-# ubuntu-owned (the config push above re-created them root-owned via rsync).
+# ubuntu-owned (the config push above re-created them root-owned via sudo cp).
 sudo chown -R ubuntu:ubuntu /etc/nginx/ssl
 sudo chmod 0755 /etc/nginx/ssl
 if [ -x "$ACME" ]; then
