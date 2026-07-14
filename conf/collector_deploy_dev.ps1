@@ -412,7 +412,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -1670,7 +1670,7 @@ fi
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for s in tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+for s in tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
 for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron; do
@@ -1681,7 +1681,7 @@ done
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_mysql.sh'; echo '5 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_mysql.sh > /dev/null 2>&1') | crontab -
 
 echo '--- final states ---'
-for s in auto_sync halo2 immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer gitlab-runsvdir gitlab tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+for s in auto_sync halo2 immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer gitlab-runsvdir gitlab tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     resolved="$(unit_name "$s" 2>/dev/null || true)"
     if [ -n "$resolved" ]; then
         printf '  %s: ' "$s"; systemctl is-enabled "$resolved" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$resolved" 2>/dev/null | tr -d '\n'; echo
