@@ -152,6 +152,12 @@ ensure_linux_build_environment() {
 
 ensure_flutter_web_environment() {
   local flutter_root="${FLUTTER_ROOT:-/root/src/software/flutter}"
+  if [[ "$(realpath -m "$flutter_root")" != "$(realpath -m /root/src/software/flutter)" && \
+        "$(realpath -m "$flutter_root")" != "$(realpath -m /opt/src/software/flutter)" ]]; then
+    echo "Unsupported Flutter SDK path: $flutter_root" >&2
+    echo "Use /root/src/software/flutter on dev or /opt/src/software/flutter on NAS." >&2
+    exit 1
+  fi
   local legacy_roots=(
     "$HOME/flutter"
     "$HOME/src/software/flutter"
@@ -167,9 +173,6 @@ ensure_flutter_web_environment() {
   done
   if [[ -x "$flutter_root/bin/flutter" ]]; then
     export PATH="$flutter_root/bin:$PATH"
-    return
-  fi
-  if command -v flutter >/dev/null 2>&1; then
     return
   fi
 
