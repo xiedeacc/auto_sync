@@ -188,11 +188,28 @@ Transfer-CollectedPathsToStage $collectPaths @() '~/.auto_sync_stage'
 # Copy without deleting live-only files; ownership for ubuntu-owned trees is
 # fixed below.
 Invoke-Remote @'
-echo "stop services before installing collected paths"
-for s in rblog.service rblog-backup.timer shadowsocks-rust.service nginx.service vlmcsd.service tbox_server.service tbox_client.service tbox-logrotate.timer waiwei-web.service waiwei-puller.service xray.service; do
+echo "prepare services before installing collected paths"
+for s in rblog.service rblog-backup.timer nginx.service vlmcsd.service tbox_server.service tbox_client.service tbox-logrotate.timer waiwei-web.service waiwei-puller.service xray.service; do
     if systemctl list-unit-files "$s" --no-legend 2>/dev/null | grep -q . || [ -e "/etc/systemd/system/$s" ] || [ -e "/lib/systemd/system/$s" ] || [ -e "/usr/lib/systemd/system/$s" ]; then
         sudo systemctl stop "$s" >/dev/null 2>&1 || true
         echo "stopped $s before installing collected paths"
+    fi
+done
+stage="$HOME/.auto_sync_stage"
+for rel in \
+    usr/local/blog/bin/rblog \
+    usr/local/blog/bin/rblog-backup \
+    usr/local/shadowsocks/bin/ssserver \
+    usr/local/shadowsocks/bin/xray-plugin \
+    usr/local/vlmcsd/bin/vlmcsd \
+    usr/local/xray/bin/xray \
+    usr/local/tbox/bin/tbox_server \
+    usr/local/waiwei/bin/waiwei_web \
+    usr/local/waiwei/bin/waiwei_puller
+do
+    if [ -e "$stage/$rel" ] && [ -e "/$rel" ]; then
+        sudo rm -f "/$rel.auto_sync_old" 2>/dev/null || true
+        sudo mv "/$rel" "/$rel.auto_sync_old" 2>/dev/null || true
     fi
 done
 exit 0
@@ -259,6 +276,10 @@ for p in /home/ubuntu /usr/local/blog; do
         sudo chown -R ubuntu:ubuntu "$p" || echo "!! chown $p FAILED"
     fi
 done
+for d in /usr/local/blog/bin /usr/local/blog/bin/admin /usr/local/shadowsocks/bin /usr/local/vlmcsd/bin /usr/local/tbox/bin /usr/local/waiwei/bin /usr/local/xray/bin; do
+    [ -d "$d" ] && sudo find "$d" -type f -exec chmod 0755 {} + 2>/dev/null || true
+done
+sudo find /usr/local/blog /usr/local/shadowsocks /usr/local/vlmcsd /usr/local/tbox /usr/local/waiwei /usr/local/xray -type d -exec chmod 0755 {} + 2>/dev/null || true
 
 # rblog backup: /usr/local/blog/.backup-worktree is the real blog_data checkout
 # used by rblog-backup. Do not copy it back over /usr/local/blog.

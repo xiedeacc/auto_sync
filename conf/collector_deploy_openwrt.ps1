@@ -498,7 +498,13 @@ ensure_ubus || exit 1
 [ -s /usr/local/shadowsocks/conf/shadowsocks-client.json ] || { echo "!! missing shadowsocks-client.json" >&2; exit 1; }
 
 /etc/init.d/shadowsocks enable || exit 1
-/etc/init.d/shadowsocks restart || exit 1
+restart_log=/tmp/auto_sync_shadowsocks_restart.log
+if ! /etc/init.d/shadowsocks restart >"$restart_log" 2>&1; then
+    cat "$restart_log" >&2
+    exit 1
+fi
+grep -v 'Command failed: ubus call service delete .*Not found' "$restart_log" || true
+rm -f "$restart_log"
 
 # procd spawns sslocal asynchronously; verify both the process and DNS listener
 # before switching dnsmasq to 127.0.0.1#1053.
