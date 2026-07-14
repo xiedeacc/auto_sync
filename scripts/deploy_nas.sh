@@ -7,6 +7,7 @@ cd "$ROOT_DIR"
 CONFIG="${CONFIG:-conf/auto_sync.linux.toml}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/usr/local/auto_sync}"
 FLUTTER_ROOT="${FLUTTER_ROOT:-/opt/src/software/flutter}"
+SOURCE_DIR="${SOURCE_DIR:-/opt/src/rust/auto_sync}"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "deploy_nas.sh must run on the NAS Linux host." >&2
@@ -15,6 +16,12 @@ fi
 
 if [[ "$INSTALL_DIR" != /opt/usr/local/auto_sync ]]; then
   echo "NAS install dir must stay /opt/usr/local/auto_sync; got: $INSTALL_DIR" >&2
+  exit 1
+fi
+
+if [[ "$(realpath -m "$ROOT_DIR")" != "$(realpath -m "$SOURCE_DIR")" ]]; then
+  echo "NAS source dir must stay $SOURCE_DIR; got: $ROOT_DIR" >&2
+  echo "Run: cd $SOURCE_DIR && scripts/deploy_nas.sh" >&2
   exit 1
 fi
 

@@ -16,8 +16,9 @@ OUT_DIR="${OUT_DIR:-bin/openwrt/aarch64}"
 OPENWRT_TOOLCHAIN="${OPENWRT_TOOLCHAIN:-}"
 
 TOOLCHAIN_SEARCH_ROOTS=(
+  /root/src/software/openwrt
   /root/src/software
-  /root/src/toolchains
+  /opt/src/software/openwrt
   /opt
 )
 
@@ -75,7 +76,7 @@ build_openwrt_binaries() {
       apply_openwrt_toolchain "$detected"
     else
       echo "Missing aarch64 musl C compiler." >&2
-      echo "Set OPENWRT_TOOLCHAIN=/path/to/toolchain or install /root/src/software/aarch64-linux-musl-cross." >&2
+      echo "Set OPENWRT_TOOLCHAIN=/path/to/toolchain or install the OpenWrt toolchain under /root/src/software/openwrt." >&2
       exit 1
     fi
   fi

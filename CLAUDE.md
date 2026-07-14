@@ -13,9 +13,9 @@
   1. On Windows, commit all intended repository changes and push them.
   2. After the push succeeds, deploy this Windows machine, NAS, and dev in parallel when possible:
      - Windows: `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1`.
-     - NAS directly on NAS: `ssh -p 10022 root@192.168.2.247 "cd /opt/usr/local/auto_sync && git pull --ff-only && scripts/deploy_nas.sh"`.
-     - Dev directly on dev: `ssh -p 10022 root@192.168.2.126 "cd /root/src/auto_sync && git pull --ff-only && scripts/deploy_local.sh --install-dir /usr/local/auto_sync"`.
+     - NAS directly on NAS: `ssh -p 10022 root@192.168.2.247 "cd /opt/src/rust/auto_sync && git pull --ff-only && scripts/deploy_nas.sh"`.
+     - Dev directly on dev: `ssh -p 10022 root@192.168.2.126 "cd /root/src/rust/auto_sync && git pull --ff-only && scripts/deploy_local.sh --install-dir /usr/local/auto_sync"`.
      If parallel execution is not available, run the same three commands sequentially.
 - Do not deploy to tiger and do not use Windows-to-Linux cross-compilation for the normal NAS deployment path; build Linux x64 binaries on NAS.
 - Always deploy through the existing project scripts when deployment is explicitly requested, never with ad-hoc commands. On Windows use `scripts/deploy_windows.ps1`; on NAS use `scripts/deploy_nas.sh`. Do not run ad-hoc `cargo build`/`cargo check` against other targets (e.g. `--target *-linux-*`) on Windows to "validate" Linux-only code; cross-target builds pull in unbuildable native deps (libdbus, etc.). Validate Linux/`cfg`-gated code on the relevant Linux host when needed.
-- For normal NAS deployment, do not delete `/opt/usr/local/auto_sync`, do not run `git reset --hard`, and do not clean `/opt/usr/local/auto_sync/target`; preserving Cargo build cache is required. If tracked files in `/opt/usr/local/auto_sync` are dirty, stop and resolve why instead of masking it with reset.
+- For normal NAS deployment, do not delete `/opt/usr/local/auto_sync` runtime data and do not clean `/opt/src/rust/auto_sync/target`; preserving Cargo build cache is required. If tracked files in `/opt/src/rust/auto_sync` are dirty, stop and resolve why instead of masking it with reset.
