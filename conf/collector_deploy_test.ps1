@@ -1759,8 +1759,20 @@ def make_image(src, dst, size, stream, kind):
 
 
 def make_image_from_source(src, dst, size, kind):
+    if make_image_fast_source(src, dst, size, kind):
+        return True
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-frames:v", "1", "-vf", scale_filter(size), *output_quality_args(kind), str(dst)]
     return run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0
+
+
+def make_image_fast_source(src, dst, size, kind):
+    tool = shutil.which("magick") or shutil.which("convert")
+    if not tool:
+        return False
+    resize = f"{size}x{size}>"
+    quality = "95" if kind == "thumbnail" else "92"
+    cmd = [tool, str(src), "-auto-orient", "-resize", resize, "-quality", quality, str(dst)]
+    return run(cmd, check=False, timeout=120).returncode == 0 and dst.exists() and dst.stat().st_size > 0
 
 
 def make_normal_image_source(src, work_dir):
@@ -2281,22 +2293,26 @@ WITH files AS (
     GROUP BY a.id, a.type, a."ownerId", a."originalPath", a."fileModifiedAt", a."createdAt"
 ),
 missing AS (
-    SELECT id, type, "ownerId", "originalPath", orientation, "fileModifiedAt", "createdAt"
+    SELECT id, type, "ownerId", "originalPath", orientation, "fileModifiedAt", "createdAt",
+           thumbnail, preview, fullsize, thumbnail_bytes, preview_bytes, fullsize_bytes
     FROM files
     WHERE ({where_clause})
     {shard_clause}
     ORDER BY "fileModifiedAt" DESC NULLS LAST, "createdAt" DESC
     {limit_clause}
 )
-SELECT id, type, "ownerId", "originalPath", coalesce(orientation, '') FROM missing
+SELECT id, type, "ownerId", "originalPath", coalesce(orientation, ''),
+       coalesce(thumbnail, ''), coalesce(preview, ''), coalesce(fullsize, ''),
+       coalesce(thumbnail_bytes, 0), coalesce(preview_bytes, 0), coalesce(fullsize_bytes, 0)
+FROM missing
 """
 
-rows = [line.split("\t", 4) for line in psql(query).splitlines() if line.strip()]
+rows = [line.split("\t", 10) for line in psql(query).splitlines() if line.strip()]
 completed_ids = load_checkpoint()
 ok = 0
 failed = 0
 resumed = 0
-for asset_id, asset_type, owner_id, original_path, orientation in rows:
+for asset_id, asset_type, owner_id, original_path, orientation, thumbnail, preview, fullsize, thumbnail_bytes, preview_bytes, fullsize_bytes in rows:
     if asset_id in completed_ids:
         resumed += 1
         if (ok + failed + resumed) % 100 == 0:
@@ -2318,13 +2334,17 @@ for asset_id, asset_type, owner_id, original_path, orientation in rows:
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         if asset_type == "IMAGE":
-            outputs = [
-                ("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 512),
-                ("preview", out_dir / f"{asset_id}_preview.jpeg", 2048),
-                ("fullsize", out_dir / f"{asset_id}_fullsize.jpeg", 4096),
-            ]
+            outputs = []
+            if not thumbnail or int(thumbnail_bytes or 0) < 1000 or not Path(thumbnail).exists():
+                outputs.append(("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 512))
+            if not preview or int(preview_bytes or 0) < 50000 or not Path(preview).exists():
+                outputs.append(("preview", out_dir / f"{asset_id}_preview.jpeg", 2048))
+            if not fullsize or int(fullsize_bytes or 0) < 50000 or not Path(fullsize).exists():
+                outputs.append(("fullsize", out_dir / f"{asset_id}_fullsize.jpeg", 4096))
             suffix = src.suffix.lower()
-            if suffix in (".heic", ".heif"):
+            if not outputs:
+                made = []
+            elif suffix in (".heic", ".heif"):
                 with tempfile.TemporaryDirectory(prefix="immich-derivative-") as temp_dir:
                     # Prefer the primary color Tile Grid for iPhone HEIC files.
                     # Generic HEIF decoders can pick depth/gain-map/tmap auxiliary
@@ -2360,6 +2380,10 @@ for asset_id, asset_type, owner_id, original_path, orientation in rows:
                 else:
                     made = [(kind, path) for kind, path, size in outputs if make_video(src, path, size)]
         if not made:
+            if asset_type == "IMAGE" and not outputs:
+                ok += 1
+                mark_checkpoint(asset_id, "already-good")
+                continue
             failed += 1
             print(f"ffmpeg failed: {asset_id} {src}")
             continue
