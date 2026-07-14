@@ -1620,6 +1620,8 @@ from pathlib import Path
 UPLOAD_ROOT = Path("/opt/immich/upload")
 LIMIT = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_LIMIT", "200") or "200")
 REPAIR_ALL = os.environ.get("IMMICH_DERIVATIVE_REPAIR_ALL", "").lower() in ("1", "true", "yes", "all")
+SHARD_INDEX = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_SHARD_INDEX", "0") or "0")
+SHARD_COUNT = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_SHARD_COUNT", "1") or "1")
 
 
 def run(cmd, *, check=True, timeout=None):
@@ -1900,6 +1902,9 @@ where_clause = """
       )
 """
 limit_clause = "" if LIMIT <= 0 else f"LIMIT {LIMIT}"
+shard_clause = ""
+if SHARD_COUNT > 1:
+    shard_clause = f"AND mod(abs(hashtext(id::text)), {SHARD_COUNT}) = {SHARD_INDEX}"
 
 query = f"""
 WITH files AS (
@@ -1921,7 +1926,8 @@ WITH files AS (
 missing AS (
     SELECT id, type, "ownerId", "originalPath", orientation, "fileModifiedAt", "createdAt"
     FROM files
-    WHERE {where_clause}
+    WHERE ({where_clause})
+    {shard_clause}
     ORDER BY "fileModifiedAt" DESC NULLS LAST, "createdAt" DESC
     {limit_clause}
 )
@@ -1946,15 +1952,19 @@ for asset_id, asset_type, owner_id, original_path, orientation in rows:
                 ("preview", out_dir / f"{asset_id}_preview.jpeg", 2048),
                 ("fullsize", out_dir / f"{asset_id}_fullsize.jpeg", 4096),
             ]
-            with tempfile.TemporaryDirectory(prefix="immich-derivative-") as temp_dir:
-                source = make_normal_image_source(src, temp_dir)
-                if source is None:
-                    source = make_tile_grid_source(src, temp_dir, orientation)
-                if source is not None:
-                    made = [(kind, path) for kind, path, size in outputs if make_image_from_source(source, path, size, kind)]
-                else:
-                    stream = first_color_stream(src)
-                    made = [(kind, path) for kind, path, size in outputs if make_image(src, path, size, stream, kind)]
+            suffix = src.suffix.lower()
+            if suffix in (".heic", ".heif"):
+                with tempfile.TemporaryDirectory(prefix="immich-derivative-") as temp_dir:
+                    source = make_normal_image_source(src, temp_dir)
+                    if source is None:
+                        source = make_tile_grid_source(src, temp_dir, orientation)
+                    if source is not None:
+                        made = [(kind, path) for kind, path, size in outputs if make_image_from_source(source, path, size, kind)]
+                    else:
+                        stream = first_color_stream(src)
+                        made = [(kind, path) for kind, path, size in outputs if make_image(src, path, size, stream, kind)]
+            else:
+                made = [(kind, path) for kind, path, size in outputs if make_image_from_source(src, path, size, kind)]
         else:
             outputs = [
                 ("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 512),
