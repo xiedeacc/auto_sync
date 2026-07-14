@@ -1986,6 +1986,13 @@ def video_duration(path):
     return None
 
 
+def has_video_stream(path):
+    info = probe_json(path)
+    if info is None:
+        return False
+    return any(stream.get("codec_type") == "video" for stream in info.get("streams", []))
+
+
 def video_seek_times(path):
     duration = video_duration(path)
     if duration is None:
@@ -2170,6 +2177,12 @@ for asset_id, asset_type, owner_id, original_path, orientation in rows:
             else:
                 made = [(kind, path) for kind, path, size in outputs if make_image_from_source(src, path, size, kind)]
         else:
+            if not has_video_stream(src):
+                ok += 1
+                print(f"skip video without video stream: {asset_id} {src}")
+                if (ok + failed) % 100 == 0:
+                    print(f"immich derivative repair progress: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {ok + failed}/{len(rows)} checked", flush=True)
+                continue
             outputs = [
                 ("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 512),
                 ("preview", out_dir / f"{asset_id}_preview.jpeg", 2048),
