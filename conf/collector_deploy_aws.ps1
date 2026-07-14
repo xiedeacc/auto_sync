@@ -339,14 +339,14 @@ log_unit_processes() {
 }
 
 # enable at boot + restart (restart, since a process may already be running)
-for s in rblog rblog-backup.timer shadowsocks-rust nginx vlmcsd; do
+for s in rblog rblog-backup.timer shadowsocks-rust nginx vlmcsd tbox_server; do
     sudo systemctl enable "$s" >/dev/null 2>&1
     sudo systemctl restart "$s" && { echo "restarted $s"; log_unit_processes "$s"; } || echo "!! restart $s FAILED"
 done
 
-# tbox + waiwei + xray: off and stay off. waiwei is split into
-# waiwei-web and waiwei-puller; there is no standalone waiwei unit.
-for s in tbox_server tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray; do
+# tbox_server runs on aws; tbox client/logrotate plus waiwei + xray stay off.
+# waiwei is split into waiwei-web and waiwei-puller; there is no standalone waiwei unit.
+for s in tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray; do
     sudo systemctl disable "$s" >/dev/null 2>&1
     sudo systemctl stop "$s" 2>/dev/null
     sudo systemctl reset-failed "$s" 2>/dev/null
