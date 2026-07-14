@@ -1511,6 +1511,7 @@ RESUME_ENABLED = (
 )
 STATE_DIR = Path(os.environ.get("IMMICH_DERIVATIVE_REPAIR_STATE_DIR", "/var/lib/immich_derivative_repair"))
 CHECKPOINT_PATH = STATE_DIR / f"repair_all_shard_{SHARD_INDEX}_of_{SHARD_COUNT}.ok"
+STRATEGY_CACHE_PATH = STATE_DIR / "strategy-cache.json"
 
 
 def run(cmd, *, check=True, timeout=None):
@@ -1537,6 +1538,50 @@ def mark_checkpoint(asset_id, status):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with CHECKPOINT_PATH.open("a", encoding="utf-8") as handle:
         handle.write(f"{asset_id}\t{status}\n")
+
+
+def load_strategy_cache():
+    if not STRATEGY_CACHE_PATH.exists():
+        return {}
+    try:
+        return json.loads(STRATEGY_CACHE_PATH.read_text(errors="ignore") or "{}")
+    except Exception:
+        return {}
+
+
+STRATEGY_CACHE = load_strategy_cache()
+
+
+def save_strategy_cache():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STRATEGY_CACHE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(STRATEGY_CACHE, sort_keys=True), encoding="utf-8")
+    tmp.replace(STRATEGY_CACHE_PATH)
+
+
+def file_fingerprint(path):
+    stat = Path(path).stat()
+    return {
+        "path": str(path),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def cached_strategy(asset_id, fingerprint):
+    entry = STRATEGY_CACHE.get(asset_id)
+    if not entry or entry.get("fingerprint") != fingerprint:
+        return None
+    return entry
+
+
+def remember_strategy(asset_id, fingerprint, status, strategy=None):
+    STRATEGY_CACHE[asset_id] = {
+        "fingerprint": fingerprint,
+        "status": status,
+        "strategy": strategy or "",
+    }
+    save_strategy_cache()
 
 
 def psql(sql):
@@ -1989,6 +2034,65 @@ def make_tile_grid_source(src, work_dir, orientation):
     return full_path
 
 
+def make_heif_source_by_strategy(src, work_dir, orientation, strategy):
+    if strategy == "box-grid":
+        return make_heif_box_grid_source(src, work_dir)
+    if strategy == "normal":
+        return make_normal_image_source(src, work_dir)
+    if strategy == "primary-stream":
+        stream = first_color_stream(src)
+        if stream is None:
+            return None
+        dst = Path(work_dir) / "primary_stream.jpg"
+        if make_image(src, dst, 4096, stream, "fullsize"):
+            return dst
+        return None
+    if strategy == "tile-grid":
+        return make_tile_grid_source(src, work_dir, orientation)
+    return None
+
+
+def make_outputs_from_source(source, outputs):
+    made = [(kind, path) for kind, path, size in outputs if make_image_from_source(source, path, size, kind)]
+    if len(made) == len(outputs):
+        return made
+    for _, path, _ in outputs:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+    return []
+
+
+def repair_heif_outputs(asset_id, src, outputs, orientation, work_dir):
+    fingerprint = file_fingerprint(src)
+    cached = cached_strategy(asset_id, fingerprint)
+    if cached and cached.get("status") in ("empty-original", "known-failed"):
+        return [], cached["status"]
+    cached_strategy_name = cached.get("strategy") if cached and cached.get("status") == "ok" else None
+    strategies = []
+    if cached_strategy_name:
+        strategies.append(cached_strategy_name)
+    # Cheap, targeted paths first. The expensive full tile-grid fallback is last
+    # and is cached per original file once it proves necessary.
+    strategies.extend(["box-grid", "normal", "primary-stream", "tile-grid"])
+    seen = set()
+    for strategy in strategies:
+        if strategy in seen:
+            continue
+        seen.add(strategy)
+        source = make_heif_source_by_strategy(src, work_dir, orientation, strategy)
+        if source is None:
+            continue
+        made = make_outputs_from_source(source, outputs)
+        if made:
+            remember_strategy(asset_id, fingerprint, "ok", strategy)
+            return made, None
+    remember_strategy(asset_id, fingerprint, "known-failed")
+    return [], None
+
+
 def make_video(src, dst, size):
     for second in video_seek_times(src):
         base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{second:.3f}", "-i", str(src), "-map", "0:v:0", "-frames:v", "1"]
@@ -2226,19 +2330,14 @@ for asset_id, asset_type, owner_id, original_path, orientation, thumbnail, previ
                 made = []
             elif suffix in (".heic", ".heif"):
                 with tempfile.TemporaryDirectory(prefix="immich-derivative-") as temp_dir:
-                    # Prefer the primary color Tile Grid for iPhone HEIC files.
-                    # Generic HEIF decoders can pick depth/gain-map/tmap auxiliary
-                    # images and produce black, grayscale, or wrong-aspect outputs.
-                    source = make_tile_grid_source(src, temp_dir, orientation)
-                    if source is None:
-                        source = make_heif_box_grid_source(src, temp_dir)
-                    if source is None:
-                        source = make_normal_image_source(src, temp_dir)
-                    if source is not None:
-                        made = [(kind, path) for kind, path, size in outputs if make_image_from_source(source, path, size, kind)]
-                    else:
-                        stream = first_color_stream(src)
-                        made = [(kind, path) for kind, path, size in outputs if make_image(src, path, size, stream, kind)]
+                    made, skip_status = repair_heif_outputs(asset_id, src, outputs, orientation, temp_dir)
+                    if skip_status:
+                        ok += 1
+                        mark_checkpoint(asset_id, skip_status)
+                        print(f"skip cached HEIC {skip_status}: {asset_id} {src}")
+                        if (ok + failed + resumed) % 100 == 0:
+                            print(f"immich derivative repair progress: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {resumed} resumed, {ok + failed + resumed}/{len(rows)} checked", flush=True)
+                        continue
             else:
                 made = [(kind, path) for kind, path, size in outputs if make_image_from_source(src, path, size, kind)]
         else:
