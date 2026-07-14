@@ -1504,6 +1504,13 @@ REPAIR_ALL = os.environ.get("IMMICH_DERIVATIVE_REPAIR_ALL", "").lower() in ("1",
 SHARD_INDEX = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_SHARD_INDEX", "0") or "0")
 SHARD_COUNT = int(os.environ.get("IMMICH_DERIVATIVE_REPAIR_SHARD_COUNT", "1") or "1")
 ASSET_IDS = [value.strip() for value in os.environ.get("IMMICH_DERIVATIVE_REPAIR_ASSET_IDS", "").split(",") if value.strip()]
+RESUME_ENABLED = (
+    REPAIR_ALL
+    and not ASSET_IDS
+    and os.environ.get("IMMICH_DERIVATIVE_REPAIR_RESUME", "1").lower() not in ("0", "false", "no", "off")
+)
+STATE_DIR = Path(os.environ.get("IMMICH_DERIVATIVE_REPAIR_STATE_DIR", "/var/lib/immich_derivative_repair"))
+CHECKPOINT_PATH = STATE_DIR / f"repair_all_shard_{SHARD_INDEX}_of_{SHARD_COUNT}.ok"
 
 
 def run(cmd, *, check=True, timeout=None):
@@ -1511,6 +1518,25 @@ def run(cmd, *, check=True, timeout=None):
         return subprocess.run(cmd, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(cmd, 124, exc.stdout or "", exc.stderr or "timeout")
+
+
+def load_checkpoint():
+    if not RESUME_ENABLED or not CHECKPOINT_PATH.exists():
+        return set()
+    result = set()
+    for line in CHECKPOINT_PATH.read_text(errors="ignore").splitlines():
+        asset_id = line.split("\t", 1)[0].strip()
+        if asset_id:
+            result.add(asset_id)
+    return result
+
+
+def mark_checkpoint(asset_id, status):
+    if not RESUME_ENABLED:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with CHECKPOINT_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(f"{asset_id}\t{status}\n")
 
 
 def psql(sql):
@@ -2141,9 +2167,16 @@ SELECT id, type, "ownerId", "originalPath", coalesce(orientation, '') FROM missi
 """
 
 rows = [line.split("\t", 4) for line in psql(query).splitlines() if line.strip()]
+completed_ids = load_checkpoint()
 ok = 0
 failed = 0
+resumed = 0
 for asset_id, asset_type, owner_id, original_path, orientation in rows:
+    if asset_id in completed_ids:
+        resumed += 1
+        if (ok + failed + resumed) % 100 == 0:
+            print(f"immich derivative repair progress: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {resumed} resumed, {ok + failed + resumed}/{len(rows)} checked", flush=True)
+        continue
     src = Path(original_path)
     if not src.exists():
         failed += 1
@@ -2179,9 +2212,10 @@ for asset_id, asset_type, owner_id, original_path, orientation in rows:
         else:
             if not has_video_stream(src):
                 ok += 1
+                mark_checkpoint(asset_id, "no-video-stream")
                 print(f"skip video without video stream: {asset_id} {src}")
-                if (ok + failed) % 100 == 0:
-                    print(f"immich derivative repair progress: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {ok + failed}/{len(rows)} checked", flush=True)
+                if (ok + failed + resumed) % 100 == 0:
+                    print(f"immich derivative repair progress: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {resumed} resumed, {ok + failed + resumed}/{len(rows)} checked", flush=True)
                 continue
             outputs = [
                 ("thumbnail", out_dir / f"{asset_id}_thumbnail.webp", 512),
@@ -2204,13 +2238,16 @@ for asset_id, asset_type, owner_id, original_path, orientation in rows:
         cache_source = next((path for kind, path in made if kind == "preview"), made[0][1])
         refresh_asset_cache_key(asset_id, cache_source)
         ok += 1
-        if (ok + failed) % 100 == 0:
-            print(f"immich derivative repair progress: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {ok + failed}/{len(rows)} checked", flush=True)
+        mark_checkpoint(asset_id, "ok")
+        if (ok + failed + resumed) % 100 == 0:
+            print(f"immich derivative repair progress: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {resumed} resumed, {ok + failed + resumed}/{len(rows)} checked", flush=True)
     except Exception as exc:
         failed += 1
         print(f"repair failed: {asset_id} {src}: {exc}")
 
-print(f"immich derivative repair summary: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {len(rows)} checked")
+if RESUME_ENABLED and failed == 0 and CHECKPOINT_PATH.exists():
+    CHECKPOINT_PATH.unlink()
+print(f"immich derivative repair summary: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {resumed} resumed, {len(rows)} checked")
 PY_IMMICH_DERIVATIVE_REPAIR
 }
 
