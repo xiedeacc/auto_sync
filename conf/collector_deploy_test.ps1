@@ -2065,10 +2065,15 @@ def make_tile_grid_source(src, work_dir, orientation):
     tile_paths = []
     for position, stream_index in enumerate(tiles):
         tile_path = Path(work_dir) / f"tile_{position:03d}.jpg"
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-map", f"0:{stream_index}", "-frames:v", "1", "-q:v", "1", str(tile_path)]
-        if run(cmd, check=False, timeout=20).returncode != 0 or not tile_path.exists() or tile_path.stat().st_size == 0:
-            return None
         tile_paths.append(tile_path)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
+    for stream_index, tile_path in zip(tiles, tile_paths):
+        cmd += ["-map", f"0:{stream_index}", "-frames:v", "1", "-q:v", "1", str(tile_path)]
+    timeout = max(60, min(900, len(tile_paths) * 2))
+    if run(cmd, check=False, timeout=timeout).returncode != 0:
+        return None
+    if any(not tile_path.exists() or tile_path.stat().st_size == 0 for tile_path in tile_paths):
+        return None
     inputs = []
     for tile_path in tile_paths:
         inputs.extend(["-i", str(tile_path)])
