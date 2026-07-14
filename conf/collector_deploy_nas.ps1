@@ -2255,10 +2255,14 @@ for asset_id, asset_type, owner_id, original_path, orientation, thumbnail, previ
             ]
             with tempfile.TemporaryDirectory(prefix="immich-derivative-") as temp_dir:
                 frame = representative_video_frame(src, temp_dir)
-                if frame is not None:
-                    made = [(kind, path) for kind, path, size in outputs if make_image_from_source(frame, path, size, kind)]
-                else:
-                    made = [(kind, path) for kind, path, size in outputs if make_video(src, path, size)]
+                if frame is None:
+                    ok += 1
+                    mark_checkpoint(asset_id, "no-decodable-video-frame")
+                    print(f"skip video without decodable frame: {asset_id} {src}")
+                    if (ok + failed + resumed) % 100 == 0:
+                        print(f"immich derivative repair progress: shard {SHARD_INDEX}/{SHARD_COUNT}, {ok} ok, {failed} failed, {resumed} resumed, {ok + failed + resumed}/{len(rows)} checked", flush=True)
+                    continue
+                made = [(kind, path) for kind, path, size in outputs if make_image_from_source(frame, path, size, kind)]
         if not made:
             if asset_type == "IMAGE" and not outputs:
                 ok += 1
