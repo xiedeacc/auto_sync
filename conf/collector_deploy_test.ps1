@@ -1784,12 +1784,15 @@ def make_tile_grid_source(src, work_dir, orientation):
 
 
 def make_video(src, dst, size):
-    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "1", "-i", str(src), "-map", "0:v:0", "-frames:v", "1"]
-    cmd = base + ["-vf", video_filter(size), "-q:v", "2", str(dst)]
-    if run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0:
-        return True
-    cmd = base + ["-vf", scale_filter(size), "-q:v", "2", str(dst)]
-    return run(cmd, check=False).returncode == 0 and dst.exists() and dst.stat().st_size > 0
+    for second in video_seek_times(src):
+        base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{second:.3f}", "-i", str(src), "-map", "0:v:0", "-frames:v", "1"]
+        cmd = base + ["-vf", video_filter(size), "-q:v", "2", str(dst)]
+        if run(cmd, check=False, timeout=20).returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            return True
+        cmd = base + ["-vf", scale_filter(size), "-q:v", "2", str(dst)]
+        if run(cmd, check=False, timeout=20).returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            return True
+    return False
 
 
 def image_mean(path):
@@ -1804,10 +1807,40 @@ def image_mean(path):
         return 0.0
 
 
+def video_duration(path):
+    info = probe_json(path)
+    if info is None:
+        return None
+    candidates = [info.get("format", {}).get("duration")]
+    candidates.extend(stream.get("duration") for stream in info.get("streams", []) if stream.get("codec_type") == "video")
+    for value in candidates:
+        try:
+            duration = float(value)
+        except (TypeError, ValueError):
+            continue
+        if duration > 0:
+            return duration
+    return None
+
+
+def video_seek_times(path):
+    duration = video_duration(path)
+    if duration is None:
+        return (0.0, 1.0, 3.0, 5.0, 8.0)
+    candidates = [0.0, min(0.1, duration / 3), duration / 2, duration * 0.8, 1.0, 3.0, 5.0, 8.0]
+    result = []
+    for value in candidates:
+        value = max(0.0, min(float(value), max(0.0, duration - 0.001)))
+        rounded = round(value, 3)
+        if rounded not in result:
+            result.append(rounded)
+    return tuple(result)
+
+
 def representative_video_frame(src, work_dir):
     best = None
     best_mean = -1.0
-    for index, second in enumerate((1.0, 3.0, 5.0, 8.0)):
+    for index, second in enumerate(video_seek_times(src)):
         frame = Path(work_dir) / f"frame_{index}.jpg"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{second:.3f}", "-i", str(src), "-map", "0:v:0", "-frames:v", "1", "-vf", "scale=1920:-2", "-q:v", "2", str(frame)]
         if run(cmd, check=False, timeout=20).returncode != 0 or not frame.exists() or frame.stat().st_size == 0:
