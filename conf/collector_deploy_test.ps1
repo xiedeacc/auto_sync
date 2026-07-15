@@ -726,35 +726,7 @@ stop_services_before_install
 install_staged_collected_paths || { log "ERROR: collected path installation failed"; exit 1; }
 
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
-ensure_software_src_layout() {
-    new=/opt/src/software
-    old=/opt/software/src
-    mkdir -p /opt/src
-    if [ -e "$old" ] && [ ! -L "$old" ]; then
-        if [ ! -e "$new" ]; then
-            mv "$old" "$new"
-        else
-            cp -a "$old"/. "$new"/
-            mv "$old" "${old}.migrated-$(date +%Y%m%d%H%M%S)"
-        fi
-    fi
-    mkdir -p "$new"
-    if [ -L "$old" ] && [ "$(readlink "$old")" != "$new" ]; then
-        rm -f "$old"
-    fi
-    rmdir /opt/software 2>/dev/null || true
-}
-ensure_software_src_layout
-rewrite_software_src_paths() {
-    replacement="$1"
-    for root in /etc/systemd/system /etc/profile.d /opt/usr/local/bin; do
-        [ -e "$root" ] || continue
-        find "$root" -type f -exec grep -Il '/opt/software/src' {} + 2>/dev/null |
-            xargs -r sed -i "s#/opt/software/src#$replacement#g"
-    done
-    [ ! -f /etc/profile ] || sed -i "s#/opt/software/src#$replacement#g" /etc/profile
-}
-rewrite_software_src_paths /opt/src/software
+mkdir -p /opt/src/software
 ensure_opt_link() {
     path="$1"
     target="$2"
@@ -1184,14 +1156,6 @@ ExternalSizeMax=unlimited
 EOF_COREDUMP
 
 mkdir -p /opt/src/software
-if [ -d /root/src/software/pgvector ]; then
-    if [ ! -e /opt/src/software/pgvector ]; then
-        mv /root/src/software/pgvector /opt/src/software/pgvector
-    else
-        cp -a /root/src/software/pgvector/. /opt/src/software/pgvector/
-        rm -rf /root/src/software/pgvector
-    fi
-fi
 if [ ! -d /opt/src/software/pgvector ]; then
     git clone https://github.com/pgvector/pgvector.git /opt/src/software/pgvector || true
 fi
@@ -2612,59 +2576,9 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-migrate_opt_usr_local_layout() {
+ensure_opt_usr_local_path() {
     mkdir -p /opt/usr/local
     chmod 0755 /opt/usr /opt/usr/local 2>/dev/null || true
-    if grep -Eq '^/opt/usr/local[[:space:]]+/usr/local[[:space:]]' /etc/fstab 2>/dev/null; then
-        cp -a /etc/fstab "/etc/fstab.auto_sync_backup.$(date +%Y%m%d%H%M%S)"
-        sed -i '\#^/opt/usr/local[[:space:]]\+/usr/local[[:space:]]#d' /etc/fstab
-        systemctl daemon-reload 2>/dev/null || true
-        umount -l /usr/local 2>/dev/null || true
-        mkdir -p /usr/local
-        chmod 0755 /usr/local 2>/dev/null || true
-        systemctl reset-failed usr-local.mount 2>/dev/null || true
-    fi
-    if [ -d /opt/auto_sync ]; then
-        mkdir -p /opt/usr/local/auto_sync
-        cp -a /opt/auto_sync/. /opt/usr/local/auto_sync/
-        rm -rf /opt/auto_sync
-    fi
-    for name in blog go halo shadowsocks tbox waiwei xray bin; do
-        src="/usr/local/$name"
-        dst="/opt/usr/local/$name"
-        [ -e "$src" ] || [ -L "$src" ] || continue
-        if [ -e "$dst" ] && [ "$src" -ef "$dst" ]; then
-            continue
-        fi
-        mkdir -p "$dst"
-        if [ -d "$src" ]; then
-            cp -a "$src"/. "$dst"/
-        elif [ -f "$src" ]; then
-            cp -a "$src" "$dst"
-        fi
-        [ "$src" -ef "$dst" ] 2>/dev/null || rm -rf "$src"
-    done
-    for root in /etc/systemd/system /etc/profile.d /etc/logrotate.d /opt/usr/local /etc/immich; do
-        [ -e "$root" ] || continue
-        find "$root" -type f -exec grep -IlE '/opt/auto_sync|/usr/local/(blog|go|halo|shadowsocks|tbox|waiwei|xray|bin)' {} + 2>/dev/null |
-            xargs -r sed -i \
-                -e 's#/opt/auto_sync#/opt/usr/local/auto_sync#g' \
-                -e 's#/usr/local/blog#/opt/usr/local/blog#g' \
-                -e 's#/usr/local/go#/opt/usr/local/go#g' \
-                -e 's#/usr/local/halo#/opt/usr/local/halo#g' \
-                -e 's#/usr/local/shadowsocks#/opt/usr/local/shadowsocks#g' \
-                -e 's#/usr/local/tbox#/opt/usr/local/tbox#g' \
-                -e 's#/usr/local/waiwei#/opt/usr/local/waiwei#g' \
-                -e 's#/usr/local/xray#/opt/usr/local/xray#g' \
-                -e 's#/usr/local/bin#/opt/usr/local/bin#g'
-        find "$root" -type f -exec grep -Il '/opt/opt' {} + 2>/dev/null |
-            xargs -r sed -i \
-                -e 's#/opt/opt/opt/usr/local#/opt/usr/local#g' \
-                -e 's#/opt/opt/usr/local#/opt/usr/local#g'
-    done
-    if [ -f /opt/usr/local/blog/conf/rblog.toml ]; then
-        sed -i -e 's#/usr/local/blog#/opt/usr/local/blog#g' -e 's#/opt/opt/#/opt/#g' /opt/usr/local/blog/conf/rblog.toml
-    fi
     cat > /etc/profile.d/opt-usr-local-path.sh <<'EOF_OPT_USR_LOCAL_PATH'
 # Managed by auto_sync NAS deployment.
 case ":$PATH:" in
@@ -2678,7 +2592,7 @@ esac
 EOF_OPT_USR_LOCAL_PATH
     chmod 0644 /etc/profile.d/opt-usr-local-path.sh
 }
-migrate_opt_usr_local_layout
+ensure_opt_usr_local_path
 
 mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/root/.halo2 /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
