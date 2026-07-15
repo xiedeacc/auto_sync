@@ -688,15 +688,13 @@ function Ensure-AutoSyncStartup {
     if (-not [string]::IsNullOrWhiteSpace($startupDir)) {
         Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-backend-start.vbs") `
             -WorkingDirectory $BinDir `
-            -Executable $autoSyncExe `
-            -Arguments @("--elevation-attempted")
+            -Executable $autoSyncExe
         Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-gui-start.vbs") `
             -WorkingDirectory $BinDir `
             -Executable $autoSyncGuiExe
     }
 
     Start-Process -FilePath $autoSyncExe `
-        -ArgumentList @("--elevation-attempted") `
         -WorkingDirectory $BinDir `
         -WindowStyle Hidden
     Start-Sleep -Seconds 1
