@@ -34,9 +34,33 @@ use crate::core::sync::{
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MANUAL_DISCOVERY_MIN_INTERVAL: Duration = Duration::from_secs(5);
 static PROCESS_STARTED_AT: OnceLock<DateTime<Utc>> = OnceLock::new();
+static REMOTE_TASK_FETCH_BACKOFF: OnceLock<Mutex<HashMap<String, RemoteTaskFetchBackoff>>> =
+    OnceLock::new();
+
+const REMOTE_TASK_RETRY_DELAYS: [Duration; 12] = [
+    Duration::from_secs(2),
+    Duration::from_secs(60),
+    Duration::from_secs(2 * 60),
+    Duration::from_secs(4 * 60),
+    Duration::from_secs(8 * 60),
+    Duration::from_secs(16 * 60),
+    Duration::from_secs(32 * 60),
+    Duration::from_secs(64 * 60),
+    Duration::from_secs(128 * 60),
+    Duration::from_secs(256 * 60),
+    Duration::from_secs(512 * 60),
+    Duration::from_secs(1024 * 60),
+];
 
 pub fn set_process_started_at(started_at: DateTime<Utc>) {
     let _ = PROCESS_STARTED_AT.set(started_at);
+}
+
+#[derive(Debug, Default)]
+struct RemoteTaskFetchBackoff {
+    next_retry_at: Option<Instant>,
+    next_delay_index: usize,
+    last_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1020,26 +1044,42 @@ impl Backend {
                 .into_iter()
                 .map(|(machine_id, machine)| {
                     scope.spawn(move || {
+                        let label = machine_label(&machine);
+                        if let Some(error) = remote_task_fetch_backoff_message(&machine_id) {
+                            return MachineTasksView {
+                                machine_id,
+                                label,
+                                local: false,
+                                tasks: Vec::new(),
+                                error: Some(error),
+                            };
+                        }
                         let path = format!("/api/tasks?limit={limit}");
                         match remote_get_json::<Vec<crate::core::state::TaskLogEntry>>(
                             &machine,
                             &path,
                             Duration::from_secs(5),
                         ) {
-                            Ok(tasks) => MachineTasksView {
-                                machine_id,
-                                label: machine_label(&machine),
-                                local: false,
-                                tasks,
-                                error: None,
-                            },
-                            Err(err) => MachineTasksView {
-                                machine_id,
-                                label: machine_label(&machine),
-                                local: false,
-                                tasks: Vec::new(),
-                                error: Some(err.to_string()),
-                            },
+                            Ok(tasks) => {
+                                remote_task_fetch_succeeded(&machine_id);
+                                MachineTasksView {
+                                    machine_id,
+                                    label,
+                                    local: false,
+                                    tasks,
+                                    error: None,
+                                }
+                            }
+                            Err(err) => {
+                                let error = remote_task_fetch_failed(&machine_id, err.to_string());
+                                MachineTasksView {
+                                    machine_id,
+                                    label,
+                                    local: false,
+                                    tasks: Vec::new(),
+                                    error: Some(error),
+                                }
+                            }
                         }
                     })
                 })
@@ -1723,6 +1763,65 @@ fn machine_label(machine: &MachineConfig) -> String {
         return machine.host.trim().to_string();
     }
     machine.id.clone()
+}
+
+fn remote_task_fetch_cache() -> &'static Mutex<HashMap<String, RemoteTaskFetchBackoff>> {
+    REMOTE_TASK_FETCH_BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remote_task_fetch_backoff_message(machine_id: &str) -> Option<String> {
+    let now = Instant::now();
+    let cache = remote_task_fetch_cache().lock().ok()?;
+    let backoff = cache.get(machine_id)?;
+    let retry_at = backoff.next_retry_at?;
+    if now >= retry_at {
+        return None;
+    }
+    let wait = retry_at.saturating_duration_since(now);
+    let mut message = backoff
+        .last_error
+        .clone()
+        .unwrap_or_else(|| "peer task fetch failed".to_string());
+    message.push_str(&format!("; retrying tasks in {}", format_retry_delay(wait)));
+    Some(message)
+}
+
+fn remote_task_fetch_succeeded(machine_id: &str) {
+    if let Ok(mut cache) = remote_task_fetch_cache().lock() {
+        cache.remove(machine_id);
+    }
+}
+
+fn remote_task_fetch_failed(machine_id: &str, error: String) -> String {
+    let mut cache = match remote_task_fetch_cache().lock() {
+        Ok(cache) => cache,
+        Err(_) => return error,
+    };
+    let backoff = cache.entry(machine_id.to_string()).or_default();
+    let delay_index = backoff
+        .next_delay_index
+        .min(REMOTE_TASK_RETRY_DELAYS.len().saturating_sub(1));
+    let delay = REMOTE_TASK_RETRY_DELAYS[delay_index];
+    backoff.next_retry_at = Some(Instant::now() + delay);
+    backoff.next_delay_index = if delay_index + 1 >= REMOTE_TASK_RETRY_DELAYS.len() {
+        1
+    } else {
+        delay_index + 1
+    };
+    backoff.last_error = Some(error.clone());
+    format!("{error}; retrying tasks in {}", format_retry_delay(delay))
+}
+
+fn format_retry_delay(delay: Duration) -> String {
+    let secs = delay.as_secs();
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let minutes = secs / 60;
+    if secs % 60 == 0 {
+        return format!("{minutes}min");
+    }
+    format!("{}min {}s", minutes, secs % 60)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

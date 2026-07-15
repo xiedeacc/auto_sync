@@ -488,8 +488,12 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     try {
       await action();
       await _loadStatusOnly(force: true);
+      try {
+        runtimeStatus = await widget.api.getRuntimeStatus();
+      } catch (_) {}
       if (mounted) {
-        setState(() => message = '$label done');
+        final stillActive = _hasLiveRuntimeActivity(runtimeStatus);
+        setState(() => message = stillActive ? '' : '$label done');
       }
     } catch (error) {
       if (mounted) {
@@ -4749,8 +4753,11 @@ String _syncProgressLabel(Map<String, dynamic> runtime) {
 String _formatBytesPerSecond(int bytes) {
   if (bytes <= 0) return '';
   if (bytes < 1024) return '$bytes B/s';
-  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KiB/s';
-  return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MiB/s';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB/s';
+  if (bytes < 1024 * 1024 * 1024) {
+    return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB/s';
+  }
+  return '${(bytes / 1024 / 1024 / 1024).toStringAsFixed(1)} GB/s';
 }
 
 class _IssueSummary extends StatelessWidget {
@@ -7579,9 +7586,7 @@ class _StatusBar extends StatelessWidget {
         _str(transfer['destination']),
       );
       final file = _compactStatusPath(_str(transfer['rel_path'], '-'), 56);
-      final speed = _str(transfer['bytes_per_sec']).isEmpty
-          ? ''
-          : '${_str(transfer['bytes_per_sec'])} B/s';
+      final speed = _formatBytesPerSecond(_int(transfer['bytes_per_sec']));
       return [
         'Backing up',
         dst,
@@ -7601,15 +7606,23 @@ class _StatusBar extends StatelessWidget {
           : 'Scanning $current';
     }
     if (saving) return 'Saving config...';
-    if (message.isNotEmpty) return message;
     final syncing = _bool(runtimeStatus['syncing']);
     final phase = _str(
       runtimeStatus['sync_phase'],
       _str(runtimeStatus['phase']),
     );
     if (syncing) return 'Syncing ${phase.isEmpty ? '' : phase}'.trim();
+    if (message.isNotEmpty) return message;
     return 'Ready';
   }
+}
+
+bool _hasLiveRuntimeActivity(Map<String, dynamic> runtimeStatus) {
+  if (_map(runtimeStatus['transfer']).isNotEmpty) return true;
+  if (_map(runtimeStatus['scan']).isNotEmpty) return true;
+  if (_bool(runtimeStatus['syncing'])) return true;
+  final phase = _str(runtimeStatus['sync_phase'], _str(runtimeStatus['phase']));
+  return phase.isNotEmpty;
 }
 
 class Section extends StatelessWidget {
