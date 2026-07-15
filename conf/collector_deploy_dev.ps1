@@ -397,11 +397,12 @@ restart_if_exists() {
 log_unit_processes() {
     unit="$(unit_name "$1" 2>/dev/null || true)"
     [ -n "$unit" ] || return 0
+    enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
     active="$(systemctl is-active "$unit" 2>/dev/null || true)"
     main_pid="$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)"
     pids="$(systemctl show "$unit" -p ControlPID -p MainPID --value 2>/dev/null | awk '$1 != "" && $1 != "0" {print}' | paste -sd, - 2>/dev/null || true)"
     [ -n "$pids" ] || pids="$main_pid"
-    log "process $unit active=${active:-unknown} pid=${pids:-none}"
+    log "state $unit: enabled=${enabled:-unknown} active=${active:-unknown} pid=${pids:-none}"
 }
 stop_if_exists() {
     unit="$(unit_name "$1" 2>/dev/null || true)"
@@ -425,6 +426,7 @@ disable_if_exists() {
         systemctl stop "$unit" >/dev/null 2>&1 || true
         systemctl reset-failed "$unit" >/dev/null 2>&1 || true
         log "disabled+stopped $unit"
+        log_unit_processes "$unit"
     fi
 }
 
@@ -1106,9 +1108,13 @@ fi
 [ -d /etc/gitlab ] && chmod 700 /etc/gitlab 2>/dev/null || true
 ensure_gitlab_zfs_config
 if command -v gitlab-ctl >/dev/null 2>&1; then
-    gitlab-ctl reconfigure || log "WARN: gitlab reconfigure failed"
-    gitlab-ctl restart || log "WARN: gitlab restart failed"
-    gitlab-ctl status || true
+    gitlab_deploy_log=/var/log/auto_sync_gitlab_deploy.log
+    : > "$gitlab_deploy_log"
+    log "gitlab maintenance started; detailed output -> $gitlab_deploy_log"
+    gitlab-ctl reconfigure >>"$gitlab_deploy_log" 2>&1 || { log "WARN: gitlab reconfigure failed; see $gitlab_deploy_log"; tail -n 80 "$gitlab_deploy_log"; }
+    gitlab-ctl restart >>"$gitlab_deploy_log" 2>&1 || { log "WARN: gitlab restart failed; see $gitlab_deploy_log"; tail -n 80 "$gitlab_deploy_log"; }
+    gitlab-ctl status >>"$gitlab_deploy_log" 2>&1 || true
+    log "gitlab maintenance completed"
 fi
 
 mkdir -p /root/src/share/ubuntu
