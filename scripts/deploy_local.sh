@@ -158,19 +158,6 @@ ensure_flutter_web_environment() {
     echo "Use /root/src/software/flutter on dev or /opt/src/software/flutter on NAS." >&2
     exit 1
   fi
-  local legacy_roots=(
-    "$HOME/flutter"
-    "$HOME/src/software/flutter"
-    "/opt/flutter"
-  )
-  for legacy_flutter_root in "${legacy_roots[@]}"; do
-    if [[ ! -e "$flutter_root" && -d "$legacy_flutter_root" && ! -L "$legacy_flutter_root" && -x "$legacy_flutter_root/bin/flutter" ]]; then
-      echo "Moving Flutter SDK from $legacy_flutter_root to $flutter_root ..."
-      mkdir -p "$(dirname "$flutter_root")"
-      mv "$legacy_flutter_root" "$flutter_root"
-      break
-    fi
-  done
   if [[ -x "$flutter_root/bin/flutter" ]]; then
     export PATH="$flutter_root/bin:$PATH"
     return
@@ -256,15 +243,6 @@ install -m 0755 target/release/auto_sync bin/auto_sync
   "$INSTALL_DIR/data" \
   "$INSTALL_DIR/logs" \
   "$INSTALL_DIR/web"
-
-# Retire the old split layout (separate daemon + web service/binaries).
-"${SUDO[@]}" systemctl disable --now auto_sync_web.service 2>/dev/null || true
-"${SUDO[@]}" rm -f /etc/systemd/system/auto_sync_web.service
-"${SUDO[@]}" rm -f \
-  "$INSTALL_DIR/bin/auto_syncd" \
-  "$INSTALL_DIR/bin/auto_sync_web" \
-  "$INSTALL_DIR/bin/auto_sync_gui" \
-  "$INSTALL_DIR/bin/auto_syncctl"
 
 install_if_different 0755 bin/auto_sync "$INSTALL_DIR/bin/auto_sync"
 "${SUDO[@]}" rm -rf "$INSTALL_DIR/web"

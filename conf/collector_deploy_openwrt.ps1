@@ -44,8 +44,6 @@ $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
 $deployExcludePaths = @(
-    '/usr/local/shadowsocks/bin/sslocal-master',
-    '/usr/local/shadowsocks/bin/sslocal-master-redir-nft.sh',
     '/usr/local/shadowsocks/data/source',
     '/usr/local/shadowsocks/data/temp/dns_cache.jsonl',
     '/usr/local/shadowsocks/data/temp/domain_conflicts.jsonl',
@@ -275,10 +273,8 @@ mkdir -p /etc/init.d /etc/sysctl.d /etc/config /usr/local
 /etc/init.d/shadowsocks stop 2>/dev/null || true
 /etc/init.d/shadowsocks-rust disable 2>/dev/null || true
 /etc/init.d/shadowsocks-rust stop 2>/dev/null || true
-killall sslocal sslocal-master 2>/dev/null || true
+killall sslocal 2>/dev/null || true
 rm -rf \
-  /usr/local/shadowsocks/bin/sslocal-master \
-  /usr/local/shadowsocks/bin/sslocal-master-redir-nft.sh \
   /usr/local/shadowsocks/data/source \
   /usr/local/shadowsocks/data/temp/dns_cache.jsonl \
   /usr/local/shadowsocks/data/temp/domain_conflicts.jsonl \
@@ -486,11 +482,9 @@ ensure_ubus || exit 1
 sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
 for f in /etc/sysctl.d/*.conf; do [ -f $f ] && sysctl -p $f >/dev/null 2>&1 || true; done
 
-# shadowsocks (sslocal) on; legacy shadowsocks-rust (sslocal-master) present
-# for collection/round-trip but disabled and stopped.
+# shadowsocks (sslocal) on; shadowsocks-rust disabled and stopped.
 /etc/init.d/shadowsocks-rust disable 2>/dev/null || true
 /etc/init.d/shadowsocks-rust stop 2>/dev/null || true
-killall sslocal-master 2>/dev/null || true
 ensure_ubus || exit 1
 
 [ -x /etc/init.d/shadowsocks ] || { echo "!! missing /etc/init.d/shadowsocks" >&2; exit 1; }

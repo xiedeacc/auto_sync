@@ -14,32 +14,7 @@ BINARY_DIR="${BINARY_DIR:-}"
 TARGET="${TARGET:-aarch64-unknown-linux-musl}"
 OUT_DIR="${OUT_DIR:-bin/openwrt/aarch64}"
 OPENWRT_TOOLCHAIN="${OPENWRT_TOOLCHAIN:-}"
-
-TOOLCHAIN_SEARCH_ROOTS=(
-  /root/src/software/openwrt
-  /root/src/software
-  /opt/src/software/openwrt
-  /opt
-)
-
-auto_detect_toolchain() {
-  local root dir
-  for root in "${TOOLCHAIN_SEARCH_ROOTS[@]}"; do
-    [[ -d "$root" ]] || continue
-    dir="$(find "$root" -maxdepth 3 -type d \
-      -name 'toolchain-aarch64_*_musl' \
-      -exec ls -dt {} + 2>/dev/null | head -1)"
-    if [[ -n "$dir" && -x "$dir/bin/aarch64-openwrt-linux-musl-gcc" ]]; then
-      printf '%s\n' "$dir"
-      return
-    fi
-    dir="$root/aarch64-linux-musl-cross"
-    if [[ -x "$dir/bin/aarch64-linux-musl-gcc" ]]; then
-      printf '%s\n' "$dir"
-      return
-    fi
-  done
-}
+DEFAULT_OPENWRT_TOOLCHAIN="/root/src/software/openwrt"
 
 apply_openwrt_toolchain() {
   local tc_root="$1"
@@ -70,15 +45,12 @@ build_openwrt_binaries() {
       exit 1
     fi
     apply_openwrt_toolchain "$OPENWRT_TOOLCHAIN"
+  elif [[ -d "$DEFAULT_OPENWRT_TOOLCHAIN/bin" ]]; then
+    apply_openwrt_toolchain "$DEFAULT_OPENWRT_TOOLCHAIN"
   else
-    detected="$(auto_detect_toolchain)"
-    if [[ -n "$detected" ]]; then
-      apply_openwrt_toolchain "$detected"
-    else
-      echo "Missing aarch64 musl C compiler." >&2
-      echo "Set OPENWRT_TOOLCHAIN=/path/to/toolchain or install the OpenWrt toolchain under /root/src/software/openwrt." >&2
-      exit 1
-    fi
+    echo "Missing OpenWrt toolchain: $DEFAULT_OPENWRT_TOOLCHAIN/bin" >&2
+    echo "Set OPENWRT_TOOLCHAIN=/path/to/toolchain or install the OpenWrt toolchain under $DEFAULT_OPENWRT_TOOLCHAIN." >&2
+    exit 1
   fi
 
   cargo build --release --target "$TARGET" \
@@ -175,8 +147,7 @@ fi
 
 ssh -p "$PORT" "$target" "mkdir -p '$INSTALL_DIR/bin' '$INSTALL_DIR/conf' '$INSTALL_DIR/conf/state' '$INSTALL_DIR/logs'"
 
-# Stop and retire the old split services/binaries.
-ssh -p "$PORT" "$target" "/etc/init.d/auto_sync stop >/dev/null 2>&1 || true; /etc/init.d/auto_sync_web stop >/dev/null 2>&1 || true; /etc/init.d/auto_sync_web disable >/dev/null 2>&1 || true; rm -f /etc/init.d/auto_sync_web ${INSTALL_DIR}/bin/auto_syncd ${INSTALL_DIR}/bin/auto_sync_web ${INSTALL_DIR}/bin/auto_sync_gui ${INSTALL_DIR}/bin/auto_syncctl"
+ssh -p "$PORT" "$target" "/etc/init.d/auto_sync stop >/dev/null 2>&1 || true"
 
 scp -O -P "$PORT" "$BINARY_DIR/auto_sync" "${target}:${INSTALL_DIR}/bin/auto_sync"
 
