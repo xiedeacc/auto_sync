@@ -1184,8 +1184,8 @@ class _HeaderTitle extends StatelessWidget {
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(
-          fontSize: 18,
-          fontWeight: FontWeight.w800,
+          fontSize: 13,
+          fontWeight: FontWeight.w400,
           color: Palette.text,
         ),
       ),
