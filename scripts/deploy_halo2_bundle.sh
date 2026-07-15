@@ -11,8 +11,7 @@ Options:
   --install-dir DIR   Halo binary install directory (default: /opt/usr/local/halo)
   --data-dir DIR      Halo working/data directory (default: /root/.halo2)
   --service NAME      systemd service name (default: halo2)
-  --restore-db        Restore the latest bundled halodb dump even if halodb exists
-  --skip-db-restore   Never restore the bundled database dump
+  --skip-db-restore   Do not restore the bundled database dump
   -h, --help          Show this help
 EOF
 }
@@ -20,7 +19,7 @@ EOF
 install_dir=/opt/usr/local/halo
 data_dir=/root/.halo2
 service_name=halo2
-restore_db=auto
+restore_db=force
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -35,10 +34,6 @@ while [ "$#" -gt 0 ]; do
         --service)
             service_name="${2:?missing --service value}"
             shift 2
-            ;;
-        --restore-db)
-            restore_db=force
-            shift
             ;;
         --skip-db-restore)
             restore_db=skip
@@ -92,6 +87,54 @@ if unit_exists; then
     systemctl stop "$service_name" || true
 fi
 
+mysql_cmd=()
+mysql_ready=0
+detect_mysql_cmd() {
+    if ! command -v mysql >/dev/null 2>&1; then
+        return 1
+    fi
+    if mysql -uroot -NBe 'SELECT 1' >/dev/null 2>&1; then
+        mysql_cmd=(mysql -uroot)
+        return 0
+    fi
+    if mysql -NBe 'SELECT 1' >/dev/null 2>&1; then
+        mysql_cmd=(mysql)
+        return 0
+    fi
+    if [ -r /etc/mysql/debian.cnf ] && mysql --defaults-file=/etc/mysql/debian.cnf -NBe 'SELECT 1' >/dev/null 2>&1; then
+        mysql_cmd=(mysql --defaults-file=/etc/mysql/debian.cnf)
+        return 0
+    fi
+    return 1
+}
+
+mysql_exec() {
+    "${mysql_cmd[@]}" "$@"
+}
+
+ensure_mysql_access() {
+    systemctl start mysql 2>/dev/null || systemctl start mysqld 2>/dev/null || true
+    if detect_mysql_cmd; then
+        mysql_ready=1
+        return 0
+    fi
+    log "ERROR: cannot connect to local MySQL as root. On Ubuntu 24.04/26.04, install mysql-server and keep local root socket auth available before running this script."
+    return 1
+}
+
+ensure_halo_database_user() {
+    mysql_exec <<'SQL'
+CREATE DATABASE IF NOT EXISTS halodb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'tiger'@'localhost' IDENTIFIED BY 'qh6288QHW@';
+CREATE USER IF NOT EXISTS 'tiger'@'127.0.0.1' IDENTIFIED BY 'qh6288QHW@';
+ALTER USER 'tiger'@'localhost' IDENTIFIED BY 'qh6288QHW@';
+ALTER USER 'tiger'@'127.0.0.1' IDENTIFIED BY 'qh6288QHW@';
+GRANT ALL PRIVILEGES ON halodb.* TO 'tiger'@'localhost';
+GRANT ALL PRIVILEGES ON halodb.* TO 'tiger'@'127.0.0.1';
+FLUSH PRIVILEGES;
+SQL
+}
+
 log "install jar to $install_dir"
 mkdir -p "$install_dir"
 cp -a "$jar_path" "$install_dir/$jar_name"
@@ -130,22 +173,23 @@ if [ -d "$backup_dir" ]; then
     latest_dump="$(find "$backup_dir" -maxdepth 1 -type f \( -name 'halodb*.sql' -o -name 'halodb*.sql.gz' \) | sort -V | tail -1)"
 fi
 
+if [ "$restore_db" != "skip" ]; then
+    ensure_mysql_access
+    log "initialize Halo2 MySQL database and users"
+    ensure_halo_database_user
+fi
+
 if [ "$restore_db" != "skip" ] && [ -n "$latest_dump" ]; then
-    db_exists=0
-    if command -v mysql >/dev/null 2>&1; then
-        mysql -uroot -NBe "SHOW DATABASES LIKE 'halodb'" 2>/dev/null | grep -qx halodb && db_exists=1 || true
-    fi
-    if [ "$restore_db" = "force" ] || [ "$db_exists" -eq 0 ]; then
-        log "restore halodb from $latest_dump"
-        systemctl start mysql 2>/dev/null || true
-        if [[ "$latest_dump" == *.gz ]]; then
-            gzip -dc "$latest_dump" | mysql -uroot
-        else
-            mysql -uroot < "$latest_dump"
-        fi
+    log "overwrite halodb from $latest_dump"
+    mysql_exec -e "DROP DATABASE IF EXISTS halodb; CREATE DATABASE halodb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    if [[ "$latest_dump" == *.gz ]]; then
+        gzip -dc "$latest_dump" | mysql_exec
     else
-        log "skip database restore: halodb already exists"
+        mysql_exec < "$latest_dump"
     fi
+    ensure_halo_database_user
+elif [ "$restore_db" != "skip" ]; then
+    log "WARN: no bundled halodb dump found; database user was initialized only"
 fi
 
 log "start $service_name"
