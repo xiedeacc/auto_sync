@@ -458,8 +458,9 @@ disable_if_exists() {
 
 ensure_gitlab_running_quietly() {
     if command -v gitlab-ctl >/dev/null 2>&1; then
+        systemctl start gitlab-runsvdir.service >/dev/null 2>&1 || systemctl start gitlab-runsvdir >/dev/null 2>&1 || true
         gitlab-ctl start >>/var/log/auto_sync_gitlab_deploy.log 2>&1 || true
-        for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        for _ in $(seq 1 60); do
             gitlab-ctl status >>/var/log/auto_sync_gitlab_deploy.log 2>&1 && return 0
             sleep 5
         done
