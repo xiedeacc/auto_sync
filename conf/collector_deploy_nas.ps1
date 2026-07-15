@@ -1306,73 +1306,8 @@ if command -v gitlab-ctl >/dev/null 2>&1; then
     done
 fi
 
-mkdir -p /root/src/share/ubuntu
-if [ ! -f /root/src/share/ubuntu/backup_pg.sh ]; then
-    cat > /root/src/share/ubuntu/backup_pg.sh <<'EOF_BACKUP_PG'
-#!/bin/bash
-set -u
-BACKUP_DIR="/zfs/backup/pg_backup"
-DATE=$(date +%Y%m%d_%H%M%S)
-BACKUP_FILE="$BACKUP_DIR/pg_full_backup_$DATE.sql"
-LOG_FILE="/var/log/pg_backup.log"
-
-log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S'): $1" | tee -a "$LOG_FILE"
-}
-
-mkdir -p "$BACKUP_DIR"
-chown -R postgres:postgres "$BACKUP_DIR" 2>/dev/null || true
-log_message "Starting PostgreSQL backup..."
-
-if su - postgres -c "/usr/bin/pg_dumpall > '$BACKUP_FILE'"; then
-    if [[ -s "$BACKUP_FILE" ]]; then
-        log_message "Backup successful: $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1))"
-        find "$BACKUP_DIR" -name "pg_full_backup_*.sql" -mtime +7 -delete
-        log_message "Cleaned up old backups (kept last 7 days)"
-        exit 0
-    fi
-    log_message "ERROR: Backup file is empty or was not created"
-    rm -f "$BACKUP_FILE"
-    exit 1
-fi
-log_message "ERROR: pg_dumpall command failed"
-rm -f "$BACKUP_FILE"
-exit 1
-EOF_BACKUP_PG
-fi
-if [ ! -f /root/src/share/ubuntu/backup_mysql.sh ]; then
-    cat > /root/src/share/ubuntu/backup_mysql.sh <<'EOF_BACKUP_MYSQL'
-#!/bin/bash
-set -u
-BACKUP_DIR="/zfs/backup/mysql_backup"
-DATE=$(date +%Y%m%d_%H%M%S)
-BACKUP_FILE="$BACKUP_DIR/mysql_full_backup_$DATE.sql"
-LOG_FILE="/var/log/mysql_backup.log"
-
-log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S'): $1" | tee -a "$LOG_FILE"
-}
-
-mkdir -p "$BACKUP_DIR"
-log_message "Starting MySQL backup..."
-
-if /usr/bin/mysqldump -uroot --default-character-set=utf8mb4 -q --lock-all-tables --flush-logs -E -R --triggers --all-databases > "$BACKUP_FILE"; then
-    if [[ -s "$BACKUP_FILE" ]]; then
-        log_message "Backup successful: $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1))"
-        find "$BACKUP_DIR" -name "mysql_full_backup_*.sql" -mtime +7 -delete
-        log_message "Cleaned up old backups (kept last 7 days)"
-        exit 0
-    fi
-    log_message "ERROR: Backup file is empty or was not created"
-    rm -f "$BACKUP_FILE"
-    exit 1
-fi
-log_message "ERROR: mysqldump command failed"
-rm -f "$BACKUP_FILE"
-exit 1
-EOF_BACKUP_MYSQL
-fi
-chmod +x /root/src/share/ubuntu/backup_pg.sh /root/src/share/ubuntu/backup_mysql.sh
+[ -f /root/src/share/nas/backup_pg.sh ] && chmod +x /root/src/share/nas/backup_pg.sh
+[ -f /root/src/share/nas/backup_mysql.sh ] && chmod +x /root/src/share/nas/backup_mysql.sh
 
 wake_zfs() {
     if [ ! -d /zfs ]; then
@@ -2683,8 +2618,8 @@ for s in mysql postgresql redis-server immich-ml auto_sync halo2 immich tbox_cli
     restart_if_exists "$s"
 done
 
-(crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_pg.sh'; echo '0 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_pg.sh > /dev/null 2>&1') | crontab -
-(crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_mysql.sh'; echo '5 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_mysql.sh > /dev/null 2>&1') | crontab -
+(crontab -l 2>/dev/null | grep -v -E '/root/src/share/(ubuntu/backup_pg|nas/backup_pg)\.sh'; echo '0 10 * * 6 /bin/bash /root/src/share/nas/backup_pg.sh > /dev/null 2>&1') | crontab -
+(crontab -l 2>/dev/null | grep -v -E '/root/src/share/(ubuntu/backup_mysql|nas/backup_mysql)\.sh'; echo '5 10 * * 6 /bin/bash /root/src/share/nas/backup_mysql.sh > /dev/null 2>&1') | crontab -
 
 print_final_states() {
     echo '--- final states ---'
