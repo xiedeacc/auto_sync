@@ -752,6 +752,7 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     await showDialog<void>(
       context: context,
       builder: (context) => _DestinationInfoDialog(
+        api: widget.api,
         source: source,
         destination: destination,
         status: _statusFor(sourceId, destinationId),
@@ -4392,8 +4393,9 @@ class _FileListEntryLabel extends StatelessWidget {
   }
 }
 
-class _DestinationInfoDialog extends StatelessWidget {
+class _DestinationInfoDialog extends StatefulWidget {
   const _DestinationInfoDialog({
+    required this.api,
     required this.source,
     required this.destination,
     required this.status,
@@ -4404,6 +4406,7 @@ class _DestinationInfoDialog extends StatelessWidget {
     required this.error,
   });
 
+  final AutoSyncApi api;
   final Map<String, dynamic> source;
   final Map<String, dynamic> destination;
   final Map<String, dynamic>? status;
@@ -4414,7 +4417,87 @@ class _DestinationInfoDialog extends StatelessWidget {
   final String error;
 
   @override
+  State<_DestinationInfoDialog> createState() => _DestinationInfoDialogState();
+}
+
+class _DestinationInfoDialogState extends State<_DestinationInfoDialog> {
+  late Map<String, dynamic>? status = widget.status;
+  late Map<String, dynamic> runtimeStatus = widget.runtimeStatus;
+  late Map<String, dynamic> syncActivity = widget.syncActivity;
+  late Map<String, dynamic>? task = widget.task;
+  late Map<String, dynamic> scanReport = widget.scanReport;
+  late String error = widget.error;
+  Timer? refreshTimer;
+  int refreshTick = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    refreshTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _refresh(),
+    );
+  }
+
+  @override
+  void dispose() {
+    refreshTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _refresh() async {
+    final sourceId = _str(widget.source['id']);
+    final destinationId = _str(widget.destination['id']);
+    Map<String, dynamic>? nextStatus = status;
+    Map<String, dynamic>? nextTask = task;
+    Map<String, dynamic>? nextReport = scanReport;
+    String nextError = error;
+    try {
+      final nextRuntime = await widget.api.getRuntimeStatus();
+      final nextActivity = await widget.api.getSyncActivity();
+      refreshTick += 1;
+      if (refreshTick == 1 || refreshTick % 5 == 0) {
+        try {
+          final rows = await widget.api.getStatus();
+          nextStatus = _map(
+            rows.firstWhere(
+              (item) =>
+                  _str(item['source_id']) == sourceId &&
+                  _str(item['destination_id']) == destinationId,
+              orElse: () => <String, dynamic>{},
+            ),
+          );
+        } catch (_) {}
+        try {
+          nextTask = _newestTaskFor(
+            await widget.api.getAllTasks(limit: 50),
+            sourceId,
+            destinationId,
+          );
+        } catch (_) {}
+        try {
+          nextReport = await widget.api.scanReport(sourceId, destinationId);
+          nextError = '';
+        } catch (err) {
+          nextError = '$err';
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        runtimeStatus = nextRuntime;
+        syncActivity = nextActivity;
+        status = nextStatus;
+        task = nextTask;
+        scanReport = nextReport ?? {};
+        error = nextError;
+      });
+    } catch (_) {}
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final source = widget.source;
+    final destination = widget.destination;
     final sourceId = _str(source['id']);
     final destinationId = _str(destination['id']);
     final runtime = _runtimeForDestination(
@@ -4440,7 +4523,7 @@ class _DestinationInfoDialog extends StatelessWidget {
           ),
         ].join('  ->  '),
       ),
-      MapEntry('Status', _destinationStatusText(status)),
+      MapEntry('Status', _infoStatusLabel(status, runtime, transfer, scan)),
       MapEntry('Cycle', _cycleDisplay(status)),
       MapEntry('Type', _infoTypeLabel(source, destination, runtime, task)),
       MapEntry('Phase', _infoPhaseLabel(runtime, transfer, scan, task)),
@@ -4540,6 +4623,25 @@ String _destinationStatusText(Map<String, dynamic>? status) {
   final value = _str(status['status'], 'unknown');
   final reason = _str(status['status_reason']);
   return reason.isEmpty ? value : '$value: $reason';
+}
+
+String _infoStatusLabel(
+  Map<String, dynamic>? status,
+  Map<String, dynamic> runtime,
+  Map<String, dynamic> transfer,
+  Map<String, dynamic> scan,
+) {
+  if (transfer.isNotEmpty) return 'syncing: transferring';
+  if (scan.isNotEmpty) {
+    return _str(scan['kind']) == 'compare'
+        ? 'syncing: comparing'
+        : 'syncing: scanning';
+  }
+  final phase = _str(runtime['sync_phase'], _str(runtime['phase']));
+  if (_bool(runtime['syncing'])) {
+    return phase.isEmpty ? 'syncing' : 'syncing: ${_phaseLabel(phase)}';
+  }
+  return _destinationStatusText(status);
 }
 
 Map<String, dynamic> _runtimeForDestination(
