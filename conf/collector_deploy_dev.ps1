@@ -1111,10 +1111,21 @@ if command -v gitlab-ctl >/dev/null 2>&1; then
     gitlab_deploy_log=/var/log/auto_sync_gitlab_deploy.log
     : > "$gitlab_deploy_log"
     log "gitlab maintenance started; detailed output -> $gitlab_deploy_log"
-    gitlab-ctl reconfigure >>"$gitlab_deploy_log" 2>&1 || { log "WARN: gitlab reconfigure failed; see $gitlab_deploy_log"; tail -n 80 "$gitlab_deploy_log"; }
-    gitlab-ctl restart >>"$gitlab_deploy_log" 2>&1 || { log "WARN: gitlab restart failed; see $gitlab_deploy_log"; tail -n 80 "$gitlab_deploy_log"; }
-    gitlab-ctl status >>"$gitlab_deploy_log" 2>&1 || true
-    log "gitlab maintenance completed"
+    gitlab_ok=1
+    gitlab-ctl reconfigure >>"$gitlab_deploy_log" 2>&1 || gitlab_ok=0
+    gitlab-ctl restart >>"$gitlab_deploy_log" 2>&1 || gitlab_ok=0
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        if gitlab-ctl status >>"$gitlab_deploy_log" 2>&1; then
+            gitlab_ok=1
+            break
+        fi
+        sleep 5
+    done
+    if [ "$gitlab_ok" -eq 1 ]; then
+        log "gitlab maintenance completed"
+    else
+        log "WARN: gitlab maintenance did not reach healthy status; see $gitlab_deploy_log"
+    fi
 fi
 
 mkdir -p /root/src/share/ubuntu
