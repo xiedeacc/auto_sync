@@ -9,7 +9,7 @@ use axum::extract::Query;
 use axum::extract::State as AxumState;
 use axum::http::{Request, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -68,9 +68,6 @@ async fn require_peer_token(req: Request<axum::body::Body>, next: Next) -> Respo
 pub fn router(backend: Backend) -> Router {
     Router::new()
         .route("/", get(index))
-        .route("/legacy", get(legacy_index))
-        .route("/main.js", get(main_js))
-        .route("/styles.css", get(styles_css))
         .route("/api/config", get(api_get_config).post(api_save_config))
         .route(
             "/api/config/delegated-source-groups",
@@ -252,22 +249,18 @@ pub async fn serve(backend: Backend, port: u16) -> Result<()> {
     Ok(())
 }
 
-// The frontend assets are baked into the binary and change on every deploy;
-// no-store keeps browsers from serving a stale
-// main.js/styles.css after an update.
+// The Flutter frontend assets change on every deploy; no-store keeps browsers
+// from serving a stale Flutter web bundle after an update.
 const NO_STORE: &str = "no-store";
 
 async fn index() -> Response {
     if let Some(response) = flutter_web_response("index.html") {
         return response;
     }
-    legacy_index().await
-}
-
-async fn legacy_index() -> Response {
     (
+        StatusCode::SERVICE_UNAVAILABLE,
         [(header::CACHE_CONTROL, NO_STORE)],
-        Html(include_str!("../ui/index.html")),
+        "Flutter web UI is not built. Run the deployment script to build flutter/auto_sync_gui/build/web.",
     )
         .into_response()
 }
@@ -376,28 +369,6 @@ fn content_type_for_path(path: &Path) -> &'static str {
         "woff2" => "font/woff2",
         _ => "application/octet-stream",
     }
-}
-
-async fn main_js() -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "application/javascript"),
-            (header::CACHE_CONTROL, NO_STORE),
-        ],
-        include_str!("../ui/main.js"),
-    )
-        .into_response()
-}
-
-async fn styles_css() -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "text/css"),
-            (header::CACHE_CONTROL, NO_STORE),
-        ],
-        include_str!("../ui/styles.css"),
-    )
-        .into_response()
 }
 
 async fn api_get_config(

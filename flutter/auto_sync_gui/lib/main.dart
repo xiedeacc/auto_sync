@@ -5582,10 +5582,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
           loading = false;
           message = '';
         });
-        if (nextActiveDeployIndexes.isNotEmpty ||
-            _bool(nextDeployStatus['running'])) {
-          _startDeployPolling();
-        }
+        _startDeployPolling();
         if (nextActiveRunIndexes.isNotEmpty || _bool(nextStatus['running'])) {
           _startRunPolling();
         }
@@ -5828,32 +5825,24 @@ class _CollectorDialogState extends State<_CollectorDialog> {
 
   Future<void> _refreshDeployStatus() async {
     try {
-      final indexes = activeDeployIndexes.toList();
-      if (indexes.isEmpty) {
-        deployTimer?.cancel();
-        deployTimer = null;
-        return;
-      }
+      final indexes = List<int>.generate(hosts.length, (index) => index);
       final states = <int, Map<String, dynamic>>{};
       for (final index in indexes) {
         states[index] = await widget.api.collectorDeployStatus(index: index);
       }
       if (!mounted) return;
       setState(() {
+        activeDeployIndexes.clear();
         for (final entry in states.entries) {
-          deployStatus = entry.value;
           hostDeployStatuses[entry.key] = Map<String, dynamic>.from(
             entry.value,
           );
-          if (!_bool(entry.value['running'])) {
-            activeDeployIndexes.remove(entry.key);
+          if (_bool(entry.value['running'])) {
+            activeDeployIndexes.add(entry.key);
+            deployStatus = entry.value;
           }
         }
       });
-      if (activeDeployIndexes.isEmpty) {
-        deployTimer?.cancel();
-        deployTimer = null;
-      }
     } catch (_) {}
   }
 
