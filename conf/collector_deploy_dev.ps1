@@ -983,6 +983,9 @@ EOF_IMMICH_ML_ENV
         if [ -f "$repo/$script" ]; then
             chmod +x "$repo/$script" 2>/dev/null || true
             immich_node_home="${IMMICH_NODE_HOME:-/root/src/software/tools/nvm/versions/node/v24.18.0}"
+            immich_node_bin="${IMMICH_NODE_BIN:-$immich_node_home/bin/node}"
+            immich_npm_bin="${IMMICH_NPM_BIN:-$(command -v npm || true)}"
+            immich_pnpm_bin="${IMMICH_PNPM_BIN:-$(command -v pnpm || true)}"
             chmod -R a+rX "$immich_node_home" /root/src/software/tools/uv-python 2>/dev/null || true
             (cd "$repo" &&
                 VERSION="${IMMICH_VERSION:-deploy}" \
@@ -991,6 +994,9 @@ EOF_IMMICH_ML_ENV
                 UPLOAD_DIR=/usr/local/immich/upload \
                 TOOL_ROOT=/root/src/software/tools \
                 NODE_HOME="$immich_node_home" \
+                NODE_BIN="$immich_node_bin" \
+                NPM_BIN="$immich_npm_bin" \
+                PNPM_BIN="$immich_pnpm_bin" \
                 RUN_USER=root \
                 RUN_GROUP=root \
                 UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/root/src/software/tools/uv-python}" \
@@ -1444,7 +1450,7 @@ for d in backups encoded-video library profile thumbs upload; do
     touch "/usr/local/immich/upload/$d/.immich"
 done
 chown root:root /usr/local/immich/upload /usr/local/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
-deploy_immich_from_git || log "WARN: immich deploy from git failed"
+deploy_immich_from_git || { log "ERROR: immich deploy from git failed"; exit 1; }
 rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
 if [ "$zfs_woken" = "1" ]; then
     standby_zfs
