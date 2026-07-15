@@ -440,7 +440,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich tbox_server tbox_client tbox-logrotate.timer rblog rblog-backup.timer nginx cron shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server immich-ml auto_sync halo2 immich tbox_server tbox_client tbox-logrotate.timer rblog rblog-backup.timer nginx cron shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -454,6 +454,17 @@ disable_if_exists() {
         log "disabled+stopped $unit"
         log_unit_processes "$unit"
     fi
+}
+
+ensure_gitlab_running_quietly() {
+    if command -v gitlab-ctl >/dev/null 2>&1; then
+        gitlab-ctl start >>/var/log/auto_sync_gitlab_deploy.log 2>&1 || true
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            gitlab-ctl status >>/var/log/auto_sync_gitlab_deploy.log 2>&1 && return 0
+            sleep 5
+        done
+    fi
+    return 1
 }
 
 normalize_deploy_permissions() {
@@ -2702,8 +2713,10 @@ if ! pg_isready -q; then
     required_failed=1
 fi
 if ! command -v gitlab-ctl >/dev/null 2>&1 || ! gitlab-ctl status >/dev/null 2>&1; then
-    log "ERROR: required service gitlab is not active"
-    required_failed=1
+    if ! ensure_gitlab_running_quietly; then
+        log "ERROR: required GitLab service is not active"
+        required_failed=1
+    fi
 fi
 for url in https://code.xiedeacc.com https://unlock-music.xiedeacc.com https://halo.xiedeacc.com https://immich.xiedeacc.com https://blog.xiedeacc.com https://rblog.xiedeacc.com; do
     if ! wait_for_https_200 "$url"; then
