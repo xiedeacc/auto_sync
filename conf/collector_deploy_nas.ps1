@@ -732,12 +732,6 @@ ensure_postgresql_cluster() {
     if [ -n "$source_major" ] && [ -d "/etc/postgresql/$source_major/main" ]; then
         cp -a "/etc/postgresql/$source_major/main/." "$source_copy/"
     fi
-    for old_dir in /etc/postgresql/[0-9]*; do
-        [ -d "$old_dir" ] || continue
-        old_major="${old_dir##*/}"
-        [ "$old_major" = "$pg_major" ] && continue
-        mv "$old_dir" "/etc/postgresql/.auto_sync_saved_${old_major}_$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    done
     mkdir -p "/var/lib/postgresql/$pg_major"
     chown postgres:postgres /var/lib/postgresql "/var/lib/postgresql/$pg_major" 2>/dev/null || true
     chmod 755 /var/lib/postgresql "/var/lib/postgresql/$pg_major" 2>/dev/null || true
@@ -2479,17 +2473,6 @@ for d in backups encoded-video library profile thumbs upload; do
 done
 migrate_root_home_to_opt() {
     mkdir -p /opt/user/root
-
-    # Historical Halo state lived under tiger; merge it into root before the
-    # generic /root spillover pass creates /root/.halo2.
-    for src in /home/tiger/.halo2 /opt/user/tiger/.halo2; do
-        [ -e "$src" ] || [ -L "$src" ] || continue
-        mkdir -p /opt/user/root/.halo2
-        if [ -d "$src" ]; then
-            cp -aL "$src"/. /opt/user/root/.halo2/ 2>/dev/null || true
-        fi
-        rm -rf "$src"
-    done
 
     shopt -s dotglob nullglob
     for src in /root/*; do

@@ -165,10 +165,6 @@ function Copy-ReleaseBinaries {
             Copy-Item -LiteralPath $source -Destination $target -Force
         }
     }
-    # Remove stale binaries from the previous multi-binary layout.
-    foreach ($stale in @("auto_syncd.exe", "auto_syncctl.exe", "auto_sync_web.exe")) {
-        Remove-Item -LiteralPath (Join-Path $BinDir $stale) -Force -ErrorAction SilentlyContinue
-    }
 }
 
 function Get-FlutterExe {
@@ -239,7 +235,7 @@ function Copy-FlutterGuiBinaries {
 }
 
 function Stop-AutoSyncProcesses {
-    foreach ($name in @("auto_sync", "auto_syncd", "auto_sync_web", "auto_sync_gui")) {
+    foreach ($name in @("auto_sync", "auto_sync_gui")) {
         Get-Process -Name $name -ErrorAction SilentlyContinue |
             Stop-Process -Force -ErrorAction SilentlyContinue
     }
@@ -675,22 +671,6 @@ function Ensure-AuthorizedKey {
     }
 }
 
-function Disable-AutoSyncDaemonServiceIfPossible {
-    $service = Get-Service -Name "auto_syncd" -ErrorAction SilentlyContinue
-    if (-not $service) {
-        return $null
-    }
-    if (-not (Test-IsAdministrator)) {
-        Write-Warning "Existing auto_syncd Windows service is still registered. Run this script once as Administrator to disable the old service."
-        return "requires-admin"
-    }
-    if ($service.Status -ne "Stopped") {
-        Stop-Service -Name "auto_syncd" -Force -ErrorAction SilentlyContinue
-    }
-    & sc.exe config auto_syncd start= disabled | Out-Null
-    "disabled"
-}
-
 function Ensure-AutoSyncStartup {
     param(
         [string]$BinDir
@@ -706,8 +686,6 @@ function Ensure-AutoSyncStartup {
 
     $startupDir = [Environment]::GetFolderPath("Startup")
     if (-not [string]::IsNullOrWhiteSpace($startupDir)) {
-        Remove-Item -LiteralPath (Join-Path $startupDir "auto_syncd-start.vbs") -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath (Join-Path $startupDir "auto_sync-start.vbs") -Force -ErrorAction SilentlyContinue
         Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-backend-start.vbs") `
             -WorkingDirectory $BinDir `
             -Executable $autoSyncExe `
@@ -809,7 +787,6 @@ else {
 $pathScope = if ($useMachinePath) { "Machine" } else { "User" }
 Add-PathEntries -Scope $pathScope -Paths @($openSshBinForPath, $binDir)
 $authorizedKeyResult = Ensure-AuthorizedKey -PublicKeyFile $AuthorizedKeyFile
-$disabledService = Disable-AutoSyncDaemonServiceIfPossible
 $startupResult = $null
 if ($ensureStartup) {
     $startupResult = Ensure-AutoSyncStartup -BinDir $binDir
@@ -830,9 +807,6 @@ if ($sshResult) {
 }
 else {
     Write-Host "sshd setup skipped by -SkipSshd"
-}
-if ($disabledService) {
-    Write-Host "auto_syncd service: $disabledService"
 }
 if ($startupResult) {
     Write-Host "auto_sync startup launcher: $($startupResult.Launcher)"

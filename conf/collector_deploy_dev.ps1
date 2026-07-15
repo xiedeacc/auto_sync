@@ -615,12 +615,6 @@ ensure_postgresql_cluster() {
     if [ -n "$source_major" ] && [ -d "/etc/postgresql/$source_major/main" ]; then
         cp -a "/etc/postgresql/$source_major/main/." "$source_copy/"
     fi
-    for old_dir in /etc/postgresql/[0-9]*; do
-        [ -d "$old_dir" ] || continue
-        old_major="${old_dir##*/}"
-        [ "$old_major" = "$pg_major" ] && continue
-        mv "$old_dir" "/etc/postgresql/.auto_sync_saved_${old_major}_$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    done
     mkdir -p "/var/lib/postgresql/$pg_major"
     chown postgres:postgres /var/lib/postgresql "/var/lib/postgresql/$pg_major" 2>/dev/null || true
     chmod 755 /var/lib/postgresql "/var/lib/postgresql/$pg_major" 2>/dev/null || true
@@ -1440,30 +1434,10 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
-migrate_halo_root_home() {
+ensure_halo_root_home() {
     for name in .halo2; do
         dest="/root/$name"
-        if [ -L "$dest" ]; then
-            tmp="${dest}.auto_sync_restore_tmp"
-            rm -rf "$tmp"
-            if [ -d "$dest" ]; then
-                mkdir -p "$tmp"
-                cp -aL "$dest"/. "$tmp"/ 2>/dev/null || true
-            fi
-            rm -f "$dest"
-            mkdir -p "$dest"
-            [ ! -d "$tmp" ] || cp -a "$tmp"/. "$dest"/
-            rm -rf "$tmp"
-        else
-            mkdir -p "$dest"
-        fi
-        for src in "/home/tiger/$name" "/opt/user/tiger/$name"; do
-            [ -e "$src" ] || [ -L "$src" ] || continue
-            if [ -d "$src" ]; then
-                cp -aL "$src"/. "$dest"/ 2>/dev/null || true
-            fi
-            rm -rf "$src"
-        done
+        mkdir -p "$dest"
         chown -R root:root "$dest" 2>/dev/null || true
     done
     if [ -d /root/src/blog/halo2_theme/plugins ]; then
@@ -1472,7 +1446,7 @@ migrate_halo_root_home() {
         chown -R root:root /root/.halo2/plugins 2>/dev/null || true
     fi
 }
-migrate_halo_root_home
+ensure_halo_root_home
 for d in /usr/local/immich; do
     [ -e "$d" ] && chown root:root "$d" "$d"/{server,web,upload,machine-learning,conf} "$d"/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
 done
