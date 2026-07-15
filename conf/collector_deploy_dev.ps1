@@ -544,114 +544,7 @@ stop_services_before_install
 install_staged_collected_paths || { log "ERROR: collected path installation failed"; exit 1; }
 
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
-ensure_software_src_layout() {
-    new=/root/src/software
-    mkdir -p /root/src
-    for old in /opt/src/software /opt/software/src; do
-        if [ -e "$old" ] && [ ! -L "$old" ]; then
-            if [ ! -e "$new" ]; then
-                mv "$old" "$new"
-            else
-                cp -a "$old"/. "$new"/
-                mv "$old" "${old}.migrated-$(date +%Y%m%d%H%M%S)"
-            fi
-        fi
-    done
-    mkdir -p "$new"
-    if [ -e /opt/aarch64-linux-musl-cross ] && [ ! -L /opt/aarch64-linux-musl-cross ]; then
-        target="$new/aarch64-linux-musl-cross"
-        if [ ! -e "$target" ]; then
-            mv /opt/aarch64-linux-musl-cross "$target"
-        else
-            cp -a /opt/aarch64-linux-musl-cross/. "$target"/
-            mv /opt/aarch64-linux-musl-cross "/opt/aarch64-linux-musl-cross.migrated-$(date +%Y%m%d%H%M%S)"
-        fi
-    fi
-    [ ! -L /opt/aarch64-linux-musl-cross ] || rm -f /opt/aarch64-linux-musl-cross
-    if [ -e /usr/local/curl-cares ] && [ ! -L /usr/local/curl-cares ]; then
-        target="$new/curl-cares"
-        if [ ! -e "$target" ]; then
-            mv /usr/local/curl-cares "$target"
-        else
-            cp -a /usr/local/curl-cares/. "$target"/
-            mv /usr/local/curl-cares "/usr/local/curl-cares.migrated-$(date +%Y%m%d%H%M%S)"
-        fi
-    fi
-    [ ! -L /usr/local/curl-cares ] || rm -f /usr/local/curl-cares
-    [ ! -L /opt/src/software ] || rm -f /opt/src/software
-    [ ! -L /opt/software/src ] || rm -f /opt/software/src
-}
-ensure_software_src_layout
-rewrite_software_src_paths() {
-    replacement="$1"
-    for root in /etc/systemd/system /etc/profile.d /usr/local/bin; do
-        [ -e "$root" ] || continue
-        find "$root" -type f -exec grep -IlE '/opt/software/src|/opt/src/software' {} + 2>/dev/null |
-            xargs -r sed -i "s#/opt/software/src#$replacement#g; s#/opt/src/software#$replacement#g"
-    done
-    [ ! -f /etc/profile ] || sed -i "s#/opt/software/src#$replacement#g; s#/opt/src/software#$replacement#g" /etc/profile
-}
-rewrite_software_src_paths /root/src/software
-restore_opt_user_link() {
-    path="$1"
-    owner="$2"
-    [ -L "$path" ] || return 0
-    target="$(readlink "$path" || true)"
-    case "$target" in
-        /opt/user/*)
-            tmp="${path}.auto_sync_restore_tmp"
-            rm -rf "$tmp"
-            mkdir -p "$(dirname "$path")"
-            if [ -d "$target" ]; then
-                cp -a "$target" "$tmp"
-            elif [ -e "$target" ]; then
-                cp -a "$target" "$tmp"
-            else
-                rm -f "$path"
-                return 0
-            fi
-            rm -f "$path"
-            mv "$tmp" "$path"
-            chown -R "$owner" "$path" 2>/dev/null || true
-            ;;
-    esac
-}
-while IFS='|' read -r path owner; do
-    [ -n "$path" ] && restore_opt_user_link "$path" "$owner"
-done <<'EOF_DEV_LOCAL_LINKS'
-/root/.bashrc|root:root
-/root/.cache|root:root
-/root/.cargo|root:root
-/root/.codex|root:root
-/root/.config|root:root
-/root/.cscope.vim|root:root
-/root/.dotnet|root:root
-/root/.launchpadlib|root:root
-/root/.local|root:root
-/root/.npm|root:root
-/root/.npmrc|root:root
-/root/.nvm|root:root
-/root/.oh-my-zsh|root:root
-/root/.profile|root:root
-/root/.rustup|root:root
-/root/.vim|root:root
-/root/.vimbackup|root:root
-/root/.vimswap|root:root
-/root/.vimundo|root:root
-/root/.vimviews|root:root
-/root/.vscode-server|root:root
-/root/.halo2|root:root
-/root/.zprofile|root:root
-/root/.zshenv|root:root
-/root/.zshrc|root:root
-/root/src|root:root
-/home/tiger/.bashrc|tiger:tiger
-/home/tiger/.oh-my-zsh|tiger:tiger
-/home/tiger/.profile|tiger:tiger
-/home/tiger/.zprofile|tiger:tiger
-/home/tiger/.zshenv|tiger:tiger
-/home/tiger/.zshrc|tiger:tiger
-EOF_DEV_LOCAL_LINKS
+mkdir -p /root/src/software
 
 rm -rf /home/tiger/.nvm /home/tiger/.npm /home/tiger/.npmrc \
        /opt/user/tiger/.nvm /opt/user/tiger/.npm /opt/user/tiger/.npmrc 2>/dev/null || true
@@ -1038,7 +931,8 @@ EOF_IMMICH_ML_ENV
     export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'
     repo=/root/src/software/immich
     if [ -e "$repo" ] && [ ! -d "$repo/.git" ]; then
-        mv "$repo" "${repo}.before-git-$(date +%Y%m%d%H%M%S)" || return 1
+        log "ERROR: $repo exists but is not a git checkout; move it aside with a one-off command before deploying"
+        return 1
     fi
     if [ ! -d "$repo/.git" ]; then
         git clone --branch deploy git@github.com:xiedeacc/immich.git "$repo" || return 1
@@ -1387,12 +1281,6 @@ dump_search_roots() {
 }
 
 ensure_postgresql_ready() {
-    if command -v pg_lsclusters >/dev/null 2>&1; then
-        pg_lsclusters -h 2>/dev/null | awk '$4 ~ /binaries_missing/ { print $1 }' | while read -r old_version; do
-            [ -n "$old_version" ] || continue
-            [ -d "/etc/postgresql/$old_version" ] && mv "/etc/postgresql/$old_version" "/etc/postgresql/${old_version}.disabled-by-auto-sync-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-        done
-    fi
     version="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -1)"
     [ -z "$version" ] || fix_postgresql_config_permissions "$version"
     systemctl restart postgresql 2>/dev/null || true
@@ -1528,14 +1416,12 @@ for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/usr/local/immich/upload/$d"
     touch "/usr/local/immich/upload/$d/.immich"
 done
-chown -R tiger:tiger /usr/local/immich/upload 2>/dev/null || true
+chown root:root /usr/local/immich/upload /usr/local/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
 deploy_immich_from_git || log "WARN: immich deploy from git failed"
 rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
 if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
-
-[ ! -L /opt/auto_sync ] || rm -f /opt/auto_sync
 
 mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /root/.halo2 /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
@@ -1588,7 +1474,7 @@ migrate_halo_root_home() {
 }
 migrate_halo_root_home
 for d in /usr/local/immich; do
-    [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
+    [ -e "$d" ] && chown root:root "$d" "$d"/{server,web,upload,machine-learning,conf} "$d"/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
 done
 for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /root/.halo2; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
@@ -1625,7 +1511,6 @@ for link in /usr/local/immich/machine-learning/.venv/bin/python /usr/local/immic
             ;;
     esac
 done
-[ ! -f /usr/local/immich/machine-learning/.venv/pyvenv.cfg ] || sed -i 's#/opt/user/root/src/software#/root/src/software#g; s#/opt/software/src#/root/src/software#g; s#/opt/src/software#/root/src/software#g' /usr/local/immich/machine-learning/.venv/pyvenv.cfg
 if [ -f /usr/local/immich/machine-learning/.venv/pyvenv.cfg ]; then
     python_home="$(find /root/src/software/tools/uv-python -mindepth 1 -maxdepth 1 -type d -name 'cpython-*' 2>/dev/null | sort -V | tail -1)"
     if [ -n "$python_home" ]; then
@@ -1642,13 +1527,6 @@ fi
 find /usr/local/immich/server/bin /usr/local/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
 chmod -R a+rX /root/src/software/tools/nvm/versions/node/v24.18.0 /root/src/software/tools/uv-python 2>/dev/null || true
 normalize_deploy_permissions
-if [ -f /etc/systemd/system/auto_sync.service ]; then
-    sed -i 's#/opt/auto_sync#/usr/local/auto_sync#g' /etc/systemd/system/auto_sync.service
-fi
-for f in /etc/immich/*.env /etc/systemd/system/immich.service /etc/systemd/system/immich-ml.service; do
-    [ -f "$f" ] || continue
-    sed -i 's#/opt/immich#/usr/local/immich#g; s#/usr/local/src/software#/root/src/software#g; s#/opt/user/root/src/software#/root/src/software#g; s#/opt/software/src#/root/src/software#g; s#/opt/src/software#/root/src/software#g' "$f"
-done
 for f in /etc/systemd/system/immich.service /etc/systemd/system/immich-ml.service; do
     [ -f "$f" ] || continue
     sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"

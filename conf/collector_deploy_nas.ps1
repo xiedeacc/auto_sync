@@ -1051,7 +1051,8 @@ EOF_IMMICH_ML_ENV
     export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'
     repo=/opt/src/software/immich
     if [ -e "$repo" ] && [ ! -d "$repo/.git" ]; then
-        mv "$repo" "${repo}.before-git-$(date +%Y%m%d%H%M%S)" || return 1
+        log "ERROR: $repo exists but is not a git checkout; move it aside with a one-off command before deploying"
+        return 1
     fi
     if [ ! -d "$repo/.git" ]; then
         git clone --branch deploy git@github.com:xiedeacc/immich.git "$repo" || return 1
@@ -1412,12 +1413,6 @@ dump_search_roots() {
 }
 
 ensure_postgresql_ready() {
-    if command -v pg_lsclusters >/dev/null 2>&1; then
-        pg_lsclusters -h 2>/dev/null | awk '$4 ~ /binaries_missing/ { print $1 }' | while read -r old_version; do
-            [ -n "$old_version" ] || continue
-            [ -d "/etc/postgresql/$old_version" ] && mv "/etc/postgresql/$old_version" "/etc/postgresql/${old_version}.disabled-by-auto-sync-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-        done
-    fi
     version="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -1)"
     [ -z "$version" ] || fix_postgresql_config_permissions "$version"
     systemctl restart postgresql 2>/dev/null || true
@@ -2447,7 +2442,7 @@ for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
 done
-chown tiger:tiger /opt/immich/upload /opt/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
+chown root:root /opt/immich/upload /opt/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
 deploy_immich_from_git || log "WARN: immich deploy from git failed"
 if [ "${IMMICH_DERIVATIVE_REPAIR_ON_DEPLOY:-0}" = "1" ]; then
     repair_immich_media_derivatives
