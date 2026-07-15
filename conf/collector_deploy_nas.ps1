@@ -2571,7 +2571,7 @@ EOF_OPT_USR_LOCAL_PATH
 ensure_opt_usr_local_path
 
 mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/root/.halo2 /opt/user/tiger /home/tiger
-for d in search-index themes uploads; do
+for d in search-index themes; do
     if [ -e "/root/$d" ] || [ -e "/opt/user/root/$d" ]; then
         mkdir -p "/opt/user/root/.halo2/$d"
         [ ! -d "/root/$d" ] || cp -an "/root/$d"/. "/opt/user/root/.halo2/$d"/ 2>/dev/null || true
