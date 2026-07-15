@@ -12,6 +12,7 @@
 - TBox server runs on AWS and TBox client/logrotate runs on NAS. Other hosts must keep TBox services disabled/stopped if their deployment scripts touch them.
 - Waiwei and Xray are disabled/stopped on every host. Waiwei only has `waiwei-web` and `waiwei-puller`; there must not be a standalone `waiwei` service. Deployment scripts may preserve their files for backup/round-trip purposes, but must not enable or start `waiwei-web`, `waiwei-puller`, `xray`, or related init/systemd units.
 - When validating or running collector deployment scripts, execute the target `conf/collector_deploy_*.ps1` script directly with the required `AS_*` environment variables. Do not compile, restart, or deploy the `auto_sync` application itself just to run a collector deployment script unless the user explicitly asks for that.
+- After every collector deployment run, report the service states for each deployed platform as a list, including enabled/disabled and active/inactive status for the services that platform is expected to run or keep stopped.
 - Every commit must include all current repository changes. Do not leave tracked working-tree changes unstaged unless the user explicitly asks to keep them out of the commit.
 - Deploy scripts must preserve existing `conf/auto_sync.toml`; only initialize it from a template when the target config file does not exist.
 - Dev and NAS intentionally use different real paths because their disks are different:
