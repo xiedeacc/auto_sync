@@ -1069,11 +1069,13 @@ EOF_IMMICH_ML_ENV
     for script in deploy.sh scripts/deploy.sh install.sh; do
         if [ -f "$repo/$script" ]; then
             chmod +x "$repo/$script" 2>/dev/null || true
+            immich_deploy_log=/var/log/auto_sync_immich_deploy.log
             immich_node_home="${IMMICH_NODE_HOME:-/root/src/software/tools/nvm/versions/node/v24.18.0}"
             immich_node_bin="${IMMICH_NODE_BIN:-$immich_node_home/bin/node}"
             immich_npm_bin="${IMMICH_NPM_BIN:-$(command -v npm || true)}"
             immich_pnpm_bin="${IMMICH_PNPM_BIN:-$(command -v pnpm || true)}"
             chmod -R a+rX "$immich_node_home" /root/src/software/tools/uv-python 2>/dev/null || true
+            log "run immich deploy script $script; full output: $immich_deploy_log"
             (cd "$repo" &&
                 VERSION="${IMMICH_VERSION:-deploy}" \
                 REPO_DIR="$repo" \
@@ -1091,7 +1093,12 @@ EOF_IMMICH_ML_ENV
                 UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
                 PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
                 npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" \
-                bash "$script") || return 1
+                bash "$script") >"$immich_deploy_log" 2>&1 || {
+                    log "ERROR: immich deploy failed; tail of $immich_deploy_log follows"
+                    tail -80 "$immich_deploy_log" 2>/dev/null || true
+                    return 1
+                }
+            log "immich deploy completed"
             [ -z "$immich_commit" ] || printf '%s\n' "$immich_commit" > "$immich_marker"
             return 0
         fi
