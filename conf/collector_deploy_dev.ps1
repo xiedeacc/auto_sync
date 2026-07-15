@@ -467,7 +467,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server immich-ml auto_sync immich rblog rblog-backup.timer nginx cron tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -503,7 +503,7 @@ normalize_deploy_permissions() {
         find /etc/nginx/ssl -maxdepth 1 -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
         find /etc/nginx/ssl -maxdepth 1 -type f ! -name '*.key' -exec chmod 644 {} + 2>/dev/null || true
     fi
-    for d in /usr/local/blog /usr/local/tbox /usr/local/waiwei /usr/local/xray /usr/local/shadowsocks /usr/local/halo; do
+    for d in /usr/local/blog /usr/local/tbox /usr/local/waiwei /usr/local/xray /usr/local/shadowsocks; do
         [ -e "$d" ] || continue
         chown -R root:root "$d" 2>/dev/null || true
         find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
@@ -517,7 +517,6 @@ normalize_deploy_permissions() {
         /usr/local/waiwei/scripts \
         /usr/local/xray/bin \
         /usr/local/shadowsocks/bin \
-        /usr/local/halo/bin \
         /usr/local/bin
     do
         [ -d "$d" ] && find "$d" -type f -exec chmod 755 {} + 2>/dev/null || true
@@ -553,7 +552,6 @@ install_staged_collected_paths() {
         usr/local/waiwei/bin/waiwei_puller \
         usr/local/blog/bin/rblog \
         usr/local/blog/bin/rblog-backup \
-        usr/local/halo/bin/halo \
         usr/local/shadowsocks/bin/sslocal \
         usr/local/shadowsocks/bin/ssserver \
         usr/local/shadowsocks/bin/xray-plugin
@@ -1494,7 +1492,7 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /root/.halo2 /home/tiger
+mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /home/tiger
 if [ -e /root/.cscope.vim ] && [ ! -d /root/.cscope.vim ]; then
     rm -f /root/.cscope.vim
 fi
@@ -1515,27 +1513,12 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
-ensure_halo_root_home() {
-    for name in .halo2; do
-        dest="/root/$name"
-        mkdir -p "$dest"
-        chown -R root:root "$dest" 2>/dev/null || true
-    done
-    if [ -d /root/src/blog/halo2_theme/plugins ]; then
-        mkdir -p /root/.halo2/plugins
-        cp -an /root/src/blog/halo2_theme/plugins/*.jar /root/.halo2/plugins/ 2>/dev/null || true
-        chown -R root:root /root/.halo2/plugins 2>/dev/null || true
-    fi
-}
-ensure_halo_root_home
 for d in /usr/local/immich; do
     [ -e "$d" ] && chown root:root "$d" "$d"/{server,web,upload,machine-learning,conf} "$d"/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
 done
-for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /root/.halo2; do
+for d in /usr/local/auto_sync /usr/local/tbox; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
-find /root/.halo2 -type d -exec chmod 755 {} + 2>/dev/null || true
-find /root/.halo2 -type f -exec chmod 644 {} + 2>/dev/null || true
 if [ -d /usr/local/auto_sync ]; then
     chown root:root /usr/local/auto_sync /usr/local/auto_sync/logs /usr/local/auto_sync/conf/state 2>/dev/null || true
     chown -R root:root /usr/local/auto_sync/logs /usr/local/auto_sync/conf/state 2>/dev/null || true
@@ -1554,7 +1537,6 @@ for f in \
     /usr/local/blog/bin/rblog \
     /usr/local/blog/bin/rblog-backup \
     /usr/local/blog/bin/admin/* \
-    /usr/local/halo/bin/* \
     /usr/local/bin/vlmcsd
 do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
@@ -1588,27 +1570,19 @@ for f in /etc/systemd/system/immich.service /etc/systemd/system/immich-ml.servic
     [ -f "$f" ] || continue
     sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
 done
-for f in /etc/systemd/system/auto_sync.service /etc/systemd/system/halo2.service /etc/systemd/system/tbox_client.service; do
+for f in /etc/systemd/system/auto_sync.service /etc/systemd/system/tbox_client.service; do
     [ -f "$f" ] || continue
     sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
     grep -q '^User=' "$f" || sed -i '/^\[Service\]/a User=root' "$f"
     grep -q '^Group=' "$f" || sed -i '/^User=root/a Group=root' "$f"
 done
-if [ -f /etc/systemd/system/halo2.service ]; then
-    grep -q '^Environment="HOME=/root"' /etc/systemd/system/halo2.service || sed -i '/^Group=root/a Environment="HOME=/root"' /etc/systemd/system/halo2.service
-    if grep -q '^WorkingDirectory=' /etc/systemd/system/halo2.service; then
-        sed -i 's#^WorkingDirectory=.*#WorkingDirectory=/root/.halo2#' /etc/systemd/system/halo2.service
-    else
-        sed -i '/^Environment="HOME=\/root"/a WorkingDirectory=/root/.halo2' /etc/systemd/system/halo2.service
-    fi
-fi
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
 for s in tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
-for s in mysql postgresql redis-server immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron; do
+for s in mysql postgresql redis-server immich-ml auto_sync immich rblog rblog-backup.timer nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -1616,7 +1590,7 @@ done
 
 print_final_states() {
     echo '--- final states ---'
-    for s in auto_sync halo2 immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in auto_sync immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         resolved="$(unit_name "$s" 2>/dev/null || true)"
         if [ -n "$resolved" ]; then
             enabled="$(systemctl is-enabled "$resolved" 2>/dev/null || true)"
@@ -1660,7 +1634,7 @@ wait_for_https_200() {
 }
 
 required_failed=0
-for s in auto_sync halo2 immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer; do
+for s in auto_sync immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer; do
     if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
         required_failed=1

@@ -249,7 +249,6 @@ const NAS_ROOT_COLLECT_PATHS: &[&str] = &[
     "/opt/user/root/.claude.json",
     "/opt/user/root/.flutter",
     "/opt/user/root/.gitconfig",
-    "/opt/user/root/.halo2",
     "/opt/user/root/.profile",
     "/opt/user/root/.vimrc",
     "/opt/user/root/.zprofile",
