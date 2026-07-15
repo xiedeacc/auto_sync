@@ -2482,9 +2482,13 @@ for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
 done
-chown -R tiger:tiger /opt/immich/upload 2>/dev/null || true
+chown tiger:tiger /opt/immich/upload /opt/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
 deploy_immich_from_git || log "WARN: immich deploy from git failed"
-repair_immich_media_derivatives
+if [ "${IMMICH_DERIVATIVE_REPAIR_ON_DEPLOY:-0}" = "1" ]; then
+    repair_immich_media_derivatives
+else
+    log "skip immich media derivative repair during deploy; run the repair job explicitly when needed"
+fi
 rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
 if [ "$zfs_woken" = "1" ]; then
     standby_zfs
@@ -2616,9 +2620,8 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
-for d in /opt/immich /opt/user/tiger; do
-    [ -e "$d" ] && chown -R tiger:tiger "$d" 2>/dev/null || true
-done
+[ -e /opt/immich ] && chown tiger:tiger /opt/immich /opt/immich/{server,web,upload,machine-learning,conf} /opt/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
+[ -e /opt/user/tiger ] && chown -R tiger:tiger /opt/user/tiger 2>/dev/null || true
 for d in /opt/usr/local/auto_sync /opt/usr/local/halo /opt/usr/local/tbox /opt/usr/local/shadowsocks /opt/user/root/.halo2; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
