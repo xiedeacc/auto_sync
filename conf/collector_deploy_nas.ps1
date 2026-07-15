@@ -217,6 +217,9 @@ function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$Opt
         $rel = (Normalize-RemotePath $exclude).TrimStart([char[]]"/")
         if ($rel -ne '') { $excludeArgs += "--exclude=$rel" }
     }
+    foreach ($exclude in (Get-LinuxUnsupportedTarExcludes @($tarPaths))) {
+        if ($exclude -ne '') { $excludeArgs += "--exclude=$exclude" }
+    }
 
     $localTar = Join-Path ([IO.Path]::GetTempPath()) ("auto_sync_stage_" + [guid]::NewGuid().ToString('N') + ".tar")
     $remoteTar = "$remoteScratch/" + [IO.Path]::GetFileName($localTar)
@@ -242,6 +245,34 @@ function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$Opt
 
 function Quote-ShellArg([string]$Value) {
     return "'" + $Value.Replace("'", "'""'""'") + "'"
+}
+
+function Get-LinuxUnsupportedTarExcludes([string[]]$RelativePaths) {
+    $excludes = New-Object System.Collections.Generic.List[string]
+    $utf8 = [Text.Encoding]::UTF8
+    $seen = @{}
+    foreach ($rel in $RelativePaths) {
+        $local = Join-Path $root ($rel -replace '/', '\')
+        if (-not (Test-Path -LiteralPath $local)) { continue }
+        Get-ChildItem -LiteralPath $local -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            $segments = $_.FullName.Substring($root.Length).TrimStart('\') -split '[\\/]'
+            $bad = $false
+            foreach ($segment in $segments) {
+                if ($utf8.GetByteCount($segment) -gt 255) {
+                    $bad = $true
+                    break
+                }
+            }
+            if (-not $bad) { return }
+            $exclude = $_.FullName.Substring($root.Length).TrimStart('\') -replace '\\', '/'
+            if (-not $seen.ContainsKey($exclude)) {
+                $seen[$exclude] = $true
+                [void]$excludes.Add($exclude)
+                Write-Host "skip Linux-unsupported path segment (>255 bytes): /$exclude"
+            }
+        }
+    }
+    return @($excludes)
 }
 
 function Ensure-RemoteRootWritable {
