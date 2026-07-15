@@ -390,6 +390,7 @@ restart_if_exists() {
     [ -n "$unit" ] || return 0
     if unit_exists "$unit"; then
         enable_unit "$unit"
+        log "enabled $unit"
         systemctl restart "$unit" && { log "restarted $unit"; log_unit_processes "$unit"; } || log "WARN: restart $unit failed"
     fi
 }
@@ -798,14 +799,14 @@ if [ ! -s "$NVM_DIR/nvm.sh" ]; then
 fi
 if [ -s "$NVM_DIR/nvm.sh" ]; then
     . "$NVM_DIR/nvm.sh"
-    nvm install 24.18.0 || nvm install 24 || log "WARN: nvm install 24 failed"
-    nvm use 24.18.0 || nvm use 24 || true
+    nvm install 24.18.0 >/dev/null || nvm install 24 >/dev/null || log "WARN: nvm install 24 failed"
+    nvm use 24.18.0 --silent >/dev/null || nvm use 24 --silent >/dev/null || true
     hash -r 2>/dev/null || true
     if ! command -v npm >/dev/null 2>&1; then
         log "npm missing after nvm use; reinstall Node v24.18.0"
         rm -rf "$NVM_DIR/versions/node/v24.18.0"
-        nvm install 24.18.0 || nvm install 24 || log "WARN: nvm reinstall 24 failed"
-        nvm use 24.18.0 || nvm use 24 || true
+        nvm install 24.18.0 >/dev/null || nvm install 24 >/dev/null || log "WARN: nvm reinstall 24 failed"
+        nvm use 24.18.0 --silent >/dev/null || nvm use 24 --silent >/dev/null || true
         hash -r 2>/dev/null || true
     fi
     node_bin_dir="$(dirname "$(command -v node 2>/dev/null || true)")"
@@ -1458,6 +1459,10 @@ if [ "$zfs_woken" = "1" ]; then
 fi
 
 mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /root/.halo2 /home/tiger
+if [ -e /root/.cscope.vim ] && [ ! -d /root/.cscope.vim ]; then
+    rm -f /root/.cscope.vim
+fi
+mkdir -p /root/.cscope.vim
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/usr/local/immich/upload/$d"
     touch "/usr/local/immich/upload/$d/.immich"
@@ -1493,6 +1498,8 @@ done
 for d in /usr/local/auto_sync /usr/local/halo /usr/local/tbox /root/.halo2; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
+find /root/.halo2 -type d -exec chmod 755 {} + 2>/dev/null || true
+find /root/.halo2 -type f -exec chmod 644 {} + 2>/dev/null || true
 if [ -d /usr/local/auto_sync ]; then
     chown root:root /usr/local/auto_sync /usr/local/auto_sync/logs /usr/local/auto_sync/conf/state 2>/dev/null || true
     chown -R root:root /usr/local/auto_sync/logs /usr/local/auto_sync/conf/state 2>/dev/null || true
@@ -1554,9 +1561,9 @@ done
 if [ -f /etc/systemd/system/halo2.service ]; then
     grep -q '^Environment="HOME=/root"' /etc/systemd/system/halo2.service || sed -i '/^Group=root/a Environment="HOME=/root"' /etc/systemd/system/halo2.service
     if grep -q '^WorkingDirectory=' /etc/systemd/system/halo2.service; then
-        sed -i 's#^WorkingDirectory=.*#WorkingDirectory=/root#' /etc/systemd/system/halo2.service
+        sed -i 's#^WorkingDirectory=.*#WorkingDirectory=/root/.halo2#' /etc/systemd/system/halo2.service
     else
-        sed -i '/^Environment="HOME=\/root"/a WorkingDirectory=/root' /etc/systemd/system/halo2.service
+        sed -i '/^Environment="HOME=\/root"/a WorkingDirectory=/root/.halo2' /etc/systemd/system/halo2.service
     fi
 fi
 systemctl daemon-reload

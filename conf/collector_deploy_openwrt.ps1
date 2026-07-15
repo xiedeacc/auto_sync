@@ -237,7 +237,6 @@ need_cmd uci
 need_cmd ip
 need_cmd nft
 need_cmd netstat
-need_cmd pgrep
 need_cmd grep
 need_cmd start-stop-daemon
 need_init dnsmasq
@@ -437,8 +436,7 @@ ensure_ubus() {
 }
 
 sslocal_running() {
-    pgrep -f '/usr/local/shadowsocks/bin/sslocal([[:space:]]|$)' >/dev/null 2>&1 ||
-        ps w 2>/dev/null | grep -q '[s]slocal -c /usr/local/shadowsocks/conf/shadowsocks-client.json'
+    ps w 2>/dev/null | grep -q '[s]slocal -c /usr/local/shadowsocks/conf/shadowsocks-client.json'
 }
 
 dns_listener_ready() {
@@ -518,13 +516,19 @@ while [ $i -lt 15 ]; do
     i=$((i+1))
 done
 
-echo "shadowsocks pgrep:"
-pgrep -f /usr/local/shadowsocks/bin/sslocal || echo "  (not running)"
 if ! sslocal_running || ! dns_listener_ready; then
     echo "!! shadowsocks did not start cleanly; leaving dnsmasq/network untouched" >&2
     logread 2>/dev/null | grep -iE 'shadowsocks|sslocal|procd|ubus' | tail -n 80 >&2 || true
     exit 1
 fi
+echo "--- final states ---"
+for s in shadowsocks shadowsocks-rust; do
+    printf '  %s: ' "$s"
+    /etc/init.d/"$s" enabled >/dev/null 2>&1 && printf enabled || printf disabled
+    printf ' / '
+    /etc/init.d/"$s" running >/dev/null 2>&1 && printf active || printf inactive
+    echo
+done
 
 # Only now apply dhcp DNS forwarding to sslocal's DNS listener.
 validate_lan_dhcp_config || exit 1
@@ -533,7 +537,7 @@ validate_lan_dhcp_config || exit 1
 
 # apply network config last (may briefly drop this session)
 schedule_network_reload || exit 1
-echo "network reload scheduled in background"
+echo "network reload scheduled in background to avoid dropping the current SSH session"
 '@
 Invoke-Remote $remote
 

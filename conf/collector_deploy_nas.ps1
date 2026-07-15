@@ -13,7 +13,7 @@ if (-not [string]::IsNullOrEmpty($env:AS_PORT)) { $sshArgs += @('-p', $env:AS_PO
 if (-not [string]::IsNullOrEmpty($env:AS_KEY))  { $sshArgs += @('-i', $env:AS_KEY);  $scpArgs += @('-i', $env:AS_KEY) }
 
 $errCount = 0
-$remoteScratch = '/opt/tmp/auto_sync_deploy_scratch'
+$remoteScratch = '/tmp/auto_sync_deploy_scratch'
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $platformDefaultCollectPaths = @()
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
@@ -304,7 +304,7 @@ fi
 
 Copy-AwsSslIntoCollectedRoot
 Ensure-RemoteRootWritable
-$remoteStage = '/opt/tmp/auto_sync_deploy_stage'
+$remoteStage = '/tmp/auto_sync_deploy_stage'
 Invoke-Remote "rm -rf $(Quote-ShellArg $remoteStage); mkdir -p $(Quote-ShellArg $remoteStage)"
 $generatedOptionalPaths = @('/opt/immich/conf', '/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') + $platformDefaultCollectPaths
 $requiredCollectPaths = @($collectPaths | Where-Object { (Normalize-RemotePath $_) -ne '/opt/immich/conf' })
@@ -416,6 +416,7 @@ restart_if_exists() {
     [ -n "$unit" ] || return 0
     if unit_exists "$unit"; then
         enable_unit "$unit"
+        log "enabled $unit"
         systemctl restart "$unit" && { log "restarted $unit"; log_unit_processes "$unit"; } || log "WARN: restart $unit failed"
     fi
 }
@@ -486,7 +487,7 @@ normalize_deploy_permissions() {
 }
 
 install_staged_collected_paths() {
-    stage="/opt/tmp/auto_sync_deploy_stage"
+    stage="/tmp/auto_sync_deploy_stage"
     [ -d "$stage" ] || return 0
     log "install collected paths after package installation"
     for rel in \
@@ -627,7 +628,7 @@ done <<'EOF_OPT_LINKS'
 /root/.cargo|/opt/user/root/.cargo|dir|root:root
 /root/.codex|/opt/user/root/.codex|dir|root:root
 /root/.config|/opt/user/root/.config|dir|root:root
-/root/.cscope.vim|/opt/user/root/.cscope.vim|file|root:root
+/root/.cscope.vim|/opt/user/root/.cscope.vim|dir|root:root
 /root/.dotnet|/opt/user/root/.dotnet|dir|root:root
 /root/.launchpadlib|/opt/user/root/.launchpadlib|dir|root:root
 /root/.local|/opt/user/root/.local|dir|root:root
@@ -918,14 +919,14 @@ if [ ! -s "$NVM_DIR/nvm.sh" ]; then
 fi
 if [ -s "$NVM_DIR/nvm.sh" ]; then
     . "$NVM_DIR/nvm.sh"
-    nvm install 24.18.0 || nvm install 24 || log "WARN: nvm install 24 failed"
-    nvm use 24.18.0 || nvm use 24 || true
+    nvm install 24.18.0 >/dev/null || nvm install 24 >/dev/null || log "WARN: nvm install 24 failed"
+    nvm use 24.18.0 --silent >/dev/null || nvm use 24 --silent >/dev/null || true
     hash -r 2>/dev/null || true
     if ! command -v npm >/dev/null 2>&1; then
         log "npm missing after nvm use; reinstall Node v24.18.0"
         rm -rf "$NVM_DIR/versions/node/v24.18.0"
-        nvm install 24.18.0 || nvm install 24 || log "WARN: nvm reinstall 24 failed"
-        nvm use 24.18.0 || nvm use 24 || true
+        nvm install 24.18.0 >/dev/null || nvm install 24 >/dev/null || log "WARN: nvm reinstall 24 failed"
+        nvm use 24.18.0 --silent >/dev/null || nvm use 24 --silent >/dev/null || true
         hash -r 2>/dev/null || true
     fi
     node_bin_dir="$(dirname "$(command -v node 2>/dev/null || true)")"
@@ -2506,6 +2507,14 @@ EOF_OPT_USR_LOCAL_PATH
 ensure_opt_usr_local_path
 
 mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/root/.halo2 /opt/user/tiger /home/tiger
+for d in search-index themes uploads; do
+    if [ -e "/root/$d" ] || [ -e "/opt/user/root/$d" ]; then
+        mkdir -p "/opt/user/root/.halo2/$d"
+        [ ! -d "/root/$d" ] || cp -an "/root/$d"/. "/opt/user/root/.halo2/$d"/ 2>/dev/null || true
+        [ ! -d "/opt/user/root/$d" ] || cp -an "/opt/user/root/$d"/. "/opt/user/root/.halo2/$d"/ 2>/dev/null || true
+        rm -rf "/root/$d" "/opt/user/root/$d"
+    fi
+done
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
@@ -2557,6 +2566,8 @@ PY_TIGER_LINK_OWNERS
 for d in /opt/usr/local/auto_sync /opt/usr/local/halo /opt/usr/local/tbox /opt/usr/local/shadowsocks /opt/user/root/.halo2; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
+find /opt/user/root/.halo2 -type d -exec chmod 755 {} + 2>/dev/null || true
+find /opt/user/root/.halo2 -type f -exec chmod 644 {} + 2>/dev/null || true
 for f in \
     /opt/usr/local/auto_sync/bin/auto_sync \
     /opt/usr/local/auto_sync/bin/auto_syncd \
@@ -2590,9 +2601,9 @@ done
 if [ -f /etc/systemd/system/halo2.service ]; then
     grep -q '^Environment="HOME=/root"' /etc/systemd/system/halo2.service || sed -i '/^Group=root/a Environment="HOME=/root"' /etc/systemd/system/halo2.service
     if grep -q '^WorkingDirectory=' /etc/systemd/system/halo2.service; then
-        sed -i 's#^WorkingDirectory=.*#WorkingDirectory=/root#' /etc/systemd/system/halo2.service
+        sed -i 's#^WorkingDirectory=.*#WorkingDirectory=/root/.halo2#' /etc/systemd/system/halo2.service
     else
-        sed -i '/^Environment="HOME=\/root"/a WorkingDirectory=/root' /etc/systemd/system/halo2.service
+        sed -i '/^Environment="HOME=\/root"/a WorkingDirectory=/root/.halo2' /etc/systemd/system/halo2.service
     fi
 fi
 systemctl daemon-reload
