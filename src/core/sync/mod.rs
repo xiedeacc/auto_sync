@@ -3061,21 +3061,31 @@ fn sync_cycle_for_source_inner(
                 chrono::Local::now(),
             ) {
                 Ok(Some(gate)) => {
-                    all_verified = false;
-                    let not_mounted = matches!(gate, crate::core::standby::Gate::NotMounted { .. });
-                    if not_mounted {
-                        had_unblocked_failure = true;
+                    if !standby_gate_blocks_sync(&gate, cycle.manual_full_rescan) {
+                        info!(
+                            source = source.id,
+                            destination = dst.id,
+                            gate = %gate.status_reason(),
+                            "manual Full bypasses standby schedule gate"
+                        );
                     } else {
-                        blocked_count += 1;
+                        all_verified = false;
+                        let not_mounted =
+                            matches!(gate, crate::core::standby::Gate::NotMounted { .. });
+                        if not_mounted {
+                            had_unblocked_failure = true;
+                        } else {
+                            blocked_count += 1;
+                        }
+                        state.upsert_destination_status(
+                            &source.id,
+                            &dst.id,
+                            None,
+                            if not_mounted { "red" } else { "yellow" },
+                            &gate.status_reason(),
+                        )?;
+                        continue;
                     }
-                    state.upsert_destination_status(
-                        &source.id,
-                        &dst.id,
-                        None,
-                        if not_mounted { "red" } else { "yellow" },
-                        &gate.status_reason(),
-                    )?;
-                    continue;
                 }
                 Ok(None) => {}
                 // A malformed wake schedule must not wedge backups shut; log and
@@ -8613,6 +8623,13 @@ fn short_reason(err: &anyhow::Error) -> String {
     text.chars().take(120).collect()
 }
 
+fn standby_gate_blocks_sync(gate: &crate::core::standby::Gate, manual_full_rescan: bool) -> bool {
+    match gate {
+        crate::core::standby::Gate::Asleep { .. } => !manual_full_rescan,
+        crate::core::standby::Gate::NotMounted { .. } => true,
+    }
+}
+
 /// Record a destination sync failure: tolerated source-changing errors become
 /// yellow `source_changing` issues (the next cycle converges them); everything
 /// else goes red with a short reason.
@@ -10016,6 +10033,23 @@ mod tests {
         );
         // Unparseable names fall back gracefully.
         assert_eq!(zfs_diff_phase_label("weird", "names"), "zfs diff");
+    }
+
+    #[test]
+    fn manual_full_bypasses_standby_asleep_but_not_mount_safety() {
+        let asleep = crate::core::standby::Gate::Asleep {
+            pool: "zfs".to_string(),
+            reason: "disk zfs in standby until Sat 2026-07-18 09:00".to_string(),
+        };
+        let not_mounted = crate::core::standby::Gate::NotMounted {
+            pool: "zfs".to_string(),
+            reason: "disk zfs not mounted".to_string(),
+        };
+
+        assert!(standby_gate_blocks_sync(&asleep, false));
+        assert!(!standby_gate_blocks_sync(&asleep, true));
+        assert!(standby_gate_blocks_sync(&not_mounted, false));
+        assert!(standby_gate_blocks_sync(&not_mounted, true));
     }
 
     #[test]
