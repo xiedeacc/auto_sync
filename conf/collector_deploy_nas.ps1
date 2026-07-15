@@ -1483,6 +1483,7 @@ configure_postgresql_peer_maps() {
         touch "$ident"
         grep -Eq '^[[:space:]]*gitlab[[:space:]]+git[[:space:]]+gitlab([[:space:]]|$)' "$ident" || printf '\ngitlab  git  gitlab\n' >> "$ident"
         grep -Eq '^[[:space:]]*gitlab[[:space:]]+tiger[[:space:]]+immich([[:space:]]|$)' "$ident" || printf '\ngitlab  tiger  immich\n' >> "$ident"
+        grep -Eq '^[[:space:]]*gitlab[[:space:]]+root[[:space:]]+immich([[:space:]]|$)' "$ident" || printf 'gitlab  root  immich\n' >> "$ident"
     done
     systemctl reload postgresql 2>/dev/null || true
 }
