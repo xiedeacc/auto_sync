@@ -1103,7 +1103,20 @@ EOF_IMMICH_ML_ENV
         if [ -f "$repo/$script" ]; then
             chmod +x "$repo/$script" 2>/dev/null || true
             immich_node_home="${IMMICH_NODE_HOME:-/opt/src/software/tools/nvm/versions/node/v24.18.0}"
-            (cd "$repo" && VERSION="${IMMICH_VERSION:-deploy}" UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" bash "$script") || return 1
+            (cd "$repo" &&
+                VERSION="${IMMICH_VERSION:-deploy}" \
+                REPO_DIR="$repo" \
+                APP_DIR=/opt/immich \
+                UPLOAD_DIR=/opt/immich/upload \
+                TOOL_ROOT=/opt/src/software/tools \
+                NODE_HOME="$immich_node_home" \
+                RUN_USER=root \
+                RUN_GROUP=root \
+                UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
+                UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
+                PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
+                npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" \
+                bash "$script") || return 1
             [ -z "$immich_commit" ] || printf '%s\n' "$immich_commit" > "$immich_marker"
             return 0
         fi
