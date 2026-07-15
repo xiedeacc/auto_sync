@@ -1183,11 +1183,7 @@ class _HeaderTitle extends StatelessWidget {
         label,
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
-        style: const TextStyle(
-          fontSize: 13,
-          fontWeight: FontWeight.w400,
-          color: Palette.text,
-        ),
+        style: const TextStyle(fontSize: 13, color: Palette.text),
       ),
     );
   }

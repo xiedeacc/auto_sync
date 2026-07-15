@@ -1177,26 +1177,8 @@ ensure_zfs_for_gitlab() {
     ls -ald /zfs >/dev/null 2>&1 || true
 }
 
-ensure_gitlab_zfs_config() {
+ensure_gitlab_frontend_config() {
     [ -f /etc/gitlab/gitlab.rb ] || return 0
-    if ! grep -q '/zfs/gitlab_data' /etc/gitlab/gitlab.rb 2>/dev/null; then
-        log "add GitLab /zfs data storage config"
-        cat >> /etc/gitlab/gitlab.rb <<'EOF_GITLAB_ZFS'
-
-# Managed by auto_sync NAS deployment: keep GitLab repository/LFS data on /zfs.
-gitlab_rails['lfs_enabled'] = true
-gitlab_rails['lfs_storage_path'] = "/zfs/gitlab_data/lfs-objects"
-git_data_dirs({
-   "default" => {"path" => "/zfs/gitlab_data"},
-})
-gitlab_rails['repository_storages'] = {
-  'default' => {
-    'path' => '/zfs/gitlab_data',
-    'gitaly_address' => 'unix:/var/opt/gitlab/gitaly/gitaly.socket'
-  }
-}
-EOF_GITLAB_ZFS
-    fi
     if ! grep -q 'auto_sync GitLab frontend ports' /etc/gitlab/gitlab.rb 2>/dev/null; then
         cat >> /etc/gitlab/gitlab.rb <<'EOF_GITLAB_FRONTEND'
 
@@ -1244,20 +1226,18 @@ if [ "$installed_gitlab_version" != "$GITLAB_CE_VERSION" ]; then
     apt-get install -y --allow-downgrades "gitlab-ce=$GITLAB_CE_VERSION" || exit 1
 fi
 ensure_zfs_for_gitlab
-mkdir -p /zfs/gitlab_data /zfs/gitlab_data/lfs-objects /zfs/gitlab_data/repositories 2>/dev/null || true
 passwd -S git >/dev/null 2>&1 || true
 if id git >/dev/null 2>&1; then
     git_pw_hash="$(openssl passwd -6 "auto-sync-git-$(date +%s)-$RANDOM" 2>/dev/null || true)"
     [ -z "$git_pw_hash" ] || usermod -p "$git_pw_hash" git 2>/dev/null || true
     rm -f /etc/ssh/sshd_config.d/98-auto-sync-gitlab.conf 2>/dev/null || true
 fi
-[ -d /zfs/gitlab_data ] && chown git:git /zfs/gitlab_data 2>/dev/null || true
-[ -d /zfs/gitlab_data/lfs-objects ] && chown git:git /zfs/gitlab_data/lfs-objects 2>/dev/null || true
-[ -d /zfs/gitlab_data/repositories ] && chown git:git /zfs/gitlab_data/repositories 2>/dev/null || true
-[ -d /zfs/gitlab_data ] && chmod 2770 /zfs/gitlab_data /zfs/gitlab_data/lfs-objects /zfs/gitlab_data/repositories 2>/dev/null || true
 [ -d /etc/gitlab ] && chown -R git:git /etc/gitlab 2>/dev/null || true
 [ -d /etc/gitlab ] && chmod 700 /etc/gitlab 2>/dev/null || true
-ensure_gitlab_zfs_config
+[ -d /etc/gitlab/config_backup ] && chown git:git /etc/gitlab/config_backup 2>/dev/null || true
+[ -d /etc/gitlab/config_backup ] && chmod 700 /etc/gitlab/config_backup 2>/dev/null || true
+[ -d /etc/gitlab/config_backup ] && find /etc/gitlab/config_backup -maxdepth 1 -type f -exec chown git:git {} + -exec chmod 600 {} + 2>/dev/null || true
+ensure_gitlab_frontend_config
 if command -v gitlab-ctl >/dev/null 2>&1; then
     gitlab_deploy_log=/var/log/auto_sync_gitlab_deploy.log
     : > "$gitlab_deploy_log"
