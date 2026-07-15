@@ -44,7 +44,6 @@ $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
 $deployExcludePaths = @(
-    '/usr/local/shadowsocks/data/source',
     '/usr/local/shadowsocks/data/temp/dns_cache.jsonl',
     '/usr/local/shadowsocks/data/temp/domain_conflicts.jsonl',
     '/usr/local/shadowsocks/data/temp/ip_conflicts.jsonl',
@@ -274,7 +273,6 @@ mkdir -p /etc/init.d /etc/sysctl.d /etc/config /usr/local
 /etc/init.d/shadowsocks-rust stop 2>/dev/null || true
 killall sslocal 2>/dev/null || true
 rm -rf \
-  /usr/local/shadowsocks/data/source \
   /usr/local/shadowsocks/data/temp/dns_cache.jsonl \
   /usr/local/shadowsocks/data/temp/domain_conflicts.jsonl \
   /usr/local/shadowsocks/data/temp/ip_conflicts.jsonl \
