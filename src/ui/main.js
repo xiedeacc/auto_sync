@@ -39,6 +39,8 @@ let collectorBrowseTarget = "paths";
 // Index of the host whose deploy modal is open, plus its poll timer.
 let collectorDeployIndex = null;
 let collectorDeployTimer = null;
+let collectorDeployRowsTimer = null;
+let collectorDeployRowStates = new Map();
 // Remember the last remote directory browsed per host (keyed by hostname) so
 // the remote picker reopens there — handy for adding several files from one dir.
 let collectorLastRemotePath = {};
@@ -3449,6 +3451,8 @@ async function openCollectorModal(event) {
     setCollectorRunState(String(error));
   }
   refreshCollectorStatus();
+  refreshCollectorDeployRows();
+  startCollectorDeployRowsPolling();
 }
 
 function closeCollectorModal() {
@@ -3457,6 +3461,7 @@ function closeCollectorModal() {
   el.collectorModal.hidden = true;
   collectorDraft = null;
   stopCollectorPolling();
+  stopCollectorDeployRowsPolling();
 }
 
 function setCollectorRunState(text) {
@@ -3484,6 +3489,12 @@ function renderCollectorHosts() {
     </div>`;
   const rows = hosts.map((host, i) => {
     const pathCount = (host.paths || []).filter((p) => String(p).trim()).length;
+    const deployState = collectorDeployRowStates.get(i);
+    const deployRunning = Boolean(deployState && deployState.running);
+    const deployDisabled = deployRunning ? " disabled aria-busy=\"true\"" : "";
+    const deployTitle = deployRunning
+      ? "Deploy is running for this host"
+      : "Run deploy (copy files back + run the script on the host)";
     return `
       <div class="collector-host-row" data-index="${i}">
         <input data-field="name" data-index="${i}" value="${escapeAttr(host.name)}" placeholder="alias">
@@ -3498,7 +3509,7 @@ function renderCollectorHosts() {
         <button type="button" data-action="edit-paths" data-index="${i}" class="collector-paths-btn">Files (${pathCount})</button>
         <button type="button" data-action="deploy-edit" data-index="${i}" class="collector-icon-btn" title="Edit deploy script">📝</button>
         <button type="button" data-action="collect-run" data-index="${i}" class="collector-icon-btn" title="Collect this host">⤓</button>
-        <button type="button" data-action="deploy-run" data-index="${i}" class="collector-icon-btn collector-run-icon" title="Run deploy (copy files back + run the script on the host)">▶</button>
+        <button type="button" data-action="deploy-run" data-index="${i}" class="collector-icon-btn collector-run-icon" title="${escapeAttr(deployTitle)}"${deployDisabled}>▶</button>
         <button type="button" data-action="remove-host" data-index="${i}" class="collector-host-remove" title="Remove host">✕</button>
       </div>`;
   }).join("");
@@ -3797,8 +3808,11 @@ async function runCollectorDeploy(hostIndex) {
   try {
     await collectorPersistNow();
     const state = await invoke("collector_deploy", { index: hostIndex });
+    collectorDeployRowStates.set(hostIndex, state);
+    renderCollectorHosts();
     applyCollectorDeployState(state);
     startCollectorDeployPolling();
+    startCollectorDeployRowsPolling();
   } catch (error) {
     el.collectorDeployState.textContent = String(error);
   }
@@ -3826,7 +3840,8 @@ function applyCollectorDeployState(state) {
 async function refreshCollectorDeployStatus() {
   // Only show a live run; don't surface a previous host's finished log on open.
   try {
-    const state = await invoke("collector_deploy_status");
+    const payload = collectorDeployIndex == null ? {} : { index: collectorDeployIndex };
+    const state = await invoke("collector_deploy_status", payload);
     if (state && state.running) {
       applyCollectorDeployState(state);
       startCollectorDeployPolling();
@@ -3844,7 +3859,8 @@ function startCollectorDeployPolling() {
       return;
     }
     try {
-      const state = await invoke("collector_deploy_status");
+      const payload = collectorDeployIndex == null ? {} : { index: collectorDeployIndex };
+      const state = await invoke("collector_deploy_status", payload);
       applyCollectorDeployState(state);
       if (!state || !state.running) stopCollectorDeployPolling();
     } catch (_error) {
@@ -3858,6 +3874,50 @@ function stopCollectorDeployPolling() {
     clearInterval(collectorDeployTimer);
     collectorDeployTimer = null;
   }
+}
+
+async function refreshCollectorDeployRows() {
+  if (!collectorDraft || !Array.isArray(collectorDraft.hosts)) return;
+  try {
+    const entries = await Promise.all(collectorDraft.hosts.map(async (_host, index) => {
+      const state = await invoke("collector_deploy_status", { index });
+      return [index, state];
+    }));
+    let changed = false;
+    const next = new Map();
+    for (const [index, state] of entries) {
+      if (state && (state.running || state.ok !== null || (Array.isArray(state.log) && state.log.length))) {
+        next.set(index, state);
+      }
+      const prevRunning = Boolean(collectorDeployRowStates.get(index)?.running);
+      const nextRunning = Boolean(state && state.running);
+      if (prevRunning !== nextRunning) changed = true;
+    }
+    collectorDeployRowStates = next;
+    if (changed) renderCollectorHosts();
+  } catch (_error) {
+    // Keep the last known row state; a transient failed status poll should not
+    // re-enable a button while a deploy may still be starting.
+  }
+}
+
+function startCollectorDeployRowsPolling() {
+  if (collectorDeployRowsTimer) return;
+  collectorDeployRowsTimer = setInterval(async () => {
+    if (el.collectorModal.hidden) {
+      stopCollectorDeployRowsPolling();
+      return;
+    }
+    await refreshCollectorDeployRows();
+  }, 1000);
+}
+
+function stopCollectorDeployRowsPolling() {
+  if (collectorDeployRowsTimer) {
+    clearInterval(collectorDeployRowsTimer);
+    collectorDeployRowsTimer = null;
+  }
+  collectorDeployRowStates = new Map();
 }
 
 // Remote path picker (ssh ls) --------------------------------------------------
@@ -4157,6 +4217,8 @@ async function invokeWeb(command, payload = {}) {
     url = `${path}?limit=${encodeURIComponent(payload.limit || 100)}`;
   } else if (command === "collector_deploy_script") {
     url = `${path}?index=${encodeURIComponent(payload.index || 0)}`;
+  } else if (command === "collector_deploy_status" && payload.index != null) {
+    url = `${path}?index=${encodeURIComponent(payload.index)}`;
   } else if (command === "remove_machine") {
     const machineId = payload.machineId || payload.machine_id;
     url = `${path}/${encodeURIComponent(machineId || "")}`;
