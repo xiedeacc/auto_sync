@@ -207,10 +207,8 @@ for rel in \
     usr/local/waiwei/bin/waiwei_web \
     usr/local/waiwei/bin/waiwei_puller
 do
-    if [ -e "$stage/$rel" ] && { [ -e "/$rel" ] || [ -L "/$rel" ]; }; then
-        sudo rm -f "/$rel.auto_sync_old" 2>/dev/null || true
-        sudo mv "/$rel" "/$rel.auto_sync_old" 2>/dev/null || true
-    fi
+    [ -e "$stage/$rel" ] || continue
+    sudo rm -f "/$rel" 2>/dev/null || true
 done
 if [ -d "$stage/usr/local/lib" ]; then
     for src in "$stage"/usr/local/lib/*; do
@@ -221,7 +219,7 @@ if [ -d "$stage/usr/local/lib" ]; then
 fi
 exit 0
 '@
-Invoke-Remote 'sudo cp -a ~/.auto_sync_stage/. / && rm -rf ~/.auto_sync_stage && echo "installed collected paths"'
+Invoke-Remote 'stage="$HOME/.auto_sync_stage"; sudo cp -a "$stage"/. /; rc=$?; rm -rf "$stage"; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
 
 # 2. Restore recorded permissions for the pushed /etc files.
 function Quote-ShellArg([string]$Value) {

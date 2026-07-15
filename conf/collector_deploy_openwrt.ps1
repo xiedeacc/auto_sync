@@ -310,8 +310,14 @@ Stop-IfErrors 'file transfer'
 Invoke-Remote @'
 set -e
 stage=/tmp/auto_sync_openwrt_stage
+trap 'rm -rf "$stage"' EXIT
 chmod 755 /etc /etc/config /etc/init.d /etc/sysctl.d /usr /usr/local 2>/dev/null || true
 if [ -d "$stage" ]; then
+    /etc/init.d/shadowsocks stop 2>/dev/null || true
+    echo "stopped shadowsocks before installing collected paths"
+    [ ! -e "$stage/usr/local/shadowsocks/bin/sslocal" ] || rm -f /usr/local/shadowsocks/bin/sslocal 2>/dev/null || true
+    [ ! -e "$stage/usr/local/shadowsocks/bin/ssserver" ] || rm -f /usr/local/shadowsocks/bin/ssserver 2>/dev/null || true
+    [ ! -e "$stage/usr/local/shadowsocks/bin/xray-plugin" ] || rm -f /usr/local/shadowsocks/bin/xray-plugin 2>/dev/null || true
     for entry in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
         [ -e "$entry" ] || [ -L "$entry" ] || continue
         name=${entry##*/}
@@ -324,7 +330,6 @@ if [ -d "$stage" ]; then
             cp -f "$entry" "$dst"
         fi
     done
-    rm -rf "$stage"
 fi
 chmod 755 /etc /etc/config /etc/init.d /etc/sysctl.d /usr /usr/local 2>/dev/null || true
 '@
@@ -494,12 +499,12 @@ ensure_ubus || exit 1
 /etc/init.d/shadowsocks enable || exit 1
 echo "enabled shadowsocks"
 restart_log=/tmp/auto_sync_shadowsocks_restart.log
+trap 'rm -f "$restart_log"' EXIT
 if ! /etc/init.d/shadowsocks restart >"$restart_log" 2>&1; then
     cat "$restart_log" >&2
     exit 1
 fi
 grep -v 'Command failed: ubus call service delete .*Not found' "$restart_log" || true
-rm -f "$restart_log"
 echo "restarted shadowsocks"
 
 # procd spawns sslocal asynchronously; verify both the process and DNS listener

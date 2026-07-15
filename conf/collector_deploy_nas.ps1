@@ -489,6 +489,25 @@ install_staged_collected_paths() {
     stage="/opt/tmp/auto_sync_deploy_stage"
     [ -d "$stage" ] || return 0
     log "install collected paths after package installation"
+    for rel in \
+        opt/usr/local/auto_sync/bin/auto_sync \
+        opt/usr/local/auto_sync/bin/auto_syncd \
+        opt/usr/local/auto_sync/bin/auto_sync_gui \
+        opt/usr/local/tbox/bin/tbox_client \
+        opt/usr/local/xray/bin/xray \
+        opt/usr/local/xray/bin/update-geo.sh \
+        opt/usr/local/waiwei/bin/waiwei_web \
+        opt/usr/local/waiwei/bin/waiwei_puller \
+        opt/usr/local/blog/bin/rblog \
+        opt/usr/local/blog/bin/rblog-backup \
+        opt/usr/local/halo/bin/halo \
+        opt/usr/local/shadowsocks/bin/sslocal \
+        opt/usr/local/shadowsocks/bin/ssserver \
+        opt/usr/local/shadowsocks/bin/xray-plugin
+    do
+        [ -e "$stage/$rel" ] || continue
+        rm -f "/$rel" 2>/dev/null || true
+    done
     cp -a "$stage"/. /
     rc=$?
     if [ -f /tmp/auto_sync_root_key.pub ]; then
