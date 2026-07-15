@@ -531,6 +531,17 @@ install_staged_collected_paths() {
     stage="/tmp/auto_sync_deploy_stage"
     [ -d "$stage" ] || return 0
     log "install collected paths after package installation"
+    install_staged_file() {
+        rel="$1"
+        target="/$rel"
+        [ -f "$stage/$rel" ] || return 0
+        mkdir -p "$(dirname "$target")"
+        cp -a "$stage/$rel" "$target"
+        chmod "${2:-644}" "$target" 2>/dev/null || true
+    }
+    install_staged_file root/src/share/dev/sync_db_from_nas.sh 755
+    rm -rf "$stage/root/src/share" 2>/dev/null || true
+    rmdir "$stage/root/src" "$stage/root" 2>/dev/null || true
     for rel in \
         usr/local/auto_sync/bin/auto_sync \
         usr/local/auto_sync/bin/auto_syncd \
