@@ -207,6 +207,20 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 **Compare（对账不同步）** — 只读比对，产出差异报告，不改动数据。同样有 `zfs diff` 快路径与全树回退。报告差异存在时目标行显示修复按钮（⇆），点击后只同步这些差异路径；若差异过多导致报告被截断，修复会自动升级为全量对账（见[任务类型与并发](#任务类型与并发)的 Repair → Full）。
 
+**`sync.zfs_diff` 开关的行为差异** — 这是一个性能/信任边界开关，不是 ZFS snapshot 总开关；ZFS 源仍会用 snapshot 提供稳定读视图。
+
+| 场景 | `zfs_diff = true`（默认） | `zfs_diff = false` |
+| --- | --- | --- |
+| 适用前提 | 只有源/目标是本机 ZFS 数据集，且已有上一轮验证过的 source/destination baseline snapshot 时才启用；前提缺失自动回退。 | 始终跳过 `zfs diff` 快路径。 |
+| Incremental | 优先用 source baseline → 当前 snapshot 的 `zfs diff` 得到变化路径，只同步这些路径；事件丢失、首次同步、手动 Full 等特殊情况仍可回退。 | 只使用事件日志路径做增量；事件丢失或无基准时回退完整对账。 |
+| 手动 Full | 若两侧 baseline 都可靠，分别 diff 源/目标自 baseline 以来的变化，取并集做按路径 reconcile；并集外视为上一轮已验证且未变化。 | 强制走双树完整扫描：并行遍历源树和目标树，生成完整清单后对账。 |
+| Compare | 若两侧 baseline 都可靠，只比较 diff 并集路径；报告方法记为 `zfs_diff`。 | 强制完整扫描源树和目标树后比较。 |
+| 正确性 | 快路径依赖 baseline invariant：上一轮 verified 时源/目标全树一致，且 baseline refresh 会用 `zfs diff` 交叉检查目标端外部写入，发现污染则保留旧 baseline 或回退。 | 不依赖 baseline 信任；每次 Full/Compare 都重新看完整树，适合怀疑 baseline、磁盘事故后、手工大量改目标端后先做一次保守对账。 |
+| 性能 | 对百万级 ZFS 树，耗时通常与“变化路径数量”相关，差异少时秒级；但需要保留和维护 baseline snapshot。 | 耗时与“全树文件数量”相关，最稳但最慢；大树可能需要数分钟到十几分钟。 |
+| 失败行为 | `zfs diff` 不可用、snapshot 缺失、检测到不安全嵌套挂载等情况会自动回退全树扫描，不会因为开着该选项而跳过必要对账。 | 没有 `zfs diff` 相关回退路径，因为一开始就走全树/事件路径。 |
+
+简单说：平时保持默认开启，用它把“已验证基准之后的小变化”变成小范围同步；当你怀疑 baseline 本身不可信，或者想强制用完整树重新确认一次时，把对应目标的 `sync.zfs_diff` 关掉。
+
 **跨机传输**：源/目标清单、批量 mkdir、批量 remove、文件推送都通过 peer HTTP transfer API 执行。本机 ZFS 源先创建 snapshot 只读视图供读取；目标有已验证基准快照时优先 `zfs diff` 增量。传输细节见[性能优化点](#性能优化点)。
 
 **回收站与临时目录**：mirror 删除统一进 `.auto_sync_trash/<cycle>/`，通过校验后按 `sync.trash_keep_days`（默认 30 天，0=永久）清理；临时文件写 `.auto_sync_tmp/<cycle>/`，完成后 fsync + 原子 rename，非当前 cycle 残留 7 天后清扫。`.auto_sync_*` 内部目录永不进入 diff 并集、清单或 mirror 删除集，且**源、目标两侧遍历都剪掉**（源本身也可能是别处的目标而积累了 `.auto_sync_trash`）。
