@@ -443,6 +443,29 @@ dns_listener_ready() {
     netstat -ln 2>/dev/null | grep -Eq '(^|[.:])1053[[:space:]]'
 }
 
+service_pid() {
+    case "$1" in
+        shadowsocks)
+            ps w 2>/dev/null | awk '/[s]slocal -c \/usr\/local\/shadowsocks\/conf\/shadowsocks-client\.json/ {print $1; exit}'
+            ;;
+        shadowsocks-rust)
+            :
+            ;;
+    esac
+}
+
+service_active() {
+    /etc/init.d/"$1" running >/dev/null 2>&1 && printf active || printf inactive
+}
+
+log_service_process() {
+    service="$1"
+    active="$(service_active "$service")"
+    pid="$(service_pid "$service")"
+    [ -n "$pid" ] || pid=none
+    echo "process $service active=$active pid=$pid"
+}
+
 validate_lan_dhcp_config() {
     iface=$(uci -q get dhcp.lan.interface 2>/dev/null || true)
     ignore=$(uci -q get dhcp.lan.ignore 2>/dev/null || true)
@@ -465,18 +488,23 @@ validate_lan_dhcp_config() {
 schedule_network_reload() {
     # Network reload can reset this SSH connection. Detach it so the deploy
     # script can report success after all preflight checks have passed.
+    delay=3
+    requested_at="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    planned_epoch="$(($(date +%s) + delay))"
+    planned_at="$(date -d "@$planned_epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || printf 'epoch %s' "$planned_epoch")"
     rm -f /var/run/auto_sync_network_reload.pid /tmp/auto_sync_network_reload.log
-    start-stop-daemon -S -b -m -p /var/run/auto_sync_network_reload.pid -x /bin/sh -- -c '
+    start-stop-daemon -S -b -m -p /var/run/auto_sync_network_reload.pid -x /bin/sh -- -c "
         exec >/tmp/auto_sync_network_reload.log 2>&1 </dev/null
-        sleep 1
+        sleep $delay
         /etc/init.d/network reload || true
         sleep 6
         /etc/init.d/dnsmasq restart || true
         /etc/init.d/dropbear restart || true
-    ' || {
+    " || {
         echo "!! failed to schedule network reload" >&2
         return 1
     }
+    echo "network reload scheduled once at $planned_at (requested $requested_at, delay ${delay}s) to avoid dropping the current SSH session"
 }
 
 ensure_ubus || exit 1
@@ -521,13 +549,17 @@ if ! sslocal_running || ! dns_listener_ready; then
     logread 2>/dev/null | grep -iE 'shadowsocks|sslocal|procd|ubus' | tail -n 80 >&2 || true
     exit 1
 fi
+log_service_process shadowsocks
+log_service_process shadowsocks-rust
 echo "--- final states ---"
 for s in shadowsocks shadowsocks-rust; do
     printf '  %s: ' "$s"
     /etc/init.d/"$s" enabled >/dev/null 2>&1 && printf enabled || printf disabled
     printf ' / '
-    /etc/init.d/"$s" running >/dev/null 2>&1 && printf active || printf inactive
-    echo
+    active="$(service_active "$s")"
+    pid="$(service_pid "$s")"
+    [ -n "$pid" ] || pid=none
+    printf '%s / pid=%s\n' "$active" "$pid"
 done
 
 # Only now apply dhcp DNS forwarding to sslocal's DNS listener.
@@ -537,7 +569,6 @@ validate_lan_dhcp_config || exit 1
 
 # apply network config last (may briefly drop this session)
 schedule_network_reload || exit 1
-echo "network reload scheduled in background to avoid dropping the current SSH session"
 '@
 Invoke-Remote $remote
 

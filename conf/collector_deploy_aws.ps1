@@ -418,7 +418,11 @@ git -C /usr/local/blog/.backup-worktree log --oneline -1 2>/dev/null | sed 's/^/
 
 echo "--- final states ---"
 for s in rblog rblog-backup.timer shadowsocks-rust nginx vlmcsd tbox_server tbox_client tbox-logrotate.timer waiwei-web waiwei-puller xray; do
-    printf "  %s: " "$s"; systemctl is-enabled "$s" 2>/dev/null | tr -d '\n'; printf " / "; systemctl is-active "$s" 2>/dev/null | tr -d '\n'; echo
+    enabled="$(systemctl is-enabled "$s" 2>/dev/null || true)"
+    active="$(systemctl is-active "$s" 2>/dev/null || true)"
+    pid="$(systemctl show "$s" -p MainPID --value 2>/dev/null || true)"
+    [ -n "$pid" ] && [ "$pid" != "0" ] || pid=none
+    printf "  %s: %s / %s / pid=%s\n" "$s" "${enabled:-unknown}" "${active:-unknown}" "$pid"
 done
 # `systemctl is-active` returns non-zero for the intentionally-stopped services,
 # which would otherwise make this block's exit code look like a failure.

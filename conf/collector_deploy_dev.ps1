@@ -397,12 +397,12 @@ restart_if_exists() {
 log_unit_processes() {
     unit="$(unit_name "$1" 2>/dev/null || true)"
     [ -n "$unit" ] || return 0
-    enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
     active="$(systemctl is-active "$unit" 2>/dev/null || true)"
     main_pid="$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)"
     pids="$(systemctl show "$unit" -p ControlPID -p MainPID --value 2>/dev/null | awk '$1 != "" && $1 != "0" {print}' | paste -sd, - 2>/dev/null || true)"
     [ -n "$pids" ] || pids="$main_pid"
-    log "state $unit: enabled=${enabled:-unknown} active=${active:-unknown} pid=${pids:-none}"
+    [ "$pids" = "0" ] && pids=none
+    log "process $unit active=${active:-unknown} pid=${pids:-none}"
 }
 stop_if_exists() {
     unit="$(unit_name "$1" 2>/dev/null || true)"
@@ -658,7 +658,7 @@ ensure_postgresql_cluster() {
 }
 ensure_postgresql_cluster || exit 1
 
-cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+cmp -s /usr/share/zoneinfo/Asia/Shanghai /etc/localtime 2>/dev/null || cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
 ensure_host_entry() {
     expected_ip="$1"
@@ -801,13 +801,19 @@ if [ ! -s "$NVM_DIR/nvm.sh" ]; then
 fi
 if [ -s "$NVM_DIR/nvm.sh" ]; then
     . "$NVM_DIR/nvm.sh"
-    nvm install 24.18.0 >/dev/null || nvm install 24 >/dev/null || log "WARN: nvm install 24 failed"
+    log "ensure node.js v24.18.0 via nvm"
+    if [ -x "$NVM_DIR/versions/node/v24.18.0/bin/node" ]; then
+        log "node.js v24.18.0 already installed"
+    else
+        log "install node.js v24.18.0"
+        nvm install 24.18.0 >/dev/null 2>&1 || nvm install 24 >/dev/null 2>&1 || log "WARN: nvm install 24 failed"
+    fi
     nvm use 24.18.0 --silent >/dev/null || nvm use 24 --silent >/dev/null || true
     hash -r 2>/dev/null || true
     if ! command -v npm >/dev/null 2>&1; then
         log "npm missing after nvm use; reinstall Node v24.18.0"
         rm -rf "$NVM_DIR/versions/node/v24.18.0"
-        nvm install 24.18.0 >/dev/null || nvm install 24 >/dev/null || log "WARN: nvm reinstall 24 failed"
+        nvm install 24.18.0 >/dev/null 2>&1 || nvm install 24 >/dev/null 2>&1 || log "WARN: nvm reinstall 24 failed"
         nvm use 24.18.0 --silent >/dev/null || nvm use 24 --silent >/dev/null || true
         hash -r 2>/dev/null || true
     fi
@@ -951,17 +957,19 @@ EOF_IMMICH_ML_ENV
         return 1
     fi
     if [ ! -d "$repo/.git" ]; then
+        log "clone immich deploy branch"
         git clone --branch deploy git@github.com:xiedeacc/immich.git "$repo" || return 1
     fi
+    log "sync immich deploy branch"
     (
         cd "$repo" &&
         git remote set-url origin git@github.com:xiedeacc/immich.git &&
         (git checkout -- deploy.sh 2>/dev/null || true) &&
         (git checkout -- scripts/deploy.sh 2>/dev/null || true) &&
         (git checkout -- install.sh 2>/dev/null || true) &&
-        git fetch origin deploy &&
-        git checkout deploy &&
-        git pull --ff-only origin deploy
+        git fetch origin deploy >/dev/null 2>&1 &&
+        git checkout deploy >/dev/null 2>&1 &&
+        git pull --ff-only origin deploy >/dev/null 2>&1
     ) || return 1
     immich_commit="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
     immich_marker=/usr/local/immich/.auto_sync_deploy_commit
@@ -1094,7 +1102,7 @@ if [ "$installed_gitlab_version" != "$GITLAB_CE_VERSION" ]; then
 fi
 ensure_zfs_for_gitlab
 mkdir -p /zfs/gitlab_data /zfs/gitlab_data/lfs-objects /zfs/gitlab_data/repositories 2>/dev/null || true
-passwd -S git 2>/dev/null || true
+passwd -S git >/dev/null 2>&1 || true
 if id git >/dev/null 2>&1; then
     git_pw_hash="$(openssl passwd -6 "auto-sync-git-$(date +%s)-$RANDOM" 2>/dev/null || true)"
     [ -z "$git_pw_hash" ] || usermod -p "$git_pw_hash" git 2>/dev/null || true
@@ -1110,7 +1118,6 @@ ensure_gitlab_zfs_config
 if command -v gitlab-ctl >/dev/null 2>&1; then
     gitlab_deploy_log=/var/log/auto_sync_gitlab_deploy.log
     : > "$gitlab_deploy_log"
-    log "gitlab maintenance started; detailed output -> $gitlab_deploy_log"
     gitlab_ok=1
     gitlab-ctl reconfigure >>"$gitlab_deploy_log" 2>&1 || true
     gitlab-ctl restart >>"$gitlab_deploy_log" 2>&1 || true
@@ -1121,7 +1128,6 @@ if command -v gitlab-ctl >/dev/null 2>&1; then
         fi
         sleep 5
     done
-    log "gitlab maintenance completed; final health is checked below"
 fi
 
 mkdir -p /root/src/share/ubuntu
@@ -1585,24 +1591,28 @@ rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/nul
 for s in tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
-for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron; do
+for s in mysql postgresql redis-server immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron; do
     restart_if_exists "$s"
 done
 
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_pg.sh'; echo '0 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_pg.sh > /dev/null 2>&1') | crontab -
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_mysql.sh'; echo '5 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_mysql.sh > /dev/null 2>&1') | crontab -
 
-echo '--- final states ---'
-for s in auto_sync halo2 immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer gitlab-runsvdir gitlab tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
-    resolved="$(unit_name "$s" 2>/dev/null || true)"
-    if [ -n "$resolved" ]; then
-        printf '  %s: ' "$s"; systemctl is-enabled "$resolved" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$resolved" 2>/dev/null | tr -d '\n'; echo
-    elif [ "$s" = "gitlab" ] && command -v gitlab-ctl >/dev/null 2>&1 && gitlab-ctl status >/dev/null 2>&1; then
-        printf '  %s: enabled / active\n' "$s"
-    else
-        printf '  %s: not-found / inactive\n' "$s"
-    fi
-done
+print_final_states() {
+    echo '--- final states ---'
+    for s in auto_sync halo2 immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+        resolved="$(unit_name "$s" 2>/dev/null || true)"
+        if [ -n "$resolved" ]; then
+            enabled="$(systemctl is-enabled "$resolved" 2>/dev/null || true)"
+            active="$(systemctl is-active "$resolved" 2>/dev/null || true)"
+            pid="$(systemctl show "$resolved" -p MainPID --value 2>/dev/null || true)"
+            [ -n "$pid" ] && [ "$pid" != "0" ] || pid=none
+            printf '  %s: %s / %s / pid=%s\n' "$s" "${enabled:-unknown}" "${active:-unknown}" "$pid"
+        else
+            printf '  %s: not-found / inactive / pid=none\n' "$s"
+        fi
+    done
+}
 
 wait_for_unit_active() {
     name="$1"
@@ -1657,6 +1667,7 @@ for url in https://dev.xiedeacc.com https://coverage.xiedeacc.com; do
         required_failed=1
     fi
 done
+print_final_states
 exit "$required_failed"
 '@
 Invoke-Remote $remote
