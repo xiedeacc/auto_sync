@@ -211,6 +211,11 @@ function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$Opt
     }
 
     if ($tarPaths.Count -eq 0) { return }
+    $nameManifest = Join-Path $root '.auto_sync_name_manifest.json'
+    if (Test-Path -LiteralPath $nameManifest) {
+        [void]$tarPaths.Add('.auto_sync_name_manifest.json')
+        Write-Host "stage /.auto_sync_name_manifest.json"
+    }
 
     $excludeArgs = @()
     foreach ($exclude in $excludePaths) {
@@ -242,6 +247,53 @@ function Transfer-CollectedPathsToStage([string[]]$RequiredPaths, [string[]]$Opt
 
 function Quote-ShellArg([string]$Value) {
     return "'" + $Value.Replace("'", "'""'""'") + "'"
+}
+
+function Invoke-NameManifestRehydrate([string]$RemoteStage) {
+    $qStage = Quote-ShellArg $RemoteStage
+    Invoke-Remote @"
+set -e
+stage=$qStage
+export AUTO_SYNC_STAGE="`$stage"
+python3 - <<'PY'
+import json, os, shutil
+stage = os.environ.get("AUTO_SYNC_STAGE", "")
+if not stage:
+    raise SystemExit("AUTO_SYNC_STAGE is empty")
+manifest_path = os.path.join(stage, ".auto_sync_name_manifest.json")
+if not os.path.exists(manifest_path):
+    raise SystemExit(0)
+with open(manifest_path, "r", encoding="utf-8") as f:
+    manifest = json.load(f)
+entries = manifest.get("entries", [])
+def safe_rel(rel):
+    parts = [p for p in rel.split("/") if p]
+    if any(p in (".", "..") for p in parts):
+        raise RuntimeError(f"unsafe stored_rel: {rel}")
+    return parts
+for entry in sorted(entries, key=lambda e: e["stored_rel"].count("/"), reverse=True):
+    stored_parts = safe_rel(entry["stored_rel"])
+    stored = os.path.join(stage.encode(), *[p.encode("utf-8") for p in stored_parts])
+    original = stage.encode() + b"/" + bytes.fromhex(entry["original_rel_hex"])
+    if not os.path.lexists(stored):
+        continue
+    os.makedirs(os.path.dirname(original), exist_ok=True)
+    if os.path.lexists(original):
+        if os.path.isdir(original) and not os.path.islink(original):
+            shutil.rmtree(original)
+        else:
+            os.unlink(original)
+    os.rename(stored, original)
+for root, dirs, files in os.walk(stage.encode(), topdown=False):
+    if os.path.basename(root) == b".auto_sync_name":
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
+os.unlink(manifest_path)
+print(f"rehydrated {len(entries)} Linux byte-name path(s)")
+PY
+"@
 }
 
 function Ensure-RemoteRootWritable {
@@ -309,6 +361,7 @@ Invoke-Remote "rm -rf $(Quote-ShellArg $remoteStage); mkdir -p $(Quote-ShellArg 
 $generatedOptionalPaths = @('/opt/immich/conf', '/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') + $platformDefaultCollectPaths
 $requiredCollectPaths = @($collectPaths | Where-Object { (Normalize-RemotePath $_) -ne '/opt/immich/conf' })
 Transfer-CollectedPathsToStage $requiredCollectPaths $generatedOptionalPaths $remoteStage
+Invoke-NameManifestRehydrate $remoteStage
 Prepare-StagedSymlinks $env:AS_PERMS_FILE $remoteStage
 
 $sshPort = $env:AS_PORT

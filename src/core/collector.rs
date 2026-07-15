@@ -11,8 +11,8 @@
 //! on a schedule.
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,6 +30,8 @@ const AUTOSPLIT_MARKER: &str = ".autosplit.";
 /// Per-host permission cache written under the host's local root at collect
 /// time and replayed by `deploy` (Windows can't preserve Unix modes).
 const PERMS_FILE: &str = ".auto_sync_perms";
+const NAME_MANIFEST_FILE: &str = ".auto_sync_name_manifest.json";
+const ENCODED_NAME_DIR: &str = ".auto_sync_name";
 
 /// Non-interactive ssh/scp options: never prompt for a password, auto-trust a
 /// new host key (LAN/known infra), and cap the connect wait so a dead host
@@ -812,16 +814,8 @@ fn pull_paths_tar(
         }
     }
     let ssh_stdout = ssh_child.stdout.take().context("opening ssh tar stdout")?;
-
-    let mut tar = command("tar");
-    tar.arg("-C")
-        .arg(&host.root)
-        .arg("-xf")
-        .arg("-")
-        .stdin(Stdio::from(ssh_stdout))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let tar_output = tar.output().context("extracting tar")?;
+    let extract_result = extract_tar_preserving_linux_names(ssh_stdout, &host.root, &rel_paths)
+        .context("extracting tar stream")?;
     let ssh_output = ssh_child
         .wait_with_output()
         .context("waiting for ssh tar")?;
@@ -830,19 +824,253 @@ fn pull_paths_tar(
             "remote tar failed: {}",
             String::from_utf8_lossy(&ssh_output.stderr).trim()
         ))
-    } else if !tar_output.status.success() {
-        Err(anyhow::anyhow!(
-            "local tar failed: {}",
-            String::from_utf8_lossy(&tar_output.stderr).trim()
-        ))
     } else {
         for snapshot in &sqlite_snapshots {
             pull_sqlite_snapshot(host, conn, snapshot, state)?;
+        }
+        if extract_result.encoded_entries > 0 {
+            log(
+                state,
+                format!(
+                    "  name manifest: encoded {} Linux byte-name path(s)",
+                    extract_result.encoded_entries
+                ),
+            );
         }
         Ok(())
     };
     cleanup_sqlite_snapshots(conn, &sqlite_snapshots, state);
     result
+}
+
+#[derive(Default)]
+struct TarExtractResult {
+    encoded_entries: usize,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct NameManifest {
+    version: u32,
+    entries: Vec<NameManifestEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NameManifestEntry {
+    stored_rel: String,
+    original_rel_hex: String,
+}
+
+fn extract_tar_preserving_linux_names<R: Read>(
+    reader: R,
+    root: &Path,
+    rel_roots: &[String],
+) -> Result<TarExtractResult> {
+    let mut archive = tar::Archive::new(reader);
+    let mut manifest = load_name_manifest(root).unwrap_or_default();
+    manifest.version = 1;
+    prune_name_manifest_roots(&mut manifest, rel_roots);
+    let mut result = TarExtractResult::default();
+
+    for entry in archive.entries().context("reading tar entries")? {
+        let mut entry = entry.context("reading tar entry")?;
+        let raw_path = entry.path_bytes().into_owned();
+        let Some(stored_rel) = stored_rel_for_linux_path(&raw_path, &mut manifest)? else {
+            continue;
+        };
+        let target = root.join(local_rel_path(&stored_rel));
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            fs::create_dir_all(&target)
+                .with_context(|| format!("creating directory {}", target.display()))?;
+        } else if entry_type.is_symlink() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating directory {}", parent.display()))?;
+            }
+            File::create(&target)
+                .with_context(|| format!("creating symlink placeholder {}", target.display()))?;
+        } else if entry_type.is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating directory {}", parent.display()))?;
+            }
+            let mut file =
+                File::create(&target).with_context(|| format!("creating {}", target.display()))?;
+            io::copy(&mut entry, &mut file)
+                .with_context(|| format!("extracting {}", target.display()))?;
+        }
+    }
+
+    result.encoded_entries = manifest.entries.len();
+    write_name_manifest(root, manifest)?;
+    Ok(result)
+}
+
+fn stored_rel_for_linux_path(
+    raw_path: &[u8],
+    manifest: &mut NameManifest,
+) -> Result<Option<String>> {
+    let mut stored_parts = Vec::new();
+    let mut original_parts: Vec<Vec<u8>> = Vec::new();
+    for part in raw_path.split(|b| *b == b'/') {
+        if part.is_empty() || part == b"." {
+            continue;
+        }
+        if part == b".." {
+            bail!("tar entry contains '..'");
+        }
+        original_parts.push(part.to_vec());
+        if let Some(text) = safe_windows_component(part) {
+            stored_parts.push(text);
+            continue;
+        }
+
+        let hash = blake3::hash(part).to_hex().to_string();
+        stored_parts.push(ENCODED_NAME_DIR.to_string());
+        stored_parts.push(hash[..32].to_string());
+        let stored_rel = stored_parts.join("/");
+        let original_rel_hex = hex_encode(&join_raw_path(&original_parts));
+        if !manifest
+            .entries
+            .iter()
+            .any(|entry| entry.stored_rel == stored_rel)
+        {
+            manifest.entries.push(NameManifestEntry {
+                stored_rel,
+                original_rel_hex,
+            });
+        }
+    }
+    if stored_parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(stored_parts.join("/")))
+}
+
+fn safe_windows_component(raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    if text.is_empty() || text == "." || text == ".." {
+        return None;
+    }
+    if text.ends_with(' ') || text.ends_with('.') {
+        return None;
+    }
+    if text
+        .chars()
+        .any(|ch| ch < ' ' || matches!(ch, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*'))
+    {
+        return None;
+    }
+    let upper = text.split('.').next().unwrap_or(text).to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    ) {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+fn join_raw_path(parts: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+fn write_name_manifest(root: &Path, manifest: NameManifest) -> Result<()> {
+    let path = root.join(NAME_MANIFEST_FILE);
+    if manifest.entries.is_empty() {
+        let _ = fs::remove_file(path);
+        return Ok(());
+    }
+    let body = serde_json::to_string_pretty(&manifest)?;
+    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
+}
+
+fn load_name_manifest(root: &Path) -> Result<NameManifest> {
+    let path = root.join(NAME_MANIFEST_FILE);
+    let body = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn prune_name_manifest_roots(manifest: &mut NameManifest, rel_roots: &[String]) {
+    manifest.entries.retain(|entry| {
+        let stored_matches = rel_roots
+            .iter()
+            .any(|root| path_is_under_root(&entry.stored_rel, root));
+        let original_matches = hex_decode(&entry.original_rel_hex)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .is_some_and(|original| {
+                rel_roots
+                    .iter()
+                    .any(|root| path_is_under_root(&original, root))
+            });
+        !(stored_matches || original_matches)
+    });
+}
+
+fn path_is_under_root(path: &str, root: &str) -> bool {
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Result<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        bail!("hex string has odd length");
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let bytes = text.as_bytes();
+    for idx in (0..bytes.len()).step_by(2) {
+        let hi = hex_nibble(bytes[idx])?;
+        let lo = hex_nibble(bytes[idx + 1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => bail!("invalid hex digit"),
+    }
 }
 
 #[derive(Debug)]
@@ -2111,6 +2339,48 @@ mod tests {
                 "usr/local/blog/.backup-worktree",
                 "usr/local/blog/.backup-worktree/*",
             ]
+        );
+    }
+
+    #[test]
+    fn linux_name_manifest_keeps_safe_utf8_names_plain() {
+        let mut manifest = NameManifest::default();
+        let stored = stored_rel_for_linux_path(
+            "root/.halo2/attachments/upload/微信图片.png".as_bytes(),
+            &mut manifest,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored, "root/.halo2/attachments/upload/微信图片.png");
+        assert!(manifest.entries.is_empty());
+    }
+
+    #[test]
+    fn linux_name_manifest_encodes_windows_unsafe_components() {
+        let mut manifest = NameManifest::default();
+        let stored = stored_rel_for_linux_path(b"root/upload/bad:name.png", &mut manifest)
+            .unwrap()
+            .unwrap();
+        assert!(stored.starts_with("root/upload/.auto_sync_name/"));
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].stored_rel, stored);
+        assert_eq!(
+            hex_decode(&manifest.entries[0].original_rel_hex).unwrap(),
+            b"root/upload/bad:name.png"
+        );
+    }
+
+    #[test]
+    fn linux_name_manifest_encodes_non_utf8_components() {
+        let mut manifest = NameManifest::default();
+        let stored = stored_rel_for_linux_path(b"root/upload/\xff.png", &mut manifest)
+            .unwrap()
+            .unwrap();
+        assert!(stored.starts_with("root/upload/.auto_sync_name/"));
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(
+            hex_decode(&manifest.entries[0].original_rel_hex).unwrap(),
+            b"root/upload/\xff.png"
         );
     }
 
