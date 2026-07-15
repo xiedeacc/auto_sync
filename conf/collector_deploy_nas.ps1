@@ -573,7 +573,7 @@ id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
 ensure_software_src_layout() {
     new=/opt/src/software
     old=/opt/software/src
-    mkdir -p /opt/src /opt/software
+    mkdir -p /opt/src
     if [ -e "$old" ] && [ ! -L "$old" ]; then
         if [ ! -e "$new" ]; then
             mv "$old" "$new"
@@ -586,6 +586,7 @@ ensure_software_src_layout() {
     if [ -L "$old" ] && [ "$(readlink "$old")" != "$new" ]; then
         rm -f "$old"
     fi
+    rmdir /opt/software 2>/dev/null || true
 }
 ensure_software_src_layout
 rewrite_software_src_paths() {
@@ -2620,8 +2621,8 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
-[ -e /opt/immich ] && chown tiger:tiger /opt/immich /opt/immich/{server,web,upload,machine-learning,conf} /opt/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
 [ -e /opt/user/tiger ] && chown -R tiger:tiger /opt/user/tiger 2>/dev/null || true
+[ -e /opt/immich ] && chown root:root /opt/immich /opt/immich/{server,web,upload,machine-learning,conf} /opt/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
 for d in /opt/usr/local/auto_sync /opt/usr/local/halo /opt/usr/local/tbox /opt/usr/local/shadowsocks /opt/user/root/.halo2; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
@@ -2649,7 +2650,7 @@ normalize_deploy_permissions
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for f in /etc/systemd/system/auto_sync.service /etc/systemd/system/halo2.service /etc/systemd/system/tbox_client.service; do
+for f in /etc/systemd/system/auto_sync.service /etc/systemd/system/halo2.service /etc/systemd/system/immich.service /etc/systemd/system/immich-ml.service /etc/systemd/system/tbox_client.service; do
     [ -f "$f" ] || continue
     sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
     grep -q '^User=' "$f" || sed -i '/^\[Service\]/a User=root' "$f"
