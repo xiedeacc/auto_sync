@@ -334,7 +334,7 @@ fi
 Copy-AwsSslIntoCollectedRoot
 $remoteStage = '/tmp/auto_sync_deploy_stage'
 Invoke-Remote "rm -rf $(Quote-ShellArg $remoteStage); mkdir -p $(Quote-ShellArg $remoteStage)"
-$generatedOptionalPaths = @('/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') + $platformDefaultCollectPaths
+$generatedOptionalPaths = $platformDefaultCollectPaths
 $requiredCollectPaths = $collectPaths
 Transfer-CollectedPathsToStage $requiredCollectPaths $generatedOptionalPaths $remoteStage
 Invoke-NameManifestRehydrate $remoteStage
@@ -525,7 +525,6 @@ install_staged_collected_paths() {
         cp -a "$stage/$rel" "$target"
         chmod "${2:-644}" "$target" 2>/dev/null || true
     }
-    install_staged_file root/src/share/dev/sync_db_from_nas.sh 755
     rm -rf "$stage/root/src/share" 2>/dev/null || true
     rmdir "$stage/root/src" "$stage/root" 2>/dev/null || true
     for rel in \
@@ -994,8 +993,6 @@ for u in tiger git; do
     id "$u" >/dev/null 2>&1 && setquota -u "$u" 1000000 1000000 0 0 / 2>/dev/null || true
 done
 
-[ -f /root/src/share/dev/sync_db_from_nas.sh ] && chmod +x /root/src/share/dev/sync_db_from_nas.sh
-
 wake_zfs() {
     if [ ! -d /zfs ]; then
         log "skip /zfs wake: /zfs not found"
@@ -1061,76 +1058,6 @@ standby_zfs() {
     done
 }
 
-newest_dump() {
-    kind="$1"
-    shift
-    [ "$#" -gt 0 ] || return 0
-    tmp="$(mktemp)"
-    for root in "$@"; do
-        [ -d "$root" ] || continue
-        maxdepth_args=()
-        case "$root" in
-            /zfs/backup|/zfs/backup/*) maxdepth_args=(-maxdepth 4) ;;
-        esac
-        case "$kind" in
-            mysql)
-                find "$root" "${maxdepth_args[@]}" -type f \( \
-                    -name 'mysql_full_backup_*.sql' -o \
-                    -name 'mysql_full_backup_*.sql.gz' -o \
-                    -name 'mysql-all.sql' -o \
-                    -name 'mysql-all.sql.gz' -o \
-                    -name '*mysql*.sql' -o \
-                    -name '*mysql*.sql.gz' \
-                \) -print0 2>/dev/null >> "$tmp"
-                ;;
-            postgres)
-                find "$root" "${maxdepth_args[@]}" -type f \( \
-                    -name 'pg_full_backup_*.sql' -o \
-                    -name 'pg_full_backup_*.sql.gz' -o \
-                    -name 'postgres-all.sql' -o \
-                    -name 'postgres-all.sql.gz' -o \
-                    -name '*postgres*.sql' -o \
-                    -name '*postgres*.sql.gz' -o \
-                    -name '*pg*.sql' -o \
-                    -name '*pg*.sql.gz' \
-                \) -print0 2>/dev/null >> "$tmp"
-                ;;
-            *)
-                rm -f "$tmp"
-                return 1
-                ;;
-        esac
-    done
-    score_dumps < "$tmp" | sort -nr | head -1 | cut -f2-
-    rm -f "$tmp"
-}
-
-score_dumps() {
-    while IFS= read -r -d '' path; do
-        base="$(basename "$path")"
-        stamp="$(printf '%s\n' "$base" | sed -n 's/.*_\([0-9]\{8\}_[0-9]\{6\}\)\.sql\(\.gz\)\?$/\1/p')"
-        score=""
-        if [ -n "$stamp" ]; then
-            score="$(date -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2} ${stamp:9:2}:${stamp:11:2}:${stamp:13:2}" +%s 2>/dev/null || true)"
-        fi
-        [ -n "$score" ] || score="$(stat -c %Y "$path" 2>/dev/null || echo 0)"
-        printf '%s\t%s\n' "$score" "$path"
-    done
-}
-
-dump_search_roots() {
-    for dir in \
-        /zfs/backup \
-        /root/auto_sync_db_dumps \
-        /tmp/auto_sync_db_dumps \
-        /root/src/share/ubuntu \
-        /root/src/share/nas \
-        /root/src/share
-    do
-        [ -d "$dir" ] && printf '%s\n' "$dir"
-    done
-}
-
 ensure_postgresql_ready() {
     version="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -1)"
     [ -z "$version" ] || fix_postgresql_config_permissions "$version"
@@ -1161,65 +1088,9 @@ ensure_postgresql_ready() {
     return 1
 }
 
-mysql_has_user_data() {
-    command -v mysql >/dev/null 2>&1 || return 1
-    count="$(mysql -NBe "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null || echo 0)"
-    [ "${count:-0}" -gt 0 ] 2>/dev/null
-}
-
-postgres_has_user_data() {
-    ensure_postgresql_ready >/dev/null 2>&1 || return 1
-    count="$(sudo -u postgres psql -Atqc "SELECT COUNT(*) FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres')" 2>/dev/null || echo 0)"
-    [ "${count:-0}" -gt 0 ] 2>/dev/null
-}
-
-restore_once() {
-    kind="$1"
-    latest="$2"
-    marker="/var/lib/auto_sync/${kind}_restore_marker"
-    [ -n "$latest" ] || { log "skip $kind restore: no dump found"; return 0; }
-    mkdir -p /var/lib/auto_sync
-    if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$latest" ]; then
-        log "skip $kind restore: already restored $latest"
-        return 0
-    fi
-    case "$kind" in
-        mysql)
-            if mysql_has_user_data; then
-                log "skip mysql restore: existing user data found"
-                return 0
-            fi
-            ;;
-        postgres)
-            if postgres_has_user_data; then
-                log "skip postgres restore: existing user databases found"
-                return 0
-            fi
-            ;;
-    esac
-    log "restore $kind from $latest"
-    case "$kind" in
-        mysql)
-            systemctl restart mysql 2>/dev/null || systemctl restart mariadb 2>/dev/null || true
-            if printf '%s' "$latest" | grep -q '\.gz$'; then zcat "$latest" | mysql; else mysql < "$latest"; fi
-            ;;
-        postgres)
-            ensure_postgresql_ready || log "WARN: postgresql is not ready before restore"
-            if printf '%s' "$latest" | grep -q '\.gz$'; then zcat "$latest" | sudo -u postgres psql -v ON_ERROR_STOP=0; else sudo -u postgres psql -v ON_ERROR_STOP=0 -f "$latest"; fi
-            ;;
-    esac && printf '%s' "$latest" > "$marker" || log "WARN: $kind restore failed"
-}
 zfs_woken=0
 wake_zfs && zfs_woken=1 || true
-dump_roots="$(dump_search_roots)"
-mysql_dump="$(newest_dump mysql $dump_roots 2>/dev/null || true)"
-pg_dump="$(newest_dump postgres $dump_roots 2>/dev/null || true)"
-[ -n "$mysql_dump" ] && log "selected mysql dump: $mysql_dump"
-[ -n "$pg_dump" ] && log "selected postgres dump: $pg_dump"
-restore_once mysql "$mysql_dump"
-restore_once postgres "$pg_dump"
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
-rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
 if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
@@ -1284,7 +1155,7 @@ for s in mysql postgresql redis-server auto_sync rblog rblog-backup.timer nginx 
     restart_if_exists "$s"
 done
 
-(crontab -l 2>/dev/null | grep -v -E '/root/src/share/(ubuntu/backup_pg|ubuntu/backup_mysql|dev/sync_db_from_nas)\.sh'; echo '0 10 * * 6 /bin/bash /root/src/share/dev/sync_db_from_nas.sh > /dev/null 2>&1') | crontab -
+crontab -l 2>/dev/null | grep -v -E '/root/src/share/(ubuntu/backup_pg|ubuntu/backup_mysql|dev/sync_db_from_nas)\.sh' | crontab -
 
 print_final_states() {
     echo '--- final states ---'

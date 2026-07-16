@@ -434,7 +434,7 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
     let mut failures = 0;
     let mut pulled = Vec::new();
     let excludes = normalize_excludes(&host.exclude);
-    let mut targets = collect_targets(host);
+    let targets = collect_targets(host);
     if let Err(err) = ssh_capture(&conn, "true") {
         let message = format!("host connection failed: {err:#}");
         log(state, format!("host '{label}': {message}"));
@@ -445,33 +445,7 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
         record_file_failed(state, failed);
         return failed;
     }
-    let mut cleanup_database_dump_dir = false;
-    match prepare_database_dumps(host, &conn, &label, state) {
-        Ok(Some(dump_paths)) => {
-            cleanup_database_dump_dir = true;
-            for dump_path in dump_paths {
-                if !is_excluded(&dump_path, &excludes) && !targets.iter().any(|p| p == &dump_path) {
-                    log(state, format!("  dump ready {dump_path}"));
-                    targets.push(dump_path);
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(err) => {
-            log(state, format!("  database dump skipped/failed: {err:#}"));
-            record_run_issue(
-                state,
-                "dump_failed",
-                &label,
-                "/root/auto_sync_db_dumps",
-                format!("{err:#}"),
-            );
-        }
-    }
     if targets.is_empty() {
-        if cleanup_database_dump_dir {
-            cleanup_database_dumps(&conn, state);
-        }
         return 0;
     }
     set_current_file(
@@ -583,150 +557,7 @@ fn pull_host(host: &CollectorHost, state: &Arc<Mutex<CollectorRunState>>) -> usi
             log(state, format!("  perms: could not record: {err:#}"));
         }
     }
-    if cleanup_database_dump_dir {
-        cleanup_database_dumps(&conn, state);
-    }
     failures
-}
-
-fn prepare_database_dumps(
-    host: &CollectorHost,
-    conn: &SshConn,
-    label: &str,
-    state: &Arc<Mutex<CollectorRunState>>,
-) -> Result<Option<Vec<String>>> {
-    let host_name = host.name.trim().to_ascii_lowercase();
-    if host_name == "aws" || host_name == "openwrt" {
-        return Ok(None);
-    }
-
-    let os_release = ssh_capture(
-        conn,
-        "if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\\n%s\\n' \"${ID:-}\" \"${ID_LIKE:-}\"; fi",
-    )
-    .unwrap_or_default()
-    .to_ascii_lowercase();
-    if !os_release.lines().any(|line| line.trim() == "ubuntu") {
-        return Ok(None);
-    }
-
-    log(state, "  database dumps: preparing MySQL/PostgreSQL dumps");
-    let script = r#"
-set -o pipefail
-dump_dir=/tmp/auto_sync_db_dumps
-if [ "$(id -u)" = "0" ]; then
-    dump_dir=/root/auto_sync_db_dumps
-fi
-mkdir -p "$dump_dir"
-chmod 700 "$dump_dir" 2>/dev/null || true
-
-install_pkgs=""
-command -v gzip >/dev/null 2>&1 || install_pkgs="$install_pkgs gzip"
-command -v mysqldump >/dev/null 2>&1 || install_pkgs="$install_pkgs default-mysql-client"
-command -v pg_dumpall >/dev/null 2>&1 || install_pkgs="$install_pkgs postgresql-client"
-if [ -n "$install_pkgs" ]; then
-    if command -v apt-get >/dev/null 2>&1; then
-        if [ "$(id -u)" = "0" ]; then
-            apt_prefix=""
-        elif command -v sudo >/dev/null 2>&1; then
-            apt_prefix="sudo -n"
-        else
-            apt_prefix=""
-        fi
-        if [ "$(id -u)" = "0" ] || [ -n "$apt_prefix" ]; then
-            echo "DUMP_INSTALL$install_pkgs"
-            DEBIAN_FRONTEND=noninteractive $apt_prefix apt-get update -qq \
-                && DEBIAN_FRONTEND=noninteractive $apt_prefix apt-get install -y -qq $install_pkgs \
-                || echo "DUMP_FAIL install apt-get install$install_pkgs failed"
-        else
-            echo "DUMP_FAIL install not root and sudo unavailable"
-        fi
-    else
-        echo "DUMP_FAIL install apt-get not found"
-    fi
-fi
-
-if ! command -v gzip >/dev/null 2>&1; then
-    echo "DUMP_FAIL common gzip not found"
-    exit 0
-fi
-
-if command -v mysqldump >/dev/null 2>&1; then
-    tmp="$dump_dir/mysql-all.sql.gz.tmp"
-    out="$dump_dir/mysql-all.sql.gz"
-    err="$dump_dir/mysql-all.err"
-    rm -f "$tmp"
-    if mysqldump --all-databases --single-transaction --routines --events --triggers --hex-blob --default-character-set=utf8mb4 2>"$err" | gzip -c > "$tmp"; then
-        mv -f "$tmp" "$out"
-        chmod 600 "$out" 2>/dev/null || true
-        echo "DUMP_PATH $out"
-    else
-        rm -f "$tmp"
-        echo "DUMP_FAIL mysql $(head -n 1 "$err" 2>/dev/null)"
-    fi
-else
-    echo "DUMP_SKIP mysql mysqldump not found"
-fi
-
-if command -v pg_dumpall >/dev/null 2>&1; then
-    tmp="$dump_dir/postgres-all.sql.gz.tmp"
-    out="$dump_dir/postgres-all.sql.gz"
-    err="$dump_dir/postgres-all.err"
-    rm -f "$tmp"
-    if command -v sudo >/dev/null 2>&1; then
-        pg_cmd='sudo -n -u postgres pg_dumpall'
-    elif command -v runuser >/dev/null 2>&1; then
-        pg_cmd='runuser -u postgres -- pg_dumpall'
-    else
-        pg_cmd='pg_dumpall'
-    fi
-    if eval "$pg_cmd" 2>"$err" | gzip -c > "$tmp"; then
-        mv -f "$tmp" "$out"
-        chmod 600 "$out" 2>/dev/null || true
-        echo "DUMP_PATH $out"
-    else
-        rm -f "$tmp"
-        echo "DUMP_FAIL postgres $(head -n 1 "$err" 2>/dev/null)"
-    fi
-else
-    echo "DUMP_SKIP postgres pg_dumpall not found"
-fi
-"#;
-    let remote_cmd = format!("bash -lc {}", shell_quote(script));
-    let out = ssh_capture(conn, &remote_cmd)?;
-    let mut dump_paths = Vec::new();
-    for line in out.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        log(state, format!("  dump | {line}"));
-        if let Some(path) = line.strip_prefix("DUMP_PATH ") {
-            dump_paths.push(path.trim().to_string());
-        } else if let Some(reason) = line.strip_prefix("DUMP_FAIL ") {
-            record_run_issue(
-                state,
-                "dump_failed",
-                label,
-                "/root/auto_sync_db_dumps",
-                reason.trim().to_string(),
-            );
-        }
-    }
-    Ok(Some(dump_paths))
-}
-
-fn cleanup_database_dumps(conn: &SshConn, state: &Arc<Mutex<CollectorRunState>>) {
-    match ssh_capture(
-        conn,
-        "rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true",
-    ) {
-        Ok(_) => log(state, "  dump cleanup: removed remote auto_sync_db_dumps"),
-        Err(err) => log(
-            state,
-            format!("  dump cleanup: could not remove remote auto_sync_db_dumps: {err:#}"),
-        ),
-    }
 }
 
 enum RemotePathKind {
