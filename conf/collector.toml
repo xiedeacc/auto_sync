@@ -35,7 +35,6 @@ identity_file = "~/.ssh/id_ed25519"
 password = ""
 root = 'D:\share\dev'
 paths = [
-    "/etc/gitlab",
     "/etc/gdm3/custom.conf",
     "/etc/immich",
     "/etc/mysql",
@@ -110,7 +109,6 @@ identity_file = "~/.ssh/id_ed25519"
 password = ""
 root = 'D:\share\nas'
 paths = [
-    "/etc/gitlab",
     "/etc/immich",
     "/etc/mysql",
     "/etc/nginx/nginx.conf",
@@ -123,6 +121,12 @@ paths = [
     "/etc/systemd/system/rblog-backup.service",
     "/etc/systemd/system/rblog-backup.timer",
     "/etc/systemd/system/rblog.service",
+    "/etc/systemd/system/rgit-backup.service",
+    "/etc/systemd/system/rgit-backup.service.d",
+    "/etc/systemd/system/rgit-backup.timer",
+    "/etc/systemd/system/rgit-ocsp.service",
+    "/etc/systemd/system/rgit-ocsp.timer",
+    "/etc/systemd/system/rgit.service",
     "/etc/systemd/system/shadowsocks-rust.service",
     "/etc/systemd/system/shadowsocks.service",
     "/etc/systemd/system/tbox-logrotate.service",
@@ -148,6 +152,7 @@ paths = [
     "/opt/user/root/.zshrc",
     "/opt/usr/local/auto_sync",
     "/opt/usr/local/blog",
+    "/opt/usr/local/rgit",
     "/opt/usr/local/shadowsocks",
     "/opt/usr/local/tbox",
     "/opt/usr/local/waiwei",
@@ -157,6 +162,8 @@ exclude = [
     "/opt/usr/local/auto_sync/logs",
     "/opt/usr/local/blog/.backup-worktree",
     "/opt/usr/local/blog/logs",
+    "/opt/usr/local/rgit/.backup-worktree",
+    "/opt/usr/local/rgit/logs",
     "/opt/usr/local/shadowsocks/logs",
     "/opt/usr/local/tbox/log",
     "/opt/usr/local/waiwei/logs",

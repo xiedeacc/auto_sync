@@ -355,7 +355,7 @@ set -e
 mkdir -p /etc/ssh/sshd_config.d /root/.ssh
 cp /root/auto_sync_sshd_config /etc/ssh/sshd_config
 rm -f /root/auto_sync_sshd_config
-rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/98-auto-sync-gitlab.conf /etc/ssh/sshd_config.d/99-auto-sync-test.conf
+rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/99-auto-sync-test.conf
 if [ -f /tmp/auto_sync_root_key.pub ]; then
     cat /tmp/auto_sync_root_key.pub > /root/.ssh/authorized_keys
 fi
@@ -398,7 +398,6 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
 $remote = @'
 set -u
 export DEBIAN_FRONTEND=noninteractive
-GITLAB_CE_VERSION="17.11.7-ce.0"
 
 log() { printf '[dev-deploy] %s\n' "$*"; }
 try() { "$@" && return 0; log "WARN: command failed: $*"; return 0; }
@@ -481,18 +480,6 @@ disable_if_exists() {
         log "disabled+stopped $unit"
         log_unit_processes "$unit"
     fi
-}
-
-ensure_gitlab_running_quietly() {
-    if command -v gitlab-ctl >/dev/null 2>&1; then
-        systemctl start gitlab-runsvdir.service >/dev/null 2>&1 || systemctl start gitlab-runsvdir >/dev/null 2>&1 || true
-        gitlab-ctl start >>/var/log/auto_sync_gitlab_deploy.log 2>&1 || true
-        for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-            gitlab-ctl status >>/var/log/auto_sync_gitlab_deploy.log 2>&1 && return 0
-            sleep 5
-        done
-    fi
-    return 1
 }
 
 normalize_deploy_permissions() {
@@ -579,11 +566,6 @@ install_staged_collected_paths() {
     [ "$rc" -eq 0 ] && log "installed collected paths"
     return "$rc"
 }
-
-if [ -f /etc/apt/sources.list.d/gitlab_gitlab-ce.list ] && grep -q '/ubuntu/resolute\| resolute ' /etc/apt/sources.list.d/gitlab_gitlab-ce.list; then
-    log "GitLab CE has no resolute repo yet; use noble package repo"
-    sed -i 's#/ubuntu/resolute#/ubuntu/noble#g; s/ resolute / noble /g' /etc/apt/sources.list.d/gitlab_gitlab-ce.list
-fi
 
 if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
     sed -i 's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' /etc/apt/sources.list.d/ubuntu.sources
@@ -779,7 +761,6 @@ ensure_host_entry() {
     cat "$tmp" > /etc/hosts
     rm -f "$tmp"
 }
-ensure_host_entry 127.0.0.1 code.xiedeacc.com
 ensure_host_entry 127.0.0.1 unlock-music.xiedeacc.com
 ensure_host_entry 127.0.0.1 immich.xiedeacc.com
 ensure_host_entry 127.0.0.1 halo.xiedeacc.com
@@ -1105,111 +1086,9 @@ EOF_IMMICH_ML_ENV
     return 1
 }
 setquota -u root 20000000 20000000 0 0 /dev/mmcblk0p2 2>/dev/null || true
-for u in tiger git gitlab immich; do
+for u in tiger git immich; do
     id "$u" >/dev/null 2>&1 && setquota -u "$u" 1000000 1000000 0 0 / 2>/dev/null || true
 done
-
-ensure_zfs_for_gitlab() {
-    log "dev: use plain /zfs directory for GitLab data"
-    mkdir -p /zfs /zfs/gitlab_data /zfs/gitlab_data/lfs-objects
-    ls -ald /zfs >/dev/null 2>&1 || true
-}
-
-ensure_gitlab_zfs_config() {
-    [ -f /etc/gitlab/gitlab.rb ] || return 0
-    if ! grep -q '/zfs/gitlab_data' /etc/gitlab/gitlab.rb 2>/dev/null; then
-        log "add GitLab /zfs data storage config"
-        cat >> /etc/gitlab/gitlab.rb <<'EOF_GITLAB_ZFS'
-
-# Managed by auto_sync NAS deployment: keep GitLab repository/LFS data on /zfs.
-gitlab_rails['lfs_enabled'] = true
-gitlab_rails['lfs_storage_path'] = "/zfs/gitlab_data/lfs-objects"
-git_data_dirs({
-   "default" => {"path" => "/zfs/gitlab_data"},
-})
-gitlab_rails['repository_storages'] = {
-  'default' => {
-    'path' => '/zfs/gitlab_data',
-    'gitaly_address' => 'unix:/var/opt/gitlab/gitaly/gitaly.socket'
-  }
-}
-EOF_GITLAB_ZFS
-    fi
-    if ! grep -q 'auto_sync GitLab frontend ports' /etc/gitlab/gitlab.rb 2>/dev/null; then
-        cat >> /etc/gitlab/gitlab.rb <<'EOF_GITLAB_FRONTEND'
-
-# Managed by auto_sync GitLab frontend ports.
-# Workhorse serves nginx on 10080. Puma must not bind TCP 8080 because waiwei-web uses it.
-gitlab_rails['gitlab_shell_ssh_port'] = 10022
-gitlab_workhorse['listen_network'] = "tcp"
-gitlab_workhorse['listen_addr'] = "127.0.0.1:10080"
-puma['listen'] = ""
-puma['port'] = nil
-EOF_GITLAB_FRONTEND
-    fi
-    if grep -q "gitlab_rails\['gitlab_shell_ssh_port'\]" /etc/gitlab/gitlab.rb 2>/dev/null; then
-        sed -i -E "s/^#?[[:space:]]*gitlab_rails\['gitlab_shell_ssh_port'\].*/gitlab_rails['gitlab_shell_ssh_port'] = 10022/" /etc/gitlab/gitlab.rb
-    else
-        cat >> /etc/gitlab/gitlab.rb <<'EOF_GITLAB_SSH_PORT'
-
-# Managed by auto_sync GitLab SSH clone port.
-gitlab_rails['gitlab_shell_ssh_port'] = 10022
-EOF_GITLAB_SSH_PORT
-    fi
-}
-
-ensure_gitlab_repo_compatible() {
-    list="/etc/apt/sources.list.d/gitlab_gitlab-ce.list"
-    key=/etc/apt/keyrings/gitlab_gitlab-ce-archive-keyring.asc
-    mkdir -p /etc/apt/keyrings
-    for attempt in 1 2 3 4 5; do
-        if curl -fsSL --connect-timeout 30 --retry 5 --retry-delay 5 --retry-all-errors \
-            https://packages.gitlab.com/gitlab/gitlab-ce/gpgkey -o "$key"; then
-            break
-        fi
-        log "WARN: GitLab repo key download failed, attempt $attempt"
-        sleep $((attempt * 5))
-    done
-    [ -s "$key" ] || { log "ERROR: GitLab repo key download failed"; return 1; }
-    printf 'deb [signed-by=%s] https://packages.gitlab.com/gitlab/gitlab-ce/ubuntu/ noble main\n' "$key" > "$list"
-}
-
-ensure_zfs_for_gitlab
-installed_gitlab_version="$(dpkg-query -W -f='${Version}' gitlab-ce 2>/dev/null || true)"
-if [ "$installed_gitlab_version" != "$GITLAB_CE_VERSION" ]; then
-    ensure_gitlab_repo_compatible || exit 1
-    apt-get update || exit 1
-    apt-get install -y --allow-downgrades "gitlab-ce=$GITLAB_CE_VERSION" || exit 1
-fi
-ensure_zfs_for_gitlab
-mkdir -p /zfs/gitlab_data /zfs/gitlab_data/lfs-objects /zfs/gitlab_data/repositories 2>/dev/null || true
-passwd -S git >/dev/null 2>&1 || true
-if id git >/dev/null 2>&1; then
-    git_pw_hash="$(openssl passwd -6 "auto-sync-git-$(date +%s)-$RANDOM" 2>/dev/null || true)"
-    [ -z "$git_pw_hash" ] || usermod -p "$git_pw_hash" git 2>/dev/null || true
-    rm -f /etc/ssh/sshd_config.d/98-auto-sync-gitlab.conf 2>/dev/null || true
-fi
-[ -d /zfs/gitlab_data ] && chown git:git /zfs/gitlab_data 2>/dev/null || true
-[ -d /zfs/gitlab_data/lfs-objects ] && chown git:git /zfs/gitlab_data/lfs-objects 2>/dev/null || true
-[ -d /zfs/gitlab_data/repositories ] && chown git:git /zfs/gitlab_data/repositories 2>/dev/null || true
-[ -d /zfs/gitlab_data ] && chmod 2770 /zfs/gitlab_data /zfs/gitlab_data/lfs-objects /zfs/gitlab_data/repositories 2>/dev/null || true
-[ -d /etc/gitlab ] && chown -R git:git /etc/gitlab 2>/dev/null || true
-[ -d /etc/gitlab ] && chmod 700 /etc/gitlab 2>/dev/null || true
-ensure_gitlab_zfs_config
-if command -v gitlab-ctl >/dev/null 2>&1; then
-    gitlab_deploy_log=/var/log/auto_sync_gitlab_deploy.log
-    : > "$gitlab_deploy_log"
-    gitlab_ok=1
-    gitlab-ctl reconfigure >>"$gitlab_deploy_log" 2>&1 || true
-    gitlab-ctl restart >>"$gitlab_deploy_log" 2>&1 || true
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-        if gitlab-ctl status >>"$gitlab_deploy_log" 2>&1; then
-            gitlab_ok=1
-            break
-        fi
-        sleep 5
-    done
-fi
 
 [ -f /root/src/share/dev/sync_db_from_nas.sh ] && chmod +x /root/src/share/dev/sync_db_from_nas.sh
 
@@ -1399,11 +1278,6 @@ configure_postgresql_peer_maps() {
             ' "$hba" > "$tmp" && cat "$tmp" > "$hba"
             rm -f "$tmp"
         fi
-        sed -i -E 's/^(local[[:space:]]+all[[:space:]]+all[[:space:]]+peer)([[:space:]].*)?$/\1 map=gitlab/' "$hba"
-        touch "$ident"
-        grep -Eq '^[[:space:]]*gitlab[[:space:]]+git[[:space:]]+gitlab([[:space:]]|$)' "$ident" || printf '\ngitlab  git  gitlab\n' >> "$ident"
-        grep -Eq '^[[:space:]]*gitlab[[:space:]]+tiger[[:space:]]+immich([[:space:]]|$)' "$ident" || printf '\ngitlab  tiger  immich\n' >> "$ident"
-        grep -Eq '^[[:space:]]*gitlab[[:space:]]+root[[:space:]]+immich([[:space:]]|$)' "$ident" || printf 'gitlab  root  immich\n' >> "$ident"
     done
     systemctl reload postgresql 2>/dev/null || true
 }

@@ -381,7 +381,7 @@ set -e
 mkdir -p /etc/ssh/sshd_config.d /root/.ssh
 cp $remoteScratch/auto_sync_sshd_config /etc/ssh/sshd_config
 rm -f $remoteScratch/auto_sync_sshd_config
-rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/98-auto-sync-gitlab.conf /etc/ssh/sshd_config.d/99-auto-sync-test.conf
+rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/99-auto-sync-test.conf
 if [ -f /tmp/auto_sync_root_key.pub ]; then
     cat /tmp/auto_sync_root_key.pub > /root/.ssh/authorized_keys
 fi
@@ -424,7 +424,6 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
 $remote = @'
 set -u
 export DEBIAN_FRONTEND=noninteractive
-GITLAB_CE_VERSION="17.11.7-ce.0"
 
 log() { printf '[nas-deploy] %s\n' "$*"; }
 try() { "$@" && return 0; log "WARN: command failed: $*"; return 0; }
@@ -493,7 +492,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server immich-ml auto_sync immich tbox_server tbox_client tbox-logrotate.timer rblog rblog-backup.timer nginx cron shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server immich-ml auto_sync immich tbox_server tbox_client tbox-logrotate.timer rblog rblog-backup.timer rgit rgit-backup.service rgit-backup.timer rgit-ocsp.service rgit-ocsp.timer nginx cron shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -507,18 +506,6 @@ disable_if_exists() {
         log "disabled+stopped $unit"
         log_unit_processes "$unit"
     fi
-}
-
-ensure_gitlab_running_quietly() {
-    if command -v gitlab-ctl >/dev/null 2>&1; then
-        systemctl start gitlab-runsvdir.service >/dev/null 2>&1 || systemctl start gitlab-runsvdir >/dev/null 2>&1 || true
-        gitlab-ctl start >>/var/log/auto_sync_gitlab_deploy.log 2>&1 || true
-        for _ in $(seq 1 60); do
-            gitlab-ctl status >>/var/log/auto_sync_gitlab_deploy.log 2>&1 && return 0
-            sleep 5
-        done
-    fi
-    return 1
 }
 
 normalize_deploy_permissions() {
@@ -535,9 +522,21 @@ normalize_deploy_permissions() {
         find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
         find "$d" -type f -exec chmod 644 {} + 2>/dev/null || true
     done
+    if [ -d /opt/usr/local/rgit ]; then
+        chown root:root /opt/usr/local/rgit /opt/usr/local/rgit/bin 2>/dev/null || true
+        find /opt/usr/local/rgit/bin -type f -exec chown root:root {} + -exec chmod 755 {} + 2>/dev/null || true
+        for d in /opt/usr/local/rgit/conf /opt/usr/local/rgit/data /opt/usr/local/rgit/logs /opt/usr/local/rgit/.ssh /opt/usr/local/rgit/.backup-worktree; do
+            [ -e "$d" ] && chown -R git:git "$d" 2>/dev/null || true
+        done
+        [ -d /opt/usr/local/rgit/conf ] && chmod 750 /opt/usr/local/rgit/conf 2>/dev/null || true
+        [ -d /opt/usr/local/rgit/data ] && chmod 700 /opt/usr/local/rgit/data 2>/dev/null || true
+        [ -d /opt/usr/local/rgit/logs ] && chmod 750 /opt/usr/local/rgit/logs 2>/dev/null || true
+        [ -d /opt/usr/local/rgit/.ssh ] && chmod 700 /opt/usr/local/rgit/.ssh 2>/dev/null || true
+    fi
     for d in \
         /opt/usr/local/blog/bin \
         /opt/usr/local/blog/bin/admin \
+        /opt/usr/local/rgit/bin \
         /opt/usr/local/tbox/bin \
         /opt/usr/local/waiwei/bin \
         /opt/usr/local/waiwei/scripts \
@@ -606,11 +605,6 @@ install_staged_collected_paths() {
     [ "$rc" -eq 0 ] && log "installed collected paths"
     return "$rc"
 }
-
-if [ -f /etc/apt/sources.list.d/gitlab_gitlab-ce.list ] && grep -q '/ubuntu/resolute\| resolute ' /etc/apt/sources.list.d/gitlab_gitlab-ce.list; then
-    log "GitLab CE has no resolute repo yet; use noble package repo"
-    sed -i 's#/ubuntu/resolute#/ubuntu/noble#g; s/ resolute / noble /g' /etc/apt/sources.list.d/gitlab_gitlab-ce.list
-fi
 
 if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
     sed -i 's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' /etc/apt/sources.list.d/ubuntu.sources
@@ -896,7 +890,6 @@ ensure_host_entry() {
     cat "$tmp" > /etc/hosts
     rm -f "$tmp"
 }
-ensure_host_entry 127.0.0.1 code.xiedeacc.com
 ensure_host_entry 127.0.0.1 unlock-music.xiedeacc.com
 ensure_host_entry 127.0.0.1 immich.xiedeacc.com
 ensure_host_entry 127.0.0.1 halo.xiedeacc.com
@@ -1223,104 +1216,9 @@ EOF_IMMICH_ML_ENV
     return 1
 }
 setquota -u root 20000000 20000000 0 0 /dev/mmcblk0p2 2>/dev/null || true
-for u in tiger git gitlab immich; do
+for u in tiger git immich; do
     id "$u" >/dev/null 2>&1 && setquota -u "$u" 1000000 1000000 0 0 / 2>/dev/null || true
 done
-
-ensure_zfs_for_gitlab() {
-    if ! command -v zpool >/dev/null 2>&1; then
-        log "WARN: zpool not installed; cannot ensure GitLab /zfs storage"
-        return 0
-    fi
-    log "ensure /zfs is imported and mounted before GitLab setup"
-    for pool in zfs zfs_pool ssd; do
-        if ! zpool list -H "$pool" >/dev/null 2>&1; then
-            zpool import "$pool" >/dev/null 2>&1 || true
-        fi
-    done
-    zfs mount zfs >/dev/null 2>&1 || zfs mount -a >/dev/null 2>&1 || true
-    zpool status zfs >/dev/null 2>&1 || log "WARN: zfs pool is not online"
-    if ! findmnt -T /zfs >/dev/null 2>&1; then
-        log "WARN: /zfs is not mounted"
-    fi
-    ls -ald /zfs >/dev/null 2>&1 || true
-}
-
-ensure_gitlab_frontend_config() {
-    [ -f /etc/gitlab/gitlab.rb ] || return 0
-    if ! grep -q 'auto_sync GitLab frontend ports' /etc/gitlab/gitlab.rb 2>/dev/null; then
-        cat >> /etc/gitlab/gitlab.rb <<'EOF_GITLAB_FRONTEND'
-
-# Managed by auto_sync GitLab frontend ports.
-# Workhorse serves nginx on 10080. Puma must not bind TCP 8080 because waiwei-web uses it.
-gitlab_rails['gitlab_shell_ssh_port'] = 10022
-gitlab_workhorse['listen_network'] = "tcp"
-gitlab_workhorse['listen_addr'] = "127.0.0.1:10080"
-puma['listen'] = ""
-puma['port'] = nil
-EOF_GITLAB_FRONTEND
-    fi
-    if grep -q "gitlab_rails\['gitlab_shell_ssh_port'\]" /etc/gitlab/gitlab.rb 2>/dev/null; then
-        sed -i -E "s/^#?[[:space:]]*gitlab_rails\['gitlab_shell_ssh_port'\].*/gitlab_rails['gitlab_shell_ssh_port'] = 10022/" /etc/gitlab/gitlab.rb
-    else
-        cat >> /etc/gitlab/gitlab.rb <<'EOF_GITLAB_SSH_PORT'
-
-# Managed by auto_sync GitLab SSH clone port.
-gitlab_rails['gitlab_shell_ssh_port'] = 10022
-EOF_GITLAB_SSH_PORT
-    fi
-}
-
-ensure_gitlab_repo_compatible() {
-    list="/etc/apt/sources.list.d/gitlab_gitlab-ce.list"
-    key=/etc/apt/keyrings/gitlab_gitlab-ce-archive-keyring.asc
-    mkdir -p /etc/apt/keyrings
-    for attempt in 1 2 3 4 5; do
-        if curl -fsSL --connect-timeout 30 --retry 5 --retry-delay 5 --retry-all-errors \
-            https://packages.gitlab.com/gitlab/gitlab-ce/gpgkey -o "$key"; then
-            break
-        fi
-        log "WARN: GitLab repo key download failed, attempt $attempt"
-        sleep $((attempt * 5))
-    done
-    [ -s "$key" ] || { log "ERROR: GitLab repo key download failed"; return 1; }
-    printf 'deb [signed-by=%s] https://packages.gitlab.com/gitlab/gitlab-ce/ubuntu/ noble main\n' "$key" > "$list"
-}
-
-ensure_zfs_for_gitlab
-installed_gitlab_version="$(dpkg-query -W -f='${Version}' gitlab-ce 2>/dev/null || true)"
-if [ "$installed_gitlab_version" != "$GITLAB_CE_VERSION" ]; then
-    ensure_gitlab_repo_compatible || exit 1
-    apt-get update || exit 1
-    apt-get install -y --allow-downgrades "gitlab-ce=$GITLAB_CE_VERSION" || exit 1
-fi
-ensure_zfs_for_gitlab
-passwd -S git >/dev/null 2>&1 || true
-if id git >/dev/null 2>&1; then
-    git_pw_hash="$(openssl passwd -6 "auto-sync-git-$(date +%s)-$RANDOM" 2>/dev/null || true)"
-    [ -z "$git_pw_hash" ] || usermod -p "$git_pw_hash" git 2>/dev/null || true
-    rm -f /etc/ssh/sshd_config.d/98-auto-sync-gitlab.conf 2>/dev/null || true
-fi
-[ -d /etc/gitlab ] && chown -R git:git /etc/gitlab 2>/dev/null || true
-[ -d /etc/gitlab ] && chmod 700 /etc/gitlab 2>/dev/null || true
-[ -d /etc/gitlab/config_backup ] && chown git:git /etc/gitlab/config_backup 2>/dev/null || true
-[ -d /etc/gitlab/config_backup ] && chmod 700 /etc/gitlab/config_backup 2>/dev/null || true
-[ -d /etc/gitlab/config_backup ] && find /etc/gitlab/config_backup -maxdepth 1 -type f -exec chown git:git {} + -exec chmod 600 {} + 2>/dev/null || true
-ensure_gitlab_frontend_config
-if command -v gitlab-ctl >/dev/null 2>&1; then
-    gitlab_deploy_log=/var/log/auto_sync_gitlab_deploy.log
-    : > "$gitlab_deploy_log"
-    gitlab_ok=1
-    gitlab-ctl reconfigure >>"$gitlab_deploy_log" 2>&1 || true
-    gitlab-ctl restart >>"$gitlab_deploy_log" 2>&1 || true
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-        if gitlab-ctl status >>"$gitlab_deploy_log" 2>&1; then
-            gitlab_ok=1
-            break
-        fi
-        sleep 5
-    done
-fi
 
 [ -f /root/src/share/nas/backup_pg.sh ] && chmod +x /root/src/share/nas/backup_pg.sh
 [ -f /root/src/share/nas/backup_mysql.sh ] && chmod +x /root/src/share/nas/backup_mysql.sh
@@ -1488,20 +1386,6 @@ ensure_postgresql_ready() {
         sleep 1
     done
     return 1
-}
-
-configure_postgresql_peer_maps() {
-    for hba in /etc/postgresql/[0-9]*/main/pg_hba.conf; do
-        [ -f "$hba" ] || continue
-        dir="$(dirname "$hba")"
-        ident="$dir/pg_ident.conf"
-        sed -i -E 's/^(local[[:space:]]+all[[:space:]]+all[[:space:]]+peer)([[:space:]].*)?$/\1 map=gitlab/' "$hba"
-        touch "$ident"
-        grep -Eq '^[[:space:]]*gitlab[[:space:]]+git[[:space:]]+gitlab([[:space:]]|$)' "$ident" || printf '\ngitlab  git  gitlab\n' >> "$ident"
-        grep -Eq '^[[:space:]]*gitlab[[:space:]]+tiger[[:space:]]+immich([[:space:]]|$)' "$ident" || printf '\ngitlab  tiger  immich\n' >> "$ident"
-        grep -Eq '^[[:space:]]*gitlab[[:space:]]+root[[:space:]]+immich([[:space:]]|$)' "$ident" || printf 'gitlab  root  immich\n' >> "$ident"
-    done
-    systemctl reload postgresql 2>/dev/null || true
 }
 
 prepare_immich_database_extensions() {
@@ -2470,7 +2354,6 @@ restore_once() {
             ;;
         postgres)
             ensure_postgresql_ready || log "WARN: postgresql is not ready before restore"
-            configure_postgresql_peer_maps
             if printf '%s' "$latest" | grep -q '\.gz$'; then zcat "$latest" | sudo -u postgres psql -v ON_ERROR_STOP=0; else sudo -u postgres psql -v ON_ERROR_STOP=0 -f "$latest"; fi
             ;;
     esac && printf '%s' "$latest" > "$marker" || log "WARN: $kind restore failed"
@@ -2521,7 +2404,7 @@ EOF_OPT_USR_LOCAL_PATH
 }
 ensure_opt_usr_local_path
 
-mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
+mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/rgit/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
@@ -2573,6 +2456,13 @@ PY_TIGER_LINK_OWNERS
 for d in /opt/usr/local/auto_sync /opt/usr/local/tbox /opt/usr/local/shadowsocks; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
+if [ -d /opt/usr/local/rgit ]; then
+    chown root:root /opt/usr/local/rgit /opt/usr/local/rgit/bin 2>/dev/null || true
+    find /opt/usr/local/rgit/bin -type f -exec chown root:root {} + -exec chmod 755 {} + 2>/dev/null || true
+    for d in /opt/usr/local/rgit/conf /opt/usr/local/rgit/data /opt/usr/local/rgit/logs /opt/usr/local/rgit/.ssh /opt/usr/local/rgit/.backup-worktree; do
+        [ -e "$d" ] && chown -R git:git "$d" 2>/dev/null || true
+    done
+fi
 for f in \
     /opt/usr/local/auto_sync/bin/auto_sync \
     /opt/usr/local/auto_sync/bin/auto_syncd \
@@ -2585,6 +2475,7 @@ for f in \
     /opt/usr/local/blog/bin/rblog \
     /opt/usr/local/blog/bin/rblog-backup \
     /opt/usr/local/blog/bin/admin/* \
+    /opt/usr/local/rgit/bin/* \
     /opt/usr/local/shadowsocks/bin/* \
     /opt/usr/local/bin/vlmcsd
 do
@@ -2611,7 +2502,7 @@ fi
 for s in tbox_server shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
-for s in mysql postgresql redis-server immich-ml auto_sync immich tbox_client tbox-logrotate.timer rblog rblog-backup.timer nginx cron; do
+for s in mysql postgresql redis-server immich-ml auto_sync immich tbox_client tbox-logrotate.timer rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -2620,7 +2511,7 @@ done
 
 print_final_states() {
     echo '--- final states ---'
-    for s in auto_sync immich immich-ml tbox_server tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in auto_sync immich immich-ml tbox_server tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         resolved="$(unit_name "$s" 2>/dev/null || true)"
         if [ -n "$resolved" ]; then
             enabled="$(systemctl is-enabled "$resolved" 2>/dev/null || true)"
@@ -2664,7 +2555,7 @@ wait_for_https_200() {
 }
 
 required_failed=0
-for s in auto_sync immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer; do
+for s in auto_sync immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer; do
     if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
         required_failed=1
@@ -2678,13 +2569,7 @@ if ! pg_isready -q; then
     log "ERROR: PostgreSQL is not accepting connections"
     required_failed=1
 fi
-if ! command -v gitlab-ctl >/dev/null 2>&1 || ! gitlab-ctl status >/dev/null 2>&1; then
-    if ! ensure_gitlab_running_quietly; then
-        log "ERROR: required GitLab service is not active"
-        required_failed=1
-    fi
-fi
-for url in https://code.xiedeacc.com https://unlock-music.xiedeacc.com https://immich.xiedeacc.com https://blog.xiedeacc.com https://rblog.xiedeacc.com; do
+for url in https://unlock-music.xiedeacc.com https://immich.xiedeacc.com https://blog.xiedeacc.com https://rblog.xiedeacc.com; do
     if ! wait_for_https_200 "$url"; then
         required_failed=1
     fi
