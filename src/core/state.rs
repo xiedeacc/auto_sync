@@ -1009,6 +1009,18 @@ impl State {
         Ok(())
     }
 
+    pub fn mark_cycle_manual_incremental(&self, cycle_id: i64) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE sync_cycle
+            SET manual_changed_since_rescan=1, updated_at=?1
+            WHERE id=?2
+            "#,
+            params![now_string(), cycle_id],
+        )?;
+        Ok(())
+    }
+
     pub fn clear_cycle_needs_rescan(&self, cycle_id: i64) -> Result<()> {
         // Only the event-loss flag — and only when nothing manual arrived in
         // the meantime. This used to zero manual_full_rescan too, based on a

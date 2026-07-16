@@ -305,7 +305,7 @@ pub fn queue_destination_sync(
     }
     if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
         match mode {
-            SyncRequestMode::Incremental => {}
+            SyncRequestMode::Incremental => state.mark_cycle_manual_incremental(cycle.id)?,
             SyncRequestMode::Full => state.mark_cycle_manual_full_rescan(cycle.id)?,
             SyncRequestMode::RepairScan => unreachable!("handled above"),
         }
@@ -3061,12 +3061,13 @@ fn sync_cycle_for_source_inner(
                 chrono::Local::now(),
             ) {
                 Ok(Some(gate)) => {
-                    if !standby_gate_blocks_sync(&gate, cycle.manual_full_rescan) {
+                    let manual_sync = cycle.manual_full_rescan || cycle.manual_changed_since_rescan;
+                    if !standby_gate_blocks_sync(&gate, manual_sync) {
                         info!(
                             source = source.id,
                             destination = dst.id,
                             gate = %gate.status_reason(),
-                            "manual Full bypasses standby schedule gate"
+                            "manual sync bypasses standby schedule gate"
                         );
                     } else {
                         all_verified = false;
@@ -8623,9 +8624,9 @@ fn short_reason(err: &anyhow::Error) -> String {
     text.chars().take(120).collect()
 }
 
-fn standby_gate_blocks_sync(gate: &crate::core::standby::Gate, manual_full_rescan: bool) -> bool {
+fn standby_gate_blocks_sync(gate: &crate::core::standby::Gate, manual_sync: bool) -> bool {
     match gate {
-        crate::core::standby::Gate::Asleep { .. } => !manual_full_rescan,
+        crate::core::standby::Gate::Asleep { .. } => !manual_sync,
         crate::core::standby::Gate::NotMounted { .. } => true,
     }
 }
@@ -9809,6 +9810,62 @@ mod tests {
     }
 
     #[test]
+    fn manual_incremental_marks_cycle_as_manual_sync() {
+        let temp = temp_dir("manual_incremental_marks_cycle");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        let db = temp.join("state.sqlite");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("hello.txt"), b"hello").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.app.data_db = db.clone();
+        cfg.source_groups.push(SourceGroupConfig {
+            id: "src_1".to_string(),
+            machine_id: "local".to_string(),
+            src: src.clone(),
+            add_directory: true,
+            managed_by: String::new(),
+            excludes: Vec::new(),
+            enabled: true,
+            order: 0,
+            mode: SyncMode::Mirror,
+            snapshot: SnapshotConfig {
+                backend: SnapshotBackend::Manifest,
+                ..SnapshotConfig::default()
+            },
+            destinations: vec![DestinationConfig {
+                id: "dst_1".to_string(),
+                machine_id: "local".to_string(),
+                path: dst.clone(),
+                enabled: true,
+                schedule: ScheduleConfig::default(),
+                paused: false,
+                sync: None,
+            }],
+        });
+
+        let state = State::open(&db).unwrap();
+        queue_destination_sync(&cfg, &state, "src_1", "dst_1", SyncRequestMode::Incremental)
+            .unwrap();
+
+        let (manual_full_rescan, manual_changed_since_rescan): (i64, i64) =
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT manual_full_rescan, manual_changed_since_rescan FROM sync_cycle WHERE source_id='src_1' AND status='closed' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+        assert_eq!(manual_full_rescan, 0);
+        assert_eq!(manual_changed_since_rescan, 1);
+
+        fs::remove_dir_all(temp).ok();
+    }
+
+    #[test]
     fn full_destination_sync_only_targets_selected_destination() {
         let temp = temp_dir("full_sync_one_dst_now");
         let src = temp.join("src");
@@ -10036,7 +10093,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_full_bypasses_standby_asleep_but_not_mount_safety() {
+    fn manual_sync_bypasses_standby_asleep_but_not_mount_safety() {
         let asleep = crate::core::standby::Gate::Asleep {
             pool: "zfs".to_string(),
             reason: "disk zfs in standby until Sat 2026-07-18 09:00".to_string(),
