@@ -346,7 +346,9 @@ fn queue_scan_repair(
         for diff in &report.differences {
             state.record_event(source_id, 0, "scan_repair", Some(&diff.rel_path), false)?;
         }
-        state.force_target_destination(cfg, source_id, destination_id)?;
+        if let Some(cycle) = state.force_target_destination(cfg, source_id, destination_id)? {
+            state.mark_cycle_manual_incremental(cycle.id)?;
+        }
         info!(
             source = source_id,
             destination = destination_id,
@@ -10361,6 +10363,17 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let (manual_full_rescan, manual_changed_since_rescan): (i64, i64) =
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT manual_full_rescan, manual_changed_since_rescan FROM sync_cycle WHERE source_id='scan_repair_src' AND status='closed' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+        assert_eq!(manual_full_rescan, 0);
+        assert_eq!(manual_changed_since_rescan, 1);
         sync_all_pending(&cfg, &mut state).unwrap();
 
         assert_eq!(fs::read(effective_dst.join("hello.txt")).unwrap(), b"hello");
