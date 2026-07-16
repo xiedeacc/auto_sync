@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 # Runs on Windows. Pushes the collected NAS tree back to the Ubuntu host, then
-# applies packages, services, runtimes, quotas, database restore, and cron.
+# applies packages, services, runtimes, quotas, ZFS standby handling, and cron.
 $ssh  = $env:AS_SSH
 $scp  = $env:AS_SCP
 $dest = $env:AS_DEST
@@ -1142,7 +1142,7 @@ wake_zfs() {
         log "skip /zfs wake: /zfs not found"
         return 1
     fi
-    log "wake /zfs before database restore"
+    log "wake /zfs before standby handling"
     ls -ald /zfs >/dev/null 2>&1 || true
     find /zfs/backup -maxdepth 2 -type d -print -quit >/dev/null 2>&1 || true
     return 0
