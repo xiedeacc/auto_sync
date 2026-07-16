@@ -1048,7 +1048,6 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
                     onCancel: (sourceId, destinationId) => _run(
                       'Cancel $sourceId -> $destinationId',
                       () => widget.api.cancelActivity(
-                        scope: 'destination',
                         sourceId: sourceId,
                         destinationId: destinationId,
                       ),
@@ -1666,9 +1665,13 @@ class _MasterDestinationRow extends StatelessWidget {
     );
     final diffCount = _int(status?['scan_differences']);
     final showRepair = diffCount > 0;
+    final showCancel = syncDisabled.destinationRunning(source, destination);
     final infoCellWidth = showRepair ? 72.0 : 34.0;
     return _MasterSplitRow(
-      rightWidth: _masterRightBlockWidth + (showRepair ? 38 : 0),
+      rightWidth:
+          _masterRightBlockWidth +
+          (showRepair ? 38 : 0) +
+          (showCancel ? 42 : 0),
       leftControlMarker: Container(
         width: _masterStatusDotSize,
         height: _masterStatusDotSize,
@@ -1709,6 +1712,10 @@ class _MasterDestinationRow extends StatelessWidget {
         const SizedBox(width: 8),
         const _MasterLabelBox('Sync', width: 104),
         const SizedBox(width: 8),
+        if (showCancel) ...[
+          const _MasterLabelBox('', width: 34),
+          const SizedBox(width: 8),
+        ],
         const _MasterLabelBox('', width: 34),
       ],
       rightControls: [
@@ -1760,6 +1767,15 @@ class _MasterDestinationRow extends StatelessWidget {
           onSelected: (mode) => onSync(sourceId, dstId, mode),
         ),
         const SizedBox(width: 8),
+        if (showCancel) ...[
+          MasterIconButton(
+            kind: MasterIconKind.cancel,
+            color: Palette.red,
+            tooltip: 'Cancel running task',
+            onTap: () => onCancel(sourceId, dstId),
+          ),
+          const SizedBox(width: 8),
+        ],
         MasterButton(
           label: 'x',
           square: true,
@@ -2104,7 +2120,7 @@ class MasterButton extends StatelessWidget {
   }
 }
 
-enum MasterIconKind { info, gear }
+enum MasterIconKind { info, gear, cancel }
 
 class MasterIconButton extends StatelessWidget {
   const MasterIconButton({
@@ -2112,48 +2128,57 @@ class MasterIconButton extends StatelessWidget {
     required this.kind,
     required this.color,
     required this.onTap,
+    this.tooltip,
   });
 
   final MasterIconKind kind;
   final Color color;
   final VoidCallback? onTap;
+  final String? tooltip;
 
   @override
   Widget build(BuildContext context) {
-    return MasterButton(
+    final button = MasterButton(
       label: '',
       square: true,
       onTap: onTap,
-      child: kind == MasterIconKind.info
-          ? Container(
-              width: 18,
-              height: 18,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                border: Border.all(color: color, width: 2),
-              ),
-              child: Text(
-                'i',
-                style: TextStyle(
-                  color: color,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w800,
-                  height: 1,
-                ),
-              ),
-            )
-          : Text(
-              '\u2699\uFE0E',
-              style: TextStyle(
-                color: color,
-                fontFamily: 'Segoe UI Symbol',
-                fontSize: 14,
-                fontWeight: FontWeight.w700,
-                height: 1,
-              ),
+      child: switch (kind) {
+        MasterIconKind.info => Container(
+          width: 18,
+          height: 18,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(color: color, width: 2),
+          ),
+          child: Text(
+            'i',
+            style: TextStyle(
+              color: color,
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+              height: 1,
             ),
+          ),
+        ),
+        MasterIconKind.gear => Text(
+          '\u2699\uFE0E',
+          style: TextStyle(
+            color: color,
+            fontFamily: 'Segoe UI Symbol',
+            fontSize: 14,
+            fontWeight: FontWeight.w700,
+            height: 1,
+          ),
+        ),
+        MasterIconKind.cancel => Icon(
+          Icons.stop_rounded,
+          size: 18,
+          color: color,
+        ),
+      },
     );
+    return tooltip == null ? button : Tooltip(message: tooltip!, child: button);
   }
 }
 
@@ -2643,6 +2668,14 @@ class _SyncDisableState {
     void collectRuntime(Map<String, dynamic> runtime, String machineId) {
       if (_bool(runtime['syncing'])) {
         machineSyncingKeys.add(_machineKey(machineId));
+        final sourceId = _str(runtime['source_id']);
+        final destinationId = _str(runtime['destination_id']);
+        if (sourceId.isNotEmpty) {
+          runningSourceIds.add(sourceId);
+          if (destinationId.isNotEmpty) {
+            runningDestinationKeys.add('$sourceId/$destinationId');
+          }
+        }
       }
       for (final scan in _runtimeScans(runtime)) {
         final sourceId = _str(scan['source_id']);
@@ -2751,6 +2784,14 @@ class _SyncDisableState {
       return true;
     }
     return _destinationRoots(source, destination).any(_overlapsActiveRoot);
+  }
+
+  bool destinationRunning(
+    Map<String, dynamic> source,
+    Map<String, dynamic> destination,
+  ) {
+    final key = '${_str(source['id'])}/${_str(destination['id'])}';
+    return runningDestinationKeys.contains(key) || compareKeys.contains(key);
   }
 
   bool _overlapsActiveRoot(_PathRoot root) =>

@@ -810,6 +810,16 @@ impl Backend {
         target: Option<(&str, &str)>,
         propagate: bool,
     ) -> Result<CancelOutcome> {
+        let scope = match scope {
+            Some("sync") | Some("compare") => scope,
+            // Older UI builds sent "destination" to mean "cancel both sync
+            // and compare, but only for this destination target".
+            Some("destination") | Some("all") | None => None,
+            Some(other) => {
+                warn!(scope = other, "ignoring unknown cancel scope");
+                None
+            }
+        };
         let target_label =
             target.map(|(source_id, destination_id)| cancel::target_for(source_id, destination_id));
         let cancelled_local = cancel::request(scope, target_label.as_deref());
