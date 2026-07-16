@@ -1101,17 +1101,21 @@ fn record_host_perms(
 ) -> Result<()> {
     let mut lines: Vec<String> = Vec::new();
     for path in paths {
+        if is_excluded(path, excludes) {
+            continue;
+        }
         let q = shell_quote(path);
+        let prune = find_prune_clause(path, excludes);
         let cmd = format!(
             "if command -v stat >/dev/null 2>&1; then \
-find -H {q} \\( -type f -o -type d \\) -exec stat -c '%a %n' {{}} \\; 2>/dev/null; \
+find -H {q} {prune}\\( -type f -o -type d \\) -exec stat -c '%a %n' {{}} \\; 2>/dev/null; \
 else \
-find -H {q} \\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null; \
+find -H {q} {prune}\\( -type f -o -type d \\) -exec ls -ldn {{}} \\; 2>/dev/null; \
 fi; \
 if [ -L {q} ]; then \
 t=$(readlink {q}) && b=$(printf %s \"$t\" | base64 | tr -d \"\\n\") && printf \"symlink %s %s\\n\" \"$b\" {q}; \
 fi; \
-find -H {q} -mindepth 1 -type l -exec sh -c 'for p do t=$(readlink \"$p\") || continue; b=$(printf %s \"$t\" | base64 | tr -d \"\\n\"); printf \"symlink %s %s\\n\" \"$b\" \"$p\"; done' sh {{}} + 2>/dev/null"
+find -H {q} -mindepth 1 {prune}-type l -exec sh -c 'for p do t=$(readlink \"$p\") || continue; b=$(printf %s \"$t\" | base64 | tr -d \"\\n\"); printf \"symlink %s %s\\n\" \"$b\" \"$p\"; done' sh {{}} + 2>/dev/null"
         );
         let out = match ssh_capture(conn, &cmd) {
             Ok(out) => out,
@@ -1137,6 +1141,25 @@ find -H {q} -mindepth 1 -type l -exec sh -c 'for p do t=$(readlink \"$p\") || co
     fs::write(&file, body).with_context(|| format!("writing {}", file.display()))?;
     log(state, format!("  perms: recorded {} entries", lines.len()));
     Ok(())
+}
+
+fn find_prune_clause(root: &str, excludes: &[String]) -> String {
+    let root = root.trim_end_matches('/');
+    let prefix = format!("{root}/");
+    let mut tests = Vec::new();
+    for exclude in excludes {
+        let exclude = exclude.trim_end_matches('/');
+        if exclude == root || !exclude.starts_with(&prefix) {
+            continue;
+        }
+        tests.push(format!("-path {}", shell_quote(exclude)));
+        tests.push(format!("-path {}", shell_quote(&format!("{exclude}/*"))));
+    }
+    if tests.is_empty() {
+        String::new()
+    } else {
+        format!("\\( {} \\) -prune -o ", tests.join(" -o "))
+    }
 }
 
 fn perm_record_path(line: &str) -> Option<String> {
