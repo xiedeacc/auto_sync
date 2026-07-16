@@ -5715,6 +5715,7 @@ fn copy_entries_parallel(
                     {
                         Ok(()) => {
                             done.fetch_add(1, Ordering::Relaxed);
+                            sync_plan_add_done(1);
                         }
                         Err(err) => {
                             let paths = source_changed_paths(&err);
@@ -5760,7 +5761,6 @@ fn copy_entries_parallel(
     }
     let transferred = done.load(Ordering::Relaxed) as usize;
     cancel::add_synced_files(transferred as u64);
-    sync_plan_add_done(transferred as u64);
     let failed = failed.into_inner().unwrap_or_else(|err| err.into_inner());
     cancel::add_failed_files(failed.len() as u64);
     Ok(TransferOutcome {
