@@ -297,7 +297,7 @@ PY
 }
 
 function Ensure-RemoteRootWritable {
-    & $ssh @sshArgs $dest @'
+    Invoke-Remote @'
 set -eu
 if ! touch /etc/.auto_sync_rw_test 2>/dev/null; then
     mount -o remount,rw /
@@ -305,11 +305,6 @@ fi
 touch /etc/.auto_sync_rw_test
 rm -f /etc/.auto_sync_rw_test
 '@
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "! remote root filesystem is not writable"
-        $script:errCount++
-        throw "remote root filesystem is not writable"
-    }
 }
 
 function Prepare-StagedSymlinks([string]$PermsFile, [string]$RemoteStage) {
