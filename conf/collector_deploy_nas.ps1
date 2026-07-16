@@ -847,8 +847,6 @@ ensure_postgresql_cluster() {
     systemctl restart "postgresql@$pg_major-main.service"
     pg_isready -q || { log "ERROR: PostgreSQL cluster $pg_major/main is not ready"; return 1; }
 }
-ensure_postgresql_cluster || exit 1
-
 cmp -s /usr/share/zoneinfo/Asia/Shanghai /etc/localtime 2>/dev/null || cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
 ensure_host_entry() {
@@ -1444,10 +1442,10 @@ if [ -f /etc/systemd/system/redis.service ] && [ -f /usr/lib/systemd/system/redi
     rm -f /etc/systemd/system/redis.service
     systemctl daemon-reload
 fi
-for s in tbox_server immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+for s in tbox_server mysql postgresql redis-server immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
-for s in mysql postgresql redis-server auto_sync tbox_client tbox-logrotate.timer rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer nginx cron; do
+for s in auto_sync tbox_client tbox-logrotate.timer rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -1499,7 +1497,7 @@ wait_for_https_200() {
 }
 
 required_failed=0
-for s in auto_sync tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer; do
+for s in auto_sync tbox_client tbox-logrotate.timer nginx cron rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer; do
     if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
         required_failed=1
@@ -1509,10 +1507,6 @@ for s in auto_sync tbox_client tbox-logrotate.timer nginx cron mysql postgresql 
         required_failed=1
     fi
 done
-if ! pg_isready -q; then
-    log "ERROR: PostgreSQL is not accepting connections"
-    required_failed=1
-fi
 for url in https://unlock-music.xiedeacc.com https://blog.xiedeacc.com https://rblog.xiedeacc.com; do
     if ! wait_for_https_200 "$url"; then
         required_failed=1
