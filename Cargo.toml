@@ -40,6 +40,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(all(unix, not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = "0.7"
+
 [build-dependencies]
 chrono = { version = "0.4", features = ["clock"] }
 

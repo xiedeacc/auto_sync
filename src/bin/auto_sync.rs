@@ -5,6 +5,10 @@
 //! `auto_sync_gui` app, which attaches to this process over the existing HTTP
 //! API.
 
+#[cfg(all(unix, not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
