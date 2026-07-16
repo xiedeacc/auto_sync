@@ -466,9 +466,16 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
     }
     try {
       final next = await widget.api.getRuntimeStatus();
+      Map<String, dynamic>? nextActivity;
+      try {
+        nextActivity = await widget.api.getSyncActivity();
+      } catch (_) {}
       if (mounted) {
         setState(() {
           runtimeStatus = next;
+          if (nextActivity != null) {
+            syncActivity = nextActivity;
+          }
           if (_isStartupConnectionMessage(message)) {
             message = '';
           }
@@ -492,8 +499,21 @@ class _AutoSyncHomeState extends State<AutoSyncHome> {
         runtimeStatus = await widget.api.getRuntimeStatus();
       } catch (_) {}
       if (mounted) {
-        final stillActive = _hasLiveRuntimeActivity(runtimeStatus);
-        setState(() => message = stillActive ? '' : '$label done');
+        final stillActive = _hasAnyLiveRuntimeActivity(
+          syncActivity,
+          runtimeStatus,
+        );
+        final isAsyncSync =
+            label == 'Sync all' ||
+            label.startsWith('Sync source ') ||
+            label.startsWith('Sync ');
+        setState(
+          () => message = stillActive
+              ? ''
+              : isAsyncSync
+              ? '$label requested'
+              : '$label done',
+        );
       }
     } catch (error) {
       if (mounted) {
@@ -7681,47 +7701,75 @@ class _StatusBar extends StatelessWidget {
   }
 
   String _statusBarMessage() {
-    final transfer = _map(runtimeStatus['transfer']);
-    if (transfer.isNotEmpty) {
-      final dst = _str(
-        transfer['destination_id'],
-        _str(transfer['destination']),
-      );
-      final file = _compactStatusPath(_str(transfer['rel_path'], '-'), 56);
-      final speed = _formatBytesPerSecond(_int(transfer['bytes_per_sec']));
-      return [
-        'Backing up',
-        dst,
-        file,
-        speed,
-      ].where((part) => part.isNotEmpty).join(' · ');
-    }
-    final scan = _map(runtimeStatus['scan']);
-    if (scan.isNotEmpty) {
-      final current = _compactStatusPath(
-        _str(scan['current_path'], _str(scan['root_path'])),
-        56,
-      );
-      final entries = _int(scan['entries_seen']);
-      return entries > 0
-          ? 'Scanning $current · $entries entries'
-          : 'Scanning $current';
-    }
     if (saving) return 'Saving config...';
-    final syncing = _bool(runtimeStatus['syncing']);
-    final phase = _str(
-      runtimeStatus['sync_phase'],
-      _str(runtimeStatus['phase']),
-    );
-    if (syncing) return 'Syncing ${phase.isEmpty ? '' : phase}'.trim();
+    final active = _liveActivityStatusBarMessage(activity, runtimeStatus);
+    if (active.isNotEmpty) return active;
     if (message.isNotEmpty) return message;
     return 'Ready';
   }
 }
 
+String _liveActivityStatusBarMessage(
+  Map<String, dynamic> syncActivity,
+  Map<String, dynamic> runtimeStatus,
+) {
+  for (final row in _activityRows(syncActivity, runtimeStatus)) {
+    final runtime = _bool(row['local']) ? runtimeStatus : _map(row['runtime']);
+    final text = _runtimeStatusBarMessage(runtime);
+    if (text.isEmpty) continue;
+    final label = _bool(row['local'])
+        ? ''
+        : _str(row['label'], _str(row['machine_id']));
+    return label.isEmpty ? text : '$label · $text';
+  }
+  return '';
+}
+
+String _runtimeStatusBarMessage(Map<String, dynamic> runtimeStatus) {
+  final transfer = _map(runtimeStatus['transfer']);
+  if (transfer.isNotEmpty) {
+    final dst = _str(transfer['destination_id'], _str(transfer['destination']));
+    final file = _compactStatusPath(_str(transfer['rel_path'], '-'), 56);
+    final speed = _formatBytesPerSecond(_int(transfer['bytes_per_sec']));
+    return [
+      'Backing up',
+      dst,
+      file,
+      speed,
+    ].where((part) => part.isNotEmpty).join(' · ');
+  }
+  final scans = _runtimeScans(runtimeStatus);
+  if (scans.isNotEmpty) {
+    final scan = scans.first;
+    final current = _compactStatusPath(
+      _str(scan['current_path'], _str(scan['root_path'])),
+      56,
+    );
+    final entries = _int(scan['entries_seen']);
+    return entries > 0
+        ? 'Scanning $current · $entries entries'
+        : 'Scanning $current';
+  }
+  final syncing = _bool(runtimeStatus['syncing']);
+  final phase = _str(runtimeStatus['sync_phase'], _str(runtimeStatus['phase']));
+  if (syncing) return 'Syncing ${phase.isEmpty ? '' : phase}'.trim();
+  return '';
+}
+
+bool _hasAnyLiveRuntimeActivity(
+  Map<String, dynamic> syncActivity,
+  Map<String, dynamic> runtimeStatus,
+) {
+  for (final row in _activityRows(syncActivity, runtimeStatus)) {
+    final runtime = _bool(row['local']) ? runtimeStatus : _map(row['runtime']);
+    if (_hasLiveRuntimeActivity(runtime)) return true;
+  }
+  return false;
+}
+
 bool _hasLiveRuntimeActivity(Map<String, dynamic> runtimeStatus) {
   if (_map(runtimeStatus['transfer']).isNotEmpty) return true;
-  if (_map(runtimeStatus['scan']).isNotEmpty) return true;
+  if (_runtimeScans(runtimeStatus).isNotEmpty) return true;
   if (_bool(runtimeStatus['syncing'])) return true;
   final phase = _str(runtimeStatus['sync_phase'], _str(runtimeStatus['phase']));
   return phase.isNotEmpty;
