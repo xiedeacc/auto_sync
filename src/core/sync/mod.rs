@@ -63,6 +63,7 @@ static SYNC_KIND: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 /// "scanning", "transferring", "verifying"). Surfaced in the UI Info panel so a
 /// long-running task shows WHAT it is doing right now, not just that it is busy.
 static SYNC_PHASE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static SYNC_TARGET: OnceLock<Mutex<Option<SyncTarget>>> = OnceLock::new();
 /// Live file-count progress (total / to-copy / matched / done) of the running
 /// pass; see [`SyncPlan`].
 static SYNC_PLAN: OnceLock<Mutex<Option<Arc<SyncPlan>>>> = OnceLock::new();
@@ -154,8 +155,25 @@ pub fn current_sync_phase() -> Option<String> {
         .clone()
 }
 
+#[derive(Debug, Clone)]
+pub struct SyncTarget {
+    pub source_id: String,
+    pub destination_id: String,
+}
+
+pub fn current_sync_target() -> Option<SyncTarget> {
+    sync_target_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
 fn sync_phase_lock() -> &'static Mutex<Option<String>> {
     SYNC_PHASE.get_or_init(|| Mutex::new(None))
+}
+
+fn sync_target_lock() -> &'static Mutex<Option<SyncTarget>> {
+    SYNC_TARGET.get_or_init(|| Mutex::new(None))
 }
 
 /// Record the coarse phase of the running pass (plain setter; overwrites).
@@ -165,6 +183,15 @@ fn set_sync_phase(phase: &str) {
     *sync_phase_lock()
         .lock()
         .unwrap_or_else(|err| err.into_inner()) = Some(phase.to_string());
+}
+
+fn set_sync_target(source_id: &str, destination_id: &str) {
+    *sync_target_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = Some(SyncTarget {
+        source_id: source_id.to_string(),
+        destination_id: destination_id.to_string(),
+    });
 }
 
 /// Live file-count progress for the pass currently holding the sync gate. Set
@@ -235,6 +262,9 @@ impl Drop for SyncPhaseReset {
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = None;
         *sync_plan_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = None;
+        *sync_target_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = None;
     }
@@ -3267,6 +3297,7 @@ fn sync_cycle_for_source_inner(
     let mut shared_source_snapshot: Option<Vec<SnapshotEntry>> = None;
     for (dst_index, dst_endpoint) in ready_destinations {
         let dst = &source.destinations[dst_index];
+        set_sync_target(&source.id, &dst.id);
         let sync = effective_sync_config(cfg, dst);
         info!(
             source = source.id,
@@ -3980,6 +4011,7 @@ fn sync_cycle_with_transfer(
     let mut full_source_snapshot: Option<Vec<SnapshotEntry>> = None;
     for dst_index in ready_destinations {
         let dst = &source.destinations[dst_index];
+        set_sync_target(&source.id, &dst.id);
         let sync = effective_sync_config(cfg, dst);
         let dst_machine_id = machine_id_or_local(&dst.machine_id);
         let dst_machine = match find_machine(cfg, dst_machine_id) {

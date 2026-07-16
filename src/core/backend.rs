@@ -28,7 +28,8 @@ use crate::core::progress::{
 };
 use crate::core::state::{DestinationView, ScanReport, State as DbState};
 use crate::core::sync::{
-    SyncRequestMode, current_sync_kind, current_sync_phase, current_sync_plan, sync_is_running,
+    SyncRequestMode, current_sync_kind, current_sync_phase, current_sync_plan, current_sync_target,
+    sync_is_running,
 };
 
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -659,10 +660,13 @@ impl Backend {
                 .num_seconds()
                 .max(0) as u64
         });
+        let sync_target = current_sync_target();
         RuntimeStatus {
             syncing: sync_is_running(),
             sync_kind: current_sync_kind(),
             sync_phase: current_sync_phase(),
+            source_id: sync_target.as_ref().map(|target| target.source_id.clone()),
+            destination_id: sync_target.map(|target| target.destination_id),
             sync_plan: current_sync_plan()
                 .map(|(total, to_copy, matched, done)| [total, to_copy, matched, done]),
             transfer: current_transfer_progress(),
@@ -1830,6 +1834,10 @@ pub struct RuntimeStatus {
     pub syncing: bool,
     #[serde(default)]
     pub sync_kind: Option<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub destination_id: Option<String>,
     /// Coarse phase of the running pass ("zfs diff", "transferring",
     /// "verifying", "preparing"); `None` when idle or served by an old peer.
     #[serde(default)]

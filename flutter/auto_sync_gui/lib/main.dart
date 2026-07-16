@@ -4673,6 +4673,7 @@ Map<String, dynamic> _runtimeForDestination(
   final sourceId = _str(source['id']);
   final destinationId = _str(destination['id']);
   bool matches(Map<String, dynamic> runtime) =>
+      _runtimeMatchesTarget(runtime, sourceId, destinationId) ||
       _matchingTransfer(runtime, sourceId, destinationId).isNotEmpty ||
       _matchingScan(runtime, sourceId, destinationId).isNotEmpty;
   if (matches(localRuntime)) return localRuntime;
@@ -4681,6 +4682,17 @@ Map<String, dynamic> _runtimeForDestination(
     if (matches(runtime)) return runtime;
   }
   return localRuntime;
+}
+
+bool _runtimeMatchesTarget(
+  Map<String, dynamic> runtime,
+  String sourceId,
+  String destinationId,
+) {
+  if (!_hasLiveRuntimeActivity(runtime)) return false;
+  final runtimeSource = _str(runtime['source_id']);
+  final runtimeDestination = _str(runtime['destination_id']);
+  return runtimeSource == sourceId && runtimeDestination == destinationId;
 }
 
 Map<String, dynamic> _matchingTransfer(
