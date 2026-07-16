@@ -358,8 +358,8 @@ Copy-AwsSslIntoCollectedRoot
 Ensure-RemoteRootWritable
 $remoteStage = '/tmp/auto_sync_deploy_stage'
 Invoke-Remote "rm -rf $(Quote-ShellArg $remoteStage); mkdir -p $(Quote-ShellArg $remoteStage)"
-$generatedOptionalPaths = @('/opt/immich/conf', '/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') + $platformDefaultCollectPaths
-$requiredCollectPaths = @($collectPaths | Where-Object { (Normalize-RemotePath $_) -ne '/opt/immich/conf' })
+$generatedOptionalPaths = @('/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') + $platformDefaultCollectPaths
+$requiredCollectPaths = $collectPaths
 Transfer-CollectedPathsToStage $requiredCollectPaths $generatedOptionalPaths $remoteStage
 Invoke-NameManifestRehydrate $remoteStage
 Prepare-StagedSymlinks $env:AS_PERMS_FILE $remoteStage
@@ -492,7 +492,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server immich-ml auto_sync immich tbox_server tbox_client tbox-logrotate.timer rblog rblog-backup.timer rgit rgit-backup.service rgit-backup.timer rgit-ocsp.service rgit-ocsp.timer nginx cron shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server auto_sync tbox_server tbox_client tbox-logrotate.timer rblog rblog-backup.timer rgit rgit-backup.service rgit-backup.timer rgit-ocsp.service rgit-ocsp.timer domus domus-backup.service domus-backup.timer nginx cron immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -516,7 +516,7 @@ normalize_deploy_permissions() {
         find /etc/nginx/ssl -maxdepth 1 -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
         find /etc/nginx/ssl -maxdepth 1 -type f ! -name '*.key' -exec chmod 644 {} + 2>/dev/null || true
     fi
-    for d in /opt/usr/local/blog /opt/usr/local/tbox /opt/usr/local/waiwei /opt/usr/local/xray /opt/usr/local/shadowsocks; do
+    for d in /opt/usr/local/blog /opt/usr/local/domus /opt/usr/local/tbox /opt/usr/local/waiwei /opt/usr/local/xray /opt/usr/local/shadowsocks; do
         [ -e "$d" ] || continue
         chown -R root:root "$d" 2>/dev/null || true
         find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
@@ -533,9 +533,20 @@ normalize_deploy_permissions() {
         [ -d /opt/usr/local/rgit/logs ] && chmod 750 /opt/usr/local/rgit/logs 2>/dev/null || true
         [ -d /opt/usr/local/rgit/.ssh ] && chmod 700 /opt/usr/local/rgit/.ssh 2>/dev/null || true
     fi
+    if [ -d /opt/usr/local/domus ]; then
+        chown root:root /opt/usr/local/domus /opt/usr/local/domus/bin 2>/dev/null || true
+        find /opt/usr/local/domus/bin -type f -exec chown root:root {} + -exec chmod 755 {} + 2>/dev/null || true
+        for d in /opt/usr/local/domus/conf /opt/usr/local/domus/data /opt/usr/local/domus/logs /opt/usr/local/domus/.backup-worktree; do
+            [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
+        done
+        [ -d /opt/usr/local/domus/conf ] && chmod 750 /opt/usr/local/domus/conf 2>/dev/null || true
+        [ -d /opt/usr/local/domus/data ] && chmod 700 /opt/usr/local/domus/data 2>/dev/null || true
+        [ -d /opt/usr/local/domus/logs ] && chmod 750 /opt/usr/local/domus/logs 2>/dev/null || true
+    fi
     for d in \
         /opt/usr/local/blog/bin \
         /opt/usr/local/blog/bin/admin \
+        /opt/usr/local/domus/bin \
         /opt/usr/local/rgit/bin \
         /opt/usr/local/tbox/bin \
         /opt/usr/local/waiwei/bin \
@@ -546,7 +557,7 @@ normalize_deploy_permissions() {
     do
         [ -d "$d" ] && find "$d" -type f -exec chmod 755 {} + 2>/dev/null || true
     done
-    for d in /opt/usr/local /opt/immich /opt/src /opt/user; do
+    for d in /opt/usr/local /opt/src /opt/user; do
         [ -d "$d" ] && find "$d" -xdev \( -type d -o -type f \) \( -perm -0002 -o -perm -0020 \) -exec chmod go-w {} + 2>/dev/null || true
     done
 }
@@ -578,6 +589,8 @@ install_staged_collected_paths() {
         opt/usr/local/waiwei/bin/waiwei_puller \
         opt/usr/local/blog/bin/rblog \
         opt/usr/local/blog/bin/rblog-backup \
+        opt/usr/local/domus/bin/domus \
+        opt/usr/local/domus/bin/domus-* \
         opt/usr/local/shadowsocks/bin/sslocal \
         opt/usr/local/shadowsocks/bin/ssserver \
         opt/usr/local/shadowsocks/bin/xray-plugin
@@ -891,7 +904,6 @@ ensure_host_entry() {
     rm -f "$tmp"
 }
 ensure_host_entry 127.0.0.1 unlock-music.xiedeacc.com
-ensure_host_entry 127.0.0.1 immich.xiedeacc.com
 ensure_host_entry 127.0.0.1 halo.xiedeacc.com
 ensure_host_entry 127.0.0.1 blog.xiedeacc.com
 ensure_host_entry 127.0.0.1 rblog.xiedeacc.com
@@ -1122,101 +1134,8 @@ if [ -d /opt/src/software/pgvector ]; then
     (cd /opt/src/software/pgvector && make && make install) || log "WARN: pgvector build/install failed"
 fi
 
-deploy_immich_from_git() {
-    mkdir -p /opt/src/software
-    mkdir -p /opt/immich/server /opt/immich/web /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf
-    if [ ! -s /opt/immich/conf/immich-ml.env ]; then
-        cat > /opt/immich/conf/immich-ml.env <<'EOF_IMMICH_ML_ENV'
-IMMICH_HOST=0.0.0.0
-IMMICH_PORT=3003
-IMMICH_LOG_LEVEL=log
-MACHINE_LEARNING_CACHE_FOLDER=/opt/immich/machine-learning/.cache
-TRANSFORMERS_CACHE=/opt/immich/machine-learning/.cache
-EOF_IMMICH_ML_ENV
-        chmod 0640 /opt/immich/conf/immich-ml.env
-    fi
-    mkdir -p /root/.ssh
-    ssh-keyscan -T 10 github.com >> /root/.ssh/known_hosts 2>/dev/null || true
-    export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'
-    repo=/opt/src/software/immich
-    if [ -e "$repo" ] && [ ! -d "$repo/.git" ]; then
-        log "ERROR: $repo exists but is not a git checkout; move it aside with a one-off command before deploying"
-        return 1
-    fi
-    if [ ! -d "$repo/.git" ]; then
-        log "clone immich deploy branch"
-        git clone --branch deploy git@github.com:xiedeacc/immich.git "$repo" || return 1
-    fi
-    log "sync immich deploy branch"
-    (
-        cd "$repo" &&
-        git remote set-url origin git@github.com:xiedeacc/immich.git &&
-        (git checkout -- deploy.sh 2>/dev/null || true) &&
-        (git checkout -- scripts/deploy.sh 2>/dev/null || true) &&
-        (git checkout -- install.sh 2>/dev/null || true) &&
-        git fetch origin deploy >/dev/null 2>&1 &&
-        git checkout deploy >/dev/null 2>&1 &&
-        git pull --ff-only origin deploy >/dev/null 2>&1
-    ) || return 1
-    immich_commit="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
-    immich_marker=/opt/immich/.auto_sync_deploy_commit
-    immich_installed=0
-    if [ -f /opt/immich/server/dist/main.js ] &&
-       [ -f /opt/immich/web/build/index.html ] &&
-       [ -x /opt/immich/machine-learning/.venv/bin/python ]; then
-        immich_installed=1
-    fi
-    if [ -n "$immich_commit" ] && [ "$immich_installed" -eq 1 ]; then
-        if [ "$(cat "$immich_marker" 2>/dev/null || true)" = "$immich_commit" ]; then
-            log "immich deploy branch unchanged; skip rebuild"
-            return 0
-        fi
-        if [ ! -f "$immich_marker" ]; then
-            printf '%s\n' "$immich_commit" > "$immich_marker"
-            log "immich already installed; record current deploy commit and skip rebuild"
-            return 0
-        fi
-    fi
-    for script in deploy.sh scripts/deploy.sh install.sh; do
-        if [ -f "$repo/$script" ]; then
-            chmod +x "$repo/$script" 2>/dev/null || true
-            immich_deploy_log=/var/log/auto_sync_immich_deploy.log
-            immich_node_home="${IMMICH_NODE_HOME:-/opt/src/software/tools/nvm/versions/node/v24.18.0}"
-            immich_node_bin="${IMMICH_NODE_BIN:-$immich_node_home/bin/node}"
-            immich_npm_bin="${IMMICH_NPM_BIN:-$(command -v npm || true)}"
-            immich_pnpm_bin="${IMMICH_PNPM_BIN:-$(command -v pnpm || true)}"
-            log "run immich deploy script $script; full output: $immich_deploy_log"
-            (cd "$repo" &&
-                VERSION="${IMMICH_VERSION:-deploy}" \
-                REPO_DIR="$repo" \
-                APP_DIR=/opt/immich \
-                UPLOAD_DIR=/opt/immich/upload \
-                TOOL_ROOT=/opt/src/software/tools \
-                NODE_HOME="$immich_node_home" \
-                NODE_BIN="$immich_node_bin" \
-                NPM_BIN="$immich_npm_bin" \
-                PNPM_BIN="$immich_pnpm_bin" \
-                RUN_USER=root \
-                RUN_GROUP=root \
-                UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
-                UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
-                PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
-                npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" \
-                bash "$script") >"$immich_deploy_log" 2>&1 || {
-                    log "ERROR: immich deploy failed; tail of $immich_deploy_log follows"
-                    tail -80 "$immich_deploy_log" 2>/dev/null || true
-                    return 1
-                }
-            log "immich deploy completed"
-            [ -z "$immich_commit" ] || printf '%s\n' "$immich_commit" > "$immich_marker"
-            return 0
-        fi
-    done
-    log "WARN: immich deploy script not found in $repo"
-    return 1
-}
 setquota -u root 20000000 20000000 0 0 /dev/mmcblk0p2 2>/dev/null || true
-for u in tiger git immich; do
+for u in tiger git; do
     id "$u" >/dev/null 2>&1 && setquota -u "$u" 1000000 1000000 0 0 / 2>/dev/null || true
 done
 
@@ -1388,19 +1307,6 @@ ensure_postgresql_ready() {
     return 1
 }
 
-prepare_immich_database_extensions() {
-    ensure_postgresql_ready >/dev/null 2>&1 || { log "WARN: PostgreSQL is not ready for immich extension check"; return 0; }
-    if ! sudo -u postgres psql -Atqc "SELECT 1 FROM pg_database WHERE datname = 'immich'" 2>/dev/null | grep -qx 1; then
-        return 0
-    fi
-    sudo -u postgres psql -d immich -v ON_ERROR_STOP=0 \
-        -c "CREATE EXTENSION IF NOT EXISTS vector;" \
-        -c "ALTER EXTENSION vector UPDATE;" >/dev/null 2>&1 ||
-        log "WARN: immich pgvector extension preparation failed"
-}
-
-
-
 mysql_has_user_data() {
     command -v mysql >/dev/null 2>&1 || return 1
     count="$(mysql -NBe "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null || echo 0)"
@@ -1458,16 +1364,7 @@ pg_dump="$(newest_dump postgres $dump_roots 2>/dev/null || true)"
 [ -n "$pg_dump" ] && log "selected postgres dump: $pg_dump"
 restore_once mysql "$mysql_dump"
 restore_once postgres "$pg_dump"
-prepare_immich_database_extensions
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
-mkdir -p /opt/immich/upload
-for d in backups encoded-video library profile thumbs upload; do
-    mkdir -p "/opt/immich/upload/$d"
-    touch "/opt/immich/upload/$d/.immich"
-done
-chown root:root /opt/immich/upload /opt/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
-deploy_immich_from_git || { log "ERROR: immich deploy from git failed"; exit 1; }
-log "skip immich media derivative repair during deploy; derivative repair is managed by Domus"
 rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
 if [ "$zfs_woken" = "1" ]; then
     standby_zfs
@@ -1491,11 +1388,7 @@ EOF_OPT_USR_LOCAL_PATH
 }
 ensure_opt_usr_local_path
 
-mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/rgit/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/tiger /home/tiger
-for d in backups encoded-video library profile thumbs upload; do
-    mkdir -p "/opt/immich/upload/$d"
-    touch "/opt/immich/upload/$d/.immich"
-done
+mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/domus/logs /opt/usr/local/rgit/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/user/tiger /home/tiger
 migrate_root_home_to_opt() {
     mkdir -p /opt/user/root
 
@@ -1539,10 +1432,16 @@ for entry in Path('/home/tiger').iterdir():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
 [ -e /opt/user/tiger ] && chown -R tiger:tiger /opt/user/tiger 2>/dev/null || true
-[ -e /opt/immich ] && chown root:root /opt/immich /opt/immich/{server,web,upload,machine-learning,conf} /opt/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
 for d in /opt/usr/local/auto_sync /opt/usr/local/tbox /opt/usr/local/shadowsocks; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
+if [ -d /opt/usr/local/domus ]; then
+    chown root:root /opt/usr/local/domus /opt/usr/local/domus/bin 2>/dev/null || true
+    find /opt/usr/local/domus/bin -type f -exec chown root:root {} + -exec chmod 755 {} + 2>/dev/null || true
+    for d in /opt/usr/local/domus/conf /opt/usr/local/domus/data /opt/usr/local/domus/logs /opt/usr/local/domus/.backup-worktree; do
+        [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
+    done
+fi
 if [ -d /opt/usr/local/rgit ]; then
     chown root:root /opt/usr/local/rgit /opt/usr/local/rgit/bin 2>/dev/null || true
     find /opt/usr/local/rgit/bin -type f -exec chown root:root {} + -exec chmod 755 {} + 2>/dev/null || true
@@ -1562,19 +1461,105 @@ for f in \
     /opt/usr/local/blog/bin/rblog \
     /opt/usr/local/blog/bin/rblog-backup \
     /opt/usr/local/blog/bin/admin/* \
+    /opt/usr/local/domus/bin/* \
     /opt/usr/local/rgit/bin/* \
     /opt/usr/local/shadowsocks/bin/* \
     /opt/usr/local/bin/vlmcsd
 do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
 done
-find /opt/immich/server/bin /opt/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
 chmod a+rx /opt/src/software/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/null || true
 normalize_deploy_permissions
+ensure_domus_backup() {
+    [ -d /opt/usr/local/domus ] || return 0
+    mkdir -p /opt/usr/local/domus/bin /opt/usr/local/domus/conf /opt/usr/local/domus/data /opt/usr/local/domus/logs
+    mkdir -p /root/.ssh
+    ssh-keyscan -T 10 github.com >> /root/.ssh/known_hosts 2>/dev/null || true
+    if [ ! -d /opt/usr/local/domus/.backup-worktree/.git ]; then
+        rm -rf /opt/usr/local/domus/.backup-worktree
+        git clone git@github.com:xiedeacc/domus_data.git /opt/usr/local/domus/.backup-worktree || log "WARN: domus_data backup clone failed"
+    fi
+    if [ ! -f /etc/systemd/system/domus.service ]; then
+        cat > /etc/systemd/system/domus.service <<'EOF_DOMUS_SERVICE'
+[Unit]
+Description=Domus service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/usr/local/domus
+Environment=RUST_LOG=info
+ExecStart=/opt/usr/local/domus/bin/domus
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF_DOMUS_SERVICE
+    fi
+    cat > /opt/usr/local/domus/bin/domus-backup <<'EOF_DOMUS_BACKUP'
+#!/usr/bin/env bash
+set -euo pipefail
+app=/opt/usr/local/domus
+worktree="$app/.backup-worktree"
+mkdir -p "$app/bin" "$app/conf" "$app/data" "$app/logs" /root/.ssh
+ssh-keyscan -T 10 github.com >> /root/.ssh/known_hosts 2>/dev/null || true
+export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'
+if [ ! -d "$worktree/.git" ]; then
+    rm -rf "$worktree"
+    git clone git@github.com:xiedeacc/domus_data.git "$worktree"
+fi
+git -C "$worktree" config user.name auto_sync
+git -C "$worktree" config user.email auto_sync@nas.local
+git -C "$worktree" pull --ff-only || true
+for d in bin data conf; do
+    rm -rf "$worktree/$d"
+    if [ -e "$app/$d" ]; then
+        cp -a "$app/$d" "$worktree/$d"
+    fi
+done
+cd "$worktree"
+git add -A -- bin data conf
+if ! git diff --cached --quiet; then
+    git commit -m "Backup domus data $(date -Is)"
+fi
+git pull --rebase --autostash || true
+git push
+EOF_DOMUS_BACKUP
+    chmod 755 /opt/usr/local/domus/bin/domus-backup
+    cat > /etc/systemd/system/domus-backup.service <<'EOF_DOMUS_BACKUP_SERVICE'
+[Unit]
+Description=Back up Domus runtime data
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/usr/local/domus/bin/domus-backup
+EOF_DOMUS_BACKUP_SERVICE
+    cat > /etc/systemd/system/domus-backup.timer <<'EOF_DOMUS_BACKUP_TIMER'
+[Unit]
+Description=Run Domus runtime data backup periodically
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+Persistent=true
+Unit=domus-backup.service
+
+[Install]
+WantedBy=timers.target
+EOF_DOMUS_BACKUP_TIMER
+}
+ensure_domus_backup
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for f in /etc/systemd/system/auto_sync.service /etc/systemd/system/immich.service /etc/systemd/system/immich-ml.service /etc/systemd/system/tbox_client.service; do
+for f in /etc/systemd/system/auto_sync.service /etc/systemd/system/domus.service /etc/systemd/system/tbox_client.service; do
     [ -f "$f" ] || continue
     sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
     grep -q '^User=' "$f" || sed -i '/^\[Service\]/a User=root' "$f"
@@ -1586,10 +1571,10 @@ if [ -f /etc/systemd/system/redis.service ] && [ -f /usr/lib/systemd/system/redi
     rm -f /etc/systemd/system/redis.service
     systemctl daemon-reload
 fi
-for s in tbox_server shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+for s in tbox_server immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
-for s in mysql postgresql redis-server immich-ml auto_sync immich tbox_client tbox-logrotate.timer rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer nginx cron; do
+for s in mysql postgresql redis-server auto_sync tbox_client tbox-logrotate.timer rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -1598,7 +1583,7 @@ done
 
 print_final_states() {
     echo '--- final states ---'
-    for s in auto_sync immich immich-ml tbox_server tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in auto_sync tbox_server tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         resolved="$(unit_name "$s" 2>/dev/null || true)"
         if [ -n "$resolved" ]; then
             enabled="$(systemctl is-enabled "$resolved" 2>/dev/null || true)"
@@ -1642,7 +1627,7 @@ wait_for_https_200() {
 }
 
 required_failed=0
-for s in auto_sync immich immich-ml tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer; do
+for s in auto_sync tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer; do
     if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
         required_failed=1
@@ -1656,7 +1641,7 @@ if ! pg_isready -q; then
     log "ERROR: PostgreSQL is not accepting connections"
     required_failed=1
 fi
-for url in https://unlock-music.xiedeacc.com https://immich.xiedeacc.com https://blog.xiedeacc.com https://rblog.xiedeacc.com; do
+for url in https://unlock-music.xiedeacc.com https://blog.xiedeacc.com https://rblog.xiedeacc.com; do
     if ! wait_for_https_200 "$url"; then
         required_failed=1
     fi

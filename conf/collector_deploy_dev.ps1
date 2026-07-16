@@ -334,8 +334,8 @@ fi
 Copy-AwsSslIntoCollectedRoot
 $remoteStage = '/tmp/auto_sync_deploy_stage'
 Invoke-Remote "rm -rf $(Quote-ShellArg $remoteStage); mkdir -p $(Quote-ShellArg $remoteStage)"
-$generatedOptionalPaths = @('/usr/local/immich/conf', '/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') + $platformDefaultCollectPaths
-$requiredCollectPaths = @($collectPaths | Where-Object { (Normalize-RemotePath $_) -ne '/usr/local/immich/conf' })
+$generatedOptionalPaths = @('/root/auto_sync_db_dumps', '/tmp/auto_sync_db_dumps') + $platformDefaultCollectPaths
+$requiredCollectPaths = $collectPaths
 Transfer-CollectedPathsToStage $requiredCollectPaths $generatedOptionalPaths $remoteStage
 Invoke-NameManifestRehydrate $remoteStage
 Prepare-StagedSymlinks $env:AS_PERMS_FILE $remoteStage
@@ -466,7 +466,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server immich-ml auto_sync immich rblog rblog-backup.timer nginx cron tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server auto_sync rblog rblog-backup.timer nginx cron tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -762,7 +762,6 @@ ensure_host_entry() {
     rm -f "$tmp"
 }
 ensure_host_entry 127.0.0.1 unlock-music.xiedeacc.com
-ensure_host_entry 127.0.0.1 immich.xiedeacc.com
 ensure_host_entry 127.0.0.1 halo.xiedeacc.com
 ensure_host_entry 127.0.0.1 blog.xiedeacc.com
 ensure_host_entry 127.0.0.1 rblog.xiedeacc.com
@@ -990,103 +989,8 @@ if [ -d /root/src/software/pgvector ]; then
     (cd /root/src/software/pgvector && make && make install) || log "WARN: pgvector build/install failed"
 fi
 
-deploy_immich_from_git() {
-    mkdir -p /root/src/software
-    mkdir -p /usr/local/immich/server /usr/local/immich/web /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf
-    if [ ! -s /usr/local/immich/conf/immich-ml.env ]; then
-        cat > /usr/local/immich/conf/immich-ml.env <<'EOF_IMMICH_ML_ENV'
-IMMICH_HOST=0.0.0.0
-IMMICH_PORT=3003
-IMMICH_LOG_LEVEL=log
-MACHINE_LEARNING_CACHE_FOLDER=/usr/local/immich/machine-learning/.cache
-TRANSFORMERS_CACHE=/usr/local/immich/machine-learning/.cache
-EOF_IMMICH_ML_ENV
-        chmod 0640 /usr/local/immich/conf/immich-ml.env
-    fi
-    mkdir -p /root/.ssh
-    ssh-keyscan -T 10 github.com >> /root/.ssh/known_hosts 2>/dev/null || true
-    export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'
-    repo=/root/src/software/immich
-    if [ -e "$repo" ] && [ ! -d "$repo/.git" ]; then
-        log "ERROR: $repo exists but is not a git checkout; move it aside with a one-off command before deploying"
-        return 1
-    fi
-    if [ ! -d "$repo/.git" ]; then
-        log "clone immich deploy branch"
-        git clone --branch deploy git@github.com:xiedeacc/immich.git "$repo" || return 1
-    fi
-    log "sync immich deploy branch"
-    (
-        cd "$repo" &&
-        git remote set-url origin git@github.com:xiedeacc/immich.git &&
-        (git checkout -- deploy.sh 2>/dev/null || true) &&
-        (git checkout -- scripts/deploy.sh 2>/dev/null || true) &&
-        (git checkout -- install.sh 2>/dev/null || true) &&
-        git fetch origin deploy >/dev/null 2>&1 &&
-        git checkout deploy >/dev/null 2>&1 &&
-        git pull --ff-only origin deploy >/dev/null 2>&1
-    ) || return 1
-    immich_commit="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
-    immich_marker=/usr/local/immich/.auto_sync_deploy_commit
-    immich_installed=0
-    if [ -f /usr/local/immich/server/dist/main.js ] &&
-       [ -f /usr/local/immich/web/build/index.html ] &&
-       [ -x /usr/local/immich/machine-learning/.venv/bin/python ]; then
-        immich_installed=1
-    fi
-    if [ -n "$immich_commit" ] && [ "$immich_installed" -eq 1 ]; then
-        if [ "$(cat "$immich_marker" 2>/dev/null || true)" = "$immich_commit" ]; then
-            log "immich deploy branch unchanged; skip rebuild"
-            return 0
-        fi
-        if [ ! -f "$immich_marker" ]; then
-            printf '%s\n' "$immich_commit" > "$immich_marker"
-            log "immich already installed; record current deploy commit and skip rebuild"
-            return 0
-        fi
-    fi
-    for script in deploy.sh scripts/deploy.sh install.sh; do
-        if [ -f "$repo/$script" ]; then
-            chmod +x "$repo/$script" 2>/dev/null || true
-            immich_deploy_log=/var/log/auto_sync_immich_deploy.log
-            immich_node_home="${IMMICH_NODE_HOME:-/root/src/software/tools/nvm/versions/node/v24.18.0}"
-            immich_node_bin="${IMMICH_NODE_BIN:-$immich_node_home/bin/node}"
-            immich_npm_bin="${IMMICH_NPM_BIN:-$(command -v npm || true)}"
-            immich_pnpm_bin="${IMMICH_PNPM_BIN:-$(command -v pnpm || true)}"
-            chmod -R a+rX "$immich_node_home" /root/src/software/tools/uv-python 2>/dev/null || true
-            log "run immich deploy script $script; full output: $immich_deploy_log"
-            (cd "$repo" &&
-                VERSION="${IMMICH_VERSION:-deploy}" \
-                REPO_DIR="$repo" \
-                APP_DIR=/usr/local/immich \
-                UPLOAD_DIR=/usr/local/immich/upload \
-                TOOL_ROOT=/root/src/software/tools \
-                NODE_HOME="$immich_node_home" \
-                NODE_BIN="$immich_node_bin" \
-                NPM_BIN="$immich_npm_bin" \
-                PNPM_BIN="$immich_pnpm_bin" \
-                RUN_USER=root \
-                RUN_GROUP=root \
-                UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/root/src/software/tools/uv-python}" \
-                UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
-                UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
-                PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
-                npm_config_node_gyp="$immich_node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" \
-                bash "$script") >"$immich_deploy_log" 2>&1 || {
-                    log "ERROR: immich deploy failed; tail of $immich_deploy_log follows"
-                    tail -80 "$immich_deploy_log" 2>/dev/null || true
-                    return 1
-                }
-            log "immich deploy completed"
-            [ -z "$immich_commit" ] || printf '%s\n' "$immich_commit" > "$immich_marker"
-            return 0
-        fi
-    done
-    log "WARN: immich deploy script not found in $repo"
-    return 1
-}
 setquota -u root 20000000 20000000 0 0 /dev/mmcblk0p2 2>/dev/null || true
-for u in tiger git immich; do
+for u in tiger git; do
     id "$u" >/dev/null 2>&1 && setquota -u "$u" 1000000 1000000 0 0 / 2>/dev/null || true
 done
 
@@ -1257,42 +1161,6 @@ ensure_postgresql_ready() {
     return 1
 }
 
-configure_postgresql_peer_maps() {
-    for hba in /etc/postgresql/[0-9]*/main/pg_hba.conf; do
-        [ -f "$hba" ] || continue
-        dir="$(dirname "$hba")"
-        ident="$dir/pg_ident.conf"
-        if ! grep -Eq '^[[:space:]]*local[[:space:]]+immich[[:space:]]+immich[[:space:]]+trust([[:space:]]|$)' "$hba"; then
-            tmp="$(mktemp)"
-            awk '
-                !inserted && $1 == "local" && $2 == "all" && $3 == "all" {
-                    print "local   immich          immich                                  trust"
-                    inserted = 1
-                }
-                { print }
-                END {
-                    if (!inserted) {
-                        print "local   immich          immich                                  trust"
-                    }
-                }
-            ' "$hba" > "$tmp" && cat "$tmp" > "$hba"
-            rm -f "$tmp"
-        fi
-    done
-    systemctl reload postgresql 2>/dev/null || true
-}
-
-prepare_immich_database_extensions() {
-    ensure_postgresql_ready >/dev/null 2>&1 || { log "WARN: PostgreSQL is not ready for immich extension check"; return 0; }
-    if ! sudo -u postgres psql -Atqc "SELECT 1 FROM pg_database WHERE datname = 'immich'" 2>/dev/null | grep -qx 1; then
-        return 0
-    fi
-    sudo -u postgres psql -d immich -v ON_ERROR_STOP=0 \
-        -c "CREATE EXTENSION IF NOT EXISTS vector;" \
-        -c "ALTER EXTENSION vector UPDATE;" >/dev/null 2>&1 ||
-        log "WARN: immich pgvector extension preparation failed"
-}
-
 mysql_has_user_data() {
     command -v mysql >/dev/null 2>&1 || return 1
     count="$(mysql -NBe "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null || echo 0)"
@@ -1337,7 +1205,6 @@ restore_once() {
             ;;
         postgres)
             ensure_postgresql_ready || log "WARN: postgresql is not ready before restore"
-            configure_postgresql_peer_maps
             if printf '%s' "$latest" | grep -q '\.gz$'; then zcat "$latest" | sudo -u postgres psql -v ON_ERROR_STOP=0; else sudo -u postgres psql -v ON_ERROR_STOP=0 -f "$latest"; fi
             ;;
     esac && printf '%s' "$latest" > "$marker" || log "WARN: $kind restore failed"
@@ -1351,30 +1218,17 @@ pg_dump="$(newest_dump postgres $dump_roots 2>/dev/null || true)"
 [ -n "$pg_dump" ] && log "selected postgres dump: $pg_dump"
 restore_once mysql "$mysql_dump"
 restore_once postgres "$pg_dump"
-configure_postgresql_peer_maps
-prepare_immich_database_extensions
 id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
-mkdir -p /usr/local/immich/upload
-for d in backups encoded-video library profile thumbs upload; do
-    mkdir -p "/usr/local/immich/upload/$d"
-    touch "/usr/local/immich/upload/$d/.immich"
-done
-chown root:root /usr/local/immich/upload /usr/local/immich/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
-deploy_immich_from_git || { log "ERROR: immich deploy from git failed"; exit 1; }
 rm -rf /root/auto_sync_db_dumps /tmp/auto_sync_db_dumps 2>/dev/null || true
 if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /usr/local/immich/server /usr/local/immich/upload /usr/local/immich/machine-learning /usr/local/immich/conf /home/tiger
+mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /home/tiger
 if [ -e /root/.cscope.vim ] && [ ! -d /root/.cscope.vim ]; then
     rm -f /root/.cscope.vim
 fi
 mkdir -p /root/.cscope.vim
-for d in backups encoded-video library profile thumbs upload; do
-    mkdir -p "/usr/local/immich/upload/$d"
-    touch "/usr/local/immich/upload/$d/.immich"
-done
 python3 - <<'PY_TIGER_LINK_OWNERS'
 import os
 import pwd
@@ -1387,9 +1241,6 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
-for d in /usr/local/immich; do
-    [ -e "$d" ] && chown root:root "$d" "$d"/{server,web,upload,machine-learning,conf} "$d"/upload/{backups,encoded-video,library,profile,thumbs,upload} 2>/dev/null || true
-done
 for d in /usr/local/auto_sync /usr/local/tbox; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
@@ -1415,35 +1266,8 @@ for f in \
 do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
 done
-for link in /usr/local/immich/machine-learning/.venv/bin/python /usr/local/immich/machine-learning/.venv/bin/python3 /usr/local/immich/machine-learning/.venv/bin/python3.*; do
-    [ -L "$link" ] || continue
-    target="$(readlink "$link" || true)"
-    case "$target" in
-        /root/src/*)
-            ln -sfn "/root/src/${target#/root/src/}" "$link"
-            ;;
-    esac
-done
-if [ -f /usr/local/immich/machine-learning/.venv/pyvenv.cfg ]; then
-    python_home="$(find /root/src/software/tools/uv-python -mindepth 1 -maxdepth 1 -type d -name 'cpython-*' 2>/dev/null | sort -V | tail -1)"
-    if [ -n "$python_home" ]; then
-        sed -i -E "s#^home = .*#home = $python_home/bin#" /usr/local/immich/machine-learning/.venv/pyvenv.cfg
-        if [ -f /etc/systemd/system/immich-ml.service ]; then
-            if grep -q '^Environment="PYTHONHOME=' /etc/systemd/system/immich-ml.service; then
-                sed -i -E "s#^Environment=\"PYTHONHOME=.*#Environment=\"PYTHONHOME=$python_home\"#" /etc/systemd/system/immich-ml.service
-            else
-                sed -i "/^Environment=\"PATH=/a Environment=\"PYTHONHOME=$python_home\"" /etc/systemd/system/immich-ml.service
-            fi
-        fi
-    fi
-fi
-find /usr/local/immich/server/bin /usr/local/immich/machine-learning/.venv/bin -type f -exec chmod a+rx {} + 2>/dev/null || true
 chmod -R a+rX /root/src/software/tools/nvm/versions/node/v24.18.0 /root/src/software/tools/uv-python 2>/dev/null || true
 normalize_deploy_permissions
-for f in /etc/systemd/system/immich.service /etc/systemd/system/immich-ml.service; do
-    [ -f "$f" ] || continue
-    sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
-done
 for f in /etc/systemd/system/auto_sync.service /etc/systemd/system/tbox_client.service; do
     [ -f "$f" ] || continue
     sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
@@ -1453,10 +1277,10 @@ done
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for s in tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+for s in tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
-for s in mysql postgresql redis-server immich-ml auto_sync immich rblog rblog-backup.timer nginx cron; do
+for s in mysql postgresql redis-server auto_sync rblog rblog-backup.timer nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -1464,7 +1288,7 @@ done
 
 print_final_states() {
     echo '--- final states ---'
-    for s in auto_sync immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer tbox_server tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in auto_sync nginx cron mysql postgresql redis-server rblog rblog-backup.timer tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         resolved="$(unit_name "$s" 2>/dev/null || true)"
         if [ -n "$resolved" ]; then
             enabled="$(systemctl is-enabled "$resolved" 2>/dev/null || true)"
@@ -1508,7 +1332,7 @@ wait_for_https_200() {
 }
 
 required_failed=0
-for s in auto_sync immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer; do
+for s in auto_sync nginx cron mysql postgresql redis-server rblog rblog-backup.timer; do
     if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
         required_failed=1
