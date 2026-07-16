@@ -249,6 +249,10 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 - **唤醒后是否自动再停**：auto_sync 的 standby tick 会持续计算触及该池的任务是否 busy。读写完成、所有已锁定 cycle 都 `verified == target` 后，等待 90s settle，然后再次执行 `hdparm -Y` 停转。如果是其他进程把盘唤醒，auto_sync 下一次 tick 看到该池窗口外且没有 auto_sync 任务 busy，也会尝试重新停转；但若外部进程持续访问，盘会被反复唤醒或保持转动。
 - **最大化寿命的前提**：要让 `/zfs`、`/zfs_pool` 真正长期保持冷备状态，需要同时避免别的服务、shell、监控、索引器、备份脚本、`find`/`du`、文件管理器、ZFS 管理命令等频繁访问这些挂载点。auto_sync 只能保证自己的 sync/compare/full 在窗口外不去碰受门控的目标池。
 
+**直接判断**：当 `/zfs` 或 `/zfs_pool` 相关 sync 全部完成、目标行 `verified == target`、没有可运行积压任务，并且 90s settle 已过，auto_sync 会把对应设备重新送入 standby。此时可以把它看作“机械部分基本静止的冷备状态”：盘片不转、磁头停放、没有 auto_sync 读写，接近你想要的“尽量少工作”状态；但不能等同于断电，硬盘仍通电，控制板仍在线，SMART 通电小时通常仍继续累计。standby 对寿命的收益主要来自降低持续旋转、发热和机械磨损；代价是每次唤醒都会增加启停/装载计数，所以它适合“批量同步后长时间不碰”的冷备盘，不适合几分钟内反复访问的热盘。
+
+进入 standby 后，任何真实访问都会把盘唤醒：读 `/zfs`/`/zfs_pool` 文件、列目录、跑 `du/find`、某些 ZFS metadata 查询、备份校验、媒体索引、甚至 shell 补全碰到挂载点，都可能触发设备 spin-up。访问完成后，auto_sync 只负责在自己的 tick 中再次观察：如果窗口外且没有 auto_sync 任务 busy，就重新执行停转；如果外部进程持续或频繁访问，它无法阻止唤醒，也不会让盘保持真正冷备。
+
 每个池：`name`、`mount_roots`（该池的挂载根，任务的源或目标落在其下即受门控）、`devices`（`/dev/disk/by-id/...`，用于 `hdparm -Y` 停转）、`active_spindown`（true 才主动停转，否则只推迟任务、停转交给系统 `hdparm -S`）、`wake`（`every_weeks` 周期 + `weekday` + `time` + `anchor_date` 计数锚点 + `max_window_minutes` 窗口上限）。
 
 - **门控（目标驱动 + 源盘按需唤醒）**：`sync_cycle_for_source` 处理每个目标前调用 `standby::gate_for_sync(源根, 目标根)`。**门控只看目标所在池的唤醒窗口**（备份落在目标盘，其唤醒计划就是这条备份的节奏）：目标池不在窗口 → 目标置 `yellow`（原因 `disk <pool> in standby until <下次唤醒>`），不执行不失败，等目标池下个窗口批量补齐。**若源在另一块 standby 盘上（链式备份），源盘不受自己窗口门控，而是按需唤醒**——目标池开窗即放行，读源盘的 I/O 自动把它转起来，`busy()` 在同步期间保持它唤醒。若目标盘非 standby、源盘是 standby，则改由源盘窗口门控（冷源读取仍批量化）。
