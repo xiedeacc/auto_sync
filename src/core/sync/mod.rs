@@ -724,10 +724,11 @@ fn zfs_diff_compare(
     let Ok(dst_live_root) = dst_root.canonicalize() else {
         return Ok(None);
     };
-    let Some(src_changed) = zfs_diff_changed_paths_live(&src_base, &src_live_root) else {
+    let Some(src_changed) = zfs_diff_changed_paths_live(&src_base, &src_live_root, "source") else {
         return Ok(None);
     };
-    let Some(dst_changed) = zfs_diff_changed_paths_live(&dst_base, &dst_live_root) else {
+    let Some(dst_changed) = zfs_diff_changed_paths_live(&dst_base, &dst_live_root, "destination")
+    else {
         return Ok(None);
     };
     let (paths, dst_only) = diff_union_and_dst_only(src_changed, dst_changed);
@@ -3290,9 +3291,12 @@ fn sync_cycle_for_source_inner(
                         if let Some(base) =
                             state.destination_verified_snapshot(&source.id, &dst.id)?
                         {
-                            if let Some(rel_paths) =
-                                zfs_diff_changed_paths(&base, &zfs.full_name, &zfs.source_live_root)
-                            {
+                            if let Some(rel_paths) = zfs_diff_changed_paths(
+                                &base,
+                                &zfs.full_name,
+                                &zfs.source_live_root,
+                                "source",
+                            ) {
                                 info!(
                                     source = source.id,
                                     destination = dst.id,
@@ -3667,11 +3671,12 @@ fn full_zfs_diff_paths(
         return Ok(None);
     };
     let Some(src_changed) =
-        zfs_diff_changed_paths(&src_base, &zfs.full_name, &zfs.source_live_root)
+        zfs_diff_changed_paths(&src_base, &zfs.full_name, &zfs.source_live_root, "source")
     else {
         return Ok(None);
     };
-    let Some(dst_changed) = zfs_diff_changed_paths_live(&dst_base, &dst_live_root) else {
+    let Some(dst_changed) = zfs_diff_changed_paths_live(&dst_base, &dst_live_root, "destination")
+    else {
         return Ok(None);
     };
     Ok(Some(diff_union_and_dst_only(src_changed, dst_changed)))
@@ -4002,9 +4007,12 @@ fn sync_cycle_with_transfer(
         if sync.zfs_diff && !is_event_loss_reconcile && !cycle.manual_full_rescan {
             if let Some(zfs) = zfs_snapshot {
                 if let Some(base) = state.destination_verified_snapshot(&source.id, &dst.id)? {
-                    if let Some(rel_paths) =
-                        zfs_diff_changed_paths(&base, &zfs.full_name, &zfs.source_live_root)
-                    {
+                    if let Some(rel_paths) = zfs_diff_changed_paths(
+                        &base,
+                        &zfs.full_name,
+                        &zfs.source_live_root,
+                        "source",
+                    ) {
                         info!(
                             source = source.id,
                             destination = dst.id,
@@ -5937,7 +5945,7 @@ impl ZfsSnapshot {
 /// it covers (parsed from the snapshot names, `…_000000000057` → 57). This is a
 /// metadata diff over the source dataset, not file transfer; naming it makes a
 /// slow catch-up self-explaining instead of looking frozen.
-fn zfs_diff_phase_label(base_full_name: &str, new_full_name: &str) -> String {
+fn zfs_diff_phase_label(base_full_name: &str, new_full_name: &str, role: &str) -> String {
     let cycle_of = |name: &str| -> Option<i64> {
         name.rsplit('_')
             .next()
@@ -5947,9 +5955,12 @@ fn zfs_diff_phase_label(base_full_name: &str, new_full_name: &str) -> String {
         .split_once('@')
         .map(|(dataset, _)| dataset.trim())
         .filter(|dataset| !dataset.is_empty());
-    let prefix = match dataset {
-        Some(dataset) => format!("zfs metadata diff {dataset}"),
-        None => "zfs metadata diff".to_string(),
+    let role = role.trim();
+    let prefix = match (role.is_empty(), dataset) {
+        (false, Some(dataset)) => format!("zfs metadata diff {role} {dataset}"),
+        (false, None) => format!("zfs metadata diff {role}"),
+        (true, Some(dataset)) => format!("zfs metadata diff {dataset}"),
+        (true, None) => "zfs metadata diff".to_string(),
     };
     match (cycle_of(base_full_name), cycle_of(new_full_name)) {
         (Some(base), Some(to)) if base != to => format!("{prefix} {base}→{to}"),
@@ -5961,8 +5972,9 @@ fn zfs_diff_changed_paths(
     base_full_name: &str,
     new_full_name: &str,
     source_live_root: &Path,
+    role: &str,
 ) -> Option<Vec<DiffPath>> {
-    set_sync_phase(&zfs_diff_phase_label(base_full_name, new_full_name));
+    set_sync_phase(&zfs_diff_phase_label(base_full_name, new_full_name, role));
     if base_full_name == new_full_name {
         return Some(Vec::new());
     }
@@ -6340,7 +6352,26 @@ fn snapshot_cycle_suffix_matches(name: &str, prefix: &str) -> bool {
 /// LIVE filesystem (`zfs diff -H <snapshot>` with no second argument diffs
 /// against the current state). Same contract as [`zfs_diff_changed_paths`]:
 /// `None` means "no reliable diff — fall back".
-fn zfs_diff_changed_paths_live(base_full_name: &str, live_root: &Path) -> Option<Vec<DiffPath>> {
+fn zfs_diff_live_phase_label(base_full_name: &str, role: &str) -> String {
+    let dataset = base_full_name
+        .split_once('@')
+        .map(|(dataset, _)| dataset.trim())
+        .filter(|dataset| !dataset.is_empty());
+    let role = role.trim();
+    match (role.is_empty(), dataset) {
+        (false, Some(dataset)) => format!("zfs metadata diff {role} {dataset} live"),
+        (false, None) => format!("zfs metadata diff {role} live"),
+        (true, Some(dataset)) => format!("zfs metadata diff {dataset} live"),
+        (true, None) => "zfs metadata diff live".to_string(),
+    }
+}
+
+fn zfs_diff_changed_paths_live(
+    base_full_name: &str,
+    live_root: &Path,
+    role: &str,
+) -> Option<Vec<DiffPath>> {
+    set_sync_phase(&zfs_diff_live_phase_label(base_full_name, role));
     let base_exists = Command::new("zfs")
         .args(["list", "-H", "-t", "snapshot", base_full_name])
         .stdout(Stdio::null())
@@ -10085,20 +10116,29 @@ mod tests {
         assert_eq!(
             zfs_diff_phase_label(
                 "ssd@auto_sync_src_4_000000000057",
-                "ssd@auto_sync_src_4_000000000085"
+                "ssd@auto_sync_src_4_000000000085",
+                "source"
             ),
-            "zfs metadata diff ssd 57→85"
+            "zfs metadata diff source ssd 57→85"
         );
         // Same base and target (nothing to catch up): plain label.
         assert_eq!(
             zfs_diff_phase_label(
                 "ssd@auto_sync_src_4_000000000085",
-                "ssd@auto_sync_src_4_000000000085"
+                "ssd@auto_sync_src_4_000000000085",
+                "source"
             ),
-            "zfs metadata diff ssd"
+            "zfs metadata diff source ssd"
         );
         // Unparseable names fall back gracefully.
-        assert_eq!(zfs_diff_phase_label("weird", "names"), "zfs metadata diff");
+        assert_eq!(
+            zfs_diff_phase_label("weird", "names", "source"),
+            "zfs metadata diff source"
+        );
+        assert_eq!(
+            zfs_diff_live_phase_label("zfs@auto_sync_src_5_000000000145", "destination"),
+            "zfs metadata diff destination zfs live"
+        );
     }
 
     #[test]
