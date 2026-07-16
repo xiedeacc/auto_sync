@@ -240,6 +240,15 @@ scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 
 顶层配置 `standby_pools`：把冷备 HDD 池设成"只在计划窗口内唤醒"，窗口外的一切 sync/compare/full 都被推迟（任务积压），盘保持停转。为空时功能完全休眠，所有盘始终可用。
 
+**standby 到底意味着什么**：这里的 standby 是通过 `hdparm -Y` 让硬盘进入 ATA standby / spun-down 状态，盘片停转、磁头停在安全位置、功耗和机械磨损显著下降；但它**不是物理断电**，硬盘仍然上电、连接在 SATA/USB 控制器上，控制板和接口仍可响应系统命令。因此可以把它理解成“盘片停转的低功耗待机”，而不是“拔掉电源”。具体影响：
+
+- **是否等同完全不工作**：对盘片、主轴马达、寻道机构来说，standby 后基本没有持续机械工作；对硬盘电子部分来说仍处于上电待机。它比 idle 省机械磨损和功耗，但不是完整断电隔离。
+- **是否增加硬盘使用时间**：SMART 的 `Power_On_Hours`/通电小时通常按硬盘上电时间累计，standby 期间多数硬盘仍会继续计入通电小时；但 `Start_Stop_Count` / `Load_Cycle_Count` 等启停/装载计数会在停转和重新唤醒时增加。也就是说 standby 能减少盘片旋转小时和热量，但不一定减少“通电小时”指标。
+- **寿命权衡**：长时间不用时停转通常有利于降低热量、轴承/马达持续旋转磨损和功耗；但非常频繁的停转/唤醒会增加启动电流冲击、马达启停次数和磁头装载次数。auto_sync 因此按备份窗口批量 drain，完成后再 90s settle 才停转，避免短时间内反复启停。
+- **什么会唤醒**：任何进程只要对该盘所在挂载点发起需要真实访问设备的 I/O（例如读取 `/zfs` 下文件、遍历目录、ZFS metadata 访问、`zpool status`/`zfs list` 某些路径、备份/校验任务等），内核/控制器都会把盘唤醒。`standby_pools` 只能让 auto_sync 自己在窗口外不主动读写；它不能阻止其他进程访问 `/zfs` 或 `/zfs_pool`。
+- **唤醒后是否自动再停**：auto_sync 的 standby tick 会持续计算触及该池的任务是否 busy。读写完成、所有已锁定 cycle 都 `verified == target` 后，等待 90s settle，然后再次执行 `hdparm -Y` 停转。如果是其他进程把盘唤醒，auto_sync 下一次 tick 看到该池窗口外且没有 auto_sync 任务 busy，也会尝试重新停转；但若外部进程持续访问，盘会被反复唤醒或保持转动。
+- **最大化寿命的前提**：要让 `/zfs`、`/zfs_pool` 真正长期保持冷备状态，需要同时避免别的服务、shell、监控、索引器、备份脚本、`find`/`du`、文件管理器、ZFS 管理命令等频繁访问这些挂载点。auto_sync 只能保证自己的 sync/compare/full 在窗口外不去碰受门控的目标池。
+
 每个池：`name`、`mount_roots`（该池的挂载根，任务的源或目标落在其下即受门控）、`devices`（`/dev/disk/by-id/...`，用于 `hdparm -Y` 停转）、`active_spindown`（true 才主动停转，否则只推迟任务、停转交给系统 `hdparm -S`）、`wake`（`every_weeks` 周期 + `weekday` + `time` + `anchor_date` 计数锚点 + `max_window_minutes` 窗口上限）。
 
 - **门控（目标驱动 + 源盘按需唤醒）**：`sync_cycle_for_source` 处理每个目标前调用 `standby::gate_for_sync(源根, 目标根)`。**门控只看目标所在池的唤醒窗口**（备份落在目标盘，其唤醒计划就是这条备份的节奏）：目标池不在窗口 → 目标置 `yellow`（原因 `disk <pool> in standby until <下次唤醒>`），不执行不失败，等目标池下个窗口批量补齐。**若源在另一块 standby 盘上（链式备份），源盘不受自己窗口门控，而是按需唤醒**——目标池开窗即放行，读源盘的 I/O 自动把它转起来，`busy()` 在同步期间保持它唤醒。若目标盘非 standby、源盘是 standby，则改由源盘窗口门控（冷源读取仍批量化）。
