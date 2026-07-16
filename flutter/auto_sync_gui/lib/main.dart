@@ -4821,6 +4821,20 @@ String _phaseLabel(String phase) {
       return 'Verifying';
     case 'preparing':
       return 'Preparing';
+    case 'fsync file':
+      return 'Fsync file';
+    case 'setting metadata':
+      return 'Setting metadata';
+    case 'renaming':
+      return 'Renaming';
+    case 'fsync parent':
+      return 'Fsync parent';
+    case 'fixing modes':
+      return 'Fixing modes';
+    case 'removing extras':
+      return 'Removing extras';
+    case 'setting dir mtimes':
+      return 'Setting directory mtimes';
     default:
       return phase;
   }

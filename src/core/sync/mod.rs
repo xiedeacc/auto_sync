@@ -7046,6 +7046,7 @@ fn sync_destination(
         drop(transfer_guard);
 
         if sync.mirror {
+            set_sync_phase("removing extras");
             for rel in diff.extra_paths_deepest_first() {
                 move_to_trash(dst_root, &rel, cycle_id)
                     .with_context(|| format!("failed to remove extra destination path {rel}"))?;
@@ -7053,13 +7054,16 @@ fn sync_destination(
         }
 
         // Content-equal files whose permission bits drifted: chmod in place.
+        set_sync_phase("fixing modes");
         for entry in &diff.mode_fixes {
             let path = safe_join_rel(dst_root, &entry.rel_path)?;
             set_mode(&path, entry.mode)
                 .with_context(|| format!("failed to set mode on {}", entry.rel_path))?;
         }
 
+        set_sync_phase("setting dir mtimes");
         set_snapshot_dir_mtimes(dst_root, source_snapshot)?;
+        set_sync_phase("verifying");
         // Verify what this cycle wrote; untouched entries were compared against
         // the fresh destination scan above, so re-walking the tree is redundant.
         verify_copied_entries(
@@ -7176,6 +7180,7 @@ fn sync_destination_fast_missing_dirs(
         touched.extend(to_copy.iter().map(|e| e.rel_path.clone()));
 
         // Content-equal files whose permission bits drifted: chmod in place.
+        set_sync_phase("fixing modes");
         for entry in source_snapshot.iter().filter(|e| e.file_type == "file") {
             if let Some(existing) = dst_map.get(entry.rel_path.as_str()) {
                 if entries_match(entry, existing, sync) && entry_mode_differs(entry, existing) {
@@ -7188,6 +7193,7 @@ fn sync_destination_fast_missing_dirs(
         }
 
         if sync.mirror {
+            set_sync_phase("removing extras");
             let mut extra_paths: Vec<String> = dst_map
                 .keys()
                 .filter(|rel| {
@@ -7206,11 +7212,13 @@ fn sync_destination_fast_missing_dirs(
             }
         }
 
+        set_sync_phase("setting dir mtimes");
         set_snapshot_dir_mtimes(dst_root, &source_snapshot)?;
         info!(
             destination = destination_id,
             "reconcile: verifying copied entries"
         );
+        set_sync_phase("verifying");
         let large_snapshot_entries = source_snapshot.len() + dst_snapshot.len();
         drop(source_map);
         drop(dst_map);
@@ -8045,7 +8053,9 @@ fn copy_file(
     }
     // fsync data before tightening mode (a read-only mode would block the
     // writable handle fsync needs on Windows).
+    set_sync_phase("fsync file");
     fsync_file(&tmp).with_context(|| format!("failed to fsync {}", entry.rel_path))?;
+    set_sync_phase("setting metadata");
     set_mode(&tmp, entry.mode).ok();
     let mtime = FileTime::from_unix_time(
         entry.mtime_ns / 1_000_000_000,
@@ -8056,7 +8066,9 @@ fn copy_file(
         // re-transfer every cycle; make that visible instead of silent.
         warn!(rel_path = entry.rel_path, error = %err, "failed to set file mtime");
     }
+    set_sync_phase("renaming");
     replace_path(dst_root, cycle_id, &entry.rel_path, &tmp, final_path)?;
+    set_sync_phase("fsync parent");
     fsync_parent(final_path).ok();
     Ok(())
 }
@@ -8458,14 +8470,12 @@ fn trim_allocator_after_large_snapshot(entry_count: usize) {
     let trimmed = unsafe { libc::malloc_trim(0) };
     debug!(
         entry_count,
-        trimmed,
-        "trimmed allocator after large snapshot reconcile"
+        trimmed, "trimmed allocator after large snapshot reconcile"
     );
 }
 
 #[cfg(not(target_env = "gnu"))]
-fn trim_allocator_after_large_snapshot(_entry_count: usize) {
-}
+fn trim_allocator_after_large_snapshot(_entry_count: usize) {}
 
 fn hash_file(path: &Path) -> Result<String> {
     let mut file =
