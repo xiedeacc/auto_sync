@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -898,8 +898,8 @@ fn diff_manifests<'a>(
 ) -> ManifestDiff<'a> {
     // Reference maps: the snapshots can each hold hundreds of thousands of
     // entries, and cloning both into owned maps doubles peak memory.
-    let source_map = map_entry_refs(source_snapshot);
     let dst_map = map_entry_refs(dst_snapshot);
+    let source_map = sync.mirror.then(|| map_entry_refs(source_snapshot));
     let mut diff = ManifestDiff {
         transfer: Vec::new(),
         type_mismatch: Vec::new(),
@@ -935,12 +935,14 @@ fn diff_manifests<'a>(
             }
         }
     }
-    for entry in dst_snapshot {
-        if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
-            continue;
-        }
-        if !source_map.contains_key(entry.rel_path.as_str()) {
-            diff.extras.push(entry);
+    if let Some(source_map) = source_map {
+        for entry in dst_snapshot {
+            if is_rel_excluded(Path::new(&entry.rel_path), excludes) {
+                continue;
+            }
+            if !source_map.contains_key(entry.rel_path.as_str()) {
+                diff.extras.push(entry);
+            }
         }
     }
     diff
@@ -7119,7 +7121,7 @@ fn sync_destination_fast_missing_dirs(
         let dst_snapshot = dst_result?;
         let source_snapshot = source_result?;
         let dst_map = map_entry_refs(&dst_snapshot);
-        let source_map = map_entry_refs(&source_snapshot);
+        let source_map = sync.mirror.then(|| map_entry_refs(&source_snapshot));
 
         // Everything this pass writes/removes/chmods, for the baseline
         // refresh cross-check.
@@ -7187,7 +7189,10 @@ fn sync_destination_fast_missing_dirs(
             let mut extra_paths: Vec<String> = dst_map
                 .keys()
                 .filter(|rel| {
-                    !source_map.contains_key(*rel) && !is_rel_excluded(Path::new(rel), excludes)
+                    !source_map
+                        .as_ref()
+                        .is_some_and(|source_map| source_map.contains_key(*rel))
+                        && !is_rel_excluded(Path::new(rel), excludes)
                 })
                 .map(|rel| rel.to_string())
                 .collect();
@@ -7204,6 +7209,10 @@ fn sync_destination_fast_missing_dirs(
             destination = destination_id,
             "reconcile: verifying copied entries"
         );
+        let large_snapshot_entries = source_snapshot.len() + dst_snapshot.len();
+        drop(source_map);
+        drop(dst_map);
+        drop(dst_snapshot);
         // Verify everything this cycle wrote (the changed/missing batch,
         // whole missing subtrees included). Untouched entries were compared
         // against the fresh destination scan above.
@@ -7221,6 +7230,7 @@ fn sync_destination_fast_missing_dirs(
         if !changing_paths.is_empty() {
             return Err(source_changing_error(&changing_paths));
         }
+        trim_allocator_after_large_snapshot(large_snapshot_entries);
         Ok((source_snapshot, touched))
     })();
     cleanup_tmp_cycle(dst_root, cycle_id);
@@ -8429,11 +8439,30 @@ fn ensure_source_stable(src: &Path, entry: &SnapshotEntry) -> Result<()> {
 
 /// Relative-path index over a snapshot for read-only comparisons; borrows
 /// instead of deep-copying every entry (snapshots run to ~600K entries).
-fn map_entry_refs(entries: &[SnapshotEntry]) -> BTreeMap<&str, &SnapshotEntry> {
-    entries
-        .iter()
-        .map(|entry| (entry.rel_path.as_str(), entry))
-        .collect()
+fn map_entry_refs(entries: &[SnapshotEntry]) -> HashMap<&str, &SnapshotEntry> {
+    let mut refs = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        refs.insert(entry.rel_path.as_str(), entry);
+    }
+    refs
+}
+
+#[cfg(target_env = "gnu")]
+fn trim_allocator_after_large_snapshot(entry_count: usize) {
+    const LARGE_SNAPSHOT_ENTRIES: usize = 500_000;
+    if entry_count < LARGE_SNAPSHOT_ENTRIES {
+        return;
+    }
+    let trimmed = unsafe { libc::malloc_trim(0) };
+    debug!(
+        entry_count,
+        trimmed,
+        "trimmed allocator after large snapshot reconcile"
+    );
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn trim_allocator_after_large_snapshot(_entry_count: usize) {
 }
 
 fn hash_file(path: &Path) -> Result<String> {
