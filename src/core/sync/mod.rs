@@ -5666,6 +5666,7 @@ fn copy_entries_parallel(
     entries: &[&SnapshotEntry],
     sync: &NativeSyncConfig,
 ) -> Result<TransferOutcome> {
+    set_sync_phase("transferring");
     if entries.is_empty() {
         return Ok(TransferOutcome {
             transferred: 0,
@@ -7098,6 +7099,7 @@ fn sync_destination_fast_missing_dirs(
             destination = destination_id,
             "reconcile: scanning source and destination trees concurrently"
         );
+        set_sync_phase("scanning");
         // The two trees are independent (typically different disks or pools):
         // scanning them concurrently roughly halves the reconcile's dominant
         // scan phase versus the old serial dst-then-src walk.

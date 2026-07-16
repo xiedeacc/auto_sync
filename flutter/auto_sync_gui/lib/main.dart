@@ -3068,11 +3068,11 @@ String _cycleDisplay(Map<String, dynamic>? status) {
     return '-';
   }
   final verified = _str(status['last_verified_cycle_id'], '-');
-  final latest = _str(
-    status['latest_closed_cycle_id'],
-    _str(status['target_cycle_id'], '-'),
+  final target = _str(
+    status['target_cycle_id'],
+    _str(status['latest_closed_cycle_id'], '-'),
   );
-  return '$verified / $latest';
+  return '$verified / $target';
 }
 
 String _sourceLatestCycle(Iterable<Map<String, dynamic>?> statuses) {
