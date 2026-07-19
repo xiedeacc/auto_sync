@@ -585,12 +585,13 @@ curl -s -X POST http://127.0.0.1:18765/api/sync-destination-now \
 
 ## 部署
 
-| 目标 | 命令（在目标机本机运行） | 说明 |
-| --- | --- | --- |
-| Windows | `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1` | 构建到仓库 `bin\`，当前用户登录任务启动单进程；不装 Windows 服务。运行时进程以管理员权限自启（读 USN Journal）。 |
-| NAS | `scripts/deploy_nas.sh` | 本机编译到 `/opt/usr/local/auto_sync`、装 systemd unit 并启动 `auto_sync.service`；首次自动补齐 Ubuntu/Debian 构建依赖和 Rust stable。 |
-| Linux / dev | `scripts/deploy_local.sh --install-dir /usr/local/auto_sync` | 通用 Linux 本机部署入口，dev 默认使用 `/usr/local/auto_sync`。 |
-| OpenWrt | `scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root` | 交叉编译 aarch64，渲染 `conf/auto_sync.procd` 为 `/etc/init.d/auto_sync`。 |
+| 说明 | Windows | NAS | Linux / dev | OpenWrt |
+| --- | --- | --- | --- | --- |
+| 命令（在目标机本机运行） | `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1` | `scripts/deploy_nas.sh` | `scripts/deploy_local.sh --install-dir /usr/local/auto_sync` | `scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root` |
+| 安装目录 | 仓库 `bin\` | `/opt/usr/local/auto_sync` | `/usr/local/auto_sync` | `/usr/local/auto_sync` |
+| 构建方式 | Windows 本机构建并复制到 `bin\` | NAS 本机编译；不做 Windows -> Linux 交叉编译 | Linux 本机编译 | 从 dev 交叉编译 aarch64 |
+| 启动方式 | 当前用户登录任务启动 `auto_sync` 和 Flutter GUI；不装 Windows 服务 | systemd unit `auto_sync.service` | systemd unit `auto_sync.service` | procd init 脚本 `/etc/init.d/auto_sync` |
+| 关键约束 | 运行时进程以管理员权限自启，用于读取 NTFS USN Journal；通过单实例锁接管旧进程 | 保留 Cargo 构建缓存；首次自动补齐 Ubuntu/Debian 构建依赖和 Rust stable | 通用 Linux 本机部署入口，dev 默认使用 `/usr/local/auto_sync` | 渲染 `conf/auto_sync.procd`，并安装到 OpenWrt init 目录 |
 
 Dev 和 NAS 的真实部署目录、用户目录 symlink 策略、toolchain 位置与环境变量见 `docs/deployment-paths.md`。
 
