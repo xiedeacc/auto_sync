@@ -511,6 +511,27 @@ normalize_deploy_permissions() {
     for d in /usr/local /root/src/software; do
         [ -d "$d" ] && find "$d" -xdev \( -type d -o -type f \) \( -perm -0002 -o -perm -0020 \) -exec chmod go-w {} + 2>/dev/null || true
     done
+    for f in \
+        /etc/systemd/system/auto_sync.service \
+        /etc/systemd/system/domus.service \
+        /etc/systemd/system/domus-backup.service \
+        /etc/systemd/system/domus-backup.timer \
+        /etc/systemd/system/rblog.service \
+        /etc/systemd/system/rblog-backup.service \
+        /etc/systemd/system/rblog-backup.timer \
+        /etc/systemd/system/rgit.service \
+        /etc/systemd/system/rgit-backup.service \
+        /etc/systemd/system/rgit-backup.timer \
+        /etc/systemd/system/rgit-backup.service.d/ssh.conf \
+        /etc/systemd/system/rgit-ocsp.service \
+        /etc/systemd/system/rgit-ocsp.timer \
+        /etc/systemd/system/tbox_client.service \
+        /etc/systemd/system/tbox-logrotate.service \
+        /etc/systemd/system/tbox-logrotate.timer
+    do
+        [ -e "$f" ] && chown root:root "$f" 2>/dev/null || true
+        [ -e "$f" ] && chmod 0644 "$f" 2>/dev/null || true
+    done
 }
 
 install_staged_collected_paths() {
