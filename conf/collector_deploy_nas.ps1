@@ -938,14 +938,6 @@ export RUSTUP_DIST_SERVER=https://rsproxy.cn
 export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export PATH="$JAVA_HOME/bin:$PATH"
-case ":$PATH:" in
-  *:/opt/usr/local/bin:*) ;;
-  *) export PATH="/opt/usr/local/bin:$PATH" ;;
-esac
-case ":$PATH:" in
-  *:/opt/usr/local/go/go1.25.1/bin:*) ;;
-  *) [ ! -d /opt/usr/local/go/go1.25.1/bin ] || export PATH="/opt/usr/local/go/go1.25.1/bin:$PATH" ;;
-esac
 # END auto_sync domestic mirrors
 EOF_DOMESTIC_MIRRORS
     cat "$tmp_profile" > /etc/profile
