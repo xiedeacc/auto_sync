@@ -49,9 +49,6 @@ paths = [
     "/etc/systemd/system/auto_sync.service",
     "/etc/systemd/system/shadowsocks-rust.service",
     "/etc/systemd/system/shadowsocks.service",
-    "/etc/systemd/system/tbox-logrotate.service",
-    "/etc/systemd/system/tbox-logrotate.timer",
-    "/etc/systemd/system/tbox_client.service",
     "/etc/systemd/system/waiwei-puller.service",
     "/etc/systemd/system/waiwei-web.service",
     "/etc/systemd/system/xray.service",
@@ -74,14 +71,12 @@ paths = [
     "/root/.zshrc",
     "/usr/local/auto_sync",
     "/usr/local/shadowsocks",
-    "/usr/local/tbox",
     "/usr/local/waiwei",
     "/usr/local/xray",
     "/usr/share/applications/google-chrome.desktop",
 ]
 exclude = [
     "/usr/local/auto_sync/logs",
-    "/usr/local/tbox/log",
     "/usr/local/waiwei/logs",
     "/usr/local/xray/logs",
 ]

@@ -465,7 +465,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server auto_sync nginx cron tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server auto_sync nginx cron tbox_server shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -489,14 +489,13 @@ normalize_deploy_permissions() {
         find /etc/nginx/ssl -maxdepth 1 -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
         find /etc/nginx/ssl -maxdepth 1 -type f ! -name '*.key' -exec chmod 644 {} + 2>/dev/null || true
     fi
-    for d in /usr/local/tbox /usr/local/waiwei /usr/local/xray /usr/local/shadowsocks; do
+    for d in /usr/local/waiwei /usr/local/xray /usr/local/shadowsocks; do
         [ -e "$d" ] || continue
         chown -R root:root "$d" 2>/dev/null || true
         find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
         find "$d" -type f -exec chmod 644 {} + 2>/dev/null || true
     done
     for d in \
-        /usr/local/tbox/bin \
         /usr/local/waiwei/bin \
         /usr/local/waiwei/scripts \
         /usr/local/xray/bin \
@@ -518,10 +517,7 @@ normalize_deploy_permissions() {
         /etc/systemd/system/rgit-backup.timer \
         /etc/systemd/system/rgit-backup.service.d/ssh.conf \
         /etc/systemd/system/rgit-ocsp.service \
-        /etc/systemd/system/rgit-ocsp.timer \
-        /etc/systemd/system/tbox_client.service \
-        /etc/systemd/system/tbox-logrotate.service \
-        /etc/systemd/system/tbox-logrotate.timer
+        /etc/systemd/system/rgit-ocsp.timer
     do
         [ -e "$f" ] && chown root:root "$f" 2>/dev/null || true
         [ -e "$f" ] && chmod 0644 "$f" 2>/dev/null || true
@@ -546,7 +542,6 @@ install_staged_collected_paths() {
         usr/local/auto_sync/bin/auto_sync \
         usr/local/auto_sync/bin/auto_syncd \
         usr/local/auto_sync/bin/auto_sync_gui \
-        usr/local/tbox/bin/tbox_client \
         usr/local/xray/bin/xray \
         usr/local/xray/bin/update-geo.sh \
         usr/local/waiwei/bin/waiwei_web \
@@ -1106,7 +1101,7 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-mkdir -p /usr/local/auto_sync/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /home/tiger
+mkdir -p /usr/local/auto_sync/logs /usr/local/waiwei/logs /usr/local/xray/logs /home/tiger
 if [ -e /root/.cscope.vim ] && [ ! -d /root/.cscope.vim ]; then
     rm -f /root/.cscope.vim
 fi
@@ -1123,7 +1118,7 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
-for d in /usr/local/auto_sync /usr/local/tbox; do
+for d in /usr/local/auto_sync; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
 if [ -d /usr/local/auto_sync ]; then
@@ -1136,7 +1131,6 @@ for f in \
     /usr/local/auto_sync/bin/auto_sync \
     /usr/local/auto_sync/bin/auto_syncd \
     /usr/local/auto_sync/bin/auto_sync_gui \
-    /usr/local/tbox/bin/tbox_client \
     /usr/local/xray/bin/xray \
     /usr/local/xray/bin/update-geo.sh \
     /usr/local/waiwei/bin/waiwei_web \
@@ -1147,7 +1141,7 @@ do
 done
 chmod -R a+rX /root/src/software/tools/nvm/versions/node/v24.18.0 /root/src/software/tools/uv-python 2>/dev/null || true
 normalize_deploy_permissions
-for f in /etc/systemd/system/auto_sync.service /etc/systemd/system/tbox_client.service; do
+for f in /etc/systemd/system/auto_sync.service; do
     [ -f "$f" ] || continue
     sed -i -E 's/^User=.*/User=root/; s/^Group=.*/Group=root/' "$f"
     grep -q '^User=' "$f" || sed -i '/^\[Service\]/a User=root' "$f"
@@ -1156,7 +1150,7 @@ done
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for s in tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+for s in tbox_server shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
 for s in mysql postgresql redis-server auto_sync nginx cron; do
@@ -1167,7 +1161,7 @@ crontab -l 2>/dev/null | grep -v -E '/root/src/share/(ubuntu/backup_pg|ubuntu/ba
 
 print_final_states() {
     echo '--- final states ---'
-    for s in auto_sync nginx cron mysql postgresql redis-server tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in auto_sync nginx cron mysql postgresql redis-server tbox_server shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         resolved="$(unit_name "$s" 2>/dev/null || true)"
         if [ -n "$resolved" ]; then
             enabled="$(systemctl is-enabled "$resolved" 2>/dev/null || true)"
