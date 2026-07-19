@@ -779,23 +779,16 @@ ensure_auto_sync_profile_block() {
     awk '
         /^# BEGIN auto_sync domestic mirrors$/ { skip = 1; next }
         /^# END auto_sync domestic mirrors$/ { skip = 0; next }
+        /^# BEGIN auto_sync java environment$/ { skip = 1; next }
+        /^# END auto_sync java environment$/ { skip = 0; next }
         skip == 0 { print }
     ' /etc/profile > "$tmp_profile"
     cat >> "$tmp_profile" <<'EOF_DOMESTIC_MIRRORS'
 
-# BEGIN auto_sync domestic mirrors
-export GOPROXY=https://goproxy.cn,direct
-export NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node
-export npm_config_registry=https://registry.npmmirror.com
-export COREPACK_NPM_REGISTRY=https://registry.npmmirror.com
-export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
-export UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-export RUSTUP_DIST_SERVER=https://rsproxy.cn
-export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+# BEGIN auto_sync java environment
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export PATH="$JAVA_HOME/bin:$PATH"
-# END auto_sync domestic mirrors
+# END auto_sync java environment
 EOF_DOMESTIC_MIRRORS
     cat "$tmp_profile" > /etc/profile
     rm -f "$tmp_profile"
@@ -806,9 +799,6 @@ export GOPROXY=https://goproxy.cn,direct
 export NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node
 export npm_config_registry=https://registry.npmmirror.com
 export COREPACK_NPM_REGISTRY=https://registry.npmmirror.com
-export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
-export UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 export RUSTUP_DIST_SERVER=https://rsproxy.cn
 export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
@@ -831,6 +821,10 @@ cat > /etc/pip.conf <<'EOF_PIP_MIRROR'
 index-url = https://pypi.tuna.tsinghua.edu.cn/simple
 timeout = 120
 EOF_PIP_MIRROR
+cat > /root/.npmrc <<'EOF_NPM_MIRROR'
+registry=https://registry.npmmirror.com
+EOF_NPM_MIRROR
+chmod 0600 /root/.npmrc
 mkdir -p /root/.cargo
 cat > /root/.cargo/config.toml <<'EOF_CARGO_MIRROR'
 [source.crates-io]
@@ -864,6 +858,7 @@ export GOBIN=$GOPATH/bin
 mkdir -p "$GOBIN" "$GOPATH/pkg"
 export PATH="/usr/local/go/go1.25.1/bin:$GOBIN:$PATH"
 if command -v go >/dev/null 2>&1; then
+    go env -w GOPROXY=https://goproxy.cn,direct || log "WARN: go mirror setup failed"
     go install github.com/google/pprof@latest || log "WARN: go install pprof failed"
 fi
 
