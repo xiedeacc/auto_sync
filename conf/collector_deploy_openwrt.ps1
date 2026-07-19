@@ -267,7 +267,7 @@ echo "OpenWrt deploy prerequisites OK"
 # 1. Prepare parent directories before file transfer. The router must already
 #    have the required OpenWrt packages and filesystem layout.
 Invoke-Remote @'
-mkdir -p /etc/init.d /etc/sysctl.d /etc/config /usr/local
+mkdir -p /etc/init.d /etc/config /usr/local
 /etc/init.d/shadowsocks stop 2>/dev/null || true
 /etc/init.d/shadowsocks-rust disable 2>/dev/null || true
 /etc/init.d/shadowsocks-rust stop 2>/dev/null || true
@@ -308,7 +308,7 @@ Invoke-Remote @'
 set -e
 stage=/tmp/auto_sync_openwrt_stage
 trap 'rm -rf "$stage"' EXIT
-chmod 755 /etc /etc/config /etc/init.d /etc/sysctl.d /usr /usr/local 2>/dev/null || true
+chmod 755 /etc /etc/config /etc/init.d /usr /usr/local 2>/dev/null || true
 if [ -d "$stage" ]; then
     /etc/init.d/shadowsocks stop 2>/dev/null || true
     echo "stopped shadowsocks before installing collected paths"
@@ -328,7 +328,7 @@ if [ -d "$stage" ]; then
         fi
     done
 fi
-chmod 755 /etc /etc/config /etc/init.d /etc/sysctl.d /usr /usr/local 2>/dev/null || true
+chmod 755 /etc /etc/config /etc/init.d /usr /usr/local 2>/dev/null || true
 '@
 
 # 3. Overwrite the remote client config with the server-substituted copy that
@@ -356,7 +356,6 @@ function Test-ProtectedModePath([string]$Path) {
         '/etc',
         '/etc/config',
         '/etc/init.d',
-        '/etc/sysctl.d',
         '/usr',
         '/usr/local',
         '/usr/local/shadowsocks',
@@ -404,7 +403,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:AS_PERMS_FILE) -and (Test-Path -Liter
 Stop-IfErrors 'permission restore'
 
 Invoke-Remote @'
-chmod 755 /etc /etc/config /etc/init.d /etc/sysctl.d /usr /usr/local /usr/local/shadowsocks /usr/local/shadowsocks/bin /usr/local/shadowsocks/conf /usr/local/shadowsocks/data /usr/local/shadowsocks/data/temp 2>/dev/null || true
+chmod 755 /etc /etc/config /etc/init.d /usr /usr/local /usr/local/shadowsocks /usr/local/shadowsocks/bin /usr/local/shadowsocks/conf /usr/local/shadowsocks/data /usr/local/shadowsocks/data/temp 2>/dev/null || true
 '@
 
 # 5. Apply the config and (re)start shadowsocks. Network reload is last because

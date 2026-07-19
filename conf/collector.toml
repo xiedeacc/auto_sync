@@ -17,8 +17,6 @@ paths = [
     "/etc/init.d/shadowsocks-rust",
     "/etc/resolv.conf",
     "/etc/sysctl.conf",
-    "/etc/sysctl.d/10-default.conf",
-    "/etc/sysctl.d/11-nf-conntrack.conf",
     "/usr/local/shadowsocks",
 ]
 exclude = []
