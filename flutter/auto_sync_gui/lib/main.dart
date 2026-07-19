@@ -6135,7 +6135,6 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   @override
   Widget build(BuildContext context) {
     final globalRunActive = _bool(status['running']);
-    final globalDeployActive = _bool(deployStatus['running']);
     return _MasterDialogFrame(
       title: 'Collector',
       width: 980,
@@ -6228,8 +6227,14 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                       if (hosts.isEmpty)
                         const SizedBox.shrink()
                       else
-                        ...hosts.asMap().entries.map(
-                          (entry) => _CollectorHostRow(
+                        ...hosts.asMap().entries.map((entry) {
+                          final hostRunActive = _bool(
+                            hostRunStatuses[entry.key]?['running'],
+                          );
+                          final hostDeployActive = _bool(
+                            hostDeployStatuses[entry.key]?['running'],
+                          );
+                          return _CollectorHostRow(
                             index: entry.key,
                             host: entry.value,
                             onChanged: () {
@@ -6275,22 +6280,18 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                             onDeployLog: () => _showHostLog(entry.key),
                             onCollect:
                                 globalRunActive ||
-                                    globalDeployActive ||
-                                    _bool(
-                                      hostRunStatuses[entry.key]?['running'],
-                                    )
+                                    hostRunActive ||
+                                    hostDeployActive
                                 ? null
                                 : () => _runHost(entry.key),
                             onDeployRun:
                                 globalRunActive ||
-                                    globalDeployActive ||
-                                    _bool(
-                                      hostDeployStatuses[entry.key]?['running'],
-                                    )
+                                    hostRunActive ||
+                                    hostDeployActive
                                 ? null
                                 : () => _runDeploy(entry.key),
-                          ),
-                        ),
+                          );
+                        }),
                     ],
                   ),
                 ),

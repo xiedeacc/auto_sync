@@ -510,7 +510,7 @@ normalize_deploy_permissions() {
         find /etc/nginx/ssl -maxdepth 1 -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
         find /etc/nginx/ssl -maxdepth 1 -type f ! -name '*.key' -exec chmod 644 {} + 2>/dev/null || true
     fi
-    for d in /opt/usr/local/domus /opt/usr/local/tbox /opt/usr/local/waiwei /opt/usr/local/xray /opt/usr/local/shadowsocks; do
+    for d in /opt/usr/local/tbox /opt/usr/local/waiwei /opt/usr/local/xray /opt/usr/local/shadowsocks; do
         [ -e "$d" ] || continue
         chown -R root:root "$d" 2>/dev/null || true
         find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
@@ -528,11 +528,8 @@ normalize_deploy_permissions() {
         [ -d /opt/usr/local/rgit/.ssh ] && chmod 700 /opt/usr/local/rgit/.ssh 2>/dev/null || true
     fi
     if [ -d /opt/usr/local/domus ]; then
-        chown root:root /opt/usr/local/domus /opt/usr/local/domus/bin 2>/dev/null || true
+        chown root:root /opt/usr/local/domus /opt/usr/local/domus/bin /opt/usr/local/domus/conf /opt/usr/local/domus/data /opt/usr/local/domus/logs /opt/usr/local/domus/.backup-worktree 2>/dev/null || true
         find /opt/usr/local/domus/bin -type f -exec chown root:root {} + -exec chmod 755 {} + 2>/dev/null || true
-        for d in /opt/usr/local/domus/conf /opt/usr/local/domus/data /opt/usr/local/domus/logs /opt/usr/local/domus/.backup-worktree; do
-            [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
-        done
         [ -d /opt/usr/local/domus/conf ] && chmod 750 /opt/usr/local/domus/conf 2>/dev/null || true
         [ -d /opt/usr/local/domus/data ] && chmod 700 /opt/usr/local/domus/data 2>/dev/null || true
         [ -d /opt/usr/local/domus/logs ] && chmod 750 /opt/usr/local/domus/logs 2>/dev/null || true
@@ -1313,11 +1310,8 @@ for d in /opt/usr/local/auto_sync /opt/usr/local/tbox /opt/usr/local/shadowsocks
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
 if [ -d /opt/usr/local/domus ]; then
-    chown root:root /opt/usr/local/domus /opt/usr/local/domus/bin 2>/dev/null || true
+    chown root:root /opt/usr/local/domus /opt/usr/local/domus/bin /opt/usr/local/domus/conf /opt/usr/local/domus/data /opt/usr/local/domus/logs /opt/usr/local/domus/.backup-worktree 2>/dev/null || true
     find /opt/usr/local/domus/bin -type f -exec chown root:root {} + -exec chmod 755 {} + 2>/dev/null || true
-    for d in /opt/usr/local/domus/conf /opt/usr/local/domus/data /opt/usr/local/domus/logs /opt/usr/local/domus/.backup-worktree; do
-        [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
-    done
 fi
 if [ -d /opt/usr/local/rgit ]; then
     chown root:root /opt/usr/local/rgit /opt/usr/local/rgit/bin 2>/dev/null || true
