@@ -486,7 +486,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server auto_sync tbox_server tbox_client tbox-logrotate.timer rgit rgit-backup.service rgit-backup.timer rgit-ocsp.service rgit-ocsp.timer domus domus-backup.service domus-backup.timer nginx cron immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server auto_sync tbox_server tbox_client tbox-logrotate.timer rgit rgit-backup.service rgit-backup.timer rgit-ocsp.service rgit-ocsp.timer domus domus-backup.service domus-backup.timer nginx cron shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -1451,7 +1451,7 @@ if [ -f /etc/systemd/system/redis.service ] && [ -f /usr/lib/systemd/system/redi
     rm -f /etc/systemd/system/redis.service
     systemctl daemon-reload
 fi
-for s in tbox_server mysql postgresql redis-server immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+for s in tbox_server mysql postgresql redis-server shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
 for s in auto_sync tbox_client tbox-logrotate.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer nginx cron; do
@@ -1462,7 +1462,7 @@ crontab -l 2>/dev/null | grep -v -E '/root/src/share/(ubuntu/backup_pg|nas/backu
 
 print_final_states() {
     echo '--- final states ---'
-    for s in auto_sync tbox_server tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in auto_sync tbox_server tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         resolved="$(unit_name "$s" 2>/dev/null || true)"
         if [ -n "$resolved" ]; then
             enabled="$(systemctl is-enabled "$resolved" 2>/dev/null || true)"
