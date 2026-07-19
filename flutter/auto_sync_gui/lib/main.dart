@@ -5779,9 +5779,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
           message = '';
         });
         _startDeployPolling();
-        if (nextActiveRunIndexes.isNotEmpty || _bool(nextStatus['running'])) {
-          _startRunPolling();
-        }
+        _startRunPolling();
       }
     } catch (error) {
       if (mounted) {
@@ -5889,30 +5887,25 @@ class _CollectorDialogState extends State<_CollectorDialog> {
 
   Future<void> _refreshRunStatus() async {
     try {
+      final global = await widget.api.collectorStatus();
       final indexes = activeRunIndexes.toList();
-      if (indexes.isEmpty) {
-        runTimer?.cancel();
-        runTimer = null;
-        return;
-      }
       final states = <int, Map<String, dynamic>>{};
       for (final index in indexes) {
         states[index] = await widget.api.collectorStatus(index: index);
       }
       if (!mounted) return;
       setState(() {
+        status = Map<String, dynamic>.from(global);
         for (final entry in states.entries) {
-          hostRunStatuses[entry.key] = Map<String, dynamic>.from(entry.value);
-          status = entry.value;
-          if (!_bool(entry.value['running'])) {
+          final next = Map<String, dynamic>.from(entry.value);
+          hostRunStatuses[entry.key] = next;
+          if (_bool(next['running'])) {
+            status = next;
+          } else {
             activeRunIndexes.remove(entry.key);
           }
         }
       });
-      if (activeRunIndexes.isEmpty) {
-        runTimer?.cancel();
-        runTimer = null;
-      }
     } catch (_) {}
   }
 
@@ -6043,11 +6036,14 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   }
 
   Future<void> _showHostLog(int index) async {
+    final globalRun = _bool(status['running']);
     final activeRun = _bool(hostRunStatuses[index]?['running']);
     final activeDeploy = _bool(hostDeployStatuses[index]?['running']);
-    final initialRun = activeRun
-        ? (hostRunStatuses[index] ?? <String, dynamic>{})
-        : (hostRunStatuses[index] ?? <String, dynamic>{});
+    final initialRun = globalRun
+        ? status
+        : (activeRun
+              ? (hostRunStatuses[index] ?? <String, dynamic>{})
+              : (hostRunStatuses[index] ?? <String, dynamic>{}));
     final initialDeploy = activeDeploy
         ? (hostDeployStatuses[index] ?? <String, dynamic>{})
         : (hostDeployStatuses[index] ?? <String, dynamic>{});
@@ -6057,9 +6053,9 @@ class _CollectorDialogState extends State<_CollectorDialog> {
         api: widget.api,
         initialRunStatus: initialRun,
         initialDeployStatus: initialDeploy,
-        pollRun: activeRun,
+        pollRun: globalRun || activeRun,
         pollDeploy: activeDeploy,
-        hostIndex: index,
+        hostIndex: globalRun ? null : index,
       ),
     );
   }
@@ -6084,6 +6080,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   String _runState() {
     if (loading) return 'Loading...';
     if (message.isNotEmpty) return message;
+    if (_bool(status['running'])) return _collectorRunningText();
     if (activeRunIndexes.isNotEmpty) {
       if (activeRunIndexes.length == 1) return _collectorRunningText();
       return 'Collecting ${activeRunIndexes.length} hosts...';
@@ -6137,6 +6134,8 @@ class _CollectorDialogState extends State<_CollectorDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final globalRunActive = _bool(status['running']);
+    final globalDeployActive = _bool(deployStatus['running']);
     return _MasterDialogFrame(
       title: 'Collector',
       width: 980,
@@ -6275,11 +6274,19 @@ class _CollectorDialogState extends State<_CollectorDialog> {
                             },
                             onDeployLog: () => _showHostLog(entry.key),
                             onCollect:
-                                _bool(hostRunStatuses[entry.key]?['running'])
+                                globalRunActive ||
+                                    globalDeployActive ||
+                                    _bool(
+                                      hostRunStatuses[entry.key]?['running'],
+                                    )
                                 ? null
                                 : () => _runHost(entry.key),
                             onDeployRun:
-                                _bool(hostDeployStatuses[entry.key]?['running'])
+                                globalRunActive ||
+                                    globalDeployActive ||
+                                    _bool(
+                                      hostDeployStatuses[entry.key]?['running'],
+                                    )
                                 ? null
                                 : () => _runDeploy(entry.key),
                           ),
@@ -6319,7 +6326,7 @@ class _CollectorLogDialog extends StatefulWidget {
   final Map<String, dynamic> initialDeployStatus;
   final bool pollRun;
   final bool pollDeploy;
-  final int hostIndex;
+  final int? hostIndex;
 
   @override
   State<_CollectorLogDialog> createState() => _CollectorLogDialogState();
