@@ -219,7 +219,19 @@ if [ -d "$stage/usr/local/lib" ]; then
 fi
 exit 0
 '@
-Invoke-Remote 'stage="$HOME/.auto_sync_stage"; sudo cp -a "$stage"/. /; rc=$?; rm -rf "$stage"; [ "$rc" -eq 0 ] && echo "installed collected paths"; exit "$rc"'
+Invoke-Remote @'
+stage="$HOME/.auto_sync_stage"
+sudo cp -a "$stage"/. /
+rc=$?
+rm -rf "$stage"
+if [ "$rc" -eq 0 ]; then
+    sudo find /usr/local/blog/bin /usr/local/shadowsocks/bin /usr/local/vlmcsd/bin /usr/local/xray/bin /usr/local/tbox/bin /usr/local/waiwei/bin \
+        -maxdepth 1 -type f -name '*.auto_sync_old' -delete 2>/dev/null || true
+    echo "installed collected paths"
+    echo "removed binary swap leftovers"
+fi
+exit "$rc"
+'@
 
 # 2. Restore recorded permissions for the pushed /etc files.
 function Quote-ShellArg([string]$Value) {
