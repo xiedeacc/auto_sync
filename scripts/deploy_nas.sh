@@ -99,28 +99,6 @@ install -m 0755 "$ROOT_DIR/bin/auto_sync" "$tmp_dir/payload/bin/auto_sync"
 cp -a "$ROOT_DIR/flutter/auto_sync_gui/build/web/." "$tmp_dir/payload/web/"
 install -m 0644 "$CONFIG" "$tmp_dir/payload/conf/auto_sync.toml.initial"
 
-cat > "$tmp_dir/payload/auto_sync.service" <<EOF_SYSTEMD
-[Unit]
-Description=auto_sync daemon
-After=local-fs.target network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/bin/auto_sync
-Restart=always
-RestartSec=5
-User=root
-Group=root
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
-NoNewPrivileges=false
-
-[Install]
-WantedBy=multi-user.target
-EOF_SYSTEMD
-
 tar -C "$tmp_dir/payload" -czf "$payload" .
 
 remote_stage="/tmp/auto_sync_nas_deploy_$(date +%s)_$$"
@@ -159,7 +137,11 @@ else
   echo "Initialized NAS config $INSTALL_DIR/conf/auto_sync.toml"
 fi
 
-install -m 0644 "$STAGE/payload/auto_sync.service" /etc/systemd/system/auto_sync.service
+if [ ! -f /etc/systemd/system/auto_sync.service ]; then
+  echo "Missing /etc/systemd/system/auto_sync.service; create it once and collect it before deploying." >&2
+  exit 1
+fi
+chmod 0644 /etc/systemd/system/auto_sync.service
 chown -R root:root "$INSTALL_DIR/bin" "$INSTALL_DIR/web" "$INSTALL_DIR/logs" "$INSTALL_DIR/data" 2>/dev/null || true
 chmod 755 "$INSTALL_DIR" "$INSTALL_DIR/bin" "$INSTALL_DIR/web" "$INSTALL_DIR/logs" "$INSTALL_DIR/data" 2>/dev/null || true
 

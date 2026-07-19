@@ -36,6 +36,7 @@ password = ""
 root = 'D:\share\dev'
 paths = [
     "/etc/gdm3/custom.conf",
+    "/etc/apt/sources.list",
     "/etc/mysql",
     "/etc/netplan/00-installer-config.yaml",
     "/etc/netplan/90-NM-e3c0d604-374d-3ccf-b508-1b3a3aa5ba8c.yaml",
@@ -43,6 +44,7 @@ paths = [
     "/etc/pam.d/gdm-autologin",
     "/etc/pam.d/gdm-password",
     "/etc/postgresql",
+    "/etc/profile",
     "/etc/ssh/sshd_config",
     "/etc/sudoers.d/tiger",
     "/etc/sysctl.conf",
@@ -90,9 +92,11 @@ password = ""
 root = 'D:\share\nas'
 paths = [
     "/etc/mysql",
+    "/etc/apt/sources.list",
     "/etc/nginx/nginx.conf",
     "/etc/nginx/ssl",
     "/etc/postgresql",
+    "/etc/profile",
     "/etc/ssh/sshd_config",
     "/etc/systemd/system/auto_sync.service",
     "/etc/systemd/system/domus-backup.service",
@@ -159,7 +163,7 @@ password = ""
 root = 'D:\share\aws'
 paths = [
     "/etc/nginx",
-    "/etc/sysctl.d/99-shadowsocks-tune.conf",
+    "/etc/sysctl.conf",
     "/etc/systemd/system/rblog-backup.service",
     "/etc/systemd/system/rblog-backup.timer",
     "/etc/systemd/system/rblog.service",

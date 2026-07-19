@@ -625,8 +625,8 @@ install_staged_collected_paths() {
     return "$rc"
 }
 
-if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-    sed -i 's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' /etc/apt/sources.list.d/ubuntu.sources
+if [ -f /etc/apt/sources.list ]; then
+    sed -i 's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' /etc/apt/sources.list
 fi
 apt-get update
 policy_created=0
@@ -916,7 +916,17 @@ swapoff -a || true
 sed -i '/^\/swap\.img[[:space:]]/s/^/#/' /etc/fstab 2>/dev/null || true
 rm -f /swap.img
 
-cat > /etc/profile.d/auto-sync-domestic-mirrors.sh <<'EOF_DOMESTIC_MIRRORS'
+ensure_auto_sync_profile_block() {
+    touch /etc/profile
+    tmp_profile="$(mktemp)"
+    awk '
+        /^# BEGIN auto_sync domestic mirrors$/ { skip = 1; next }
+        /^# END auto_sync domestic mirrors$/ { skip = 0; next }
+        skip == 0 { print }
+    ' /etc/profile > "$tmp_profile"
+    cat >> "$tmp_profile" <<'EOF_DOMESTIC_MIRRORS'
+
+# BEGIN auto_sync domestic mirrors
 export GOPROXY=https://goproxy.cn,direct
 export NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node
 export npm_config_registry=https://registry.npmmirror.com
@@ -928,8 +938,32 @@ export RUSTUP_DIST_SERVER=https://rsproxy.cn
 export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export PATH="$JAVA_HOME/bin:$PATH"
+case ":$PATH:" in
+  *:/opt/usr/local/bin:*) ;;
+  *) export PATH="/opt/usr/local/bin:$PATH" ;;
+esac
+case ":$PATH:" in
+  *:/opt/usr/local/go/go1.25.1/bin:*) ;;
+  *) [ ! -d /opt/usr/local/go/go1.25.1/bin ] || export PATH="/opt/usr/local/go/go1.25.1/bin:$PATH" ;;
+esac
+# END auto_sync domestic mirrors
 EOF_DOMESTIC_MIRRORS
-. /etc/profile.d/auto-sync-domestic-mirrors.sh
+    cat "$tmp_profile" > /etc/profile
+    rm -f "$tmp_profile"
+    chmod 0644 /etc/profile
+}
+ensure_auto_sync_profile_block
+export GOPROXY=https://goproxy.cn,direct
+export NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node
+export npm_config_registry=https://registry.npmmirror.com
+export COREPACK_NPM_REGISTRY=https://registry.npmmirror.com
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+export UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export RUSTUP_DIST_SERVER=https://rsproxy.cn
+export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+export PATH="$JAVA_HOME/bin:/opt/usr/local/bin:/opt/usr/local/go/go1.25.1/bin:$PATH"
 clean_shell_startup_files() {
     for f in /root/.bashrc /root/.zshrc /root/.profile /root/.zprofile /root/.zshenv /home/tiger/.bashrc /home/tiger/.zshrc /home/tiger/.profile /home/tiger/.zprofile /home/tiger/.zshenv; do
         [ -f "$f" ] || continue
@@ -992,10 +1026,7 @@ if [ ! -x /root/.cargo/bin/rustup ]; then
 fi
 
 mkdir -p /opt/src/software/tools
-if [ -L /opt/src/software/tools/nvm ]; then
-    rm -f /opt/src/software/tools/nvm
-fi
-export NVM_DIR=/opt/src/software/tools/nvm
+export NVM_DIR=/root/.nvm
 mkdir -p "$NVM_DIR"
 if [ ! -s "$NVM_DIR/nvm.sh" ]; then
     curl -fsSL https://gitee.com/mirrors/nvm/raw/v0.40.3/install.sh | NVM_SOURCE=https://gitee.com/mirrors/nvm.git bash || log "WARN: nvm install failed"
@@ -1086,7 +1117,7 @@ fi
 if [ -d /root/.vim/bundle/YouCompleteMe ]; then
     ycm_commit="$(git -C /root/.vim/bundle/YouCompleteMe rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$ycm_commit" ] && [ "$(cat /root/.vim/bundle/YouCompleteMe/.auto_sync_installed 2>/dev/null || true)" != "$ycm_commit" ]; then
-        ycm_path="$JAVA_HOME/bin:/opt/usr/local/go/go1.25.1/bin:/root/src/go/bin:/root/.cargo/bin:/opt/src/software/tools/nvm/versions/node/v24.18.0/bin:$PATH"
+        ycm_path="$JAVA_HOME/bin:/opt/usr/local/go/go1.25.1/bin:/root/src/go/bin:/root/.cargo/bin:/root/.nvm/versions/node/v24.18.0/bin:$PATH"
         ycmd_build=/root/.vim/bundle/YouCompleteMe/third_party/ycmd/build.py
         jdt_milestone="$(sed -n "s/^JDTLS_MILESTONE = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
         jdt_stamp="$(sed -n "s/^JDTLS_BUILD_STAMP = '\([^']*\)'.*/\1/p" "$ycmd_build" | head -1)"
@@ -1243,23 +1274,8 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-ensure_opt_usr_local_path() {
-    mkdir -p /opt/usr/local
-    chmod 0755 /opt/usr /opt/usr/local 2>/dev/null || true
-    cat > /etc/profile.d/opt-usr-local-path.sh <<'EOF_OPT_USR_LOCAL_PATH'
-# Managed by auto_sync NAS deployment.
-case ":$PATH:" in
-  *:/opt/usr/local/bin:*) ;;
-  *) export PATH="/opt/usr/local/bin:$PATH" ;;
-esac
-case ":$PATH:" in
-  *:/opt/usr/local/go/go1.25.1/bin:*) ;;
-  *) [ ! -d /opt/usr/local/go/go1.25.1/bin ] || export PATH="/opt/usr/local/go/go1.25.1/bin:$PATH" ;;
-esac
-EOF_OPT_USR_LOCAL_PATH
-    chmod 0644 /etc/profile.d/opt-usr-local-path.sh
-}
-ensure_opt_usr_local_path
+mkdir -p /opt/usr/local
+chmod 0755 /opt/usr /opt/usr/local 2>/dev/null || true
 
 mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/domus/logs /opt/usr/local/rgit/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/user/tiger /home/tiger
 migrate_root_home_to_opt() {
@@ -1338,7 +1354,7 @@ for f in \
 do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
 done
-chmod a+rx /opt/src/software/tools/nvm/versions/node/v24.18.0/bin/node 2>/dev/null || true
+chmod a+rx /root/.nvm/versions/node/v24.18.0/bin/node 2>/dev/null || true
 normalize_deploy_permissions
 ensure_domus_backup() {
     [ -d /opt/usr/local/domus ] || return 0

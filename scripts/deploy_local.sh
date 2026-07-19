@@ -58,13 +58,6 @@ configure_domestic_build_mirrors() {
 
   if command -v apt-get >/dev/null 2>&1; then
     local apt_changed=0
-    if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]] && \
-      grep -Eq 'archive\.ubuntu\.com|security\.ubuntu\.com' /etc/apt/sources.list.d/ubuntu.sources; then
-      "${SUDO[@]}" sed -i \
-        's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' \
-        /etc/apt/sources.list.d/ubuntu.sources
-      apt_changed=1
-    fi
     if [[ -f /etc/apt/sources.list ]] && \
       grep -Eq 'archive\.ubuntu\.com|security\.ubuntu\.com' /etc/apt/sources.list; then
       "${SUDO[@]}" sed -i \
@@ -206,32 +199,6 @@ install_if_different() {
   "${SUDO[@]}" install -m "$mode" "$src" "$dst"
 }
 
-write_systemd_unit() {
-  local install_dir="$1"
-  local output="$2"
-  cat > "$output" <<EOF_SYSTEMD
-[Unit]
-Description=auto_sync daemon
-After=local-fs.target network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$install_dir
-ExecStart=$install_dir/bin/auto_sync
-Restart=always
-RestartSec=5
-User=root
-Group=root
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
-NoNewPrivileges=false
-
-[Install]
-WantedBy=multi-user.target
-EOF_SYSTEMD
-}
-
 ensure_linux_build_environment
 build_flutter_web
 
@@ -265,12 +232,12 @@ else
   echo "Initialized local config $INSTALL_DIR/conf/auto_sync.toml from $CONFIG"
 fi
 
-tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
+if ! "${SUDO[@]}" test -f /etc/systemd/system/auto_sync.service; then
+  echo "Missing /etc/systemd/system/auto_sync.service; create it once and collect it before deploying." >&2
+  exit 1
+fi
 
-write_systemd_unit "$INSTALL_DIR" "$tmp_dir/auto_sync.service"
-
-"${SUDO[@]}" install -m 0644 "$tmp_dir/auto_sync.service" /etc/systemd/system/auto_sync.service
+"${SUDO[@]}" chmod 0644 /etc/systemd/system/auto_sync.service
 "${SUDO[@]}" systemctl daemon-reload
 "${SUDO[@]}" systemctl enable auto_sync.service
 "${SUDO[@]}" systemctl restart auto_sync.service
