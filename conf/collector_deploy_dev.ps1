@@ -465,7 +465,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server auto_sync nginx cron tbox_server shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server auto_sync nginx cron tbox_server shadowsocks shadowsocks-rust xray; do
         stop_if_exists "$s"
     done
 }
@@ -489,15 +489,13 @@ normalize_deploy_permissions() {
         find /etc/nginx/ssl -maxdepth 1 -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
         find /etc/nginx/ssl -maxdepth 1 -type f ! -name '*.key' -exec chmod 644 {} + 2>/dev/null || true
     fi
-    for d in /usr/local/waiwei /usr/local/xray /usr/local/shadowsocks; do
+    for d in /usr/local/xray /usr/local/shadowsocks; do
         [ -e "$d" ] || continue
         chown -R root:root "$d" 2>/dev/null || true
         find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
         find "$d" -type f -exec chmod 644 {} + 2>/dev/null || true
     done
     for d in \
-        /usr/local/waiwei/bin \
-        /usr/local/waiwei/scripts \
         /usr/local/xray/bin \
         /usr/local/shadowsocks/bin \
         /usr/local/bin
@@ -544,8 +542,6 @@ install_staged_collected_paths() {
         usr/local/auto_sync/bin/auto_sync_gui \
         usr/local/xray/bin/xray \
         usr/local/xray/bin/update-geo.sh \
-        usr/local/waiwei/bin/waiwei_web \
-        usr/local/waiwei/bin/waiwei_puller \
         usr/local/shadowsocks/bin/sslocal \
         usr/local/shadowsocks/bin/ssserver \
         usr/local/shadowsocks/bin/xray-plugin
@@ -1101,7 +1097,7 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-mkdir -p /usr/local/auto_sync/logs /usr/local/waiwei/logs /usr/local/xray/logs /home/tiger
+mkdir -p /usr/local/auto_sync/logs /usr/local/xray/logs /home/tiger
 if [ -e /root/.cscope.vim ] && [ ! -d /root/.cscope.vim ]; then
     rm -f /root/.cscope.vim
 fi
@@ -1133,8 +1129,6 @@ for f in \
     /usr/local/auto_sync/bin/auto_sync_gui \
     /usr/local/xray/bin/xray \
     /usr/local/xray/bin/update-geo.sh \
-    /usr/local/waiwei/bin/waiwei_web \
-    /usr/local/waiwei/bin/waiwei_puller \
     /usr/local/bin/vlmcsd
 do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
@@ -1150,7 +1144,7 @@ done
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-for s in tbox_server shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+for s in tbox_server shadowsocks shadowsocks-rust xray; do
     disable_if_exists "$s"
 done
 for s in mysql postgresql redis-server auto_sync nginx cron; do
@@ -1161,7 +1155,7 @@ crontab -l 2>/dev/null | grep -v -E '/root/src/share/(ubuntu/backup_pg|ubuntu/ba
 
 print_final_states() {
     echo '--- final states ---'
-    for s in auto_sync nginx cron mysql postgresql redis-server tbox_server shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in auto_sync nginx cron mysql postgresql redis-server tbox_server shadowsocks shadowsocks-rust xray; do
         resolved="$(unit_name "$s" 2>/dev/null || true)"
         if [ -n "$resolved" ]; then
             enabled="$(systemctl is-enabled "$resolved" 2>/dev/null || true)"
