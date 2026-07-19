@@ -32,6 +32,12 @@ if [[ -z "$CONFIG" ]]; then
   CONFIG="conf/auto_sync.linux.toml"
 fi
 
+if [[ "$(realpath -m "$INSTALL_DIR")" == "$(realpath -m /opt/usr/local/auto_sync)" ]]; then
+  echo "deploy_local.sh no longer deploys NAS directly." >&2
+  echo "Run on dev instead: scripts/deploy_nas.sh" >&2
+  exit 1
+fi
+
 if ! command -v systemctl >/dev/null 2>&1; then
   echo "systemctl is required for Linux local deployment" >&2
   exit 1
@@ -152,10 +158,9 @@ ensure_linux_build_environment() {
 
 ensure_flutter_web_environment() {
   local flutter_root="${FLUTTER_ROOT:-/root/src/software/flutter}"
-  if [[ "$(realpath -m "$flutter_root")" != "$(realpath -m /root/src/software/flutter)" && \
-        "$(realpath -m "$flutter_root")" != "$(realpath -m /opt/src/software/flutter)" ]]; then
+  if [[ "$(realpath -m "$flutter_root")" != "$(realpath -m /root/src/software/flutter)" ]]; then
     echo "Unsupported Flutter SDK path: $flutter_root" >&2
-    echo "Use /root/src/software/flutter on dev or /opt/src/software/flutter on NAS." >&2
+    echo "Use /root/src/software/flutter on dev. NAS is deployed from dev via scripts/deploy_nas.sh." >&2
     exit 1
   fi
   if [[ -x "$flutter_root/bin/flutter" ]]; then

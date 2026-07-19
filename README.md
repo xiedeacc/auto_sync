@@ -105,14 +105,14 @@ Web API 默认监听配置里的 `port`（通常 `18765`）；局域网机器通
 # Windows（在 Windows 本机运行）：构建到仓库 bin\，用当前用户登录任务启动单个 auto_sync 进程
 pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1
 
-# NAS（在 NAS 本机运行）：构建到 /opt/usr/local/auto_sync，安装 systemd unit 并启动
+# NAS（在 dev 上运行）：dev 编译 Linux release，部署 dev 本机和 NAS
 scripts/deploy_nas.sh
 
 # OpenWrt：交叉编译 aarch64，安装 procd init 脚本
 scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root
 ```
 
-部署脚本会**保留已有的 `conf/auto_sync.toml`**，只有目标配置不存在时才用模板初始化。NAS 在本机编译（不做 Windows→Linux 交叉编译），保留 Cargo 构建缓存；Windows 运行时以管理员权限自启（以便读取 USN Journal），通过单实例锁接管旧进程。
+部署脚本会**保留已有的 `conf/auto_sync.toml`**，只有目标配置不存在时才用模板初始化。NAS 不再本机编译；dev 负责编译 Linux release，并把产物部署到 dev 本机和 NAS。Windows 运行时以管理员权限自启（以便读取 USN Journal），通过单实例锁接管旧进程。
 
 ---
 
@@ -587,22 +587,22 @@ curl -s -X POST http://127.0.0.1:18765/api/sync-destination-now \
 
 | 说明 | Windows | NAS | Linux / dev | OpenWrt |
 | --- | --- | --- | --- | --- |
-| 命令（在目标机本机运行） | `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1` | `scripts/deploy_nas.sh` | `scripts/deploy_local.sh --install-dir /usr/local/auto_sync` | `scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root` |
+| 命令 | `pwsh -ExecutionPolicy Bypass -File scripts/deploy_windows.ps1` | 在 dev 上运行 `scripts/deploy_nas.sh` | `scripts/deploy_local.sh --install-dir /usr/local/auto_sync` | `scripts/deploy_openwrt.sh --host 192.168.2.1 --port 10022 --user root` |
 | 安装目录 | 仓库 `bin\` | `/opt/usr/local/auto_sync` | `/usr/local/auto_sync` | `/usr/local/auto_sync` |
-| 构建方式 | Windows 本机构建并复制到 `bin\` | NAS 本机编译；不做 Windows -> Linux 交叉编译 | Linux 本机编译 | 从 dev 交叉编译 aarch64 |
+| 构建方式 | Windows 本机构建并复制到 `bin\` | dev 编译 Linux release 后推送产物 | Linux 本机编译 | 从 dev 交叉编译 aarch64 |
 | 启动方式 | 当前用户登录任务启动 `auto_sync` 和 Flutter GUI；不装 Windows 服务 | systemd unit `auto_sync.service` | systemd unit `auto_sync.service` | procd init 脚本 `/etc/init.d/auto_sync` |
-| 关键约束 | 运行时进程以管理员权限自启，用于读取 NTFS USN Journal；通过单实例锁接管旧进程 | 保留 Cargo 构建缓存；首次自动补齐 Ubuntu/Debian 构建依赖和 Rust stable | 通用 Linux 本机部署入口，dev 默认使用 `/usr/local/auto_sync` | 渲染 `conf/auto_sync.procd`，并安装到 OpenWrt init 目录 |
+| 关键约束 | 运行时进程以管理员权限自启，用于读取 NTFS USN Journal；通过单实例锁接管旧进程 | NAS 不编译；保留 `/opt/usr/local/auto_sync` 下既有配置、数据和日志 | 通用 Linux 本机部署入口，dev 默认使用 `/usr/local/auto_sync`，并为 NAS 构建复用 dev 的 Cargo 缓存 | 渲染 `conf/auto_sync.procd`，并安装到 OpenWrt init 目录 |
 
 Dev 和 NAS 的真实部署目录、用户目录 symlink 策略、toolchain 位置与环境变量见 `docs/deployment-paths.md`。
 
-标准更新路径（NAS 直接在 NAS 上执行，保留构建缓存，不 `git reset --hard`、不清 `target`）：
+标准更新路径（NAS 不再本机编译；dev 编译并部署 dev+NAS，保留 dev 构建缓存，不 `git reset --hard`、不清 `target`）：
 
 ```bash
-# NAS
-ssh -p 10022 root@192.168.2.247 "cd /opt/src/rust/auto_sync && git pull --ff-only && scripts/deploy_nas.sh"
+# dev + NAS
+ssh -p 10022 root@192.168.2.126 "cd /root/src/rust/auto_sync && git pull --ff-only && scripts/deploy_nas.sh"
 ```
 
-systemd unit 由 `scripts/deploy_local.sh` 按安装目录直接生成（不在 `conf/` 里），NAS 通过 `scripts/deploy_nas.sh` 固定使用 `/opt/usr/local/auto_sync`。fanotify 需较高权限：daemon 需 `CAP_DAC_READ_SEARCH`（懒加载 handle 解析）与 `CAP_SYS_ADMIN`（filesystem mark），同步只读目录还需 `CAP_DAC_OVERRIDE`；磁盘 standby 主动停转（`hdparm -y` 的 `HDIO_DRIVE_CMD` ioctl）需 `CAP_SYS_RAWIO`（`CAP_SYS_ADMIN` 不够）。unit 均已授予。
+systemd unit 由部署脚本按安装目录直接生成（不在 `conf/` 里），NAS 通过 dev 运行的 `scripts/deploy_nas.sh` 固定部署到 `/opt/usr/local/auto_sync`。fanotify 需较高权限：daemon 需 `CAP_DAC_READ_SEARCH`（懒加载 handle 解析）与 `CAP_SYS_ADMIN`（filesystem mark），同步只读目录还需 `CAP_DAC_OVERRIDE`；磁盘 standby 主动停转（`hdparm -y` 的 `HDIO_DRIVE_CMD` ioctl）需 `CAP_SYS_RAWIO`（`CAP_SYS_ADMIN` 不够）。unit 均已授予。
 
 ---
 

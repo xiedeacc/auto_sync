@@ -53,8 +53,8 @@ dev 上意外出现的 `/opt/user` symlink、旧 `/opt/src/software` 或 `/opt/s
 
 | 入口 | 默认安装目录 | nas 覆盖值 |
 | --- | --- | --- |
-| `scripts/deploy_local.sh` | `/usr/local/auto_sync` | 只用于 dev；`scripts/deploy_nas.sh` 设置为 `/opt/usr/local/auto_sync`。 |
-| `scripts/deploy_nas.sh` | `/opt/usr/local/auto_sync` | 必须从 `/opt/src/rust/auto_sync` 执行；脚本会拒绝任何其他 nas 执行目录或安装目录。 |
+| `scripts/deploy_local.sh` | `/usr/local/auto_sync` | 只用于 dev 本机部署。 |
+| `scripts/deploy_nas.sh` | `/opt/usr/local/auto_sync` | 必须从 dev 的 `/root/src/rust/auto_sync` 执行；脚本会先部署 dev 本机，再把同一 Linux release 产物推到 NAS。 |
 | UI 新增 Linux 机器默认值 | `/usr/local/auto_sync` | nas 必须显式设置为 `/opt/usr/local/auto_sync`。 |
 
 ## 环境文件
@@ -76,7 +76,7 @@ dev 上意外出现的 `/opt/user` symlink、旧 `/opt/src/software` 或 `/opt/s
 | `/etc/profile.d/opt-usr-local-path.sh` | nas | collector 部署脚本 | 不 bind-mount `/usr/local`，只把 nas 的 `/opt/usr/local/bin` 和 `/opt/usr/local/go/go1.25.1/bin` 加入 `PATH`。 |
 | `/etc/pip.conf` | nas/dev | collector 部署脚本 | 将全局 pip index 设置为清华 PyPI 镜像。 |
 | `/root/.cargo/config.toml` | nas/dev | collector 部署脚本和 `scripts/deploy_local.sh` | 将 crates.io 替换为 rsproxy sparse registry，并启用 git CLI fetch。 |
-| `/etc/systemd/system/auto_sync.service` | nas/dev | nas 上由 `scripts/deploy_nas.sh` 调用 `scripts/deploy_local.sh` 生成 | 从对应主机的安装目录启动统一的 `auto_sync` 进程。 |
+| `/etc/systemd/system/auto_sync.service` | nas/dev | dev 上由 `scripts/deploy_local.sh` 生成；NAS 上由 dev 运行的 `scripts/deploy_nas.sh` 生成 | 从对应主机的安装目录启动统一的 `auto_sync` 进程。 |
 | `/etc/systemd/coredump.conf` | nas/dev | collector 部署脚本 | 启用外部无限大小 coredump 存储。 |
 | `/etc/security/limits.conf` | nas/dev | collector 部署脚本 | 追加无限 core size 限制。 |
 | `/etc/sysctl.conf` | nas/dev | collector 部署脚本 | 追加 coredump pattern 并重新加载 sysctl。 |
@@ -136,7 +136,7 @@ java 只使用 `JAVA_HOME`；不要设置全局 `CLASSPATH`/`CLASS_PATH`。colle
 | flutter storage | `FLUTTER_STORAGE_BASE_URL` | `https://storage.flutter-io.cn` | `scripts/deploy_local.sh` 和 `scripts/deploy_windows.ps1` 在 flutter 构建过程中设置。 |
 | java | `JAVA_HOME` | `/usr/lib/jvm/java-21-openjdk-amd64` | `/etc/profile.d/auto-sync-domestic-mirrors.sh`；JDK 从 apt 安装。 |
 
-systemd unit 文件应使用上表中的绝对真实路径。`scripts/deploy_local.sh` 会根据选定安装目录直接渲染 `auto_sync.service`；`scripts/deploy_nas.sh` 提供 nas 路径。
+systemd unit 文件应使用上表中的绝对真实路径。`scripts/deploy_local.sh` 会根据选定安装目录直接渲染 dev 的 `auto_sync.service`；`scripts/deploy_nas.sh` 在 dev 上构建并渲染 NAS 的 `/opt/usr/local/auto_sync` unit。
 
 
 
