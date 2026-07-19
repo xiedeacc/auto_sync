@@ -16,7 +16,6 @@ $errCount = 0
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $platformDefaultCollectPaths = @()
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
-$excludePaths += @('/usr/local/blog/data/uploads')
 
 function New-FinalSshdConfig([string]$Port) {
     if ([string]::IsNullOrWhiteSpace($Port)) { $Port = '10022' }
@@ -466,7 +465,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server auto_sync rblog rblog-backup.timer nginx cron tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server auto_sync nginx cron tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -490,15 +489,13 @@ normalize_deploy_permissions() {
         find /etc/nginx/ssl -maxdepth 1 -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
         find /etc/nginx/ssl -maxdepth 1 -type f ! -name '*.key' -exec chmod 644 {} + 2>/dev/null || true
     fi
-    for d in /usr/local/blog /usr/local/tbox /usr/local/waiwei /usr/local/xray /usr/local/shadowsocks; do
+    for d in /usr/local/tbox /usr/local/waiwei /usr/local/xray /usr/local/shadowsocks; do
         [ -e "$d" ] || continue
         chown -R root:root "$d" 2>/dev/null || true
         find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
         find "$d" -type f -exec chmod 644 {} + 2>/dev/null || true
     done
     for d in \
-        /usr/local/blog/bin \
-        /usr/local/blog/bin/admin \
         /usr/local/tbox/bin \
         /usr/local/waiwei/bin \
         /usr/local/waiwei/scripts \
@@ -516,9 +513,6 @@ normalize_deploy_permissions() {
         /etc/systemd/system/domus.service \
         /etc/systemd/system/domus-backup.service \
         /etc/systemd/system/domus-backup.timer \
-        /etc/systemd/system/rblog.service \
-        /etc/systemd/system/rblog-backup.service \
-        /etc/systemd/system/rblog-backup.timer \
         /etc/systemd/system/rgit.service \
         /etc/systemd/system/rgit-backup.service \
         /etc/systemd/system/rgit-backup.timer \
@@ -557,8 +551,6 @@ install_staged_collected_paths() {
         usr/local/xray/bin/update-geo.sh \
         usr/local/waiwei/bin/waiwei_web \
         usr/local/waiwei/bin/waiwei_puller \
-        usr/local/blog/bin/rblog \
-        usr/local/blog/bin/rblog-backup \
         usr/local/shadowsocks/bin/sslocal \
         usr/local/shadowsocks/bin/ssserver \
         usr/local/shadowsocks/bin/xray-plugin
@@ -783,8 +775,6 @@ ensure_host_entry() {
 }
 ensure_host_entry 127.0.0.1 unlock-music.xiedeacc.com
 ensure_host_entry 127.0.0.1 halo.xiedeacc.com
-ensure_host_entry 127.0.0.1 blog.xiedeacc.com
-ensure_host_entry 127.0.0.1 rblog.xiedeacc.com
 ensure_host_entry 127.0.0.1 dev.xiedeacc.com
 ensure_host_entry 127.0.0.1 coverage.xiedeacc.com
 
@@ -1116,7 +1106,7 @@ if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
 
-mkdir -p /usr/local/auto_sync/logs /usr/local/blog/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /home/tiger
+mkdir -p /usr/local/auto_sync/logs /usr/local/tbox/log /usr/local/waiwei/logs /usr/local/xray/logs /home/tiger
 if [ -e /root/.cscope.vim ] && [ ! -d /root/.cscope.vim ]; then
     rm -f /root/.cscope.vim
 fi
@@ -1151,9 +1141,6 @@ for f in \
     /usr/local/xray/bin/update-geo.sh \
     /usr/local/waiwei/bin/waiwei_web \
     /usr/local/waiwei/bin/waiwei_puller \
-    /usr/local/blog/bin/rblog \
-    /usr/local/blog/bin/rblog-backup \
-    /usr/local/blog/bin/admin/* \
     /usr/local/bin/vlmcsd
 do
     [ -e "$f" ] && chmod a+rx "$f" 2>/dev/null || true
@@ -1172,7 +1159,7 @@ rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/nul
 for s in tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
-for s in mysql postgresql redis-server auto_sync rblog rblog-backup.timer nginx cron; do
+for s in mysql postgresql redis-server auto_sync nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -1180,7 +1167,7 @@ crontab -l 2>/dev/null | grep -v -E '/root/src/share/(ubuntu/backup_pg|ubuntu/ba
 
 print_final_states() {
     echo '--- final states ---'
-    for s in auto_sync nginx cron mysql postgresql redis-server rblog rblog-backup.timer tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in auto_sync nginx cron mysql postgresql redis-server tbox_server tbox_client tbox-logrotate.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         resolved="$(unit_name "$s" 2>/dev/null || true)"
         if [ -n "$resolved" ]; then
             enabled="$(systemctl is-enabled "$resolved" 2>/dev/null || true)"
@@ -1224,7 +1211,7 @@ wait_for_https_200() {
 }
 
 required_failed=0
-for s in auto_sync nginx cron mysql postgresql redis-server rblog rblog-backup.timer; do
+for s in auto_sync nginx cron mysql postgresql redis-server; do
     if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
         required_failed=1

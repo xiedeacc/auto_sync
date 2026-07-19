@@ -596,7 +596,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich nginx cron tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -619,15 +619,13 @@ normalize_deploy_permissions() {
         find /etc/nginx/ssl -maxdepth 1 -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
         find /etc/nginx/ssl -maxdepth 1 -type f ! -name '*.key' -exec chmod 644 {} + 2>/dev/null || true
     fi
-    for d in /opt/usr/local/blog /opt/usr/local/tbox /opt/usr/local/waiwei /opt/usr/local/xray /opt/usr/local/shadowsocks /opt/usr/local/halo; do
+    for d in /opt/usr/local/tbox /opt/usr/local/waiwei /opt/usr/local/xray /opt/usr/local/shadowsocks /opt/usr/local/halo; do
         [ -e "$d" ] || continue
         chown -R root:root "$d" 2>/dev/null || true
         find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
         find "$d" -type f -exec chmod 644 {} + 2>/dev/null || true
     done
     for d in \
-        /opt/usr/local/blog/bin \
-        /opt/usr/local/blog/bin/admin \
         /opt/usr/local/tbox/bin \
         /opt/usr/local/waiwei/bin \
         /opt/usr/local/waiwei/scripts \
@@ -646,9 +644,6 @@ normalize_deploy_permissions() {
         /etc/systemd/system/domus.service \
         /etc/systemd/system/domus-backup.service \
         /etc/systemd/system/domus-backup.timer \
-        /etc/systemd/system/rblog.service \
-        /etc/systemd/system/rblog-backup.service \
-        /etc/systemd/system/rblog-backup.timer \
         /etc/systemd/system/rgit.service \
         /etc/systemd/system/rgit-backup.service \
         /etc/systemd/system/rgit-backup.timer \
@@ -961,8 +956,6 @@ ensure_host_entry 127.0.0.1 code.xiedeacc.com
 ensure_host_entry 127.0.0.1 unlock-music.xiedeacc.com
 ensure_host_entry 127.0.0.1 immich.xiedeacc.com
 ensure_host_entry 127.0.0.1 halo.xiedeacc.com
-ensure_host_entry 127.0.0.1 blog.xiedeacc.com
-ensure_host_entry 127.0.0.1 rblog.xiedeacc.com
 ensure_host_entry 127.0.0.1 dev.xiedeacc.com
 ensure_host_entry 127.0.0.1 coverage.xiedeacc.com
 
@@ -1697,7 +1690,7 @@ EOF_OPT_USR_LOCAL_PATH
 }
 ensure_opt_usr_local_path
 
-mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/root/.halo2 /opt/user/tiger /home/tiger
+mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/immich/server /opt/immich/upload /opt/immich/machine-learning /opt/immich/conf /opt/user/root/.halo2 /opt/user/tiger /home/tiger
 for d in backups encoded-video library profile thumbs upload; do
     mkdir -p "/opt/immich/upload/$d"
     touch "/opt/immich/upload/$d/.immich"
@@ -1769,9 +1762,6 @@ for f in \
     /opt/usr/local/xray/bin/update-geo.sh \
     /opt/usr/local/waiwei/bin/waiwei_web \
     /opt/usr/local/waiwei/bin/waiwei_puller \
-    /opt/usr/local/blog/bin/rblog \
-    /opt/usr/local/blog/bin/rblog-backup \
-    /opt/usr/local/blog/bin/admin/* \
     /opt/usr/local/halo/bin/* \
     /opt/usr/local/shadowsocks/bin/* \
     /opt/usr/local/bin/vlmcsd
@@ -1807,7 +1797,7 @@ fi
 for s in tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
-for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich rblog rblog-backup.timer nginx cron; do
+for s in mysql postgresql redis-server gitlab-runsvdir gitlab immich-ml auto_sync halo2 immich nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -1815,7 +1805,7 @@ done
 (crontab -l 2>/dev/null | grep -v '/root/src/share/ubuntu/backup_mysql.sh'; echo '5 10 * * 0 /bin/bash /root/src/share/ubuntu/backup_mysql.sh > /dev/null 2>&1') | crontab -
 
 echo '--- final states ---'
-for s in auto_sync halo2 immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer gitlab-runsvdir gitlab tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+for s in auto_sync halo2 immich immich-ml nginx cron mysql postgresql redis-server gitlab-runsvdir gitlab tbox_client tbox-logrotate.timer shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     resolved="$(unit_name "$s" 2>/dev/null || true)"
     if [ -n "$resolved" ]; then
         printf '  %s: ' "$s"; systemctl is-enabled "$resolved" 2>/dev/null | tr -d '\n'; printf ' / '; systemctl is-active "$resolved" 2>/dev/null | tr -d '\n'; echo
@@ -1856,7 +1846,7 @@ wait_for_https_200() {
 }
 
 required_failed=0
-for s in auto_sync halo2 immich immich-ml nginx cron mysql postgresql redis-server rblog rblog-backup.timer; do
+for s in auto_sync halo2 immich immich-ml nginx cron mysql postgresql redis-server; do
     if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
         required_failed=1
@@ -1874,7 +1864,7 @@ if ! command -v gitlab-ctl >/dev/null 2>&1 || ! gitlab-ctl status >/dev/null 2>&
     log "ERROR: required service gitlab is not active"
     required_failed=1
 fi
-for url in https://code.xiedeacc.com https://unlock-music.xiedeacc.com https://halo.xiedeacc.com https://immich.xiedeacc.com https://blog.xiedeacc.com https://rblog.xiedeacc.com; do
+for url in https://code.xiedeacc.com https://unlock-music.xiedeacc.com https://halo.xiedeacc.com https://immich.xiedeacc.com; do
     if ! wait_for_https_200 "$url"; then
         required_failed=1
     fi

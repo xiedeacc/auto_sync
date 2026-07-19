@@ -17,7 +17,6 @@ $remoteScratch = '/tmp/auto_sync_deploy_scratch'
 $collectPaths = @($env:AS_COLLECT_PATHS -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $platformDefaultCollectPaths = @()
 $excludePaths = @($env:AS_EXCLUDE_PATHS -split "`n" | ForEach-Object { $_.Trim().TrimEnd([char[]]"/") } | Where-Object { $_ -ne '' })
-$excludePaths += @('/opt/usr/local/blog/data/uploads')
 
 function New-FinalSshdConfig([string]$Port) {
     if ([string]::IsNullOrWhiteSpace($Port)) { $Port = '10022' }
@@ -487,7 +486,7 @@ stop_if_exists() {
 }
 stop_services_before_install() {
     log "stop services before installing collected paths"
-    for s in mysql postgresql redis-server auto_sync tbox_server tbox_client tbox-logrotate.timer rblog rblog-backup.timer rgit rgit-backup.service rgit-backup.timer rgit-ocsp.service rgit-ocsp.timer domus domus-backup.service domus-backup.timer nginx cron immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in mysql postgresql redis-server auto_sync tbox_server tbox_client tbox-logrotate.timer rgit rgit-backup.service rgit-backup.timer rgit-ocsp.service rgit-ocsp.timer domus domus-backup.service domus-backup.timer nginx cron immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         stop_if_exists "$s"
     done
 }
@@ -511,7 +510,7 @@ normalize_deploy_permissions() {
         find /etc/nginx/ssl -maxdepth 1 -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
         find /etc/nginx/ssl -maxdepth 1 -type f ! -name '*.key' -exec chmod 644 {} + 2>/dev/null || true
     fi
-    for d in /opt/usr/local/blog /opt/usr/local/domus /opt/usr/local/tbox /opt/usr/local/waiwei /opt/usr/local/xray /opt/usr/local/shadowsocks; do
+    for d in /opt/usr/local/domus /opt/usr/local/tbox /opt/usr/local/waiwei /opt/usr/local/xray /opt/usr/local/shadowsocks; do
         [ -e "$d" ] || continue
         chown -R root:root "$d" 2>/dev/null || true
         find "$d" -type d -exec chmod 755 {} + 2>/dev/null || true
@@ -539,8 +538,6 @@ normalize_deploy_permissions() {
         [ -d /opt/usr/local/domus/logs ] && chmod 750 /opt/usr/local/domus/logs 2>/dev/null || true
     fi
     for d in \
-        /opt/usr/local/blog/bin \
-        /opt/usr/local/blog/bin/admin \
         /opt/usr/local/domus/bin \
         /opt/usr/local/rgit/bin \
         /opt/usr/local/tbox/bin \
@@ -560,9 +557,6 @@ normalize_deploy_permissions() {
         /etc/systemd/system/domus.service \
         /etc/systemd/system/domus-backup.service \
         /etc/systemd/system/domus-backup.timer \
-        /etc/systemd/system/rblog.service \
-        /etc/systemd/system/rblog-backup.service \
-        /etc/systemd/system/rblog-backup.timer \
         /etc/systemd/system/rgit.service \
         /etc/systemd/system/rgit-backup.service \
         /etc/systemd/system/rgit-backup.timer \
@@ -601,8 +595,6 @@ install_staged_collected_paths() {
         opt/usr/local/xray/bin/update-geo.sh \
         opt/usr/local/waiwei/bin/waiwei_web \
         opt/usr/local/waiwei/bin/waiwei_puller \
-        opt/usr/local/blog/bin/rblog \
-        opt/usr/local/blog/bin/rblog-backup \
         opt/usr/local/domus/bin/domus \
         opt/usr/local/domus/bin/domus-* \
         opt/usr/local/shadowsocks/bin/sslocal \
@@ -917,8 +909,6 @@ ensure_host_entry() {
 }
 ensure_host_entry 127.0.0.1 unlock-music.xiedeacc.com
 ensure_host_entry 127.0.0.1 halo.xiedeacc.com
-ensure_host_entry 127.0.0.1 blog.xiedeacc.com
-ensure_host_entry 127.0.0.1 rblog.xiedeacc.com
 ensure_host_entry 127.0.0.1 dev.xiedeacc.com
 ensure_host_entry 127.0.0.1 coverage.xiedeacc.com
 
@@ -1271,7 +1261,7 @@ EOF_OPT_USR_LOCAL_PATH
 }
 ensure_opt_usr_local_path
 
-mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/blog/logs /opt/usr/local/domus/logs /opt/usr/local/rgit/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/user/tiger /home/tiger
+mkdir -p /opt/usr/local/auto_sync/logs /opt/usr/local/domus/logs /opt/usr/local/rgit/logs /opt/usr/local/tbox/log /opt/usr/local/waiwei/logs /opt/usr/local/xray/logs /opt/usr/local/shadowsocks/logs /opt/usr/local/shadowsocks/conf /opt/usr/local/shadowsocks/data /opt/user/tiger /home/tiger
 migrate_root_home_to_opt() {
     mkdir -p /opt/user/root
 
@@ -1341,9 +1331,6 @@ for f in \
     /opt/usr/local/xray/bin/update-geo.sh \
     /opt/usr/local/waiwei/bin/waiwei_web \
     /opt/usr/local/waiwei/bin/waiwei_puller \
-    /opt/usr/local/blog/bin/rblog \
-    /opt/usr/local/blog/bin/rblog-backup \
-    /opt/usr/local/blog/bin/admin/* \
     /opt/usr/local/domus/bin/* \
     /opt/usr/local/rgit/bin/* \
     /opt/usr/local/shadowsocks/bin/* \
@@ -1467,7 +1454,7 @@ fi
 for s in tbox_server mysql postgresql redis-server immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
     disable_if_exists "$s"
 done
-for s in auto_sync tbox_client tbox-logrotate.timer rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer nginx cron; do
+for s in auto_sync tbox_client tbox-logrotate.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer nginx cron; do
     restart_if_exists "$s"
 done
 
@@ -1475,7 +1462,7 @@ crontab -l 2>/dev/null | grep -v -E '/root/src/share/(ubuntu/backup_pg|nas/backu
 
 print_final_states() {
     echo '--- final states ---'
-    for s in auto_sync tbox_server tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
+    for s in auto_sync tbox_server tbox_client tbox-logrotate.timer nginx cron mysql postgresql redis-server rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer immich immich-ml shadowsocks shadowsocks-rust waiwei-web waiwei-puller xray; do
         resolved="$(unit_name "$s" 2>/dev/null || true)"
         if [ -n "$resolved" ]; then
             enabled="$(systemctl is-enabled "$resolved" 2>/dev/null || true)"
@@ -1519,7 +1506,7 @@ wait_for_https_200() {
 }
 
 required_failed=0
-for s in auto_sync tbox_client tbox-logrotate.timer nginx cron rblog rblog-backup.timer rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer; do
+for s in auto_sync tbox_client tbox-logrotate.timer nginx cron rgit rgit-backup.timer rgit-ocsp.timer domus domus-backup.timer; do
     if ! wait_for_unit_active "$s"; then
         log "ERROR: required service $s is not active"
         required_failed=1
@@ -1529,7 +1516,7 @@ for s in auto_sync tbox_client tbox-logrotate.timer nginx cron rblog rblog-backu
         required_failed=1
     fi
 done
-for url in https://unlock-music.xiedeacc.com https://blog.xiedeacc.com https://rblog.xiedeacc.com; do
+for url in https://unlock-music.xiedeacc.com; do
     if ! wait_for_https_200 "$url"; then
         required_failed=1
     fi
