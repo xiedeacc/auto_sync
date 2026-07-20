@@ -106,6 +106,7 @@ paths = [
     "/etc/postgresql",
     "/etc/pip.conf",
     "/etc/environment",
+    "/etc/fstab",
     "/etc/profile",
     "/etc/ssh/sshd_config",
     "/etc/systemd/system/auto_sync.service",
