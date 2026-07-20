@@ -6036,7 +6036,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   }
 
   Future<void> _showHostLog(int index) async {
-    final globalRun = _bool(status['running']);
+    final globalRun = _bool(status['running']) && activeRunIndexes.isEmpty;
     final activeRun = _bool(hostRunStatuses[index]?['running']);
     final activeDeploy = _bool(hostDeployStatuses[index]?['running']);
     final initialRun = globalRun
@@ -6134,7 +6134,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final globalRunActive = _bool(status['running']);
+    final globalRunActive = _bool(status['running']) && activeRunIndexes.isEmpty;
     return _MasterDialogFrame(
       title: 'Collector',
       width: 980,
