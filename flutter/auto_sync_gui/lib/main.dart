@@ -5697,6 +5697,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
   bool loading = true;
   bool busy = false;
   bool autoPush = false;
+  bool dirty = false;
   final activeRunIndexes = <int>{};
   final activeDeployIndexes = <int>{};
   Timer? saveTimer;
@@ -5722,7 +5723,7 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     saveTimer?.cancel();
     runTimer?.cancel();
     deployTimer?.cancel();
-    if (cfg.isNotEmpty) {
+    if (dirty && cfg.isNotEmpty) {
       unawaited(_save());
     }
     gitDir.dispose();
@@ -5796,10 +5797,12 @@ class _CollectorDialogState extends State<_CollectorDialog> {
     cfg['split_threshold_mb'] = int.tryParse(splitMb.text) ?? 95;
     cfg['auto_commit_push'] = autoPush;
     await widget.api.saveCollectorConfig(cfg);
+    dirty = false;
   }
 
   void _scheduleSave() {
     if (loading || cfg.isEmpty) return;
+    dirty = true;
     saveTimer?.cancel();
     saveTimer = Timer(const Duration(milliseconds: 400), () {
       saveTimer = null;
