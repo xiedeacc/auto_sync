@@ -1,10 +1,10 @@
 # 部署路径说明
 
-本文档记录 dev 和 nas 的预期真实路径。collector 路径、部署脚本、systemd 单元以及 shell 环境配置都需要和这里保持一致。
+本文档记录 dev、nas 和 vmware 的预期真实路径。collector 路径、部署脚本、systemd 单元以及 shell 环境配置都需要和这里保持一致。
 
 ## 主机路径矩阵
 
-nas 的根分区很小，所以大型软件目录和大部分用户 home 状态都放在 `/opt` 下。dev 的根分区是大 SSD，故意不复制 nas 的 symlink 布局。
+nas 的根分区很小，所以大型软件目录和大部分用户 home 状态都放在 `/opt` 下。dev 的根分区是大 SSD，故意不复制 nas 的 symlink 布局。vmware 使用 dev 布局，collector root 为 `D:\share\vmware`，部署脚本复用 `collector_deploy_dev.ps1`。
 
 ### 服务与应用
 
