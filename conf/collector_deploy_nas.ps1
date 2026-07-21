@@ -638,6 +638,7 @@ install_staged_collected_paths() {
 if [ -f /etc/apt/sources.list ]; then
     sed -i 's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' /etc/apt/sources.list
 fi
+rm -f /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
 apt-get update
 policy_created=0
 if [ ! -e /usr/sbin/policy-rc.d ]; then

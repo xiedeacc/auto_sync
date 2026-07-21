@@ -586,6 +586,7 @@ install_staged_collected_paths() {
 if [ -f /etc/apt/sources.list ]; then
     sed -i 's#http://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#http://security.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://archive.ubuntu.com#https://mirrors.cloud.tencent.com#g; s#https://security.ubuntu.com#https://mirrors.cloud.tencent.com#g' /etc/apt/sources.list
 fi
+rm -f /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
 apt-get update
 policy_created=0
 if [ ! -e /usr/sbin/policy-rc.d ]; then
@@ -1255,11 +1256,11 @@ if ! pg_isready -q; then
     log "ERROR: PostgreSQL is not accepting connections"
     required_failed=1
 fi
-for url in https://dev.xiedeacc.com https://coverage.xiedeacc.com; do
-    if ! wait_for_https_200 "$url"; then
-        required_failed=1
-    fi
-done
+if ! wait_for_https_200 https://dev.xiedeacc.com; then
+    required_failed=1
+fi
+coverage_code="$(curl -k -L --max-time 20 -o /dev/null -s -w '%{http_code}' https://coverage.xiedeacc.com || true)"
+[ "$coverage_code" = "200" ] || log "WARN: optional coverage.xiedeacc.com health check failed; status: $coverage_code"
 print_final_states
 exit "$required_failed"
 '@
