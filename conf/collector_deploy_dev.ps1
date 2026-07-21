@@ -38,6 +38,7 @@ Port $Port
 ClientAliveInterval 360
 ClientAliveCountMax 0
 AllowUsers root tiger git
+PermitUserEnvironment PATH,NVM_DIR
 
 #AuthenticationMethods publickey password
 AuthenticationMethods publickey
@@ -371,11 +372,16 @@ rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/99-auto-s
 if [ -f /tmp/auto_sync_root_key.pub ]; then
     cat /tmp/auto_sync_root_key.pub > /root/.ssh/authorized_keys
 fi
+cat > /root/.ssh/environment <<'EOF_ROOT_SSH_ENV'
+NVM_DIR=/root/.nvm
+PATH=/root/.nvm/versions/node/v24.18.0/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EOF_ROOT_SSH_ENV
 chmod 700 /root /root/.ssh
 chown -R root:root /root/.ssh 2>/dev/null || true
 find /root/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \; 2>/dev/null || true
 find /root/.ssh -type f -name "*.pub" -exec chmod 644 {} \; 2>/dev/null || true
 chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+chmod 600 /root/.ssh/environment 2>/dev/null || true
 sshd -t
 systemctl disable --now ssh.socket 2>/dev/null || true
 systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service
@@ -581,6 +587,7 @@ install_staged_collected_paths() {
     find /root/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \; 2>/dev/null || true
     find /root/.ssh -type f -name "*.pub" -exec chmod 644 {} \; 2>/dev/null || true
     chmod 600 /root/.ssh/config 2>/dev/null || true
+    chmod 600 /root/.ssh/environment 2>/dev/null || true
     chmod 644 /root/.ssh/known_hosts /root/.ssh/known_hosts.old 2>/dev/null || true
     chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
     rm -rf "$stage"
@@ -938,13 +945,6 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
 fi
 if [ -d "$NVM_DIR" ]; then
     chmod -R a+rX "$NVM_DIR" || true
-fi
-node_v24_bin="$NVM_DIR/versions/node/v24.18.0/bin"
-if [ -x "$node_v24_bin/node" ]; then
-    ln -sfn "$node_v24_bin/node" /usr/local/bin/node
-    [ -x "$node_v24_bin/npm" ] && ln -sfn "$node_v24_bin/npm" /usr/local/bin/npm
-    [ -x "$node_v24_bin/npx" ] && ln -sfn "$node_v24_bin/npx" /usr/local/bin/npx
-    [ -x "$node_v24_bin/codex" ] && ln -sfn "$node_v24_bin/codex" /usr/local/bin/codex
 fi
 
 if [ ! -x /usr/local/bin/buildifier ]; then
