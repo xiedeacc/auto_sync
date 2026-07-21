@@ -637,7 +637,13 @@ rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/nul
 stop_services_before_install
 install_staged_collected_paths || { log "ERROR: collected path installation failed"; exit 1; }
 
-id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
+if ! id tiger >/dev/null 2>&1; then
+    if [ -d /home/tiger ]; then
+        useradd -M -d /home/tiger -s /bin/bash tiger
+    else
+        useradd -m -d /home/tiger -s /bin/bash tiger
+    fi
+fi
 mkdir -p /root/src/software
 
 rm -rf /home/tiger/.nvm /home/tiger/.npm /home/tiger/.npmrc \
@@ -1122,7 +1128,13 @@ ensure_postgresql_ready() {
 
 zfs_woken=0
 wake_zfs && zfs_woken=1 || true
-id tiger >/dev/null 2>&1 || useradd -m -s /bin/bash tiger
+if ! id tiger >/dev/null 2>&1; then
+    if [ -d /home/tiger ]; then
+        useradd -M -d /home/tiger -s /bin/bash tiger
+    else
+        useradd -m -d /home/tiger -s /bin/bash tiger
+    fi
+fi
 if [ "$zfs_woken" = "1" ]; then
     standby_zfs
 fi
