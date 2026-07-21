@@ -33,6 +33,8 @@ use std::ffi::{OsStr, OsString};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -350,7 +352,12 @@ fn maybe_relaunch_elevated_on_windows(args: &Args, config_arg: &std::path::Path)
     if args.elevation_attempted || unsafe { IsUserAnAdmin() } != 0 {
         return Ok(false);
     }
-    warn!("auto_sync is not elevated on Windows; relaunching with UAC");
+    warn!("auto_sync is not elevated on Windows; trying scheduled task elevation");
+    if run_windows_scheduled_task("auto_sync") {
+        info!("elevated auto_sync scheduled task requested; exiting non-elevated process");
+        return Ok(true);
+    }
+    warn!("auto_sync scheduled task elevation failed; relaunching with UAC");
 
     let exe = std::env::current_exe().context("failed to locate current executable")?;
     let working_dir = std::env::current_dir().context("failed to locate current directory")?;
@@ -392,6 +399,25 @@ fn maybe_relaunch_elevated_on_windows(args: &Args, config_arg: &std::path::Path)
     }
     info!("elevated auto_sync relaunch requested; exiting non-elevated process");
     Ok(true)
+}
+
+#[cfg(windows)]
+fn run_windows_scheduled_task(task_name: &str) -> bool {
+    match std::process::Command::new("schtasks.exe")
+        .args(["/Run", "/TN", task_name])
+        .creation_flags(0x08000000)
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            warn!(task = task_name, code = ?status.code(), "scheduled task run failed");
+            false
+        }
+        Err(err) => {
+            warn!(task = task_name, error = %err, "failed to run scheduled task");
+            false
+        }
+    }
 }
 
 #[cfg(windows)]

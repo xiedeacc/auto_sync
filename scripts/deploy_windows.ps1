@@ -38,6 +38,11 @@ function ConvertTo-CommandLineArgument {
     '"' + ($Value -replace '"', '\"') + '"'
 }
 
+function Get-CurrentUserId {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $identity.Name
+}
+
 function Invoke-ElevatedSelf {
     $powerShellExe = Get-PreferredPowerShell
     $args = @(
@@ -685,25 +690,46 @@ function Ensure-AutoSyncStartup {
     }
 
     $startupDir = [Environment]::GetFolderPath("Startup")
-    if (-not [string]::IsNullOrWhiteSpace($startupDir)) {
-        Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-backend-start.vbs") `
-            -WorkingDirectory $BinDir `
-            -Executable $autoSyncExe
-        Write-StartupLauncher -Path (Join-Path $startupDir "auto_sync-gui-start.vbs") `
-            -WorkingDirectory $BinDir `
-            -Executable $autoSyncGuiExe
+    foreach ($oldLauncher in @("auto_sync-backend-start.vbs", "auto_sync-gui-start.vbs")) {
+        if (-not [string]::IsNullOrWhiteSpace($startupDir)) {
+            Remove-Item -LiteralPath (Join-Path $startupDir $oldLauncher) -Force -ErrorAction SilentlyContinue
+        }
     }
 
-    Start-Process -FilePath $autoSyncExe `
-        -WorkingDirectory $BinDir `
-        -WindowStyle Hidden
+    $userId = Get-CurrentUserId
+    $backendAction = New-ScheduledTaskAction -Execute $autoSyncExe -WorkingDirectory $BinDir
+    $guiAction = New-ScheduledTaskAction -Execute $autoSyncGuiExe -WorkingDirectory $BinDir
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+    $backendPrincipal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
+    $guiPrincipal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel LeastPrivilege
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit (New-TimeSpan -Days 9999) `
+        -MultipleInstances IgnoreNew `
+        -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 1)
+
+    Register-ScheduledTask -TaskName "auto_sync" `
+        -Action $backendAction `
+        -Trigger $logonTrigger `
+        -Principal $backendPrincipal `
+        -Settings $settings `
+        -Force | Out-Null
+    Register-ScheduledTask -TaskName "auto_sync_gui" `
+        -Action $guiAction `
+        -Trigger $logonTrigger `
+        -Principal $guiPrincipal `
+        -Settings $settings `
+        -Force | Out-Null
+
+    Start-ScheduledTask -TaskName "auto_sync"
     Start-Sleep -Seconds 1
-    Start-Process -FilePath $autoSyncGuiExe `
-        -WorkingDirectory $BinDir
+    Start-ScheduledTask -TaskName "auto_sync_gui"
 
     [PSCustomObject]@{
-        Launcher = "current-user Startup launchers for auto_sync and auto_sync_gui"
-        Processes = "auto_sync and auto_sync_gui started"
+        Launcher = "Windows Task Scheduler tasks: auto_sync (highest privileges), auto_sync_gui"
+        Processes = "auto_sync and auto_sync_gui started via scheduled tasks"
     }
 }
 
@@ -748,7 +774,7 @@ if ([string]::IsNullOrWhiteSpace($AuthorizedKeyFile)) {
 $ensureSshd = $InstallSshd -and -not $SkipSshd
 $ensureStartup = -not $SkipStartup
 $useMachinePath = (-not $UserPath) -and (Test-IsAdministrator)
-$needsAdmin = $ensureSshd -or $useMachinePath
+$needsAdmin = $ensureSshd -or $useMachinePath -or $ensureStartup
 if ($needsAdmin -and -not (Test-IsAdministrator)) {
     if ($NoElevate) {
         throw "Administrator privileges are required. Re-run without -NoElevate or start PowerShell as Administrator."
