@@ -1345,7 +1345,9 @@ for entry in Path('/home/tiger').iterdir():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
 [ -e /home/tiger ] && chown -R tiger:tiger /home/tiger 2>/dev/null || true
+[ -e /home/tiger ] && find /home/tiger -xdev \( -type d -o -type f \) \( -perm -0002 -o -perm -0020 \) -exec chmod go-w {} + 2>/dev/null || true
 [ -e /opt/user/tiger ] && chown -R tiger:tiger /opt/user/tiger 2>/dev/null || true
+[ -e /opt/user/tiger ] && find /opt/user/tiger -xdev \( -type d -o -type f \) \( -perm -0002 -o -perm -0020 \) -exec chmod go-w {} + 2>/dev/null || true
 for d in /opt/usr/local/auto_sync /opt/usr/local/tbox /opt/usr/local/shadowsocks; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
