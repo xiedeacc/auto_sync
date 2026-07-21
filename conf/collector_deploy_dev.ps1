@@ -583,6 +583,17 @@ install_staged_collected_paths() {
     return "$rc"
 }
 
+install_staged_apt_sources() {
+    stage="/tmp/auto_sync_deploy_stage"
+    rel="etc/apt/sources.list"
+    [ -f "$stage/$rel" ] || return 0
+    mkdir -p /etc/apt
+    cp -a "$stage/$rel" /etc/apt/sources.list
+    chmod 0644 /etc/apt/sources.list 2>/dev/null || true
+    log "installed staged /etc/apt/sources.list before apt update"
+}
+
+install_staged_apt_sources
 rm -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu-ports.sources 2>/dev/null || true
 apt-get update
 policy_created=0
