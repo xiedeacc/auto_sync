@@ -6521,7 +6521,7 @@ class _CollectorHostRow extends StatelessWidget {
         InkWell(
           borderRadius: BorderRadius.circular(6),
           onTap: onBrowseRoot,
-          child: _MasterReadOnlyInput(value: _str(host['root'])),
+          child: _MasterReadOnlyInput(value: _displayPath(_str(host['root']))),
         ),
         MasterButton(label: '$pathCount', onTap: onPaths),
         _CollectorTinyButton(label: '📝', onTap: onDeploy),

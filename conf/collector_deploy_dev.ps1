@@ -6,6 +6,19 @@ $scp  = $env:AS_SCP
 $dest = $env:AS_DEST
 $root = $env:AS_ROOT
 
+function Normalize-LocalWindowsPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $Path.Substring(8)
+    }
+    if ($Path.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return $Path.Substring(4)
+    }
+    return $Path
+}
+
+$root = Normalize-LocalWindowsPath $root
+
 $opts    = @('-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new','-o','LogLevel=ERROR','-o','ConnectTimeout=20','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=20')
 $sshArgs = @() + $opts
 $scpArgs = @('-r') + $opts

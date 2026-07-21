@@ -235,11 +235,24 @@ impl CollectorConfig {
     }
 
     pub fn normalized(mut self) -> Self {
+        self.git_dir = normalize_windows_display_path_buf(&self.git_dir);
         for host in &mut self.hosts {
+            host.root = normalize_windows_display_path_buf(&host.root);
             host.paths = normalize_collector_paths(&host.paths);
             host.exclude = normalize_collector_paths(&host.exclude);
         }
         self
+    }
+}
+
+fn normalize_windows_display_path_buf(path: &Path) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
     }
 }
 
