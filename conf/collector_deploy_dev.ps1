@@ -939,6 +939,13 @@ fi
 if [ -d "$NVM_DIR" ]; then
     chmod -R a+rX "$NVM_DIR" || true
 fi
+node_v24_bin="$NVM_DIR/versions/node/v24.18.0/bin"
+if [ -x "$node_v24_bin/node" ]; then
+    ln -sfn "$node_v24_bin/node" /usr/local/bin/node
+    [ -x "$node_v24_bin/npm" ] && ln -sfn "$node_v24_bin/npm" /usr/local/bin/npm
+    [ -x "$node_v24_bin/npx" ] && ln -sfn "$node_v24_bin/npx" /usr/local/bin/npx
+    [ -x "$node_v24_bin/codex" ] && ln -sfn "$node_v24_bin/codex" /usr/local/bin/codex
+fi
 
 if [ ! -x /usr/local/bin/buildifier ]; then
     curl -L -o /usr/local/bin/buildifier https://github.com/bazelbuild/buildtools/releases/download/v7.1.2/buildifier-linux-amd64
