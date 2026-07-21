@@ -518,6 +518,11 @@ normalize_deploy_permissions() {
     for d in /usr/local /root/src/software; do
         [ -d "$d" ] && find "$d" -xdev \( -type d -o -type f \) \( -perm -0002 -o -perm -0020 \) -exec chmod go-w {} + 2>/dev/null || true
     done
+    if [ -d /etc/sudoers.d ]; then
+        chown root:root /etc/sudoers.d /etc/sudoers.d/* 2>/dev/null || true
+        chmod 0755 /etc/sudoers.d 2>/dev/null || true
+        find /etc/sudoers.d -maxdepth 1 -type f -exec chmod 0440 {} + 2>/dev/null || true
+    fi
     for f in \
         /etc/systemd/system/auto_sync.service \
         /etc/systemd/system/domus.service \
@@ -1165,6 +1170,7 @@ for entry in Path('/home/tiger').iterdir():
     if entry.is_symlink():
         os.lchown(entry, uid, gid)
 PY_TIGER_LINK_OWNERS
+[ -d /home/tiger ] && chown -R tiger:tiger /home/tiger 2>/dev/null || true
 for d in /usr/local/auto_sync; do
     [ -e "$d" ] && chown -R root:root "$d" 2>/dev/null || true
 done
