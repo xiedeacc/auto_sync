@@ -172,6 +172,25 @@ function Copy-ReleaseBinaries {
     }
 }
 
+function Remove-StaleBinArtifacts {
+    param(
+        [string]$BinDir
+    )
+
+    foreach ($name in @("conf", "logs", "windows")) {
+        $path = Join-Path $BinDir $name
+        if (Test-Path -LiteralPath $path) {
+            Remove-DirectoryUnder -Path $path -Parent $BinDir
+        }
+    }
+    foreach ($name in @("auto_sync-master.exe", "auto_syncctl-master.exe", "auto_syncd.exe", "auto_syncd.pdb")) {
+        $path = Join-Path $BinDir $name
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Force
+        }
+    }
+}
+
 function Get-FlutterExe {
     $flutter = Get-Command flutter.bat -ErrorAction SilentlyContinue
     if ($flutter) {
@@ -759,7 +778,7 @@ $scriptPath = $MyInvocation.MyCommand.Path
 $scriptDir = Split-Path -Parent $scriptPath
 $rootDir = Split-Path -Parent $scriptDir
 if ([string]::IsNullOrWhiteSpace($RuntimeDir)) {
-    $RuntimeDir = Join-Path $rootDir "bin\windows"
+    $RuntimeDir = Join-Path $rootDir "runtime\windows"
 }
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $InstallDir = $rootDir
@@ -791,6 +810,7 @@ $targetRuntime = Join-Path $InstallDir "runtime"
 
 New-Item -ItemType Directory -Force -Path $InstallDir, $binDir, $confDir, $dataDir, $logDir | Out-Null
 Stop-AutoSyncProcesses
+Remove-StaleBinArtifacts -BinDir $binDir
 Copy-ReleaseBinaries -RootDir $rootDir -BinDir $binDir
 Copy-FlutterGuiBinaries -RootDir $rootDir -BinDir $binDir
 $configAction = Initialize-Config -SourceConfig $Config -TargetConfig $targetConfig
