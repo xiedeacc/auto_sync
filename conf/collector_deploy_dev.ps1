@@ -38,7 +38,6 @@ Port $Port
 ClientAliveInterval 360
 ClientAliveCountMax 0
 AllowUsers root tiger git
-PermitUserEnvironment PATH,NVM_DIR
 
 #AuthenticationMethods publickey password
 AuthenticationMethods publickey
@@ -51,7 +50,7 @@ StrictModes yes
 MaxAuthTries 3
 
 HostbasedAuthentication no
-UsePAM no
+UsePAM yes
 X11Forwarding no
 PrintMotd no
 IgnoreRhosts yes
@@ -372,16 +371,12 @@ rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/99-auto-s
 if [ -f /tmp/auto_sync_root_key.pub ]; then
     cat /tmp/auto_sync_root_key.pub > /root/.ssh/authorized_keys
 fi
-cat > /root/.ssh/environment <<'EOF_ROOT_SSH_ENV'
-NVM_DIR=/root/.nvm
-PATH=/root/.nvm/versions/node/v24.18.0/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EOF_ROOT_SSH_ENV
+rm -f /root/.ssh/environment
 chmod 700 /root /root/.ssh
 chown -R root:root /root/.ssh 2>/dev/null || true
 find /root/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \; 2>/dev/null || true
 find /root/.ssh -type f -name "*.pub" -exec chmod 644 {} \; 2>/dev/null || true
 chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
-chmod 600 /root/.ssh/environment 2>/dev/null || true
 sshd -t
 systemctl disable --now ssh.socket 2>/dev/null || true
 systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service
@@ -587,7 +582,6 @@ install_staged_collected_paths() {
     find /root/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \; 2>/dev/null || true
     find /root/.ssh -type f -name "*.pub" -exec chmod 644 {} \; 2>/dev/null || true
     chmod 600 /root/.ssh/config 2>/dev/null || true
-    chmod 600 /root/.ssh/environment 2>/dev/null || true
     chmod 644 /root/.ssh/known_hosts /root/.ssh/known_hosts.old 2>/dev/null || true
     chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
     rm -rf "$stage"
