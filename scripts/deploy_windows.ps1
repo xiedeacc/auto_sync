@@ -51,18 +51,13 @@ function Invoke-ElevatedSelf {
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        $scriptPath,
-        "-InstallDir",
-        $InstallDir,
-        "-RuntimeDir",
-        $RuntimeDir,
-        "-Config",
-        $Config,
-        "-AuthorizedKeyFile",
-        $AuthorizedKeyFile,
-        "-SshPort",
-        ([string]$SshPort)
+        $scriptPath
     )
+    if (-not [string]::IsNullOrWhiteSpace($InstallDir)) { $args += @("-InstallDir", $InstallDir) }
+    if (-not [string]::IsNullOrWhiteSpace($RuntimeDir)) { $args += @("-RuntimeDir", $RuntimeDir) }
+    if (-not [string]::IsNullOrWhiteSpace($Config)) { $args += @("-Config", $Config) }
+    if (-not [string]::IsNullOrWhiteSpace($AuthorizedKeyFile)) { $args += @("-AuthorizedKeyFile", $AuthorizedKeyFile) }
+    $args += @("-SshPort", ([string]$SshPort))
     if ($NoBuild) { $args += "-NoBuild" }
     if ($InstallSshd) { $args += "-InstallSshd" }
     if ($SkipSshd) { $args += "-SkipSshd" }
@@ -72,13 +67,30 @@ function Invoke-ElevatedSelf {
     if ($SkipStartup) { $args += "-SkipStartup" }
 
     $argLine = ($args | ForEach-Object { ConvertTo-CommandLineArgument $_ }) -join " "
+    $elevatedLog = Join-Path $env:TEMP "auto_sync_deploy_elevated.log"
+    $wrapper = Join-Path $env:TEMP ("auto_sync_deploy_elevated_" + [guid]::NewGuid().ToString("N") + ".cmd")
+    $cmdLines = @(
+        "@echo off",
+        "cd /d ""$rootDir""",
+        "echo auto_sync elevated deploy started at %DATE% %TIME% > ""$elevatedLog""",
+        """$powerShellExe"" $argLine >> ""$elevatedLog"" 2>>&1",
+        "set rc=%ERRORLEVEL%",
+        "echo auto_sync elevated deploy exit code %rc% >> ""$elevatedLog""",
+        "exit /b %rc%"
+    )
+    Set-Content -LiteralPath $wrapper -Value $cmdLines -Encoding ascii
     Write-Host "Administrator privileges are required; requesting elevation with $powerShellExe ..."
-    $process = Start-Process -FilePath $powerShellExe `
-        -ArgumentList $argLine `
+    Write-Host "Elevated deploy log: $elevatedLog"
+    $process = Start-Process -FilePath $wrapper `
         -Verb RunAs `
         -WorkingDirectory $rootDir `
         -Wait `
         -PassThru
+    Remove-Item -LiteralPath $wrapper -Force -ErrorAction SilentlyContinue
+    if ($process.ExitCode -ne 0 -and (Test-Path -LiteralPath $elevatedLog)) {
+        Write-Host "Elevated deploy failed; last log lines:"
+        Get-Content -LiteralPath $elevatedLog -Tail 80
+    }
     exit $process.ExitCode
 }
 
@@ -720,7 +732,7 @@ function Ensure-AutoSyncStartup {
     $guiAction = New-ScheduledTaskAction -Execute $autoSyncGuiExe -WorkingDirectory $BinDir
     $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
     $backendPrincipal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
-    $guiPrincipal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel LeastPrivilege
+    $guiPrincipal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
